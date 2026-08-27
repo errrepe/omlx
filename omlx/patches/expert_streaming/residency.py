@@ -340,8 +340,8 @@ def _cached_estimate(
     resident_bytes = int(checkpoint_bytes * _MODEL_OVERHEAD_FACTOR)
     # streaming with empty cache = dense only
     streaming_bytes_min = int(dense_bytes * _MODEL_OVERHEAD_FACTOR)
-    # default cache 2 GiB
-    default_budget = 2 * 1024 * 1024 * 1024
+    # default cache 1 GiB (enxuto)
+    default_budget = 1 * 1024 * 1024 * 1024
     streaming_bytes = streaming_bytes_min
     if supported and per_expert > 0:
         slots = min(experts_per_layer, default_budget // (num_moe_layers * per_expert) if num_moe_layers else 0)

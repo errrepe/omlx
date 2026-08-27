@@ -39,23 +39,43 @@ class CacheStats:
 
 
 class ExpertLRUCache:
-    """Global per-model LRU for expert slices.
+    """Per-layer LRU for expert slices (global budget split evenly).
 
-    Each slot holds one expert's data for one layer and one projection.
-    For fused gate+up, one slot is one expert's fused tensor.
+    Each slot holds one expert's bundle for one layer (weight+scales+biases).
+    Budget is split across MoE layers → per-layer capacity = budget // (layers*per_expert)
+    approximated via total capacity, but eviction is per-layer to avoid cross-layer thrashing.
+    `size`/`capacity` remain global totals for logging.
     """
 
-    def __init__(self, budget_bytes: int, per_expert_bytes: int):
+    def __init__(self, budget_bytes: int, per_expert_bytes: int, num_layers: int | None = None):
         self.budget_bytes = int(budget_bytes)
-        # number of experts (total across all layers) that fit
+        self.per_expert_bytes = int(per_expert_bytes)
+        self.num_layers = int(num_layers) if num_layers else 0
         if per_expert_bytes > 0:
             self.capacity = max(1, budget_bytes // per_expert_bytes) if budget_bytes > 0 else 0
         else:
             self.capacity = 0
-        self._store: OrderedDict[tuple[int, int, str], mx.array] = OrderedDict()
+        # per-layer stores to avoid global thrashing (layer 47 evicting layer 0)
+        if self.num_layers > 0 and self.capacity > 0:
+            per_layer = max(1, self.capacity // self.num_layers)
+            # distribute remainder
+            self._per_layer_cap = per_layer
+            self._global_cap = self.capacity
+        else:
+            self._per_layer_cap = self.capacity
+            self._global_cap = self.capacity
+        self._store: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
+        # per-layer tracking for eviction
+        self._layer_counts: Dict[int, int] = {}
         self.stats = CacheStats()
 
-    def get(self, key: tuple[int, int, str]) -> mx.array | None:
+    def _layer_of(self, key: tuple[int, int, str]) -> int:
+        try:
+            return int(key[0])
+        except Exception:
+            return -1
+
+    def get(self, key: tuple[int, int, str]) -> Any | None:
         if key in self._store:
             self._store.move_to_end(key)
             self.stats.hits += 1
@@ -63,21 +83,39 @@ class ExpertLRUCache:
         self.stats.misses += 1
         return None
 
-    def put(self, key: tuple[int, int, str], value: mx.array) -> None:
+    def put(self, key: tuple[int, int, str], value: Any) -> None:
         if self.capacity <= 0:
             return
         if key in self._store:
             self._store.move_to_end(key)
             self._store[key] = value
             return
-        # evict
+        # per-layer cap enforcement
+        layer = self._layer_of(key)
+        if self.num_layers > 0 and self._per_layer_cap:
+            cnt = self._layer_counts.get(layer, 0)
+            # evict oldest entry of same layer if per-layer full
+            if cnt >= self._per_layer_cap:
+                # find oldest entry of this layer
+                for k in list(self._store.keys()):
+                    if self._layer_of(k) == layer:
+                        self._store.pop(k)
+                        self.stats.evictions += 1
+                        self._layer_counts[layer] = max(0, self._layer_counts.get(layer, 1) - 1)
+                        break
+                # if still over capacity due to rounding, fall through to global
+        # global cap
         while len(self._store) >= self.capacity:
-            self._store.popitem(last=False)
+            old_k, _ = self._store.popitem(last=False)
             self.stats.evictions += 1
+            old_layer = self._layer_of(old_k)
+            self._layer_counts[old_layer] = max(0, self._layer_counts.get(old_layer, 1) - 1)
         self._store[key] = value
+        self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
 
     def clear(self) -> None:
         self._store.clear()
+        self._layer_counts.clear()
         self.stats = CacheStats()
 
     @property
@@ -283,21 +321,30 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         self._bias = bias
 
     def _load_expert_bundle(self, expert_id: int) -> tuple[mx.array, mx.array, mx.array | None]:
+        # Bundle cache: one LRU slot holds (weight, scales, biases) together — avoids 3× capacity waste
         key = (self.layer_idx, expert_id, self.stacked_weight_key)
-        # cache key includes weight; scales/biases are co-located, so we cache bundle
-        cached_w = self.cache.get(key)
-        if cached_w is not None:
-            # scales/biases cached under companion keys
-            s_key = (self.layer_idx, expert_id, self.stacked_scales_key)
-            b_key = (self.layer_idx, expert_id, self.stacked_biases_key) if self.stacked_biases_key else None
-            s = self.cache.get(s_key)
-            b = self.cache.get(b_key) if b_key else None
-            # if scales miss, reload bundle
-            if s is None:
-                # reload all
-                pass
-            else:
-                return cached_w, s, b  # type: ignore[return-value]
+        cached = self.cache.get(key)
+        if cached is not None:
+            # New format: bundle tuple stored under weight key
+            if isinstance(cached, tuple) and len(cached) == 3:
+                return cached  # type: ignore[return-value]
+            # Legacy: companion keys (weight hit but scales separate) — upgrade to bundle
+            if isinstance(cached, mx.array):
+                s_key = (self.layer_idx, expert_id, self.stacked_scales_key)
+                b_key = (self.layer_idx, expert_id, self.stacked_biases_key) if self.stacked_biases_key else None
+                s = self.cache.get(s_key)
+                b = self.cache.get(b_key) if b_key else None
+                if s is not None:
+                    bundle = (cached, s, b)
+                    # Collapse 3 slots into 1 bundle slot (evict companions)
+                    try:
+                        self.cache._store.pop(s_key, None)  # type: ignore[attr-defined]
+                        if b_key:
+                            self.cache._store.pop(b_key, None)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    self.cache.put(key, bundle)  # type: ignore[arg-type]
+                    return bundle  # type: ignore[return-value]
         # load from backing
         if hasattr(self.backing, "load_expert"):
             w = self.backing.load_expert(self.stacked_weight_key, expert_id)
@@ -319,11 +366,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             if b_bank is not None:
                 bb = b_bank[expert_id]
                 b = bb if isinstance(bb, mx.array) else mx.array(bb)
-        self.cache.put(key, w)
-        self.cache.put((self.layer_idx, expert_id, self.stacked_scales_key), s)
-        if b is not None and self.stacked_biases_key:
-            self.cache.put((self.layer_idx, expert_id, self.stacked_biases_key), b)
-        return w, s, b
+        bundle = (w, s, b)
+        self.cache.put(key, bundle)  # type: ignore[arg-type]
+        return bundle
 
     def __call__(self, x, indices, sorted_indices=False):
         mx.eval(indices)

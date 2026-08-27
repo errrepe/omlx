@@ -365,9 +365,9 @@ class EnginePool:
             if exp_enabled and exp_est is not None and exp_est.supported:
                 budget_gib = getattr(runtime_settings, "expert_streaming_budget_gib", None) if runtime_settings else None
                 try:
-                    budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 2 * 1024**3
+                    budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 1 * 1024**3
                 except Exception:
-                    budget_bytes = 2 * 1024**3
+                    budget_bytes = 1 * 1024**3
                 exp_streaming_bytes = exp_est.streaming_bytes_for_budget(budget_bytes)
                 # Use the smaller of current base and streaming estimate (streaming is a ceiling reduction)
                 base = min(base, exp_streaming_bytes)
@@ -376,14 +376,26 @@ class EnginePool:
         # When both PLE mmap and expert streaming are active, combine savings:
         # dense_without_both = checkpoint - ple - expert; streaming+ple = dense_without_both*1.05 + cache
         # Both estimates' checkpoint_bytes overlap (PLE may have separate artifact), so use max.
+        # Force PLE mmap when streaming is active for qwen4_exp (saves ~30G) even if ceiling wouldn't force it.
+        if not qwen4_active and exp_enabled and (entry.config_model_type or "").replace("-", "_").lower() == "qwen4_exp":
+            # streaming implies PLE should also be mmap to stay enxuto
+            try:
+                from .patches.mlx_vlm_qwen4_exp_compat.residency import qwen4_exp_residency_estimate
+                qest = qwen4_exp_residency_estimate(entry.model_path)
+                if qest.supported:
+                    qwen4_active = True
+                    qwen4_estimate = qest
+                    base = min(base, qest.mmap_bytes)
+            except Exception:
+                pass
         try:
             if qwen4_active and exp_enabled and exp_est is not None and exp_est.supported:
                 # Recompute cache for combined (same budget)
                 budget_gib = getattr(runtime_settings, "expert_streaming_budget_gib", None) if runtime_settings else None
                 try:
-                    budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 2 * 1024**3
+                    budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 1 * 1024**3
                 except Exception:
-                    budget_bytes = 2 * 1024**3
+                    budget_bytes = 1 * 1024**3
                 slots = exp_est.slots_for_budget(budget_bytes)
                 cache = slots * exp_est.num_moe_layers * exp_est.per_expert_bytes if slots else 0
                 chk = max(qwen4_estimate.checkpoint_bytes, exp_est.checkpoint_bytes)

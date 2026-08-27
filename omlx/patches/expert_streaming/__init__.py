@@ -38,15 +38,18 @@ def apply_expert_streaming_patch() -> bool:
 
 def _get_budget_bytes(model_settings: Any | None, estimate: Any | None) -> int:
     if model_settings is not None:
-        gib = getattr(model_settings, "expert_cache_budget_gib", None)
-        if gib is not None and float(gib) > 0:
-            return int(float(gib) * 1024**3)
+        # Preferred name (model_settings.py:222) + legacy cache name
+        for attr in ("expert_streaming_budget_gib", "expert_cache_budget_gib"):
+            gib = getattr(model_settings, attr, None)
+            if gib is not None and float(gib) > 0:
+                return int(float(gib) * 1024**3)
         # legacy mib
-        mib = getattr(model_settings, "expert_cache_budget_mib", None)
-        if mib is not None and int(mib) > 0:
-            return int(int(mib) * 1024 * 1024)
-    # default 2 GiB
-    return 2 * 1024 * 1024 * 1024
+        for attr in ("expert_streaming_budget_mib", "expert_cache_budget_mib"):
+            mib = getattr(model_settings, attr, None)
+            if mib is not None and int(mib) > 0:
+                return int(int(mib) * 1024 * 1024)
+    # default 1 GiB (enxuto para Qwen 99G + GLM 50G — 2G estoura 16G Macs)
+    return 1 * 1024 * 1024 * 1024
 
 
 def _candidate_stacked_keys(layer_idx: int, proj: str, suffix: str) -> list[str]:
@@ -113,7 +116,7 @@ def convert_model_to_streaming(
     from .streaming_switch import ExpertLRUCache, StreamingQuantizedSwitchLinear, StreamingSwitchGLU, StreamingSwitchLinear
 
     per_expert = estimate.per_expert_bytes or 0
-    cache = ExpertLRUCache(budget_bytes, per_expert)
+    cache = ExpertLRUCache(budget_bytes, per_expert, num_layers=estimate.num_moe_layers)
 
     # Backing store
     backing = None
