@@ -1130,5 +1130,10 @@
   "js.success.download_started": "已開始下載：{repo_id}",
   "js.success.settings_saved": "設定儲存成功",
   "settings.mcp.expose_tools": "向客戶端公開後端 MCP 工具",
-  "settings.mcp.expose_tools_hint": "將後端 MCP 工具合併到聊天回應中。如果您的用戶端有自己的 MCP 伺服器，請停用此選項。"
+  "settings.mcp.expose_tools_hint": "將後端 MCP 工具合併到聊天回應中。如果您的用戶端有自己的 MCP 伺服器，請停用此選項。",
+  "modal.model_settings.expert_streaming": "Expert Streaming (SSD)",
+  "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
+  "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
+  "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
+  "modal.model_settings.expert_streaming_budget_hint": "Total RAM for the expert cache across all MoE layers (empty = auto ~2 GiB). Larger = fewer SSD faults but more RAM."
 }

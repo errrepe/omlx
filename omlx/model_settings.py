@@ -216,6 +216,11 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    # MoE expert streaming (SSD): keep hot experts resident, stream the rest
+    # from SSD. Hardware-specific; may be auto-forced when resident load cannot
+    # fit under the memory ceiling but streaming fits. Budget 0/None = auto 2 GiB.
+    expert_streaming_enabled: bool = False
+    expert_streaming_budget_gib: Optional[float] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

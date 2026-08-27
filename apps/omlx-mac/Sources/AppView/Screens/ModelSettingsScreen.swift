@@ -735,6 +735,47 @@ private struct AdvancedTab: View {
                         .disabled(vm.qwen4PleSsdOffloadForced)
                     }
                 }
+                if vm.expertStreamingSupported {
+                    Row(label: String(localized: "settings.advanced.expert_streaming.label",
+                                      defaultValue: "Expert Streaming (SSD)",
+                                      comment: "Row label for the MoE expert streaming toggle"),
+                        sublabel: vm.expertStreamingForced
+                            ? String(localized: "settings.advanced.expert_streaming.forced",
+                                     defaultValue: "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
+                                     comment: "Sublabel when expert streaming is forced by memory limits")
+                            : String(localized: "settings.advanced.expert_streaming.sub",
+                                     defaultValue: "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for memory. One request at a time. Takes effect after reload.",
+                                     comment: "Sublabel for the expert streaming toggle")) {
+                        Toggle("", isOn: vm.bind(
+                            $vm.expertStreamingEnabled,
+                            save: {
+                                Task {
+                                    await vm.save(.expertStreamingEnabled, client: client)
+                                }
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .disabled(vm.expertStreamingForced)
+                    }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.budget.label",
+                                          defaultValue: "Cache budget",
+                                          comment: "Row label for the expert cache budget field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.budget.sub",
+                                             defaultValue: "Total RAM for the expert cache across all MoE layers (empty = auto ~2 GiB). Larger = fewer SSD faults.",
+                                             comment: "Sublabel for the expert cache budget field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingBudgetGib,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingBudgetGib, client: client)
+                                    }
+                                }
+                            ), mono: true, suffix: "GiB", width: 110)
+                        }
+                    }
+                }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),

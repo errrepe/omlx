@@ -57,6 +57,17 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let qwen4PleSsdOffloadForced: Bool?
     let qwen4PleResidentBytes: Int64?
     let qwen4PleMmapBytes: Int64?
+    /// Expert streaming (SSD) capability for MoE models (glm_moe_dsa etc.).
+    let expertStreamingSupported: Bool?
+    let expertStreamingForced: Bool?
+    let expertStreamingReason: String?
+    let expertDenseBytes: Int64?
+    let expertTotalBytes: Int64?
+    let expertResidentBytes: Int64?
+    let expertStreamingBytes: Int64?
+    let expertMoeLayers: Int?
+    let expertsPerLayer: Int?
+    let perExpertBytes: Int64?
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -89,6 +100,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
     let qwen4PleSsdOffload: Bool?
+    let expertStreamingEnabled: Bool?
+    let expertStreamingBudgetGib: Double?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -176,6 +189,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var ttlSeconds: Int? = nil
     var enableThinking: Bool? = nil
     var qwen4PleSsdOffload: Bool? = nil
+    var expertStreamingEnabled: Bool? = nil
+    var expertStreamingBudgetGib: Double? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil

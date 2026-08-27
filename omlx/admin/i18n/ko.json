@@ -1130,5 +1130,10 @@
   "js.success.download_started": "다운로드 시작: {repo_id}",
   "js.success.settings_saved": "설정이 저장되었습니다",
   "settings.mcp.expose_tools": "백엔드 MCP 도구를 클라이언트에 노출",
-  "settings.mcp.expose_tools_hint": "백엔드 MCP 도구를 채팅 응답에 병합합니다. 클라이언트에 자체 MCP 서버가 있는 경우 비활성화하세요."
+  "settings.mcp.expose_tools_hint": "백엔드 MCP 도구를 채팅 응답에 병합합니다. 클라이언트에 자체 MCP 서버가 있는 경우 비활성화하세요.",
+  "modal.model_settings.expert_streaming": "Expert Streaming (SSD)",
+  "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
+  "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
+  "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
+  "modal.model_settings.expert_streaming_budget_hint": "Total RAM for the expert cache across all MoE layers (empty = auto ~2 GiB). Larger = fewer SSD faults but more RAM."
 }

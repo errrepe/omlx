@@ -291,13 +291,41 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._model
         )
 
+        # Expert streaming (SSD): keep hot experts resident, stream the rest.
+        # Must run after materialize so expert banks are evaluated, and before
+        # gate+up fusion (fusion would change the stacked layout). Effective
+        # settings already include forced activation from EnginePool.
+        if getattr(self._model_settings, "expert_streaming_enabled", False):
+            try:
+                from ..patches.expert_streaming import convert_model_to_streaming
+
+                def _do_streaming():
+                    _, backing = convert_model_to_streaming(
+                        self._model, self._model_name, self._model_settings
+                    )
+                    # keep backing alive on the engine/model
+                    if backing is not None:
+                        self._expert_streaming_backing = backing
+                        try:
+                            self._model._expert_streaming_backing = backing  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    return backing
+
+                await loop.run_in_executor(get_mlx_executor(), _do_streaming)
+                logger.info("Expert streaming enabled for %s", self._model_name)
+            except Exception:
+                logger.warning("Expert streaming conversion failed for %s", self._model_name, exc_info=True)
+
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
-        # executor because it rewrites weights in place.
+        # executor because it rewrites weights in place. Skip when expert
+        # streaming is active — streaming already handles the projection layout.
         if (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
+            and not getattr(self._model_settings, "expert_streaming_enabled", False)
         ):
             try:
                 from ..patches.qwen35_moe_gate_up import (

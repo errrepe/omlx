@@ -7378,6 +7378,18 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    expert_streaming_enabled: model?.expert_streaming_forced === true
+                        || s.expert_streaming_enabled === true,
+                    expert_streaming_supported:
+                        model?.expert_streaming_supported === true,
+                    expert_streaming_forced:
+                        model?.expert_streaming_forced === true,
+                    expert_streaming_budget_gib: s.expert_streaming_budget_gib ?? null,
+                    expert_dense_bytes: model?.expert_dense_bytes || 0,
+                    expert_total_bytes: model?.expert_total_bytes || 0,
+                    expert_moe_layers: model?.expert_moe_layers || 0,
+                    experts_per_layer: model?.experts_per_layer || 0,
+                    per_expert_bytes: model?.per_expert_bytes || 0,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -8300,6 +8312,10 @@
                                 enable_thinking: this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
+                                expert_streaming_enabled: !!this.modelSettings.expert_streaming_enabled,
+                                expert_streaming_budget_gib: this.modelSettings.expert_streaming_budget_gib != null && String(this.modelSettings.expert_streaming_budget_gib).length
+                                    ? parseFloat(this.modelSettings.expert_streaming_budget_gib)
+                                    : null,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)

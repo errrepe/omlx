@@ -1130,5 +1130,10 @@
   "js.success.download_started": "Téléchargement démarré : {repo_id}",
   "js.success.settings_saved": "Paramètres enregistrés avec succès",
   "settings.mcp.expose_tools": "Exposer les outils MCP du backend aux clients",
-  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP."
+  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP.",
+  "modal.model_settings.expert_streaming": "Expert Streaming (SSD)",
+  "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
+  "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
+  "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
+  "modal.model_settings.expert_streaming_budget_hint": "Total RAM for the expert cache across all MoE layers (empty = auto ~2 GiB). Larger = fewer SSD faults but more RAM."
 }

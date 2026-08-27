@@ -354,6 +354,20 @@ class EnginePool:
         )
         if qwen4_offload and qwen4_estimate is not None:
             base = min(base, qwen4_estimate.mmap_bytes)
+        # Expert streaming reduces resident to dense + cache budget
+        try:
+            exp_enabled, _, exp_est = self._expert_streaming_status(entry, runtime_settings)
+            if exp_enabled and exp_est is not None and exp_est.supported:
+                budget_gib = getattr(runtime_settings, "expert_streaming_budget_gib", None) if runtime_settings else None
+                try:
+                    budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 2 * 1024**3
+                except Exception:
+                    budget_bytes = 2 * 1024**3
+                streaming_bytes = exp_est.streaming_bytes_for_budget(budget_bytes)
+                # Use the smaller of current base and streaming estimate (streaming is a ceiling reduction)
+                base = min(base, streaming_bytes)
+        except Exception:
+            pass
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -417,6 +431,42 @@ class EnginePool:
             return settings
         effective = copy.copy(settings)
         setattr(effective, "qwen4_ple_ssd_offload", True)
+        return effective
+
+    def _expert_streaming_status(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> tuple[bool, bool, object | None]:
+        """Resolve requested/forced expert streaming for this process."""
+
+        try:
+            from .patches.expert_streaming.residency import expert_streaming_estimate
+
+            est = expert_streaming_estimate(entry.model_path)
+        except Exception:
+            return False, False, None
+        if not est.supported:
+            return False, False, est
+        ceiling = self._fallback_admission_ceiling()
+        if ceiling <= 0:
+            ceiling = self._current_ceiling()
+        forced = est.force_streaming(ceiling)
+        requested = bool(
+            settings is not None and getattr(settings, "expert_streaming_enabled", False)
+        )
+        return requested or forced, forced, est
+
+    def _effective_expert_streaming_settings(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> object | None:
+        enabled, forced, _ = self._expert_streaming_status(entry, settings)
+        if not enabled or not forced or settings is None:
+            return settings
+        effective = copy.copy(settings)
+        setattr(effective, "expert_streaming_enabled", True)
         return effective
 
     @property
@@ -589,6 +639,10 @@ class EnginePool:
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
+            exp_enabled, _, _ = self._expert_streaming_status(entry, settings)
+            add("expert_streaming_enabled", exp_enabled)
+            if exp_enabled:
+                add("expert_streaming_budget_gib", data.get("expert_streaming_budget_gib"))
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -2517,6 +2571,7 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+            model_settings = self._effective_expert_streaming_settings(entry, model_settings)
 
             deployment = self._distributed_deployment_for_entry(entry)
             base_resident_size = self._entry_resident_size(entry)

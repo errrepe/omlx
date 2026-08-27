@@ -130,6 +130,8 @@ class ModelSettingsRequest(BaseModel):
     index_cache_freq: int | None = None
     enable_thinking: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    expert_streaming_enabled: bool | None = None
+    expert_streaming_budget_gib: float | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -1951,6 +1953,38 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                     exc_info=True,
                 )
 
+        # Expert streaming capability (glm_moe_dsa etc.)
+        expert_streaming_supported = False
+        expert_streaming_forced = False
+        expert_streaming_reason: str | None = None
+        expert_dense_bytes = 0
+        expert_total_bytes = 0
+        expert_resident_bytes = 0
+        expert_streaming_bytes = 0
+        expert_moe_layers = 0
+        experts_per_layer = 0
+        per_expert_bytes = 0
+        try:
+            from ..patches.expert_streaming.residency import expert_streaming_estimate
+
+            _est = expert_streaming_estimate(model_info.get("model_path", "") or "")
+            expert_streaming_supported = bool(_est.supported)
+            expert_streaming_reason = _est.reason
+            expert_dense_bytes = int(_est.dense_bytes)
+            expert_total_bytes = int(_est.expert_bytes)
+            expert_resident_bytes = int(_est.resident_bytes)
+            expert_streaming_bytes = int(_est.streaming_bytes)
+            expert_moe_layers = int(_est.num_moe_layers)
+            experts_per_layer = int(_est.experts_per_layer)
+            per_expert_bytes = int(_est.per_expert_bytes)
+            if _est.supported:
+                try:
+                    expert_streaming_forced = bool(_est.force_streaming(residency_ceiling))
+                except Exception:
+                    expert_streaming_forced = False
+        except Exception:
+            logger.debug("Could not inspect expert streaming for %s", model_id, exc_info=True)
+
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
@@ -2004,6 +2038,16 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "expert_streaming_supported": expert_streaming_supported,
+            "expert_streaming_forced": expert_streaming_forced,
+            "expert_streaming_reason": expert_streaming_reason,
+            "expert_dense_bytes": expert_dense_bytes,
+            "expert_total_bytes": expert_total_bytes,
+            "expert_resident_bytes": expert_resident_bytes,
+            "expert_streaming_bytes": expert_streaming_bytes,
+            "expert_moe_layers": expert_moe_layers,
+            "experts_per_layer": experts_per_layer,
+            "per_expert_bytes": per_expert_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2335,6 +2379,22 @@ async def update_model_settings(
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
         )
+    if "expert_streaming_enabled" in sent:
+        current_settings.expert_streaming_enabled = bool(
+            request.expert_streaming_enabled
+        )
+    if "expert_streaming_budget_gib" in sent:
+        v = request.expert_streaming_budget_gib
+        if v is None:
+            current_settings.expert_streaming_budget_gib = None
+        else:
+            try:
+                gib = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expert_streaming_budget_gib must be a number")
+            if not 0 <= gib <= 64:
+                raise HTTPException(status_code=400, detail="expert_streaming_budget_gib must be between 0 and 64 GiB")
+            current_settings.expert_streaming_budget_gib = float(gib) if gib > 0 else None
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
