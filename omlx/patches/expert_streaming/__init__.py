@@ -478,6 +478,21 @@ def convert_model_to_streaming(
         # Replace
         mlp.switch_mlp = streaming_glu  # type: ignore[attr-defined]
         converted += 1
+        # Disable decoder FFN compilation (GLM-5.3 Glm5NextDecoderLayer
+        # compiles the FFN when compile_ffn is True): mx.eval(indices) inside
+        # the streaming switch is illegal under mx.compile/vmap transforms.
+        try:
+            layer.compile_ffn = False  # type: ignore[attr-defined]
+            layer._ffn_c = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # Evaluate the layer output so the lazy graph does not pin every
+        # layer's mini-bank (42 layers x ~13 MB/expert) at once — without
+        # this the accumulate graph swaps on GLM-class experts.
+        try:
+            layer._stream_eval = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
         # Free original tensors to save memory
         # Drop references; will be GC'd. For mmap backing, original stacked banks are no longer needed.
         # For RAM dict backing, we kept a copy; we can still free the original stacked mx arrays.

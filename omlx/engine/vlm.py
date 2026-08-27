@@ -1677,7 +1677,11 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                    if model_type in (QWEN4_EXP_MODEL_TYPE, "glm5_next"):
+                        # Lazy-load so giant MoE checkpoints (Qwen3.8-Flash-Next
+                        # 99G, GLM-5.3-Flash-oQ4e 190G) stream from SSD instead of
+                        # materializing fully in RAM; expert streaming replaces
+                        # the MoE projections afterwards.
                         load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
@@ -1714,18 +1718,15 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_name,
                 )
 
-        # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
-        # loader thread so per-engine inference threads can read them (#1304).
-        from ..utils.model_loading import materialize_lazy_state
-
-        await loop.run_in_executor(
-            get_mlx_executor(), materialize_lazy_state, self._vlm_model
-        )
-
         # Expert streaming (SSD): keep hot experts resident, stream the rest.
-        # Must run after materialize so expert banks are evaluated, and before
-        # gate+up fusion (fusion would change the stacked layout). Effective
-        # settings already include forced activation from EnginePool.
+        # Runs BEFORE materialize_lazy_state on purpose. On lazy-loaded
+        # checkpoints (qwen4_exp, glm5_next) every tensor is a plain mx.array
+        # and materialize_lazy_state would evaluate the entire tree — including
+        # the multi-hundred-GB MoE expert banks (OOM). Converting to streaming
+        # first drops those arrays (GC'd), so the materialize that follows only
+        # evaluates dense weights, RoPE freqs and vision/audio towers.
+        # Also runs before gate+up fusion (fusion would change the stacked
+        # layout).
         if getattr(self._model_settings, "expert_streaming_enabled", False):
             try:
                 from ..patches.expert_streaming import convert_model_to_streaming
@@ -1750,6 +1751,15 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_name,
                     exc_info=True,
                 )
+
+        # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
+        # loader thread so per-engine inference threads can read them (#1304).
+        # Post-streaming: the MoE banks are gone, so this stays bounded.
+        from ..utils.model_loading import materialize_lazy_state
+
+        await loop.run_in_executor(
+            get_mlx_executor(), materialize_lazy_state, self._vlm_model
+        )
 
         # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
         # The repacked safetensors carries 2-bit biases for format compat;

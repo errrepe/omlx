@@ -840,8 +840,19 @@ class Glm5NextDecoderLayer(nn.Module):
         if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
-            return self._ffn_c(x)
-        return self._ffn_block(x)
+            out = self._ffn_c(x)
+        else:
+            out = self._ffn_block(x)
+        # Expert streaming: evaluate per layer so the lazy graph does not pin
+        # every layer's mini-bank (42 layers x ~13 MB/expert x uniq) at once.
+        # Without this, decode/prefill accumulates multi-GB of temp experts
+        # and the process swaps. Also release the allocator cache — GLM mini-
+        # banks are ~3.4 GB/layer and the pool would otherwise retain tens of
+        # GB across layers.
+        if getattr(self, "_stream_eval", False):
+            mx.eval(out)
+            mx.clear_cache()
+        return out
 
     def _ffn_block(self, x: mx.array) -> mx.array:
         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.

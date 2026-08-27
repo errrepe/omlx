@@ -11,8 +11,10 @@ is global per model.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
 import mlx.core as mx
@@ -20,6 +22,114 @@ import mlx.nn as nn
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_PROFILE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
+
+
+@dataclass
+class LayerProfile:
+    calls: int = 0
+    gate_eval_s: float = 0.0
+    unique_s: float = 0.0
+    load_s: float = 0.0
+    stack_s: float = 0.0
+    load_hits: int = 0
+    load_misses: int = 0
+    experts_requested: int = 0
+    positions: int = 0
+
+
+class ProfileAccumulator:
+    """Per-layer stage timing for the streaming switch (Fase 0 instrumentation).
+
+    Buckets per layer, per token:
+      gate_eval  – mx.eval(indices) + device->host copy
+      unique     – np.unique + id remap
+      load       – _load_expert_bundle total (split hits/misses)
+      stack      – mx.stack of mini-bank + gather graph build (lazy; kernel cost
+                   shows up in GLU wall time)
+    Wall time (full GLU __call__) is tracked separately so kernel cost can be
+    derived as wall − ∑(linears buckets).
+    """
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self.layers: Dict[int, LayerProfile] = {}
+        self.wall_s: Dict[int, float] = {}
+
+    def add(
+        self,
+        idx: int,
+        *,
+        gate: float,
+        unique: float,
+        load: float,
+        stack: float,
+        hits: int,
+        misses: int,
+        experts: int,
+        positions: int,
+    ) -> None:
+        if not self.enabled:
+            return
+        lp = self.layers.setdefault(idx, LayerProfile())
+        lp.calls += 1
+        lp.gate_eval_s += gate
+        lp.unique_s += unique
+        lp.load_s += load
+        lp.stack_s += stack
+        lp.load_hits += hits
+        lp.load_misses += misses
+        lp.experts_requested += experts
+        lp.positions += positions
+
+    def add_wall(self, idx: int, dt: float) -> None:
+        if not self.enabled:
+            return
+        self.wall_s[idx] = self.wall_s.get(idx, 0.0) + dt
+
+    def report(self) -> dict:
+        per: Dict[str, dict] = {}
+        totals = LayerProfile()
+        for idx in sorted(self.layers):
+            lp = self.layers[idx]
+            c = max(lp.calls, 1)
+            per[str(idx)] = {
+                "calls": lp.calls,
+                "gate_eval_ms": lp.gate_eval_s / c * 1e3,
+                "unique_ms": lp.unique_s / c * 1e3,
+                "load_ms": lp.load_s / c * 1e3,
+                "stack_ms": lp.stack_s / c * 1e3,
+                "wall_ms": self.wall_s.get(idx, 0.0) / c * 1e3,
+                "load_hits": lp.load_hits,
+                "load_misses": lp.load_misses,
+                "hit_rate": lp.load_hits / max(lp.load_hits + lp.load_misses, 1),
+                "experts_req_per_call": lp.experts_requested / c,
+                "positions_per_call": lp.positions / c,
+            }
+            totals.calls += lp.calls
+            totals.gate_eval_s += lp.gate_eval_s
+            totals.unique_s += lp.unique_s
+            totals.load_s += lp.load_s
+            totals.stack_s += lp.stack_s
+            totals.load_hits += lp.load_hits
+            totals.load_misses += lp.load_misses
+            totals.experts_requested += lp.experts_requested
+            totals.positions += lp.positions
+        n = max(totals.calls, 1)
+        tots = {
+            "calls": totals.calls,
+            "gate_eval_ms": totals.gate_eval_s / n * 1e3,
+            "unique_ms": totals.unique_s / n * 1e3,
+            "load_ms": totals.load_s / n * 1e3,
+            "stack_ms": totals.stack_s / n * 1e3,
+            "load_hits": totals.load_hits,
+            "load_misses": totals.load_misses,
+            "hit_rate_global": totals.load_hits / max(totals.load_hits + totals.load_misses, 1),
+            "wall_ms_per_call": sum(self.wall_s.values()) / n * 1e3,
+            "layers": len(self.layers),
+        }
+        return {"per_layer": per, "totals": tots}
 
 try:
     from .shard_bank import ExpertBackingStore
@@ -68,6 +178,10 @@ class ExpertLRUCache:
         # per-layer tracking for eviction
         self._layer_counts: Dict[int, int] = {}
         self.stats = CacheStats()
+        self.profile = ProfileAccumulator(enabled=_PROFILE_ENV)
+
+    def __contains__(self, key: tuple[int, int, str]) -> bool:
+        return key in self._store
 
     def _layer_of(self, key: tuple[int, int, str]) -> int:
         try:
@@ -225,6 +339,8 @@ class StreamingSwitchLinear(nn.Module):
         # Use mx.eval + tolist pattern?
         # We avoid double eval by checking if indices is already evaluated (has no graph)
         # For simplicity, eval indices.
+        p = self.cache.profile
+        t0 = time.perf_counter()
         mx.eval(indices)
         # Convert to numpy for unique
         try:
@@ -240,14 +356,26 @@ class StreamingSwitchLinear(nn.Module):
                 else:
                     yield obj
             flat_np = np.array(list(_flatten(flat_list)), dtype=np.int32)
+        t1 = time.perf_counter()
         uniq = np.unique(flat_np)
         uniq_list = uniq.tolist()
         # Map global expert id -> compact id
         id_to_compact = {int(e): i for i, e in enumerate(uniq_list)}
+        t2 = time.perf_counter()
         # Load each unique expert weight
         mini_weights = []
+        t_load = 0.0
+        hits = 0
+        misses = 0
         for eid in uniq_list:
+            was_hit = (self.layer_idx, eid, self.stacked_key) in self.cache
+            t_l = time.perf_counter()
             w = self._load_expert_weight(int(eid))
+            t_load += time.perf_counter() - t_l
+            if was_hit:
+                hits += 1
+            else:
+                misses += 1
             mini_weights.append(w)
         # Stack into mini-bank (U, O, I)
         if len(mini_weights) == 1:
@@ -269,6 +397,18 @@ class StreamingSwitchLinear(nn.Module):
             # slice similarly
             b_mini = mx.stack([self._bias[int(e)] for e in uniq_list], axis=0)  # (U,O)
             out = out + mx.expand_dims(b_mini[remapped], -2)
+        t4 = time.perf_counter()
+        p.add(
+            self.layer_idx,
+            gate=t1 - t0,
+            unique=t2 - t1,
+            load=t_load,
+            stack=t4 - t2 - t_load,
+            hits=hits,
+            misses=misses,
+            experts=len(uniq_list),
+            positions=int(flat_np.size),
+        )
         return out
 
 
@@ -371,6 +511,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         return bundle
 
     def __call__(self, x, indices, sorted_indices=False):
+        p = self.cache.profile
+        t0 = time.perf_counter()
         mx.eval(indices)
         try:
             flat_np = np.array(indices, copy=False).reshape(-1)
@@ -383,14 +525,26 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 else:
                     yield obj
             flat_np = np.array(list(_flatten(flat_list)), dtype=np.int32)
+        t1 = time.perf_counter()
         uniq = np.unique(flat_np)
         uniq_list = uniq.tolist()
         id_to_compact = {int(e): i for i, e in enumerate(uniq_list)}
+        t2 = time.perf_counter()
         # Load bundles
         mini_w, mini_s, mini_b = [], [], []
         has_b = False
+        t_load = 0.0
+        hits = 0
+        misses = 0
         for eid in uniq_list:
+            was_hit = (self.layer_idx, eid, self.stacked_weight_key) in self.cache
+            t_l = time.perf_counter()
             w, s, b = self._load_expert_bundle(int(eid))
+            t_load += time.perf_counter() - t_l
+            if was_hit:
+                hits += 1
+            else:
+                misses += 1
             mini_w.append(w)
             mini_s.append(s)
             if b is not None:
@@ -421,6 +575,18 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         if self._bias is not None and self._has_bias:
             b_mini = mx.stack([self._bias[int(e)] for e in uniq_list], axis=0)
             out = out + mx.expand_dims(b_mini[remapped], -2)
+        t4 = time.perf_counter()
+        p.add(
+            self.layer_idx,
+            gate=t1 - t0,
+            unique=t2 - t1,
+            load=t_load,
+            stack=t4 - t2 - t_load,
+            hits=hits,
+            misses=misses,
+            experts=len(uniq_list),
+            positions=int(flat_np.size),
+        )
         return out
 
 
@@ -470,6 +636,8 @@ class StreamingSwitchGLU(nn.Module):
 
     def __call__(self, x, indices, scores=None, weighted_sum: bool = False):
         # Mirror SwitchGLU.__call__ but route through streaming linears
+        p = getattr(self, "_cache", None).profile if hasattr(self, "_cache") else None
+        t_wall0 = time.perf_counter() if (p is not None and p.enabled) else None
         # Determine fused vs split by presence of gate_up_proj
         has_fused = hasattr(self, "gate_up_proj")
         x_exp = mx.expand_dims(x, (-2, -3))
@@ -507,4 +675,7 @@ class StreamingSwitchGLU(nn.Module):
 
         if do_sort:
             x_out = _scatter_unsort(x_out, inv_order, indices.shape)
-        return x_out.squeeze(-2)
+        out = x_out.squeeze(-2)
+        if t_wall0 is not None and p is not None:
+            p.add_wall(self.layer_idx, time.perf_counter() - t_wall0)
+        return out
