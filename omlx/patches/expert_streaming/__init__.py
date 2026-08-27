@@ -11,7 +11,14 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 
-SUPPORTED_TYPES = {"glm_moe_dsa", "deepseek_v32"}
+SUPPORTED_TYPES = {
+    "glm_moe_dsa",
+    "deepseek_v32",
+    "glm5_next",
+    "glm5_next_text",
+    "qwen4_exp",
+    "qwen4_exp_text",
+}
 
 
 def is_supported_model_type(model_type: str | None) -> bool:
@@ -40,6 +47,32 @@ def _get_budget_bytes(model_settings: Any | None, estimate: Any | None) -> int:
             return int(int(mib) * 1024 * 1024)
     # default 2 GiB
     return 2 * 1024 * 1024 * 1024
+
+
+def _candidate_stacked_keys(layer_idx: int, proj: str, suffix: str) -> list[str]:
+    prefixes = [
+        f"model.layers.{layer_idx}.mlp.switch_mlp",
+        f"model.language_model.layers.{layer_idx}.mlp.switch_mlp",
+        f"language_model.model.layers.{layer_idx}.mlp.switch_mlp",
+        f"language_model.layers.{layer_idx}.mlp.switch_mlp",
+    ]
+    return [f"{p}.{proj}.{suffix}" for p in prefixes]
+
+
+def _resolve_stacked_key(layer_idx: int, proj: str, suffix: str, backing: Any | None) -> str:
+    if backing is not None and hasattr(backing, "_weight_map"):
+        wm = getattr(backing, "_weight_map", {}) or {}
+        for cand in _candidate_stacked_keys(layer_idx, proj, suffix):
+            if cand in wm:
+                return cand
+        # fallback: any key containing layer and proj/suffix
+        needle = f"layers.{layer_idx}."
+        mid = f"switch_mlp.{proj}.{suffix}"
+        for k in wm:
+            if needle in k and mid in k:
+                return k
+    # default for LLM or RAM dict
+    return f"model.layers.{layer_idx}.mlp.switch_mlp.{proj}.{suffix}"
 
 
 def convert_model_to_streaming(
@@ -105,13 +138,34 @@ def convert_model_to_streaming(
     import mlx.core as mx
 
     converted = 0
-    # Walk model.layers
+    # Walk model.layers — handle LLM (model.model.layers) and VLM wrappers
+    # (language_model.model.layers via language_model indirection)
     layers = None
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-    elif hasattr(model, "layers"):
-        layers = model.layers  # type: ignore[assignment]
-    else:
+    # candidate attribute paths to try
+    candidate_paths = [
+        ("model", "layers"),  # mlx_lm LanguageModel.model.layers
+        ("layers",),  # VLM Model.layers property (glm5_next)
+        ("language_model", "model", "layers"),  # VLM wrapper: Model.language_model.model.layers
+        ("language_model", "layers"),  # alternative VLM wrapper
+        ("model", "language_model", "model", "layers"),
+    ]
+    for path in candidate_paths:
+        cur = model
+        ok = True
+        for attr in path:
+            if not hasattr(cur, attr):
+                ok = False
+                break
+            cur = getattr(cur, attr)
+        if ok and cur is not None:
+            # sanity: should be iterable with length ~ num_layers
+            try:
+                _ = len(cur)  # type: ignore[arg-type]
+                layers = cur  # type: ignore[assignment]
+                break
+            except Exception:
+                continue
+    if layers is None:
         logger.warning("Expert streaming: could not find model.layers")
         return model, backing if isinstance(backing, dict) is False else None
 
@@ -160,15 +214,69 @@ def convert_model_to_streaming(
         except Exception:
             pass
 
-        # Use model config for dims
-        cfg = getattr(model, "args", None) or getattr(getattr(model, "model", None), "args", None)
-        if cfg is not None:
-            hidden = getattr(cfg, "hidden_size", None)
-            moe_hidden = getattr(cfg, "moe_intermediate_size", None)
+        # Use model config for dims — try multiple locations for VLM wrappers
+        hidden = None
+        moe_hidden = None
+        cfg_candidates = []
+        # collect potential config objects
+        for obj in [
+            getattr(model, "args", None),
+            getattr(getattr(model, "model", None), "args", None),
+            getattr(getattr(model, "language_model", None), "args", None),
+            getattr(getattr(getattr(model, "language_model", None), "model", None), "args", None),
+            getattr(model, "config", None),
+            getattr(getattr(model, "config", None), "text_config", None),
+            getattr(getattr(model, "language_model", None), "config", None),
+            getattr(getattr(getattr(model, "language_model", None), "model", None), "config", None),
+        ]:
+            if obj is not None:
+                cfg_candidates.append(obj)
+        # also try dict-style configs
+        for cand in cfg_candidates:
+            try:
+                h = getattr(cand, "hidden_size", None)
+                if h is None and isinstance(cand, dict):
+                    h = cand.get("hidden_size")
+                if h is not None:
+                    hidden = int(h)
+                m = getattr(cand, "moe_intermediate_size", None)
+                if m is None and isinstance(cand, dict):
+                    m = cand.get("moe_intermediate_size")
+                    if m is None:
+                        # qwen uses moe_intermediate_size in text_config
+                        m = cand.get("moe_intermediate_size")
+                if m is not None:
+                    moe_hidden = int(m)
+                if hidden is not None and moe_hidden is not None:
+                    break
+            except Exception:
+                continue
+        # fallback to estimate fields
         if hidden is None:
             hidden = 4096
         if moe_hidden is None:
+            # qwen4_exp default is 640, glm5_next is 2048; try to infer from first expert
+            # keep original default 1407 for glm_moe_dsa; will be corrected after download
             moe_hidden = 1407
+        # Override for known types when fallback is still generic
+        try:
+            mt = None
+            for c in cfg_candidates:
+                mt = getattr(c, "model_type", None) or (c.get("model_type") if isinstance(c, dict) else None)
+                if mt:
+                    break
+            if mt and str(mt).lower().replace("-", "_") in ("qwen4_exp", "qwen4_exp_text"):
+                if moe_hidden == 1407:
+                    moe_hidden = 640
+                if hidden == 4096:
+                    # hidden for qwen flash is 2560 (from config)
+                    # keep 4096 only if not overridden by real config; qwen will have provided
+                    pass
+            elif mt and str(mt).lower().replace("-", "_") in ("glm5_next", "glm5_next_text"):
+                if moe_hidden == 1407:
+                    moe_hidden = 2048
+        except Exception:
+            pass
 
         # Create streaming GLU shell
         fused = hasattr(switch_mlp, "gate_up_proj")
@@ -240,11 +348,11 @@ def convert_model_to_streaming(
         if fused:
             src = getattr(switch_mlp, "gate_up_proj")
             # Determine stacked keys for file backing (for mmap path)
-            # Use checkpoint key pattern: model.layers.{l}.mlp.switch_mlp.gate_up_proj.weight
-            stacked_w_key = f"model.layers.{layer_idx}.mlp.switch_mlp.gate_up_proj.weight"
+            # Try multiple prefixes to cover LLM vs VLM checkpoints
+            stacked_w_key = _resolve_stacked_key(layer_idx, "gate_up_proj", "weight", backing)
             if is_quantized:
-                stacked_s_key = f"model.layers.{layer_idx}.mlp.switch_mlp.gate_up_proj.scales"
-                stacked_b_key = f"model.layers.{layer_idx}.mlp.switch_mlp.gate_up_proj.biases"
+                stacked_s_key = _resolve_stacked_key(layer_idx, "gate_up_proj", "scales", backing)
+                stacked_b_key = _resolve_stacked_key(layer_idx, "gate_up_proj", "biases", backing)
                 proj_stream = StreamingQuantizedSwitchLinear(
                     layer_idx=layer_idx,
                     proj_name="gate_up_proj",
@@ -280,10 +388,10 @@ def convert_model_to_streaming(
             streaming_glu.gate_up_proj = proj_stream  # type: ignore[attr-defined]
             # down
             src_down = getattr(switch_mlp, "down_proj")
-            stacked_w_key = f"model.layers.{layer_idx}.mlp.switch_mlp.down_proj.weight"
+            stacked_w_key = _resolve_stacked_key(layer_idx, "down_proj", "weight", backing)
             if is_quantized:
-                stacked_s_key = f"model.layers.{layer_idx}.mlp.switch_mlp.down_proj.scales"
-                stacked_b_key = f"model.layers.{layer_idx}.mlp.switch_mlp.down_proj.biases"
+                stacked_s_key = _resolve_stacked_key(layer_idx, "down_proj", "scales", backing)
+                stacked_b_key = _resolve_stacked_key(layer_idx, "down_proj", "biases", backing)
                 down_stream = StreamingQuantizedSwitchLinear(
                     layer_idx=layer_idx,
                     proj_name="down_proj",
@@ -326,10 +434,10 @@ def convert_model_to_streaming(
                 src = getattr(switch_mlp, proj_name, None)
                 if src is None:
                     continue
-                stacked_w_key = f"model.layers.{layer_idx}.mlp.switch_mlp.{proj_name}.weight"
+                stacked_w_key = _resolve_stacked_key(layer_idx, proj_name, "weight", backing)
                 if is_quantized:
-                    stacked_s_key = f"model.layers.{layer_idx}.mlp.switch_mlp.{proj_name}.scales"
-                    stacked_b_key = f"model.layers.{layer_idx}.mlp.switch_mlp.{proj_name}.biases"
+                    stacked_s_key = _resolve_stacked_key(layer_idx, proj_name, "scales", backing)
+                    stacked_b_key = _resolve_stacked_key(layer_idx, proj_name, "biases", backing)
                     proj_stream = StreamingQuantizedSwitchLinear(
                         layer_idx=layer_idx,
                         proj_name=proj_name,

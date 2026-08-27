@@ -352,9 +352,14 @@ class EnginePool:
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
             entry, runtime_settings
         )
-        if qwen4_offload and qwen4_estimate is not None:
+        # Track individual PLE state for combined handling below
+        qwen4_active = qwen4_offload and qwen4_estimate is not None and qwen4_estimate.supported
+        if qwen4_active:
             base = min(base, qwen4_estimate.mmap_bytes)
         # Expert streaming reduces resident to dense + cache budget
+        exp_enabled = False
+        exp_est = None
+        exp_streaming_bytes = None
         try:
             exp_enabled, _, exp_est = self._expert_streaming_status(entry, runtime_settings)
             if exp_enabled and exp_est is not None and exp_est.supported:
@@ -363,9 +368,31 @@ class EnginePool:
                     budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 2 * 1024**3
                 except Exception:
                     budget_bytes = 2 * 1024**3
-                streaming_bytes = exp_est.streaming_bytes_for_budget(budget_bytes)
+                exp_streaming_bytes = exp_est.streaming_bytes_for_budget(budget_bytes)
                 # Use the smaller of current base and streaming estimate (streaming is a ceiling reduction)
-                base = min(base, streaming_bytes)
+                base = min(base, exp_streaming_bytes)
+        except Exception:
+            pass
+        # When both PLE mmap and expert streaming are active, combine savings:
+        # dense_without_both = checkpoint - ple - expert; streaming+ple = dense_without_both*1.05 + cache
+        # Both estimates' checkpoint_bytes overlap (PLE may have separate artifact), so use max.
+        try:
+            if qwen4_active and exp_enabled and exp_est is not None and exp_est.supported:
+                # Recompute cache for combined (same budget)
+                budget_gib = getattr(runtime_settings, "expert_streaming_budget_gib", None) if runtime_settings else None
+                try:
+                    budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 2 * 1024**3
+                except Exception:
+                    budget_bytes = 2 * 1024**3
+                slots = exp_est.slots_for_budget(budget_bytes)
+                cache = slots * exp_est.num_moe_layers * exp_est.per_expert_bytes if slots else 0
+                chk = max(qwen4_estimate.checkpoint_bytes, exp_est.checkpoint_bytes)
+                ple = qwen4_estimate.ple_bytes
+                expert = exp_est.expert_bytes
+                overhead = 1.05
+                dense_without_both = max(0, chk - ple - expert)
+                combined = int(dense_without_both * overhead + cache)
+                base = min(base, combined)
         except Exception:
             pass
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
