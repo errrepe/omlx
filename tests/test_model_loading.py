@@ -613,7 +613,10 @@ class TestCheckpointHasMtpWeights:
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
-
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "language_model.mtp."
+        )
 
     def test_returns_true_when_index_has_bare_mtp(self, tmp_path):
         self._write_index(
@@ -621,6 +624,9 @@ class TestCheckpointHasMtpWeights:
             {"mtp.layers.0.self_attn.q_proj.weight": "model.safetensors"},
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) == "mtp."
+        )
 
     def test_returns_true_when_index_has_model_language_model_mtp(self, tmp_path):
         # mlx-vlm HF-source layout before sanitize-time remap (oQ writes this).
@@ -629,6 +635,10 @@ class TestCheckpointHasMtpWeights:
             {"model.language_model.mtp.norm.weight": "model.safetensors"},
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "model.language_model.mtp."
+        )
 
     def test_returns_false_when_index_lacks_mtp(self, tmp_path):
         # Unsloth Qwen3.6 UD MLX layout: vision_tower + language_model.model.*
@@ -642,6 +652,7 @@ class TestCheckpointHasMtpWeights:
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+        assert model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) is None
 
     @pytest.mark.parametrize(
         "prefix",
@@ -667,6 +678,27 @@ class TestCheckpointHasMtpWeights:
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) is None
+
+    def test_returns_false_for_qwen4_nextn_layout(self, tmp_path):
+        import json as _json
+
+        (tmp_path / "config.json").write_text(
+            _json.dumps(
+                {
+                    "model_type": "qwen4_exp",
+                    "text_config": {
+                        "num_hidden_layers": 78,
+                        "num_nextn_predict_layers": 1,
+                    },
+                }
+            )
+        )
+        self._write_index(
+            tmp_path,
+            {"model.layers.78.eh_proj.weight": "model.safetensors"},
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
 
     def test_returns_false_for_nextn_config_without_weights(self, tmp_path):
         # Config declares nextn layers but the checkpoint stripped them.
@@ -715,6 +747,10 @@ class TestCheckpointHasMtpWeights:
         )
 
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "language_model.mtp."
+        )
 
 
 class TestExpandPerLayerQuantKeys:

@@ -53,41 +53,9 @@ def configure_mtp_runtime(
 
     checkpoint_prefix = None
     if enabled:
-        model_path = Path(model_path)
-        index_path = model_path / "model.safetensors.index.json"
-        if index_path.is_file():
-            try:
-                weight_map = json.loads(index_path.read_text()).get("weight_map") or {}
-            except (OSError, ValueError):
-                weight_map = {}
-            for prefix in (
-                "mtp.",
-                "language_model.mtp.",
-                "model.mtp.",
-                "model.language_model.mtp.",
-            ):
-                if any(key.startswith(prefix) for key in weight_map):
-                    checkpoint_prefix = prefix
-                    break
-        else:
-            try:
-                import safetensors
+        from omlx.utils.model_loading import _checkpoint_qwen4_mtp_weight_prefix
 
-                for shard in sorted(model_path.glob("*.safetensors")):
-                    with safetensors.safe_open(str(shard), framework="numpy") as file:
-                        for prefix in (
-                            "mtp.",
-                            "language_model.mtp.",
-                            "model.mtp.",
-                            "model.language_model.mtp.",
-                        ):
-                            if any(key.startswith(prefix) for key in file.keys()):
-                                checkpoint_prefix = prefix
-                                break
-                    if checkpoint_prefix is not None:
-                        break
-            except Exception:
-                checkpoint_prefix = None
+        checkpoint_prefix = _checkpoint_qwen4_mtp_weight_prefix(model_path)
 
     _MTP_RUNTIME = Qwen4ExpMTPRuntime(
         enabled=bool(enabled and checkpoint_prefix),
