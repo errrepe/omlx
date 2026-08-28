@@ -868,6 +868,11 @@ class StreamingSwitchGLU(nn.Module):
         t_wall0 = time.perf_counter() if (p is not None and p.enabled) else None
         # Determine fused vs split by presence of gate_up_proj
         has_fused = hasattr(self, "gate_up_proj")
+        # Opt-in warm/pin hook (warmer.py): fires previous-token reads for
+        # the next layer before this layer's demand loads; decode-only.
+        hook = getattr(self, "_warm_pins", None)
+        if hook is not None:
+            hook.on_layer_start(self.layer_idx, int(indices.size))
         x_exp = mx.expand_dims(x, (-2, -3))
         do_sort = indices.size >= 64
         idx = indices
@@ -889,6 +894,9 @@ class StreamingSwitchGLU(nn.Module):
             x_gate = self.gate_proj(x_exp, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]
             x_act = self._apply_activation(x_up, x_gate)
             x_out = self.down_proj(x_act, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]
+
+        if hook is not None:
+            hook.on_layer_plan(self.layer_idx, plan.uniq_list, plan.positions)
 
         # weighted sum fast path — keep compatible but may not use fast kernel when streaming
         if weighted_sum and scores is not None and do_sort:

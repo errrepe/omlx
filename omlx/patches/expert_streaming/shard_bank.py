@@ -7,7 +7,9 @@ but slices a stacked bank (E, O, I) per expert id.
 
 from __future__ import annotations
 
+import ctypes
 import json
+import logging
 import mmap
 import os
 import struct
@@ -16,6 +18,73 @@ from typing import Dict, Tuple
 
 import mlx.core as mx
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+_PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_libc.mlock.restype = ctypes.c_int
+
+
+class _PyBuffer(ctypes.Structure):
+    _fields_ = [
+        ("buf", ctypes.c_void_p),
+        ("obj", ctypes.py_object),
+        ("len", ctypes.c_ssize_t),
+        ("itemsize", ctypes.c_ssize_t),
+        ("readonly", ctypes.c_int),
+        ("ndim", ctypes.c_int),
+        ("format", ctypes.c_void_p),
+        ("shape", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("strides", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("suboffsets", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("internal", ctypes.c_void_p),
+    ]
+
+
+_pyapi = ctypes.pythonapi
+_pyapi.PyObject_GetBuffer.argtypes = [ctypes.py_object, ctypes.POINTER(_PyBuffer), ctypes.c_int]
+_pyapi.PyObject_GetBuffer.restype = ctypes.c_int
+_pyapi.PyBuffer_Release.argtypes = [ctypes.POINTER(_PyBuffer)]
+
+_MLOCK_FAILED_LOGGED = False
+
+
+def _mlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
+    """mlock a page-aligned range of an existing file mapping. Zero-copy:
+    the locked pages are the file cache pages themselves. The mapping's
+    base address is obtained via PyObject_GetBuffer (the mmap is
+    read-only, so from_buffer's writable requirement does not apply)."""
+    global _MLOCK_FAILED_LOGGED
+    try:
+        view = _PyBuffer()
+        if _pyapi.PyObject_GetBuffer(mm, ctypes.byref(view), 0) != 0 or not view.buf:
+            return False
+        try:
+            base = view.buf
+            start = (offset // _PAGE_SIZE) * _PAGE_SIZE
+            end = min(view.len, ((offset + length + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE)
+            if end <= start:
+                return False
+            rc = _libc.mlock(ctypes.c_void_p(base + start), ctypes.c_size_t(end - start))
+            if rc != 0 and not _MLOCK_FAILED_LOGGED:
+                import errno
+
+                _MLOCK_FAILED_LOGGED = True
+                logger.warning(
+                    "mlock failed (errno=%s) — pinned-expert mode disabled for new pins",
+                    errno.errorcode.get(ctypes.get_errno(), ctypes.get_errno()),
+                )
+            return rc == 0
+        finally:
+            _pyapi.PyBuffer_Release(ctypes.byref(view))
+    except Exception as e:
+        if not _MLOCK_FAILED_LOGGED:
+            _MLOCK_FAILED_LOGGED = True
+            logger.warning("mlock unavailable: %s", e)
+        return False
 
 
 _DTYPE_MAP: dict[str, tuple[np.dtype, int]] = {
@@ -102,6 +171,32 @@ class _ShardReader:
             raise OSError(f"Short read for {key}[{expert_id}]: {len(buf)} of {expert_bytes}")
         return np.frombuffer(buf, dtype=np_dtype).reshape(shape[1:] if len(shape) > 1 else shape)
 
+    def expert_byte_range(self, key: str, expert_id: int) -> Tuple[int, int]:
+        """Absolute file offsets (start, end) of one expert's slice."""
+        entry = self.header[key]
+        start, end = entry["data_offsets"]
+        shape = entry["shape"]
+        num_experts = shape[0] if shape else 1
+        expert_bytes = (end - start) // num_experts
+        off = self.data_start + int(start) + expert_id * expert_bytes
+        return off, off + expert_bytes
+
+    def pin_expert(self, key: str, expert_id: int) -> int:
+        """mlock the page-aligned file range of one expert slice.
+
+        Returns the locked byte count (page-rounded) or 0 on failure. The
+        locked pages are the file-cache pages themselves — no copy, no
+        committed anonymous memory (wired, though: it cannot be evicted).
+        """
+        off, end = self.expert_byte_range(key, expert_id)
+        length = end - off
+        ok = _mlock_range(self._mmap, off, length)
+        if not ok:
+            return 0
+        start = (off // _PAGE_SIZE) * _PAGE_SIZE
+        end_pg = min(len(self._mmap), ((end + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE)
+        return end_pg - start
+
 
 class ExpertBackingStore:
     """Open shard readers and serve per-expert mx.arrays on demand."""
@@ -122,6 +217,9 @@ class ExpertBackingStore:
         self._weight_map = weight_map
         # Build header cache lazily
         self._header_cache: Dict[str, dict] = {}
+        # mlock pin tracking (expert_streaming pin mode)
+        self._pinned: set = set()
+        self.pinned_bytes = 0
 
     def _roots(self) -> list[Path]:
         return [self.model_path, *self._extra_roots]
@@ -223,6 +321,25 @@ class ExpertBackingStore:
         """
         reader = self._reader_for_key(key)
         return reader.expert_slice(key, expert_id)
+
+    def pin_expert(self, key: str, expert_id: int) -> int:
+        """mlock one expert's file range across the resolved shard.
+
+        Returns locked bytes (0 on failure). Duplicate pins of the same
+        (key, expert) are tracked and skipped."""
+        pkey = (str(self._reader_for_key(key).path), key, expert_id)
+        if pkey in self._pinned:
+            return 0
+        reader = self._reader_for_key(key)
+        locked = reader.pin_expert(key, expert_id)
+        if locked > 0:
+            self._pinned.add(pkey)
+            self.pinned_bytes += locked
+        return locked
+
+    @property
+    def pinned_count(self) -> int:
+        return len(self._pinned)
 
     def close(self) -> None:
         for r in list(self._readers.values()):

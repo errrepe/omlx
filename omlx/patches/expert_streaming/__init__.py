@@ -700,6 +700,53 @@ def convert_model_to_streaming(
                     )
             except Exception as e:
                 logger.warning("Expert streaming: PILOT prefetch init failed: %s", e)
+
+        # Opt-in warm-only page-cache prefetch + mlock pins (page-cache
+        # complements; replaces the LRU's "keep hot experts in RAM" role).
+        from . import warmer as _warmer_mod
+
+        if _warmer_mod.WARM_ENABLED or _warmer_mod.PIN_ENABLED:
+            try:
+                glus: dict[int, Any] = {}
+                for layer_idx_, layer_ in enumerate(layers):
+                    moe_ = getattr(layer_, "mlp", None) or getattr(layer_, "ffn", None)
+                    sm_ = getattr(moe_, "switch_mlp", None)
+                    if sm_ is not None and hasattr(sm_, "down_proj"):
+                        glus[layer_idx_] = sm_
+                linears_by_layer: dict[int, list] = {
+                    i: [
+                        getattr(g, p)
+                        for p in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+                        if hasattr(g, p)
+                    ]
+                    for i, g in glus.items()
+                }
+                warmer = (
+                    _warmer_mod.PageCacheWarmer(linears_by_layer)
+                    if _warmer_mod.WARM_ENABLED
+                    else None
+                )
+                pinner = None
+                if _warmer_mod.PIN_ENABLED and backing is not None and not isinstance(backing, dict):
+                    pinner = _warmer_mod.PinController(
+                        linears_by_layer,
+                        backing,
+                        budget_bytes=_warmer_mod.PIN_BUDGET_BYTES,
+                        observe_calls=_warmer_mod.PIN_OBSERVE_CALLS,
+                        per_expert_bytes=estimate.per_expert_bytes,
+                    )
+                if warmer is not None or pinner is not None:
+                    hook = _warmer_mod.WarmPinHook(warmer, pinner)
+                    for sm_ in glus.values():
+                        sm_._warm_pins = hook  # type: ignore[attr-defined]
+                    logger.info(
+                        "Expert streaming: warm=%s pin=%s attached (%d layers)",
+                        bool(warmer),
+                        bool(pinner),
+                        len(glus),
+                    )
+            except Exception as e:
+                logger.warning("Expert streaming: warm/pin init failed: %s", e)
     else:
         logger.info("Expert streaming: no MoE layers converted")
 

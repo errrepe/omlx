@@ -959,3 +959,149 @@ def test_adaptive_topk_qwen_block_patch():
     assert out_trunc.shape == out_exact.shape
     assert bool(mx.isfinite(out_trunc).all())
     adaptive_topk.configure(None)
+
+
+def test_shard_bank_pin_expert_mlock():
+    """pin_expert locks the page-aligned file range and dedupes repeats."""
+    import mlx.core as mx  # noqa: F401
+
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_shard(
+            tmp / "model.safetensors",
+            {"model.layers.0.mlp.switch_mlp.gate_proj.weight": ((4, 8, 16), "BF16")},
+        )
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"model.layers.0.mlp.switch_mlp.gate_proj.weight": "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        locked = backing.pin_expert(key, 0)
+        assert locked > 0
+        assert backing.pinned_bytes == locked
+        assert backing.pinned_count == 1
+        # duplicate pin skipped
+        assert backing.pin_expert(key, 0) == 0
+        assert backing.pinned_count == 1
+        # range math sanity: page-rounded >= slice bytes
+        off, end = backing._reader_for_key(key).expert_byte_range(key, 1)
+        assert end - off == 8 * 16 * 2
+
+
+def test_page_cache_warmer_flow():
+    from omlx.patches.expert_streaming import warmer
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        tensors = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            tensors[f"model.layers.0.mlp.switch_mlp.{proj}.weight"] = ((4, 8, 16), "BF16")
+            tensors[f"model.layers.0.mlp.switch_mlp.{proj}.scales"] = ((4, 8, 1), "U32")
+            tensors[f"model.layers.0.mlp.switch_mlp.{proj}.biases"] = ((4, 8, 1), "U32")
+        tensors["model.layers.1.mlp.switch_mlp.gate_proj.weight"] = ((4, 8, 16), "BF16")
+        tensors["model.layers.1.mlp.switch_mlp.gate_proj.scales"] = ((4, 8, 1), "U32")
+        tensors["model.layers.1.mlp.switch_mlp.gate_proj.biases"] = ((4, 8, 1), "U32")
+        _write_shard(tmp / "model.safetensors", tensors)
+        wm = {k: "model.safetensors" for k in tensors}
+        (tmp / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm}))
+
+        backing = ExpertBackingStore(tmp)
+        cache = ExpertLRUCache(0, 1 << 12, num_layers=2)
+
+        def mk_lin(layer, proj):
+            return StreamingQuantizedSwitchLinear(
+                layer_idx=layer,
+                proj_name=proj,
+                stacked_weight_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.weight",
+                stacked_scales_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.scales",
+                stacked_biases_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.biases",
+                num_experts=4,
+                input_dims=16,
+                output_dims=8,
+                backing=backing,
+                cache=cache,
+            )
+
+        linears = {0: [mk_lin(0, p) for p in ("gate_proj", "up_proj", "down_proj")]}
+        linears[1] = [mk_lin(1, "gate_proj")]
+        w = warmer.PageCacheWarmer(linears)
+        hook = warmer.WarmPinHook(w, None)
+        # token 1: layer 0 records its set; layer 1 records its own
+        hook.on_layer_start(0, 8)
+        hook.on_layer_plan(0, [1, 2, 3], 8)
+        hook.on_layer_start(1, 8)
+        hook.on_layer_plan(1, [2], 8)
+        # token 2: layer 0 fires warm for layer 1's token-1 set
+        hook.on_layer_start(0, 8)
+        hook.on_layer_plan(0, [0, 1], 8)
+        # warm pool is async; give it a moment and confirm no crash + reads done
+        import time
+
+        deadline = time.time() + 5
+        while time.time() < deadline and w.warmed == 0:
+            time.sleep(0.05)
+        assert w.warmed > 0
+        # big-prefetch guard: positions > _MAX_WARM_ROWS records empty
+        hook.on_layer_start(0, 4096)
+        hook.on_layer_plan(0, [0, 1, 2, 3], 4096)
+        assert w.last_uniq[0] == []
+
+
+def test_pin_controller_pins_within_budget():
+    from omlx.patches.expert_streaming import warmer
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        tensors = {}
+        for layer in range(2):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                tensors[f"model.layers.{layer}.mlp.switch_mlp.{proj}.weight"] = ((4, 8, 16), "BF16")
+                tensors[f"model.layers.{layer}.mlp.switch_mlp.{proj}.scales"] = ((4, 8, 1), "U32")
+                tensors[f"model.layers.{layer}.mlp.switch_mlp.{proj}.biases"] = ((4, 8, 1), "U32")
+        _write_shard(tmp / "model.safetensors", tensors)
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
+        )
+        backing = ExpertBackingStore(tmp)
+
+        def _stub_lin(layer, proj):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                stacked_weight_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.weight",
+                stacked_scales_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.scales",
+                stacked_biases_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.biases",
+                backing=backing,
+            )
+
+        pc = warmer.PinController(
+            {0: [_stub_lin(0, p) for p in ("gate_proj", "up_proj", "down_proj")],
+             1: [_stub_lin(1, p) for p in ("gate_proj", "up_proj", "down_proj")]},
+            backing,
+            budget_bytes=1 << 20,
+            observe_calls=2,
+            per_expert_bytes=(8 * 16 * 2) + (8 * 4) + (8 * 4),
+        )
+        for token in range(4):
+            for layer in range(2):
+                pc.on_layer_plan(layer, [token % 4, (token + 1) % 4], 8)
+        # pin pass scheduled after 2*2 layer reports
+        import time
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not pc.pinned:
+            time.sleep(0.05)
+        assert pc.pinned
+        deadline = time.time() + 5
+        while time.time() < deadline and backing.pinned_count == 0:
+            time.sleep(0.05)
+        assert backing.pinned_count > 0
+        assert 0 < backing.pinned_bytes <= (1 << 20) + (1 << 12)

@@ -6,15 +6,15 @@ Inspired by [slipstream](https://github.com/dwijenpatel/slipstream) (Swift/Metal
 
 ## When to use
 
-- **You have a large MoE** (e.g. `glm_moe_dsa` / Qwen3.6-35B-A3B) and a **16–24 GB Mac**. Without streaming the model needs `resident_bytes` (checkpoint × 1.05) — often above the wired limit. With streaming it needs `dense_bytes × 1.05 + cache_budget` (default `2 GiB`), so a 35B MoE that needs ~21 GB resident fits in ~5–8 GB.
+- **You have a large MoE** (e.g. `glm_moe_dsa` / Qwen3.6-35B-A3B) and a **16–24 GB Mac**. Without streaming the model needs `resident_bytes` (checkpoint × 1.05) — often above the wired limit. With streaming it needs `dense_bytes × 1.05` (page-cache-only default), so a 35B MoE that needs ~21 GB resident fits in ~5–8 GB.
 - You care about **fitting, not single-stream speed**. Streaming is slower than fully resident and disables continuous batching for that model (one request at a time). Use the default resident mode when the model already fits.
 
 ## How it works
 
 - **Dense stays resident**: attention, shared experts, embeddings, LM head — always in unified memory.
 - **Experts live on SSD**: the stacked `switch_mlp.(gate|up|down)_proj` banks (`(E, O, I)` tensors) stay memory-mapped from the original safetensors files (MADV_RANDOM, like the Qwen4 PLE `DiskBackedShardedEmbedding`). No duplicate copy is made.
-- **Per-expert LRU**: one slot = one expert's weight for one layer. The cache is global per model and bounded by a single budget knob (GiB) — `slots_per_layer = budget / (num_moe_layers × per_expert_bytes)`. On a batch, the union of routed experts is looked up; hits run immediately, misses fault the expert slice via a `memcpy` from the mmap and evict the LRU entry. Quantized scales/biases are co-cached with the weight.
-- **One budget, auto-forced**: set `Expert Streaming` on in the per-model settings (or leave the budget empty for `~2 GiB`). If `resident_bytes > ceiling ≥ streaming_bytes`, oMLX auto-enables it and shows an amber "auto-enabled" hint — the same pattern as `qwen4_ple_ssd_offload`.
+- **Per-layer demand loads**: on a batch, the union of routed experts is resolved per layer; hits in the (optional) LRU run immediately, misses fault the expert slice with one `os.pread` each on an 8-thread pool (QD8) and the mini-bank is assembled on the inference thread. Quantized scales/biases ride along. The default cache policy is **page-cache only** (no LRU) — see Fase B below; `expert_streaming_budget_gib > 0` re-enables a bounded LRU.
+- **One budget, auto-forced**: set `Expert Streaming` on in the per-model settings (or leave the budget empty for the page-cache-only default). If `resident_bytes > ceiling ≥ streaming_bytes`, oMLX auto-enables it and shows an amber "auto-enabled" hint — the same pattern as `qwen4_ple_ssd_offload`.
 
 ## Supported models
 
@@ -41,9 +41,10 @@ Loading a glm5_next / qwen4_exp checkpoint with `expert_streaming_enabled` uses 
 | field | type | notes |
 |---|---|---|
 | `expert_streaming_enabled` | bool | hardware-specific; excluded from profiles/templates |
-| `expert_streaming_budget_gib` | float? | `null` / `0` or empty → auto `1 GiB`, clamp `0–64` |
+| `expert_streaming_budget_gib` | float? | `null` / `0` = **page-cache only** (default; no app-level LRU), `>0` = fixed LRU heap (opt-in), clamp `0–64` |
+| `expert_streaming_topk_threshold` | float? | `null` / `>= 1.0` = exact routing (default, bit-exact); `0.05–0.95` = adaptive top-k mass truncation (approximate, changes outputs) |
 
-Both are load-time settings: toggling unloads (and re-loads if pinned) the model. The runtime signature includes the *effective* (forced-or-requested) value, so the `GET /admin/api/models` capability flags `expert_streaming_supported / forced / reason / *_bytes / moe_layers / per_expert_bytes` always reflect what would actually run.
+All are load-time settings: toggling unloads (and re-loads if pinned) the model. The runtime signature includes the *effective* (forced-or-requested) value and the threshold when `< 1.0` (it changes outputs), so the `GET /admin/api/models` capability flags `expert_streaming_supported / forced / reason / *_bytes / moe_layers / per_expert_bytes` always reflect what would actually run.
 
 ## UI
 
@@ -156,6 +157,59 @@ bundles dropped), so it stays default-off. Batch decode still amortizes
 nothing (see Fase A3). Remaining bottlenecks: disk random-read ceiling
 (~2.3 GB/s of the 3.7 sequential spec) and the mini-bank assemble/promote
 (~5 ms/call); bytes/token (oQ2e) is the next real lever.
+
+## Fase B — FlashNext comparison (page-cache era)
+
+Ported the transferable techniques from [macqwen-releases](https://github.com/1architect/macqwen-releases) ("FlashNext", MIT). Their README claims 1.9 tok/s on Qwen3.8-Flash-Next; their own code comments pin down the components: threshold-1.0 exact = 0.53, 0.85 mass truncation = 0.94 ("the cliff"), 1.9 = 0.85 truncation + mlock pins + warm file cache + steady state. Our bit-exact pread path already measured 0.853 cold where they measure 0.53 exact.
+
+### B1 — fixed-cost cuts (bit-exact) — commit 7e958a6
+
+- BF16 promoted via `mx.array(v).view(mx.bfloat16)` bit-reinterpret: ~9× faster on 4 MB slices, and it matches `mx.load` exactly — the old `shift → f32 → astype` roundtrip flushed bf16 subnormals to zero (Metal FTZ), i.e. the *old* path was the inexact one.
+- One host sync per MoE layer: the first streaming linear builds a shared `_RemapPlan` (eval + unique + compact remap via `np.searchsorted`), gate/up/down reuse it. (MLX 0.32 refuses zero-copy CPU dlpack — `mx.from_dlpack(np, copy=False)` — so the view-reinterpret is the practical promote.)
+- Demand reads sorted by ascending expert id (= ascending file offset, row-major banks).
+- Profile (Qwen 4G cold): wall/call 21.8 → 9.2 ms; stack bucket 5.4 → 0.5 ms. Decode is now **disk-bound** — remaining levers are fewer bytes (truncation) and fewer disk reads (page cache / pins).
+
+### B2 — page-cache-only is the new default — commit cd10501
+
+Budget semantics: `null`/`0` = no app-level LRU — expert reuse rides the OS file cache (clean, evictable pages, never swapped). `>0` = fixed LRU heap (opt-in). Admission charges dense bytes only for the default (file cache is not committed memory → more load headroom).
+
+Cold A/B on the 48 GiB Mac (16-token decode):
+
+| config | tok/s | RSS (decode avg) |
+|---|---|---|
+| Qwen LRU 4G | 0.834 | 7.3 GB |
+| Qwen **page-cache only** | **1.007** (warm 1.133) | 5.6–5.8 GB |
+| GLM LRU 8G | 0.363 — 0% hit rate, 8 GB of bundles pinned in RSS | 11.7 GB |
+| GLM **page-cache only** | **0.381** | 4.8 GB |
+
+Even at a 14.5% LRU hit rate (Qwen) the heap loses: it pins RSS that the OS could have used for page cache. Matches FlashNext's finding that their app-level LRU always lost.
+
+### B4 — adaptive top-k truncation (opt-in, approximate) — commit 15071667
+
+`expert_streaming_topk_threshold`: after top-k selection, keep the smallest score-descending prefix whose relative mass reaches the threshold; dropped slots reuse the top expert (duplicates collapse in the streaming plan — no extra I/O); kept scores renormalize to the original total top-k mass. `null`/`>= 1.0` bypasses everything — bit-exact by construction (verified: identical generated text on the real checkpoint with `--topk 1.0`).
+
+Cold sweep (16-token decode, page-cache only):
+
+| threshold | Qwen | GLM |
+|---|---|---|
+| exact | ~1.0 | 0.381 |
+| 0.85 | 1.091 | **0.485 (+27%)** |
+| 0.70 | 1.197 | — |
+
+Outputs diverge by design below 1.0 (FlashNext measured 7/10 identical tokens at 0.70); the WebUI/Swift hint carries that warning.
+
+### B3 — mlock pins (opt-in) and warm-only prefetch (experimental)
+
+- **Pins** (`OMLX_EXPERT_STREAMING_PIN=1`): observe routing for the first 8 decode calls, then `mlock` the page-aligned file ranges of the most frequent experts per layer within `OMLX_EXPERT_STREAMING_PIN_GIB` (default 1.25 GiB, `OMLX_EXPERT_STREAMING_PIN_TOKENS` for the window). Zero-copy — the locked pages ARE the file cache pages — but they become wired memory. The mapping address is obtained via `PyObject_GetBuffer` (read-only mmap cannot expose a writable buffer). Qwen 48-token decode: **1.538 → 1.764 tok/s (+15%)**; GLM short decode: neutral (13 MB experts → the budget covers ~2 experts/layer, and the 8-token observation eats half a 16-token run).
+- **Warm-only prefetch** (`OMLX_EXPERT_STREAMING_WARM=1`): before a layer's demand loads, fire discarded reads for the previous token's next-layer experts (independent routing repeats ~35% across adjacent tokens). On the 48 GiB Mac: **neutral to negative** (1.531 vs 1.538 alone; drags pins 1.764 → 1.624) — the QD8 demand path already saturates the NVMe, and warming adds read traffic. It exists for the 16 GB-class case FlashNext targets (small page cache, less demand pressure); leave it off otherwise. The old PILOT staging prefetcher (default OFF) is superseded by this.
+
+### Recommendation matrix
+
+| hardware | budget | pins | threshold |
+|---|---|---|---|
+| 48 GB+, model >> RAM | default (0) | optional (+15% Qwen) | 1.0 exact |
+| 48 GB+, quality flexible | default | optional | 0.85 |
+| 16 GB-class | default | `PIN=1` | 0.85 (+ `WARM=1` to test) |
 
 ## Trade-offs
 
