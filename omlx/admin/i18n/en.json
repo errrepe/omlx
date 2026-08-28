@@ -618,7 +618,7 @@
   "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
   "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
-  "modal.model_settings.expert_streaming_budget_hint": "Total RAM for the expert cache across all MoE layers (empty = auto ~2 GiB). Larger = fewer SSD faults but more RAM.",
+  "modal.model_settings.expert_streaming_budget_hint": "Optional app-level expert LRU. Empty or 0 = page-cache only (default; measured faster with less RAM). Set >0 to pin a fixed GiB expert cache.",
   "modal.model_settings.thinking_budget": "Thinking Budget",
   "modal.model_settings.thinking_budget_hint": "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
   "modal.model_settings.thinking_budget_placeholder": "e.g. 4096",

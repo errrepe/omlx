@@ -760,10 +760,10 @@ private struct AdvancedTab: View {
                     }
                     if vm.expertStreamingEnabled {
                         Row(label: String(localized: "settings.advanced.expert_streaming.budget.label",
-                                          defaultValue: "Cache budget",
+                                          defaultValue: "Expert LRU budget",
                                           comment: "Row label for the expert cache budget field"),
                             sublabel: String(localized: "settings.advanced.expert_streaming.budget.sub",
-                                             defaultValue: "Total RAM for the expert cache across all MoE layers (empty = auto ~2 GiB). Larger = fewer SSD faults.",
+                                             defaultValue: "Optional app-level expert LRU. Empty or 0 = page-cache only (default; measured faster with less RAM). >0 pins a fixed GiB cache.",
                                              comment: "Sublabel for the expert cache budget field")) {
                             TextInput(text: vm.bind(
                                 $vm.expertStreamingBudgetGib,

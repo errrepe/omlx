@@ -363,11 +363,7 @@ class EnginePool:
         try:
             exp_enabled, _, exp_est = self._expert_streaming_status(entry, runtime_settings)
             if exp_enabled and exp_est is not None and exp_est.supported:
-                budget_gib = getattr(runtime_settings, "expert_streaming_budget_gib", None) if runtime_settings else None
-                try:
-                    budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 1 * 1024**3
-                except Exception:
-                    budget_bytes = 1 * 1024**3
+                budget_bytes = self._streaming_budget_bytes(runtime_settings)
                 exp_streaming_bytes = exp_est.streaming_bytes_for_budget(budget_bytes)
                 # Use the smaller of current base and streaming estimate (streaming is a ceiling reduction)
                 base = min(base, exp_streaming_bytes)
@@ -391,11 +387,7 @@ class EnginePool:
         try:
             if qwen4_active and exp_enabled and exp_est is not None and exp_est.supported:
                 # Recompute cache for combined (same budget)
-                budget_gib = getattr(runtime_settings, "expert_streaming_budget_gib", None) if runtime_settings else None
-                try:
-                    budget_bytes = int(float(budget_gib) * 1024**3) if budget_gib else 1 * 1024**3
-                except Exception:
-                    budget_bytes = 1 * 1024**3
+                budget_bytes = self._streaming_budget_bytes(runtime_settings)
                 slots = exp_est.slots_for_budget(budget_bytes)
                 cache = slots * exp_est.num_moe_layers * exp_est.per_expert_bytes if slots else 0
                 chk = max(qwen4_estimate.checkpoint_bytes, exp_est.checkpoint_bytes)
@@ -507,6 +499,22 @@ class EnginePool:
         effective = copy.copy(settings)
         setattr(effective, "expert_streaming_enabled", True)
         return effective
+
+    @staticmethod
+    def _streaming_budget_bytes(settings: object | None) -> int:
+        """Expert LRU budget in bytes from settings.
+
+        None (unset) -> 0 = page-cache only (default: rely on the OS file
+        cache for expert reuse — measured A/B beats the app-level LRU);
+        explicit 0 -> page-cache only; >0 -> fixed LRU budget.
+        """
+        gib = getattr(settings, "expert_streaming_budget_gib", None) if settings else None
+        if gib is None:
+            return 0
+        try:
+            return max(0, int(float(gib) * 1024**3))
+        except Exception:
+            return 0
 
     @property
     def current_model_memory(self) -> int:

@@ -808,3 +808,56 @@ def test_streaming_quantized_glu_matches_reference():
         out_s = glu(x, idx)
         assert out_s.shape == out_ref.shape
         assert mx.array_equal(out_ref, out_s), f"mismatch at trial {trial}"
+
+
+def test_budget_zero_means_page_cache_only():
+    """Explicit budget 0 = page-cache only: no LRU slots, admission charges
+    dense only (file-cache pages are clean/evictable, not committed)."""
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import _get_budget_bytes
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    assert _get_budget_bytes(ModelSettings(expert_streaming_budget_gib=0.0), None) == 0
+    assert _get_budget_bytes(ModelSettings(expert_streaming_budget_gib=None), None) == 0
+    assert _get_budget_bytes(ModelSettings(expert_streaming_budget_gib=2.0), None) == 2 << 30
+
+    cache = ExpertLRUCache(0, 1 << 20, num_layers=4)
+    assert cache.capacity == 0
+    cache.put((0, 0, "k"), mx.zeros(4))
+    assert cache.size == 0
+    assert cache.get((0, 0, "k")) is None
+
+
+def test_engine_pool_budget_zero_streaming_bytes():
+    from omlx.patches.expert_streaming.residency import expert_streaming_estimate
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_glm_checkpoint(tmp, num_layers=2, experts=4, hidden=32, moe_hidden=16)
+        est = expert_streaming_estimate(str(tmp))
+        assert est.supported
+        # 0 budget -> dense-only resident estimate (no cache term)
+        assert est.streaming_bytes_for_budget(0) == int(est.dense_bytes * 1.05)
+        assert est.slots_for_budget(0) == 0
+
+
+def test_engine_pool_streaming_budget_helper():
+    from omlx.engine_pool import EnginePool
+
+    assert EnginePool._streaming_budget_bytes(None) == 0
+    assert EnginePool._streaming_budget_bytes(ModelSettings()) == 0
+    assert EnginePool._streaming_budget_bytes(ModelSettings(expert_streaming_budget_gib=0.0)) == 0
+    assert EnginePool._streaming_budget_bytes(ModelSettings(expert_streaming_budget_gib=4)) == 4 << 30
+
+
+@pytest.mark.asyncio
+async def test_expert_streaming_budget_zero_persists():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(expert_streaming_budget_gib=0),
+    )
+    assert settings.expert_streaming_budget_gib == 0.0

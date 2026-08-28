@@ -40,18 +40,27 @@ def apply_expert_streaming_patch() -> bool:
 
 def _get_budget_bytes(model_settings: Any | None, estimate: Any | None) -> int:
     if model_settings is not None:
-        # Preferred name (model_settings.py:222) + legacy cache name
+        # Preferred name (model_settings.py:222) + legacy cache name.
+        # Explicit 0 = page-cache only (no app-level LRU); None falls through
+        # to the engine default below.
         for attr in ("expert_streaming_budget_gib", "expert_cache_budget_gib"):
             gib = getattr(model_settings, attr, None)
-            if gib is not None and float(gib) > 0:
-                return int(float(gib) * 1024**3)
+            if gib is not None:
+                try:
+                    return max(0, int(float(gib) * 1024**3))
+                except (TypeError, ValueError):
+                    continue
         # legacy mib
         for attr in ("expert_streaming_budget_mib", "expert_cache_budget_mib"):
             mib = getattr(model_settings, attr, None)
             if mib is not None and int(mib) > 0:
                 return int(int(mib) * 1024 * 1024)
-    # default 1 GiB (enxuto para Qwen 99G + GLM 50G — 2G estoura 16G Macs)
-    return 1 * 1024 * 1024 * 1024
+    # default: page-cache only. The OS file cache serves expert reuse from
+    # clean evictable pages; measured A/B on Qwen3.8-Flash-Next and
+    # GLM-5.3-Flash showed it beats a 1-8 GiB app-level LRU in both cold and
+    # warm runs while using several GiB less RSS. Pass an explicit budget >0
+    # to opt back into the LRU heap.
+    return 0
 
 
 # SwitchGLU bank key prefixes per main layer. GLM/Qwen nest the MoE under
@@ -478,9 +487,10 @@ def convert_model_to_streaming(
         budget_bytes = _get_budget_bytes(model_settings, estimate)
 
     logger.info(
-        "Expert streaming: converting %s: budget=%.2f GiB, layers=%d, experts/layer=%d, per_expert=%.2f MB, slots/layer=%d",
+        "Expert streaming: converting %s: budget=%.2f GiB (%s), layers=%d, experts/layer=%d, per_expert=%.2f MB, slots/layer=%d",
         Path(model_path).name,
         budget_bytes / 1024**3,
+        "page-cache only, no LRU" if budget_bytes <= 0 else "LRU heap",
         estimate.num_moe_layers,
         estimate.experts_per_layer,
         estimate.per_expert_bytes / 1024 / 1024,

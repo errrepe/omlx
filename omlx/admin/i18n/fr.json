@@ -1135,5 +1135,5 @@
   "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
   "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
-  "modal.model_settings.expert_streaming_budget_hint": "Total RAM for the expert cache across all MoE layers (empty = auto ~2 GiB). Larger = fewer SSD faults but more RAM."
+  "modal.model_settings.expert_streaming_budget_hint": "LRU d'experts optionnel. Vide ou 0 = cache fichier de l'OS uniquement (défaut ; mesuré plus rapide avec moins de RAM). >0 épingle un cache d'experts en GiB."
 }

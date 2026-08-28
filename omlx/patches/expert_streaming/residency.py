@@ -391,15 +391,11 @@ def _cached_estimate(
 
     dense_bytes = max(0, checkpoint_bytes - expert_bytes)
     resident_bytes = int(checkpoint_bytes * _MODEL_OVERHEAD_FACTOR)
-    # streaming with empty cache = dense only
-    streaming_bytes_min = int(dense_bytes * _MODEL_OVERHEAD_FACTOR)
-    # default cache 1 GiB (enxuto)
-    default_budget = 1 * 1024 * 1024 * 1024
-    streaming_bytes = streaming_bytes_min
-    if supported and per_expert > 0:
-        slots = min(experts_per_layer, default_budget // (num_moe_layers * per_expert) if num_moe_layers else 0)
-        cache = int(slots * num_moe_layers * per_expert)
-        streaming_bytes = int(dense_bytes * _MODEL_OVERHEAD_FACTOR + cache)
+    # streaming default = page-cache only: dense bytes are committed; expert
+    # reuse rides the OS file cache (clean, evictable pages — not charged to
+    # admission). An explicit LRU budget is accounted via
+    # streaming_bytes_for_budget.
+    streaming_bytes = int(dense_bytes * _MODEL_OVERHEAD_FACTOR)
 
     return ExpertStreamingEstimate(
         supported=supported,

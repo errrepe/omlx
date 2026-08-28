@@ -2394,7 +2394,8 @@ async def update_model_settings(
                 raise HTTPException(status_code=400, detail="expert_streaming_budget_gib must be a number")
             if not 0 <= gib <= 64:
                 raise HTTPException(status_code=400, detail="expert_streaming_budget_gib must be between 0 and 64 GiB")
-            current_settings.expert_streaming_budget_gib = float(gib) if gib > 0 else None
+            # 0 = page-cache only (no app-level LRU); null = engine default
+            current_settings.expert_streaming_budget_gib = float(gib)
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
