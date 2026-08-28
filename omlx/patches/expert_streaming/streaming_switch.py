@@ -607,12 +607,17 @@ class StreamingSwitchGLU(nn.Module):
         group_size: int = 64,
         bits: int = 4,
         mode: str = "affine",
+        activation: Any | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.fused_gate_up = fused_gate_up
         self.inverse_scatter = inverse_scatter
         self.quantized = quantized
+        # Original SwitchGLU activation (e.g. DeepSeek V4's LimitedSwiGLU with
+        # swiglu_limit / fp32). None falls back to the stock mlx-lm swiglu.
+        # Underscore attr keeps it out of the nn.Module parameter tree.
+        self._activation = activation
 
         # We will be populated by the converter after construction
         # Placeholder attributes for introspection
@@ -634,6 +639,15 @@ class StreamingSwitchGLU(nn.Module):
         # Called once after we have a template to copy projection config
         self._initialized = True
 
+    def _apply_activation(self, x_up: Any, x_gate: Any) -> Any:
+        act = getattr(self, "_activation", None)
+        if act is not None:
+            # Same call order as the original SwitchGLU: activation(up, gate)
+            return act(x_up, x_gate)
+        from mlx_lm.models.activations import swiglu
+
+        return swiglu(x_gate, x_up)
+
     def __call__(self, x, indices, scores=None, weighted_sum: bool = False):
         # Mirror SwitchGLU.__call__ but route through streaming linears
         p = getattr(self, "_cache", None).profile if hasattr(self, "_cache") else None
@@ -650,17 +664,12 @@ class StreamingSwitchGLU(nn.Module):
         if has_fused:
             x_gate_up = self.gate_up_proj(x_exp, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
             x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
-            # swiglu
-            from mlx_lm.models.activations import swiglu
-
-            x_act = swiglu(x_gate, x_up)
+            x_act = self._apply_activation(x_up, x_gate)
             x_out = self.down_proj(x_act, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
         else:
             x_up = self.up_proj(x_exp, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
             x_gate = self.gate_proj(x_exp, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
-            from mlx_lm.models.activations import swiglu
-
-            x_act = swiglu(x_gate, x_up)
+            x_act = self._apply_activation(x_up, x_gate)
             x_out = self.down_proj(x_act, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
 
         # weighted sum fast path — keep compatible but may not use fast kernel when streaming

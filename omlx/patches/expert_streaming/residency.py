@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import struct
 from dataclasses import dataclass
 from functools import lru_cache
@@ -115,14 +116,20 @@ def _detect_expert_keys(
         model_type = str(text_cfg.get("model_type") or "")
 
     expert_keys: list[str] = []
+    mtp_expert_keys: list[str] = []
+    mtp_stage_ids: set[int] = set()
 
     # Heuristics: stacked MoE banks contain switch_mlp and dimension 0 == n_routed
     for key in weight_map.keys():
-        # Exclude PLE ngram tables and MTP heads — not MoE experts
+        # Exclude PLE ngram tables — not MoE experts
         if ".ngram_embedding." in key or ".ple." in key:
             continue
-        if ".mtp." in key or key.startswith("mtp.") or "nextn" in key.lower():
+        if "nextn" in key.lower():
             continue
+        # DeepSeek V4 (DSpark/MTP) keeps one routed-expert bank per draft stage
+        # under mtp.<stage>[.block].ffn.switch_mlp — streamable like main
+        # layers, so they count as expert bytes rather than dense.
+        is_mtp = ".mtp." in key or key.startswith("mtp.")
         is_expert = False
         if ".mlp.experts." in key:
             is_expert = True
@@ -131,15 +138,36 @@ def _detect_expert_keys(
             # weight_map may point to sharded files, need headers per file
             # we will check later via header shape; for now consider candidate
             is_expert = True
-        elif model_type.lower().replace("-", "_") in ("glm_moe_dsa", "glm5_next", "glm5_next_text", "qwen4_exp", "qwen4_exp_text") and "mlp.switch_mlp" in key:
+        elif model_type.lower().replace("-", "_") in (
+            "glm_moe_dsa",
+            "deepseek_v32",
+            "deepseek_v4",
+            "deepseek_v4_mtp",
+            "glm5_next",
+            "glm5_next_text",
+            "qwen4_exp",
+            "qwen4_exp_text",
+        ) and "switch_mlp" in key:
             is_expert = True
-        if is_expert:
+        if not is_expert:
+            continue
+        if is_mtp:
+            mtp_expert_keys.append(key)
+            m = re.search(r"mtp\.(\d+)\.", key)
+            if m:
+                try:
+                    mtp_stage_ids.add(int(m.group(1)))
+                except Exception:
+                    pass
+        else:
             expert_keys.append(key)
 
     # Refine by checking header shape when possible
-    if n_routed and expert_keys and headers:
+    def _refine(keys: list[str]) -> list[str]:
+        if not (n_routed and keys and headers):
+            return keys
         refined: list[str] = []
-        for k in expert_keys:
+        for k in keys:
             entry = headers.get(k)
             if entry is None:
                 refined.append(k)
@@ -151,12 +179,12 @@ def _detect_expert_keys(
                 refined.append(k)
             # else: may be false positive, skip stacking check
         # if refined is non-empty, use it; otherwise keep original for per-expert files
-        if refined:
-            expert_keys = refined
+        return refined if refined else keys
+
+    expert_keys = _refine(expert_keys)
+    mtp_expert_keys = _refine(mtp_expert_keys)
 
     # Determine moe layers by distinct layer indices in expert keys
-    import re
-
     layer_pat = re.compile(r"layers\.(\d+)\.")
     layers = set()
     for k in expert_keys:
@@ -192,13 +220,20 @@ def _detect_expert_keys(
                         cnt += 1
                 if cnt > 0:
                     num_moe_layers = cnt
-                # qwen4_exp: every layer is MoE when num_experts present and no mlp types
-                if num_moe_layers == 0 and model_type.lower().replace("-", "_") in ("qwen4_exp", "qwen4_exp_text") and n_routed:
+                # qwen4_exp / deepseek_v4: every layer is MoE when
+                # num_experts / n_routed present and no mlp types
+                if num_moe_layers == 0 and model_type.lower().replace("-", "_") in (
+                    "qwen4_exp",
+                    "qwen4_exp_text",
+                    "deepseek_v4",
+                    "deepseek_v4_mtp",
+                ) and n_routed:
                     num_moe_layers = int(num_layers) if num_layers else 0
         except Exception:
             pass
 
-    # Filter MTP extra layers from expert_keys so expert_bytes excludes them
+    # Filter extra layers beyond num_hidden_layers (e.g. glm5_next layer 45
+    # MTP stored as model.layers.45) so expert_bytes excludes them
     if num_layers:
         try:
             filt_pat = re.compile(r"layers\.(\d+)\.")
@@ -215,6 +250,12 @@ def _detect_expert_keys(
             expert_keys = filtered
         except Exception:
             pass
+
+    # DeepSeek V4 style MTP/DSpark expert banks are streamable: their bytes
+    # count as expert bytes and each stage counts as one MoE layer
+    if mtp_expert_keys:
+        expert_keys.extend(mtp_expert_keys)
+        num_moe_layers += len(mtp_stage_ids)
 
     return expert_keys, num_moe_layers, n_routed
 
@@ -283,7 +324,16 @@ def _cached_estimate(
         text_cfg_local = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
         if not model_type and text_cfg_local:
             model_type = str(text_cfg_local.get("model_type") or "")
-        if model_type.lower().replace("-", "_") in ("glm_moe_dsa", "deepseek_v32", "glm5_next", "glm5_next_text", "qwen4_exp", "qwen4_exp_text") and headers:
+        if model_type.lower().replace("-", "_") in (
+            "glm_moe_dsa",
+            "deepseek_v32",
+            "deepseek_v4",
+            "deepseek_v4_mtp",
+            "glm5_next",
+            "glm5_next_text",
+            "qwen4_exp",
+            "qwen4_exp_text",
+        ) and headers:
             for k, entry in headers.items():
                 if "switch_mlp" in k:
                     try:
@@ -293,8 +343,6 @@ def _cached_estimate(
                     except Exception:
                         pass
             if expert_keys:
-                import re
-
                 layer_pat = re.compile(r"layers\.(\d+)\.")
                 layers = {int(m.group(1)) for k in expert_keys if (m := layer_pat.search(k))}
                 # Filter MTP extra layers
@@ -302,6 +350,11 @@ def _cached_estimate(
                 if cfg_layers:
                     layers = {l for l in layers if l < cfg_layers}
                 num_moe_layers = len(layers)
+                # mtp.<stage> expert banks count as streamable MoE layers
+                mtp_pat = re.compile(r"mtp\.(\d+)\.")
+                num_moe_layers += len(
+                    {int(m.group(1)) for k in expert_keys if (m := mtp_pat.search(k))}
+                )
                 exp = config.get("n_routed_experts")
                 if exp is None:
                     exp = (config.get("text_config") or {}).get("n_routed_experts")

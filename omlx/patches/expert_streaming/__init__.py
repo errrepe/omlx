@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Expert streaming (SSD) patch for MoE models (glm_moe_dsa)."""
+"""Expert streaming (SSD) patch for MoE models (glm_moe_dsa, deepseek_v4, ...)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ _APPLIED = False
 SUPPORTED_TYPES = {
     "glm_moe_dsa",
     "deepseek_v32",
+    "deepseek_v4",
+    "deepseek_v4_mtp",
     "glm5_next",
     "glm5_next_text",
     "qwen4_exp",
@@ -52,30 +54,403 @@ def _get_budget_bytes(model_settings: Any | None, estimate: Any | None) -> int:
     return 1 * 1024 * 1024 * 1024
 
 
+# SwitchGLU bank key prefixes per main layer. GLM/Qwen nest the MoE under
+# ``mlp``; DeepSeek V4 nests it under ``ffn`` (and MTP stages under
+# ``mtp.<stage>`` — see _mtp_candidate_stacked_keys).
+_MAIN_SWITCH_PREFIX_TEMPLATES = (
+    "model.layers.{i}.mlp.switch_mlp",
+    "model.layers.{i}.ffn.switch_mlp",
+    "model.language_model.layers.{i}.mlp.switch_mlp",
+    "model.language_model.layers.{i}.ffn.switch_mlp",
+    "language_model.model.layers.{i}.mlp.switch_mlp",
+    "language_model.model.layers.{i}.ffn.switch_mlp",
+    "language_model.layers.{i}.mlp.switch_mlp",
+    "language_model.layers.{i}.ffn.switch_mlp",
+)
+
+
 def _candidate_stacked_keys(layer_idx: int, proj: str, suffix: str) -> list[str]:
-    prefixes = [
-        f"model.layers.{layer_idx}.mlp.switch_mlp",
-        f"model.language_model.layers.{layer_idx}.mlp.switch_mlp",
-        f"language_model.model.layers.{layer_idx}.mlp.switch_mlp",
-        f"language_model.layers.{layer_idx}.mlp.switch_mlp",
+    return [
+        f"{template.format(i=layer_idx)}.{proj}.{suffix}"
+        for template in _MAIN_SWITCH_PREFIX_TEMPLATES
     ]
-    return [f"{p}.{proj}.{suffix}" for p in prefixes]
 
 
-def _resolve_stacked_key(layer_idx: int, proj: str, suffix: str, backing: Any | None) -> str:
+def _mtp_candidate_stacked_keys(stage_idx: int, proj: str, suffix: str) -> list[str]:
+    """Bank key candidates for one DeepSeek V4 MTP/DSpark stage.
+
+    DSpark checkpoints (0731) store ``mtp.<stage>.ffn.switch_mlp.*``; the
+    legacy MTPBlock layout nests one level deeper under ``block``.
+    """
+    return [
+        f"mtp.{stage_idx}.ffn.switch_mlp.{proj}.{suffix}",
+        f"mtp.{stage_idx}.block.ffn.switch_mlp.{proj}.{suffix}",
+    ]
+
+
+def _resolve_stacked_key(
+    candidates: list[str],
+    proj: str,
+    suffix: str,
+    backing: Any | None,
+    needle: str,
+) -> str:
+    """Pick the checkpoint key for one stacked bank.
+
+    Prefers exact candidates present in the weight map, then any key
+    containing *needle* (layer/scope disambiguation) plus the
+    ``switch_mlp.<proj>.<suffix>`` middle. Falls back to the first
+    candidate for RAM dicts / missing maps.
+    """
     if backing is not None and hasattr(backing, "_weight_map"):
         wm = getattr(backing, "_weight_map", {}) or {}
-        for cand in _candidate_stacked_keys(layer_idx, proj, suffix):
+        for cand in candidates:
             if cand in wm:
                 return cand
-        # fallback: any key containing layer and proj/suffix
-        needle = f"layers.{layer_idx}."
         mid = f"switch_mlp.{proj}.{suffix}"
         for k in wm:
             if needle in k and mid in k:
                 return k
-    # default for LLM or RAM dict
-    return f"model.layers.{layer_idx}.mlp.switch_mlp.{proj}.{suffix}"
+    return candidates[0]
+
+
+def _model_config_candidates(model: Any) -> list[Any]:
+    """Collect potential config objects for dim resolution (LLM + VLM wrappers)."""
+    candidates = []
+    for obj in [
+        getattr(model, "args", None),
+        getattr(getattr(model, "model", None), "args", None),
+        getattr(getattr(model, "language_model", None), "args", None),
+        getattr(getattr(getattr(model, "language_model", None), "model", None), "args", None),
+        getattr(model, "config", None),
+        getattr(getattr(model, "config", None), "text_config", None),
+        getattr(getattr(model, "language_model", None), "config", None),
+        getattr(getattr(getattr(model, "language_model", None), "model", None), "config", None),
+    ]:
+        if obj is not None:
+            candidates.append(obj)
+    return candidates
+
+
+def _resolve_moe_dims(cfg_candidates: list[Any]) -> tuple[int, int]:
+    """Resolve (hidden_size, moe_intermediate_size) from config candidates."""
+    hidden: int | None = None
+    moe_hidden: int | None = None
+    for cand in cfg_candidates:
+        try:
+            h = getattr(cand, "hidden_size", None)
+            if h is None and isinstance(cand, dict):
+                h = cand.get("hidden_size")
+            if h is not None:
+                hidden = int(h)
+            m = getattr(cand, "moe_intermediate_size", None)
+            if m is None and isinstance(cand, dict):
+                m = cand.get("moe_intermediate_size")
+            if m is not None:
+                moe_hidden = int(m)
+            if hidden is not None and moe_hidden is not None:
+                break
+        except Exception:
+            continue
+    if hidden is None:
+        hidden = 4096
+    if moe_hidden is None:
+        # qwen4_exp default is 640, glm5_next/deepseek_v4 are 2048; try to
+        # infer from first expert — keep original default 1407 for glm_moe_dsa
+        moe_hidden = 1407
+    # Override for known types when fallback is still generic
+    try:
+        mt = None
+        for c in cfg_candidates:
+            mt = getattr(c, "model_type", None) or (c.get("model_type") if isinstance(c, dict) else None)
+            if mt:
+                break
+        mt = str(mt).lower().replace("-", "_") if mt else ""
+        if mt in ("qwen4_exp", "qwen4_exp_text") and moe_hidden == 1407:
+            moe_hidden = 640
+        elif mt in ("glm5_next", "glm5_next_text", "deepseek_v4", "deepseek_v4_mtp") and moe_hidden == 1407:
+            moe_hidden = 2048
+    except Exception:
+        pass
+    return hidden, moe_hidden
+
+
+def _convert_switch_mlp_module(
+    moe: Any,
+    layer_idx: int,
+    *,
+    candidates_for: Any,
+    needle: str,
+    backing: Any,
+    backing_kind: str,
+    cache: Any,
+    estimate: Any,
+    hidden: int,
+    moe_hidden: int,
+    layer: Any | None = None,
+) -> bool:
+    """Replace *moe*.switch_mlp with a StreamingSwitchGLU. Returns True on success.
+
+    ``candidates_for(proj, suffix)`` yields the checkpoint key candidates for
+    this module's stacked banks; ``needle`` disambiguates weight-map fallback
+    scans (e.g. ``layers.5.`` or ``mtp.2.``).
+    """
+    import mlx.core as mx
+
+    from .streaming_switch import (
+        StreamingQuantizedSwitchLinear,
+        StreamingSwitchGLU,
+        StreamingSwitchLinear,
+    )
+
+    switch_mlp = getattr(moe, "switch_mlp", None)
+    if switch_mlp is None:
+        return False
+
+    # Determine quantized vs bf16: QuantizedSwitchLinear has 'scales'
+    is_quantized = False
+    for attr in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+        proj = getattr(switch_mlp, attr, None)
+        if proj is not None:
+            if hasattr(proj, "scales") or "scales" in getattr(proj, "_data", {}):
+                is_quantized = True
+                break
+            if proj.__class__.__name__ == "QuantizedSwitchLinear":
+                is_quantized = True
+                break
+
+    n_experts = estimate.experts_per_layer
+
+    fused = hasattr(switch_mlp, "gate_up_proj")
+    inv_scatter = getattr(switch_mlp, "inverse_scatter", False)
+
+    group_size = 64
+    bits = 4
+    mode = "affine"
+    if is_quantized:
+        for attr in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+            proj = getattr(switch_mlp, attr, None)
+            if proj is not None:
+                group_size = getattr(proj, "group_size", 64)
+                bits = getattr(proj, "bits", 4)
+                mode = getattr(proj, "mode", "affine")
+                break
+
+    streaming_glu = StreamingSwitchGLU(
+        input_dims=hidden,
+        hidden_dims=moe_hidden,
+        num_experts=n_experts,
+        layer_idx=layer_idx,
+        backing=backing,
+        cache=cache,
+        fused_gate_up=fused,
+        inverse_scatter=inv_scatter,
+        quantized=is_quantized,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        # DeepSeek V4 uses LimitedSwiGLU (swiglu_limit / fp32 on MTP stages);
+        # copying it keeps streaming bit-exact with the resident path.
+        activation=getattr(switch_mlp, "activation", None),
+    )
+
+    # For RAM dict backing, populate dict from resident weights
+    if backing_kind == "ram-dict":
+        assert isinstance(backing, dict)
+        # Map resident stacked banks to per-expert entries
+        # need to know stacked keys for file backing naming, but for RAM we key by (layer, proj)
+        for proj_name in (["gate_up_proj"] if fused else ["gate_proj", "up_proj", "down_proj"]):
+            proj = getattr(switch_mlp, proj_name, None)
+            if proj is None:
+                continue
+            # weight bank
+            w = getattr(proj, "weight", None)
+            if w is not None:
+                mx.eval(w)
+                # store stacked for slicing in streaming linear fallback
+                backing[(layer_idx, proj_name)] = w  # type: ignore[index]
+                # also for quantized scales/biases
+                if is_quantized:
+                    sc = getattr(proj, "scales", None)
+                    if sc is not None:
+                        mx.eval(sc)
+                        backing[(layer_idx, proj_name, "weight")] = w  # type: ignore[index]
+                        backing[(layer_idx, proj_name, "scales")] = sc  # type: ignore[index]
+                        b = getattr(proj, "biases", None)
+                        if b is not None:
+                            mx.eval(b)
+                            backing[(layer_idx, proj_name, "biases")] = b  # type: ignore[index]
+                        else:
+                            # ensure weight/scales keys exist for uniform fallback
+                            pass
+            # bias
+            b = getattr(proj, "bias", None)
+            if b is not None:
+                mx.eval(b)
+
+    # Now create streaming linears for the projections
+    if fused:
+        src = switch_mlp.gate_up_proj
+        stacked_w_key = _resolve_stacked_key(
+            candidates_for("gate_up_proj", "weight"), "gate_up_proj", "weight", backing, needle
+        )
+        if is_quantized:
+            stacked_s_key = _resolve_stacked_key(
+                candidates_for("gate_up_proj", "scales"), "gate_up_proj", "scales", backing, needle
+            )
+            stacked_b_key = _resolve_stacked_key(
+                candidates_for("gate_up_proj", "biases"), "gate_up_proj", "biases", backing, needle
+            )
+            proj_stream = StreamingQuantizedSwitchLinear(
+                layer_idx=layer_idx,
+                proj_name="gate_up_proj",
+                stacked_weight_key=stacked_w_key,
+                stacked_scales_key=stacked_s_key,
+                stacked_biases_key=stacked_b_key,
+                num_experts=n_experts,
+                input_dims=hidden,
+                output_dims=moe_hidden * 2,
+                backing=backing,
+                cache=cache,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                has_bias=hasattr(src, "bias"),
+            )
+            if hasattr(src, "bias"):
+                proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
+        else:
+            proj_stream = StreamingSwitchLinear(
+                layer_idx=layer_idx,
+                proj_name="gate_up_proj",
+                stacked_key=stacked_w_key,
+                num_experts=n_experts,
+                input_dims=hidden,
+                output_dims=moe_hidden * 2,
+                backing=backing,
+                cache=cache,
+                bias=hasattr(src, "bias"),
+            )
+            if hasattr(src, "bias"):
+                proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
+        streaming_glu.gate_up_proj = proj_stream  # type: ignore[attr-defined]
+        # down
+        src_down = switch_mlp.down_proj
+        stacked_w_key = _resolve_stacked_key(
+            candidates_for("down_proj", "weight"), "down_proj", "weight", backing, needle
+        )
+        if is_quantized:
+            stacked_s_key = _resolve_stacked_key(
+                candidates_for("down_proj", "scales"), "down_proj", "scales", backing, needle
+            )
+            stacked_b_key = _resolve_stacked_key(
+                candidates_for("down_proj", "biases"), "down_proj", "biases", backing, needle
+            )
+            down_stream = StreamingQuantizedSwitchLinear(
+                layer_idx=layer_idx,
+                proj_name="down_proj",
+                stacked_weight_key=stacked_w_key,
+                stacked_scales_key=stacked_s_key,
+                stacked_biases_key=stacked_b_key,
+                num_experts=n_experts,
+                input_dims=moe_hidden,
+                output_dims=hidden,
+                backing=backing,
+                cache=cache,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                has_bias=hasattr(src_down, "bias"),
+            )
+            if hasattr(src_down, "bias"):
+                down_stream.set_bias(src_down.bias)  # type: ignore[attr-defined]
+        else:
+            down_stream = StreamingSwitchLinear(
+                layer_idx=layer_idx,
+                proj_name="down_proj",
+                stacked_key=stacked_w_key,
+                num_experts=n_experts,
+                input_dims=moe_hidden,
+                output_dims=hidden,
+                backing=backing,
+                cache=cache,
+                bias=hasattr(src_down, "bias"),
+            )
+            if hasattr(src_down, "bias"):
+                down_stream.set_bias(src_down.bias)  # type: ignore[attr-defined]
+        streaming_glu.down_proj = down_stream  # type: ignore[attr-defined]
+    else:
+        for proj_name, out_dim, in_dim in [
+            ("gate_proj", moe_hidden, hidden),
+            ("up_proj", moe_hidden, hidden),
+            ("down_proj", hidden, moe_hidden),
+        ]:
+            src = getattr(switch_mlp, proj_name, None)
+            if src is None:
+                continue
+            stacked_w_key = _resolve_stacked_key(
+                candidates_for(proj_name, "weight"), proj_name, "weight", backing, needle
+            )
+            if is_quantized:
+                stacked_s_key = _resolve_stacked_key(
+                    candidates_for(proj_name, "scales"), proj_name, "scales", backing, needle
+                )
+                stacked_b_key = _resolve_stacked_key(
+                    candidates_for(proj_name, "biases"), proj_name, "biases", backing, needle
+                )
+                proj_stream = StreamingQuantizedSwitchLinear(
+                    layer_idx=layer_idx,
+                    proj_name=proj_name,
+                    stacked_weight_key=stacked_w_key,
+                    stacked_scales_key=stacked_s_key,
+                    stacked_biases_key=stacked_b_key,
+                    num_experts=n_experts,
+                    input_dims=in_dim,
+                    output_dims=out_dim,
+                    backing=backing,
+                    cache=cache,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    has_bias=hasattr(src, "bias"),
+                )
+                if hasattr(src, "bias"):
+                    proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
+            else:
+                proj_stream = StreamingSwitchLinear(
+                    layer_idx=layer_idx,
+                    proj_name=proj_name,
+                    stacked_key=stacked_w_key,
+                    num_experts=n_experts,
+                    input_dims=in_dim,
+                    output_dims=out_dim,
+                    backing=backing,
+                    cache=cache,
+                    bias=hasattr(src, "bias"),
+                )
+                if hasattr(src, "bias"):
+                    proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
+            setattr(streaming_glu, proj_name, proj_stream)
+
+    # Replace
+    moe.switch_mlp = streaming_glu  # type: ignore[attr-defined]
+    # Disable decoder FFN compilation (GLM-5.3 Glm5NextDecoderLayer
+    # compiles the FFN when compile_ffn is True): mx.eval(indices) inside
+    # the streaming switch is illegal under mx.compile/vmap transforms.
+    if layer is not None:
+        try:
+            layer.compile_ffn = False  # type: ignore[attr-defined]
+            layer._ffn_c = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # Evaluate the layer output so the lazy graph does not pin every
+        # layer's mini-bank (42 layers x ~13 MB/expert) at once — without
+        # this the accumulate graph swaps on GLM-class experts.
+        try:
+            layer._stream_eval = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return True
 
 
 def convert_model_to_streaming(
@@ -113,7 +488,7 @@ def convert_model_to_streaming(
     )
 
     # Import here to avoid circular
-    from .streaming_switch import ExpertLRUCache, StreamingQuantizedSwitchLinear, StreamingSwitchGLU, StreamingSwitchLinear
+    from .streaming_switch import ExpertLRUCache
 
     per_expert = estimate.per_expert_bytes or 0
     cache = ExpertLRUCache(budget_bytes, per_expert, num_layers=estimate.num_moe_layers)
@@ -138,12 +513,11 @@ def convert_model_to_streaming(
         backing = ram_dict  # type: ignore[assignment]
         backing_kind = "ram-dict"
 
-    import mlx.core as mx
-
     converted = 0
     # Walk model.layers — handle LLM (model.model.layers) and VLM wrappers
     # (language_model.model.layers via language_model indirection)
     layers = None
+    layers_owner = None
     # candidate attribute paths to try
     candidate_paths = [
         ("model", "layers"),  # mlx_lm LanguageModel.model.layers
@@ -154,17 +528,20 @@ def convert_model_to_streaming(
     ]
     for path in candidate_paths:
         cur = model
+        owner = None
         ok = True
         for attr in path:
             if not hasattr(cur, attr):
                 ok = False
                 break
+            owner = cur
             cur = getattr(cur, attr)
         if ok and cur is not None:
             # sanity: should be iterable with length ~ num_layers
             try:
                 _ = len(cur)  # type: ignore[arg-type]
                 layers = cur  # type: ignore[assignment]
+                layers_owner = owner
                 break
             except Exception:
                 continue
@@ -172,341 +549,120 @@ def convert_model_to_streaming(
         logger.warning("Expert streaming: could not find model.layers")
         return model, backing if isinstance(backing, dict) is False else None
 
+    hidden, moe_hidden = _resolve_moe_dims(_model_config_candidates(model))
+
+    # Main decoder layers. GLM/Qwen nest the MoE under ``mlp``; DeepSeek V4
+    # nests it under ``ffn`` — prefer whichever holds a switch_mlp.
     for layer_idx, layer in enumerate(layers):
         if layer is None:
             continue
-        mlp = getattr(layer, "mlp", None)
-        if mlp is None:
+        moe = getattr(layer, "mlp", None)
+        if moe is None or getattr(moe, "switch_mlp", None) is None:
+            moe = getattr(layer, "ffn", None)
+        if moe is None or getattr(moe, "switch_mlp", None) is None:
             continue
-        # Check if MoE
-        switch_mlp = getattr(mlp, "switch_mlp", None)
-        if switch_mlp is None:
-            continue
-
-        # Determine quantized vs bf16
-        is_quantized = False
-        # check any projection is QuantizedSwitchLinear
-        for attr in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
-            proj = getattr(switch_mlp, attr, None)
-            if proj is not None:
-                # QuantizedSwitchLinear has 'scales'
-                if hasattr(proj, "scales") or "scales" in getattr(proj, "_data", {}):
-                    is_quantized = True
-                    break
-                # also check class name
-                if proj.__class__.__name__ == "QuantizedSwitchLinear":
-                    is_quantized = True
-                    break
-
-        # Build streaming GLU
-        # Need dims
-        # Infer from existing proj weight shape or config
-        # For simplicity, get from mlp.config or layer
-        hidden = None
-        moe_hidden = None
-        n_experts = estimate.experts_per_layer
-        try:
-            # Try to infer from weight shape
-            sample_proj = getattr(switch_mlp, "down_proj", None) or getattr(switch_mlp, "gate_up_proj", None) or getattr(switch_mlp, "gate_proj", None)
-            if sample_proj is not None:
-                w = getattr(sample_proj, "weight", None)
-                if w is not None:
-                    # weight shape (E, O, I) or (E, O, packed)
-                    # input_dims derived from weight shape[2] * 32/bits for quant?
-                    pass
-        except Exception:
-            pass
-
-        # Use model config for dims — try multiple locations for VLM wrappers
-        hidden = None
-        moe_hidden = None
-        cfg_candidates = []
-        # collect potential config objects
-        for obj in [
-            getattr(model, "args", None),
-            getattr(getattr(model, "model", None), "args", None),
-            getattr(getattr(model, "language_model", None), "args", None),
-            getattr(getattr(getattr(model, "language_model", None), "model", None), "args", None),
-            getattr(model, "config", None),
-            getattr(getattr(model, "config", None), "text_config", None),
-            getattr(getattr(model, "language_model", None), "config", None),
-            getattr(getattr(getattr(model, "language_model", None), "model", None), "config", None),
-        ]:
-            if obj is not None:
-                cfg_candidates.append(obj)
-        # also try dict-style configs
-        for cand in cfg_candidates:
-            try:
-                h = getattr(cand, "hidden_size", None)
-                if h is None and isinstance(cand, dict):
-                    h = cand.get("hidden_size")
-                if h is not None:
-                    hidden = int(h)
-                m = getattr(cand, "moe_intermediate_size", None)
-                if m is None and isinstance(cand, dict):
-                    m = cand.get("moe_intermediate_size")
-                    if m is None:
-                        # qwen uses moe_intermediate_size in text_config
-                        m = cand.get("moe_intermediate_size")
-                if m is not None:
-                    moe_hidden = int(m)
-                if hidden is not None and moe_hidden is not None:
-                    break
-            except Exception:
-                continue
-        # fallback to estimate fields
-        if hidden is None:
-            hidden = 4096
-        if moe_hidden is None:
-            # qwen4_exp default is 640, glm5_next is 2048; try to infer from first expert
-            # keep original default 1407 for glm_moe_dsa; will be corrected after download
-            moe_hidden = 1407
-        # Override for known types when fallback is still generic
-        try:
-            mt = None
-            for c in cfg_candidates:
-                mt = getattr(c, "model_type", None) or (c.get("model_type") if isinstance(c, dict) else None)
-                if mt:
-                    break
-            if mt and str(mt).lower().replace("-", "_") in ("qwen4_exp", "qwen4_exp_text"):
-                if moe_hidden == 1407:
-                    moe_hidden = 640
-                if hidden == 4096:
-                    # hidden for qwen flash is 2560 (from config)
-                    # keep 4096 only if not overridden by real config; qwen will have provided
-                    pass
-            elif mt and str(mt).lower().replace("-", "_") in ("glm5_next", "glm5_next_text"):
-                if moe_hidden == 1407:
-                    moe_hidden = 2048
-        except Exception:
-            pass
-
-        # Create streaming GLU shell
-        fused = hasattr(switch_mlp, "gate_up_proj")
-        inv_scatter = getattr(switch_mlp, "inverse_scatter", False)
-
-        group_size = 64
-        bits = 4
-        mode = "affine"
-        # Try to read from an existing quantized proj
-        if is_quantized:
-            for attr in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
-                proj = getattr(switch_mlp, attr, None)
-                if proj is not None:
-                    group_size = getattr(proj, "group_size", 64)
-                    bits = getattr(proj, "bits", 4)
-                    mode = getattr(proj, "mode", "affine")
-                    break
-
-        streaming_glu = StreamingSwitchGLU(
-            input_dims=hidden,
-            hidden_dims=moe_hidden,
-            num_experts=n_experts,
-            layer_idx=layer_idx,
+        if _convert_switch_mlp_module(
+            moe,
+            layer_idx,
+            candidates_for=lambda proj, suffix, _i=layer_idx: _candidate_stacked_keys(_i, proj, suffix),
+            needle=f"layers.{layer_idx}.",
             backing=backing,
+            backing_kind=backing_kind,
             cache=cache,
-            fused_gate_up=fused,
-            inverse_scatter=inv_scatter,
-            quantized=is_quantized,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-        )
+            estimate=estimate,
+            hidden=hidden,
+            moe_hidden=moe_hidden,
+            layer=layer,
+        ):
+            converted += 1
 
-        # For RAM dict backing, populate dict from resident weights
-        if backing_kind == "ram-dict":
-            assert isinstance(backing, dict)
-            # Map resident stacked banks to per-expert entries
-            # need to know stacked keys for file backing naming, but for RAM we key by (layer, proj)
-            for proj_name in (["gate_up_proj"] if fused else ["gate_proj", "up_proj", "down_proj"]):
-                proj = getattr(switch_mlp, proj_name, None)
-                if proj is None:
-                    continue
-                # weight bank
-                w = getattr(proj, "weight", None)
-                if w is not None:
-                    mx.eval(w)
-                    # store stacked for slicing in streaming linear fallback
-                    backing[(layer_idx, proj_name)] = w  # type: ignore[index]
-                    # also for quantized scales/biases
-                    if is_quantized:
-                        sc = getattr(proj, "scales", None)
-                        if sc is not None:
-                            mx.eval(sc)
-                            backing[(layer_idx, proj_name, "weight")] = w  # type: ignore[index]
-                            backing[(layer_idx, proj_name, "scales")] = sc  # type: ignore[index]
-                            b = getattr(proj, "biases", None)
-                            if b is not None:
-                                mx.eval(b)
-                                backing[(layer_idx, proj_name, "biases")] = b  # type: ignore[index]
-                            else:
-                                # ensure weight/scales keys exist for uniform fallback
-                                pass
-                # bias
-                b = getattr(proj, "bias", None)
-                if b is not None:
-                    mx.eval(b)
+    # DeepSeek V4 MTP/DSpark stages carry their own SwitchGLU banks
+    # (mtp.<stage>.ffn on DSpark checkpoints, mtp.<stage>.block.ffn on the
+    # legacy MTPBlock layout). Streaming them keeps the ~3 GB/stage banks
+    # out of RAM on low-memory hosts.
+    mtp_stages = getattr(layers_owner, "mtp", None) if layers_owner is not None else None
+    if not isinstance(mtp_stages, (list, tuple)) or not mtp_stages:
+        mtp_stages = None
+    mtp_converted = 0
+    if mtp_stages:
+        for stage_idx, stage in enumerate(mtp_stages):
+            if stage is None:
+                continue
+            stage_moe = getattr(stage, "ffn", None)
+            if stage_moe is None or getattr(stage_moe, "switch_mlp", None) is None:
+                block = getattr(stage, "block", None)
+                stage_moe = getattr(block, "ffn", None) if block is not None else None
+            if stage_moe is None or getattr(stage_moe, "switch_mlp", None) is None:
+                continue
+            if _convert_switch_mlp_module(
+                stage_moe,
+                len(layers) + stage_idx,
+                candidates_for=lambda proj, suffix, _s=stage_idx: _mtp_candidate_stacked_keys(_s, proj, suffix),
+                needle=f"mtp.{stage_idx}.",
+                backing=backing,
+                backing_kind=backing_kind,
+                cache=cache,
+                estimate=estimate,
+                hidden=hidden,
+                moe_hidden=moe_hidden,
+                layer=stage,
+            ):
+                mtp_converted += 1
+                converted += 1
+        if mtp_converted:
+            logger.info(
+                "Expert streaming: converted %d/%d MTP/DSpark stage MoE banks",
+                mtp_converted,
+                len(mtp_stages),
+            )
 
-        # Now create streaming linears for the projections
-        if fused:
-            src = getattr(switch_mlp, "gate_up_proj")
-            # Determine stacked keys for file backing (for mmap path)
-            # Try multiple prefixes to cover LLM vs VLM checkpoints
-            stacked_w_key = _resolve_stacked_key(layer_idx, "gate_up_proj", "weight", backing)
-            if is_quantized:
-                stacked_s_key = _resolve_stacked_key(layer_idx, "gate_up_proj", "scales", backing)
-                stacked_b_key = _resolve_stacked_key(layer_idx, "gate_up_proj", "biases", backing)
-                proj_stream = StreamingQuantizedSwitchLinear(
-                    layer_idx=layer_idx,
-                    proj_name="gate_up_proj",
-                    stacked_weight_key=stacked_w_key,
-                    stacked_scales_key=stacked_s_key,
-                    stacked_biases_key=stacked_b_key,
-                    num_experts=n_experts,
-                    input_dims=hidden,
-                    output_dims=moe_hidden * 2,
-                    backing=backing,
-                    cache=cache,
-                    group_size=group_size,
-                    bits=bits,
-                    mode=mode,
-                    has_bias=hasattr(src, "bias"),
-                )
-                if hasattr(src, "bias"):
-                    proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
-            else:
-                proj_stream = StreamingSwitchLinear(
-                    layer_idx=layer_idx,
-                    proj_name="gate_up_proj",
-                    stacked_key=stacked_w_key,
-                    num_experts=n_experts,
-                    input_dims=hidden,
-                    output_dims=moe_hidden * 2,
-                    backing=backing,
-                    cache=cache,
-                    bias=hasattr(src, "bias"),
-                )
-                if hasattr(src, "bias"):
-                    proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
-            streaming_glu.gate_up_proj = proj_stream  # type: ignore[attr-defined]
-            # down
-            src_down = getattr(switch_mlp, "down_proj")
-            stacked_w_key = _resolve_stacked_key(layer_idx, "down_proj", "weight", backing)
-            if is_quantized:
-                stacked_s_key = _resolve_stacked_key(layer_idx, "down_proj", "scales", backing)
-                stacked_b_key = _resolve_stacked_key(layer_idx, "down_proj", "biases", backing)
-                down_stream = StreamingQuantizedSwitchLinear(
-                    layer_idx=layer_idx,
-                    proj_name="down_proj",
-                    stacked_weight_key=stacked_w_key,
-                    stacked_scales_key=stacked_s_key,
-                    stacked_biases_key=stacked_b_key,
-                    num_experts=n_experts,
-                    input_dims=moe_hidden,
-                    output_dims=hidden,
-                    backing=backing,
-                    cache=cache,
-                    group_size=group_size,
-                    bits=bits,
-                    mode=mode,
-                    has_bias=hasattr(src_down, "bias"),
-                )
-                if hasattr(src_down, "bias"):
-                    down_stream.set_bias(src_down.bias)  # type: ignore[attr-defined]
-            else:
-                down_stream = StreamingSwitchLinear(
-                    layer_idx=layer_idx,
-                    proj_name="down_proj",
-                    stacked_key=stacked_w_key,
-                    num_experts=n_experts,
-                    input_dims=moe_hidden,
-                    output_dims=hidden,
-                    backing=backing,
-                    cache=cache,
-                    bias=hasattr(src_down, "bias"),
-                )
-                if hasattr(src_down, "bias"):
-                    down_stream.set_bias(src_down.bias)  # type: ignore[attr-defined]
-            streaming_glu.down_proj = down_stream  # type: ignore[attr-defined]
-        else:
-            for proj_name, out_dim, in_dim in [
-                ("gate_proj", moe_hidden, hidden),
-                ("up_proj", moe_hidden, hidden),
-                ("down_proj", hidden, moe_hidden),
-            ]:
-                src = getattr(switch_mlp, proj_name, None)
-                if src is None:
-                    continue
-                stacked_w_key = _resolve_stacked_key(layer_idx, proj_name, "weight", backing)
-                if is_quantized:
-                    stacked_s_key = _resolve_stacked_key(layer_idx, proj_name, "scales", backing)
-                    stacked_b_key = _resolve_stacked_key(layer_idx, proj_name, "biases", backing)
-                    proj_stream = StreamingQuantizedSwitchLinear(
-                        layer_idx=layer_idx,
-                        proj_name=proj_name,
-                        stacked_weight_key=stacked_w_key,
-                        stacked_scales_key=stacked_s_key,
-                        stacked_biases_key=stacked_b_key,
-                        num_experts=n_experts,
-                        input_dims=in_dim,
-                        output_dims=out_dim,
-                        backing=backing,
-                        cache=cache,
-                        group_size=group_size,
-                        bits=bits,
-                        mode=mode,
-                        has_bias=hasattr(src, "bias"),
-                    )
-                    if hasattr(src, "bias"):
-                        proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
-                else:
-                    proj_stream = StreamingSwitchLinear(
-                        layer_idx=layer_idx,
-                        proj_name=proj_name,
-                        stacked_key=stacked_w_key,
-                        num_experts=n_experts,
-                        input_dims=in_dim,
-                        output_dims=out_dim,
-                        backing=backing,
-                        cache=cache,
-                        bias=hasattr(src, "bias"),
-                    )
-                    if hasattr(src, "bias"):
-                        proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
-                setattr(streaming_glu, proj_name, proj_stream)
-
-        # Replace
-        mlp.switch_mlp = streaming_glu  # type: ignore[attr-defined]
-        converted += 1
-        # Disable decoder FFN compilation (GLM-5.3 Glm5NextDecoderLayer
-        # compiles the FFN when compile_ffn is True): mx.eval(indices) inside
-        # the streaming switch is illegal under mx.compile/vmap transforms.
-        try:
-            layer.compile_ffn = False  # type: ignore[attr-defined]
-            layer._ffn_c = None  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        # Evaluate the layer output so the lazy graph does not pin every
-        # layer's mini-bank (42 layers x ~13 MB/expert) at once — without
-        # this the accumulate graph swaps on GLM-class experts.
-        try:
-            layer._stream_eval = True  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        # Free original tensors to save memory
-        # Drop references; will be GC'd. For mmap backing, original stacked banks are no longer needed.
-        # For RAM dict backing, we kept a copy; we can still free the original stacked mx arrays.
-        # Delete original switch_mlp projections to release memory
-        try:
-            del switch_mlp  # type: ignore[assignment]
-        except Exception:
-            pass
+    # The estimate counts MTP stages as MoE layers; when the runtime MTP is
+    # inactive (no model.mtp) fewer layers were converted — rebalance the
+    # per-layer LRU split so the converted layers keep a fair share.
+    if converted and cache.num_layers != converted and cache.capacity > 0:
+        cache.num_layers = converted
+        cache._per_layer_cap = max(1, cache.capacity // converted)  # type: ignore[attr-defined]
 
     if converted:
         import mlx.core as mx
 
         mx.clear_cache()
         logger.info("Expert streaming: converted %d MoE layers (backing=%s, cache_capacity=%d experts)", converted, backing_kind, cache.capacity)
+        # PILOT: async router-lookahead prefetch into the LRU (glm5_next's
+        # Glm5NextModel loop scores the next MoE layer's router against the
+        # current layer output). mmap backing only; off when the RAM dict
+        # fallback is in use or OMLX_EXPERT_STREAMING_PILOT=0.
+        import os
+
+        if os.environ.get("OMLX_EXPERT_STREAMING_PILOT", "1") == "1" and not isinstance(
+            backing, dict
+        ):
+            try:
+                from .prefetch import ExpertPrefetcher
+
+                prefetcher = ExpertPrefetcher(cache)
+                prefetcher.start()
+                for obj_ in (
+                    model,
+                    getattr(model, "language_model", None),
+                    getattr(getattr(model, "language_model", None), "model", None),
+                ):
+                    if (
+                        obj_ is not None
+                        and getattr(obj_, "layers", None) is layers
+                    ):
+                        obj_._expert_prefetcher = prefetcher  # type: ignore[attr-defined]
+                        break
+                else:
+                    prefetcher.stop()
+                    prefetcher = None
+                    logger.warning(
+                        "Expert streaming: PILOT prefetch attach point not found; disabled"
+                    )
+                if prefetcher is not None:
+                    logger.info("Expert streaming: PILOT async prefetch active")
+            except Exception as e:
+                logger.warning("Expert streaming: PILOT prefetch init failed: %s", e)
     else:
         logger.info("Expert streaming: no MoE layers converted")
 

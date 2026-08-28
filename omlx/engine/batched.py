@@ -26,6 +26,19 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+def _read_config_model_type(model_path: str) -> str | None:
+    """Read ``model_type`` from a local checkpoint's config.json (None if absent)."""
+    import json
+    from pathlib import Path
+
+    try:
+        cfg = json.loads((Path(model_path) / "config.json").read_text())
+        model_type = cfg.get("model_type")
+        return str(model_type) if model_type else None
+    except Exception:
+        return None
+
+
 # Optional Harmony adapter import
 try:
     from ..adapter.harmony import preprocess_harmony_messages
@@ -266,10 +279,23 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
+            load_kwargs: dict[str, Any] = {}
+            if getattr(self._model_settings, "expert_streaming_enabled", False):
+                from ..patches.expert_streaming import is_supported_model_type
+
+                model_type = _read_config_model_type(self._model_name)
+                if model_type and is_supported_model_type(model_type):
+                    # Lazy-load so giant MoE checkpoints (DeepSeek V4 Flash
+                    # oQ4e ~166G) stream from SSD instead of materializing
+                    # fully in RAM; expert streaming replaces the MoE banks
+                    # before materialize_lazy_state runs.
+                    load_kwargs["lazy"] = True
+
             return lm_load_compat(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                **load_kwargs,
             )
 
         loop = asyncio.get_running_loop()
@@ -285,16 +311,15 @@ class BatchedEngine(BaseEngine):
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
 
-        # Materialize lazy buffers on the loader thread so per-engine
-        # inference threads can read them (#1304).
-        await loop.run_in_executor(
-            get_mlx_executor(), materialize_lazy_state, self._model
-        )
-
         # Expert streaming (SSD): keep hot experts resident, stream the rest.
-        # Must run after materialize so expert banks are evaluated, and before
-        # gate+up fusion (fusion would change the stacked layout). Effective
-        # settings already include forced activation from EnginePool.
+        # Runs BEFORE materialize_lazy_state on purpose. On lazy-loaded
+        # checkpoints every tensor is a plain mx.array and materialize_lazy_state
+        # would evaluate the entire tree — including the multi-hundred-GB MoE
+        # expert banks (OOM / SIGKILL). Converting to streaming first drops
+        # those arrays (GC'd), so the materialize that follows only evaluates
+        # dense weights and RoPE freqs. Effective settings already include
+        # forced activation from EnginePool. Also runs before gate+up fusion
+        # (fusion would change the stacked layout).
         if getattr(self._model_settings, "expert_streaming_enabled", False):
             try:
                 from ..patches.expert_streaming import convert_model_to_streaming
@@ -316,6 +341,13 @@ class BatchedEngine(BaseEngine):
                 logger.info("Expert streaming enabled for %s", self._model_name)
             except Exception:
                 logger.warning("Expert streaming conversion failed for %s", self._model_name, exc_info=True)
+
+        # Materialize lazy buffers on the loader thread so per-engine
+        # inference threads can read them (#1304). Post-streaming the MoE
+        # banks are gone, so this stays bounded.
+        await loop.run_in_executor(
+            get_mlx_executor(), materialize_lazy_state, self._model
+        )
 
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per

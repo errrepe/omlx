@@ -245,3 +245,332 @@ def test_engine_pool_forced_streaming_status(monkeypatch):
         assert enabled is True
         eff = pool._effective_expert_streaming_settings(entry, ModelSettings())
         assert eff.expert_streaming_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek V4 (ffn-nested MoE + MTP/DSpark stages)
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_dsv4_checkpoint(
+    tmp: Path,
+    num_layers=2,
+    experts=8,
+    hidden=32,
+    moe_hidden=16,
+    mtp_stages=2,
+):
+    """Fake DeepSeek V4 checkpoint: ffn-nested switch_mlp + mtp.<stage> banks."""
+    import numpy as np
+
+    config = {
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": num_layers,
+        "n_routed_experts": experts,
+        "hidden_size": hidden,
+        "moe_intermediate_size": moe_hidden,
+    }
+    (tmp / "config.json").write_text(json.dumps(config))
+
+    tensors = {}
+
+    def _add_bank(prefix: str) -> None:
+        for proj, shape in [
+            ("gate_proj", (experts, moe_hidden, hidden)),
+            ("up_proj", (experts, moe_hidden, hidden)),
+            ("down_proj", (experts, hidden, moe_hidden)),
+        ]:
+            key = f"{prefix}.{proj}.weight"
+            tensors[key] = (shape, "BF16", int(np.prod(shape)) * 2)
+
+    for layer in range(num_layers):
+        _add_bank(f"model.layers.{layer}.ffn.switch_mlp")
+    for stage in range(mtp_stages):
+        _add_bank(f"mtp.{stage}.ffn.switch_mlp")
+
+    tensors["model.embed_tokens.weight"] = ((32000, hidden), "BF16", 32000 * hidden * 2)
+    tensors["lm_head.weight"] = ((32000, hidden), "BF16", 32000 * hidden * 2)
+
+    header = {}
+    offset = 0
+    for k, (shape, dtype, size) in tensors.items():
+        header[k] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + size]}
+        offset += size
+    header_bytes = json.dumps(header).encode()
+    fname = tmp / "model.safetensors"
+    with fname.open("wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(b"\x00" * offset)
+    weight_map = {k: fname.name for k in tensors}
+    (tmp / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+
+def test_residency_supported_for_deepseek_v4_with_mtp():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        num_layers, experts, stages = 3, 8, 2
+        _write_fake_dsv4_checkpoint(tmp, num_layers=num_layers, experts=experts, mtp_stages=stages)
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True
+        # MTP/DSpark stages count as streamable MoE layers
+        assert est.num_moe_layers == num_layers + stages
+        assert est.experts_per_layer == experts
+        assert est.per_expert_bytes > 0
+        assert est.expert_bytes > 0
+        assert est.resident_bytes > est.streaming_bytes
+        assert est.slots_for_budget(64 * 1024**3) == experts  # all fit
+
+
+def test_residency_mtp_excluded_when_absent():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_dsv4_checkpoint(tmp, num_layers=2, experts=8, mtp_stages=0)
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True
+        assert est.num_moe_layers == 2
+
+
+def test_stacked_key_candidates_cover_ffn_and_mtp():
+    from omlx.patches.expert_streaming import (
+        _candidate_stacked_keys,
+        _mtp_candidate_stacked_keys,
+        _resolve_stacked_key,
+    )
+
+    cands = _candidate_stacked_keys(5, "gate_proj", "weight")
+    assert cands[0] == "model.layers.5.mlp.switch_mlp.gate_proj.weight"
+    assert "model.layers.5.ffn.switch_mlp.gate_proj.weight" in cands
+
+    mtp_cands = _mtp_candidate_stacked_keys(2, "up_proj", "scales")
+    assert mtp_cands[0] == "mtp.2.ffn.switch_mlp.up_proj.scales"
+    assert mtp_cands[1] == "mtp.2.block.ffn.switch_mlp.up_proj.scales"
+
+    class _MapFFN:
+        _weight_map = {"model.layers.5.ffn.switch_mlp.gate_proj.weight": "a.safetensors"}
+
+    assert (
+        _resolve_stacked_key(cands, "gate_proj", "weight", _MapFFN(), "layers.5.")
+        == "model.layers.5.ffn.switch_mlp.gate_proj.weight"
+    )
+
+    class _MapScan:
+        _weight_map = {"model.layers.5.ffn.switch_mlp.up_proj.weight": "b.safetensors"}
+
+    assert (
+        _resolve_stacked_key(
+            _candidate_stacked_keys(5, "up_proj", "weight"),
+            "up_proj",
+            "weight",
+            _MapScan(),
+            "layers.5.",
+        )
+        == "model.layers.5.ffn.switch_mlp.up_proj.weight"
+    )
+
+    # no weight map (RAM dict / single-file) -> legacy mlp default
+    assert (
+        _resolve_stacked_key(cands, "gate_proj", "weight", None, "layers.5.")
+        == "model.layers.5.mlp.switch_mlp.gate_proj.weight"
+    )
+
+
+class _FakeProj:
+    def __init__(self, shape):
+        import mlx.core as mx
+
+        self.weight = mx.ones(shape)
+
+
+class _FakeSwitchGLU:
+    def __init__(self, e, o, i, activation=None):
+        self.gate_proj = _FakeProj((e, o, i))
+        self.up_proj = _FakeProj((e, o, i))
+        self.down_proj = _FakeProj((e, i, o))
+        if activation is not None:
+            self.activation = activation
+
+
+class _FakeMoE:
+    def __init__(self, e, o, i, activation=None):
+        self.switch_mlp = _FakeSwitchGLU(e, o, i, activation)
+
+
+class _FakeLayer:
+    def __init__(self, e, o, i):
+        self.ffn = _FakeMoE(e, o, i)
+
+
+class _FakeDSparkStage:
+    def __init__(self, e, o, i):
+        self.ffn = _FakeMoE(e, o, i)
+
+
+class _FakeTextModel:
+    def __init__(self, layers, mtp, config):
+        self.model = type("InnerModel", (), {})()
+        self.model.layers = layers
+        self.model.mtp = mtp
+        self.config = config
+
+
+def test_convert_walk_ffn_and_mtp():
+    from omlx.patches.expert_streaming import convert_model_to_streaming
+    from omlx.patches.expert_streaming.streaming_switch import (
+        StreamingSwitchGLU,
+        StreamingSwitchLinear,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        num_layers, experts, hidden, moe_hidden, stages = 2, 4, 8, 4, 2
+        _write_fake_dsv4_checkpoint(
+            tmp,
+            num_layers=num_layers,
+            experts=experts,
+            hidden=hidden,
+            moe_hidden=moe_hidden,
+            mtp_stages=stages,
+        )
+        marker = object()
+        layers = [_FakeLayer(experts, moe_hidden, hidden) for _ in range(num_layers)]
+        layers[0].ffn.switch_mlp.activation = marker
+        mtp = [_FakeDSparkStage(experts, moe_hidden, hidden) for _ in range(stages)]
+        model = _FakeTextModel(
+            layers,
+            mtp,
+            {
+                "model_type": "deepseek_v4",
+                "hidden_size": hidden,
+                "moe_intermediate_size": moe_hidden,
+            },
+        )
+
+        out_model, backing = convert_model_to_streaming(
+            model, str(tmp), None, use_file_backing=False
+        )
+        assert out_model is model
+        # ram-dict backing is not returned (existing contract)
+        assert backing is None
+
+        for layer in layers:
+            sm = layer.ffn.switch_mlp
+            assert isinstance(sm, StreamingSwitchGLU)
+            assert isinstance(sm.gate_proj, StreamingSwitchLinear)
+            assert isinstance(sm.down_proj, StreamingSwitchLinear)
+        # activation copied from the original switch_mlp
+        assert layers[0].ffn.switch_mlp._activation is marker
+        assert layers[1].ffn.switch_mlp._activation is None
+        # MTP stages converted with distinct cache layer ids
+        for stage in mtp:
+            assert isinstance(stage.ffn.switch_mlp, StreamingSwitchGLU)
+
+
+def test_convert_walk_mtpblock_layout():
+    from omlx.patches.expert_streaming import convert_model_to_streaming
+    from omlx.patches.expert_streaming.streaming_switch import StreamingSwitchGLU
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        num_layers, experts, hidden, moe_hidden = 2, 4, 8, 4
+        _write_fake_dsv4_checkpoint(
+            tmp,
+            num_layers=num_layers,
+            experts=experts,
+            hidden=hidden,
+            moe_hidden=moe_hidden,
+            mtp_stages=0,
+        )
+        layers = [_FakeLayer(experts, moe_hidden, hidden) for _ in range(num_layers)]
+
+        class _Block:
+            def __init__(self, e, o, i):
+                self.ffn = _FakeMoE(e, o, i)
+
+        class _MTPBlockStage:
+            def __init__(self, e, o, i):
+                self.block = _Block(e, o, i)
+
+        mtp = [_MTPBlockStage(experts, moe_hidden, hidden)]
+        model = _FakeTextModel(
+            layers,
+            mtp,
+            {
+                "model_type": "deepseek_v4",
+                "hidden_size": hidden,
+                "moe_intermediate_size": moe_hidden,
+            },
+        )
+        convert_model_to_streaming(model, str(tmp), None, use_file_backing=False)
+        assert isinstance(layers[0].ffn.switch_mlp, StreamingSwitchGLU)
+        assert isinstance(mtp[0].block.ffn.switch_mlp, StreamingSwitchGLU)
+
+
+def test_streaming_glu_uses_custom_activation():
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingSwitchGLU,
+        StreamingSwitchLinear,
+    )
+
+    experts, moe_hidden, hidden = 4, 6, 8
+    calls = []
+
+    def act(up, gate):
+        calls.append((tuple(up.shape), tuple(gate.shape)))
+        return up + gate
+
+    cache = ExpertLRUCache(1 << 24, 4096, num_layers=1)
+    backing = {
+        (0, "gate_proj"): mx.arange(experts * moe_hidden * hidden, dtype=mx.float32).reshape(
+            experts, moe_hidden, hidden
+        )
+        / 100.0,
+        (0, "up_proj"): mx.arange(experts * moe_hidden * hidden, dtype=mx.float32).reshape(
+            experts, moe_hidden, hidden
+        )
+        / 200.0,
+        (0, "down_proj"): mx.arange(experts * hidden * moe_hidden, dtype=mx.float32).reshape(
+            experts, hidden, moe_hidden
+        )
+        / 300.0,
+    }
+    glu = StreamingSwitchGLU(
+        input_dims=hidden,
+        hidden_dims=moe_hidden,
+        num_experts=experts,
+        layer_idx=0,
+        backing=backing,
+        cache=cache,
+        quantized=False,
+        activation=act,
+    )
+    for name, out_dim, in_dim in [
+        ("gate_proj", moe_hidden, hidden),
+        ("up_proj", moe_hidden, hidden),
+        ("down_proj", hidden, moe_hidden),
+    ]:
+        setattr(
+            glu,
+            name,
+            StreamingSwitchLinear(
+                layer_idx=0,
+                proj_name=name,
+                stacked_key=f"k.{name}",
+                num_experts=experts,
+                input_dims=in_dim,
+                output_dims=out_dim,
+                backing=backing,
+                cache=cache,
+            ),
+        )
+
+    x = mx.random.uniform(shape=(1, 3, hidden))
+    idx = mx.array([[[0, 1], [2, 3], [0, 2]]])  # (1, 3, 2) — below sort threshold
+    out = glu(x, idx)
+    # custom activation used with the original call order (up, gate)
+    assert len(calls) == 1
+    assert glu._activation is act
+    assert out.shape == (1, 3, 2, hidden)
