@@ -223,6 +223,56 @@ Why it flipped: the draft/verify cycle runs **3.4 target forwards per generated 
 | 48 GB+, quality flexible | default | optional | 0.85 | on (qwen4_exp with `mtp.*`) |
 | 16 GB-class | default | `PIN=1` | 0.85 (+ `WARM=1` to test) | on (qwen4_exp with `mtp.*`) |
 
+## Fase E — bottleneck experiments (QD, coalescing, learned pins, MTP tuning, ANE)
+
+All runs cold (28 GB `cache_cool`), Qwen 0G page-cache-only unless noted; run-to-run noise ~±5%.
+
+### E1 — QD16 is the new pool default (+34%)
+
+| QD | tok/s (48-tok decode) |
+|---|---|
+| 8 (old default) | 1.538 |
+| **16** | **2.061** |
+| 32 | 2.097 (plateau) |
+
+Disk read max ~2.5 GB/s of the 3.7 GB/s sequential spec; short-prompt TTFT 10.4 → 8.9 s. `OMLX_EXPERT_STREAMING_QD` overrides.
+
+**Run coalescing** (consecutive expert ids → one `pread` per bank key, `_ShardReader.expert_run`, verified bit-exact): +4% decode (adjacency ~2%), ~2% at 8k prefill (the union already covers ~the full bank). Kept — free and no-regression; `OMLX_EXPERT_STREAMING_COALESCE=0` disables.
+
+**Long-prompt prefill finding**: 8k prompt = ~90 s TTFT streaming ~66 GB (full expert bank per layer) — but disk only sustains 1.85-1.89 GB/s of it and the GPU sits at 81-85%: **long-prompt prefill is ~60% GPU/CPU-bound** (expert QMM over ~7.4k positions + mini-bank assemble/promote). Decode immediately after a long prefill runs ~4.2 tok/s (page cache hot). The real long-prompt levers are chunked prefill / assemble cost — not bandwidth.
+
+### E2 — MTP tuning on the QD16 stack
+
+MTP's edge shrank from +27-37% (QD8) to +4-5% (QD16): the pool resize cut the per-forward I/O cost MTP was amortizing. Sweep (`--mtp-block`, no-MTP baseline 2.135):
+
+| block | 2 | 3 | 4 | 8 |
+|---|---|---|---|---|
+| tok/s | 2.097 | 2.165 | 2.213 | 2.248 |
+
+Pins no longer stack with deep drafting (block 8 + pins: 2.012/2.069, reproduced twice). Guidance: MTP stays default-off; when enabled use `draft_block_size` 4-8 with pins off — or QD16 alone, which beats MTP alone.
+
+### E3 — learned pin store (persisted routing frequencies)
+
+`OMLX_EXPERT_STREAMING_PIN_PROFILE=<path>`: PinController saves observed per-layer frequencies after pinning; the next load reloads them and wires the hot set from token 1 (no 8-call window). The mlock also populates the pages, so the reload doubles as a *targeted* warmup.
+
+| arm | TTFT | decode |
+|---|---|---|
+| baseline | 8.3-8.9 s | 2.06-2.14 |
+| (b) deterministic warmup 1.25 G post-load | 7.1-8.0 s | 1.71-1.93 — ~0/negative |
+| (c) learned pins loaded at start | **6.9 s (−22%)** | **2.273 (+6-10%)** |
+
+(b) confirms the prediction: warmup uncorrelated with the first request's routing is wasted I/O. (c) is the optimistic bound (profile from the same prompt); arbitrary first requests gain proportionally to overlap. Server follow-up: save on unload, reload on load, per model.
+
+### E4 — ANE prefill: attaches to qwen4_exp, not the streaming lever
+
+Required building the native extension (nanobind 2.13.0 ABI-matched to MLX 0.32.0; upstream `setup.py` cannot pass `-DPython_EXECUTABLE` through `CMAKE_ARGS` for paths with spaces — space-free venv symlink workaround). With it present, ANE attaches to the vendored qwen4_exp **without any port** ("48 MLP + 36 GDN procedures into 2 instance-pinned ANE programs").
+
+Cold TTFT: 2k 25.7 → 26.3 s (no gain); 8k 89.7 → 87.1 s (~3%). Prefill is GPU-bound (81-85%) in both arms — time goes to expert QMMs and assembly, which ANE does not touch (dense MLPs + GDN projections only). Keep ANE for resident models; streaming TTFT needs chunked prefill / assemble work instead.
+
+### E5 — GLM on the QD16 stack
+
+GLM 0G decode 64: **0.697 tok/s vs 0.381 measured pre-E1 (+83%)** — large experts benefit more from deeper queues. TTFT 23 → 18.5 s. Pins 2.5 GiB: neutral (2.5 G = ~4-5 experts/layer of 288 — too sparse). GLM's levers remain QD16 (now default) + topk 0.85 (+27%).
+
 ## Trade-offs
 
 - **Prefill is burst-heavy**: a long prompt touches almost every expert once → many faults on first prefill. Keep the existing **paged SSD KV cache** on — a repeated prefix is restored from disk in milliseconds instead of re-faulting experts. The first prefill still warms the LRU, so the following decode hits more.
