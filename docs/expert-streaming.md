@@ -295,6 +295,50 @@ GLM 0G decode 64: **0.697 tok/s vs 0.381 measured pre-E1 (+83%)** — large expe
 - Dual-SSD striping is supported: copy alternating shards to a second disk (`python bench/stripe_model.py --model <dir> --target <dir2>`) and run with `OMLX_EXPERT_STREAMING_EXTRA_ROOTS=<dir2>`. Mirrored shards are served from the stripe root, the rest fall back to the primary — no RAID, original dir untouched. Note: only pays if the second disk is *fast* — in our setup the 4 TB NVMe (~3.7 GB/s) is the fast one and the 2 TB (~875 MB/s) would slow reads down.
 - TTFT on GLM-class models is high (prefill faults ~all experts once); KV snapshot helps repeated prompts only.
 
+## Fase F — long-prompt prefill: honest accounting, and what doesn't work
+
+Investigation of the 8k-prompt TTFT bottleneck (GPU 81-85%, disk 1.85-1.9 GB/s) and the memory incidents it caused on the 48 GB dev machine.
+
+### F1 — the transient was invisible to the guard, and the guard was double-charging
+
+The prefill chunk forward is lazy: every MoE layer's assembled mini-bank stays live until the chunk-end eval, so one ~1.5k-token chunk commits ~32 GB of Metal transients (~17 MB/token measured; expert banks dominate). Four accounting bugs fell out, all fixed (`180f6c54`):
+
+1. The guard's static transient model (SDPA + KV) never included the **streaming mini-bank term** — now charged as `uniq experts/layer ≈ 0.2 × chunk tokens` (measured 0.145 on qwen4_exp; saturating at experts/layer), via `backing.streaming_guard_info` attached at convert time.
+2. `_current_usage_bytes` charged the **evictable file pages** of streamed experts as commitment (phys 21.5 GB while Metal active was 4.5 GB) — for streaming models only live Metal counts.
+3. The per-chunk transient tracker learned the same page-cache poisoning (61 MB/token) — it now probes `mx.get_active_memory()` on streaming models.
+4. Admission's `observed_max` floor assumed size-invariant transients; streaming bank transients scale with chunk size, so the floor is now discounted linearly.
+
+The bench also gained `--min-free-gb` (abort when the machine is memory-starved — starved runs fragment prefill into many chunks, re-stream experts, and thrash) and `--mem-ceiling-gib` (propagate the watermarks the server's `ProcessMemoryEnforcer` would — the bench runs without an enforcer, so throttle/guard never engaged and the Metal pool rode to ~30 GiB).
+
+**Residual truth**: with honest watermarks, chunk size controls peak, and peak × machine headroom caps throughput. On a machine with the user active (≈22 GB free), 8k TTFT is ~2.3-3× the idle-machine number — that's physics (compression + page-cache contention), not a bug.
+
+### F2 — persistent bank: tested, reverted (post-mortem `170c003f`)
+
+Two designs were measured, both reverted:
+
+- **Promote-once** (mx bundles in the LRU): double-holds the weights — LRU (Metal) + the per-chunk stack are the same bytes twice. Metal active hit 37 GB on a 6 GiB budget run and the guard force-stopped the prefill.
+- **Persistent per-linear bank** (stack surviving chunks): MLX's lazy chunk graph keeps every remount's stack live until the chunk-end eval, so the bank's Metal peak equals the per-chunk assembly it replaced — zero prefill win — plus a permanent 12 GiB+ hold between requests that starved the next prefill.
+
+The F1 profile had already said so: per GLU call the CPU-side assembly is ~7 ms (gate 1.8 + load 4.8 + stack 0.1) against a 121 ms wall — assembly was never the lever. Kept from this round: the LRU slot-sizing fix (one slot = one projection slice = `per_expert/3`; a 12 GiB budget previously bought ~4 GiB of bank, hit rate 0.002).
+
+### F3 — SpecPrefill and streaming are anti-synergistic (`70e348e3`)
+
+SpecPrefill (draft-scored sparse prefill, keep 0.2) saves target *compute*; streaming's cost is expert *I/O per routing neighborhood*. Measured on Qwen 2k, draft Qwen3.5-2B-bf16:
+
+| | TTFT | LRU misses | uniq experts/call |
+|---|---|---|---|
+| streaming only | 25.7 s | ~34k | ~34 |
+| + SpecPrefill (cold) | 93.8 s | 466k | — |
+| + SpecPrefill (warm) | 26.3 s | 57k | 132 |
+
+Sparse selected tokens spread routing across the bank (4× unique experts per forward), destroying the locality dense chunks rely on; the QMM saving is eaten by expert loading. **Do not combine** — SpecPrefill is a resident-model lever.
+
+### Where this leaves long-prompt TTFT
+
+- The levers that survived: QD16, coalesced runs, learned pins (E3), and the honest chunk watermarks (F1) that trade chunk size for machine safety under pressure.
+- The remaining prefill cost is the expert QMM itself and the one full-bank sweep — chunked prefill sizing amortizes assembly but cannot remove compute; only fewer/cheaper expert-token pairs can (none of the tested accelerators — ANE, SpecPrefill, MTP at prefill — reduce it for streaming).
+- DeepSeek V4's per-layer `mx.eval` + `clear_cache` pattern (already in its loader) is the known-good answer for the lazy-graph accumulation; a qwen4_exp equivalent would bound intra-chunk peaks if ever needed.
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.
