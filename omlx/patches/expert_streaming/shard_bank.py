@@ -33,9 +33,12 @@ _DTYPE_MAP: dict[str, tuple[np.dtype, int]] = {
 def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
     """Promote an expert's np.ndarray slice to the MLX representation."""
     if dtype_str == "BF16":
-        u32 = np_view.astype(np.uint32) << np.uint32(16)
-        f32 = u32.view(np.float32)
-        return mx.array(f32).astype(mx.bfloat16)
+        # bf16 is stored as raw uint16 bits — reinterpret directly. This
+        # matches mx.load's native handling exactly (the old
+        # shift->f32->astype roundtrip flushed bf16 subnormals to zero via
+        # Metal FTZ) and is ~9x faster on 4 MB slices: no numpy shift, half
+        # the copy bytes, no GPU conversion kernel.
+        return mx.array(np_view).view(mx.bfloat16)
     if dtype_str == "F8_E4M3":
         return mx.from_fp8(mx.array(np_view), dtype=mx.bfloat16)
     return mx.array(np_view)

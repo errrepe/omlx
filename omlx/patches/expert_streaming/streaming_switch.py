@@ -342,6 +342,61 @@ def _scatter_unsort(x, inv_order, shape=None):
 
 
 # ---------------------------------------------------------------------------
+# Shared per-layer routing plan (one host sync per MoE layer)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _RemapPlan:
+    """Routing plan shared by every streaming linear of one MoE layer call.
+
+    The first linear invoked in a layer builds the plan (mx.eval + host copy
+    + np.unique + compact remap); the other projections (up/gate/down) reuse
+    it — one sync per MoE layer instead of three.
+    """
+
+    indices_shape: Tuple[int, ...] = ()
+    flat_np: Any = None
+    uniq_list: list = field(default_factory=list)
+    remapped: Any = None  # mx.array of compact ids, original indices shape
+    positions: int = 0
+    gate_s: float = 0.0
+    unique_s: float = 0.0
+
+
+def _build_plan_into(plan: _RemapPlan, indices) -> None:
+    """Populate a shared routing plan in place (called once per MoE layer)."""
+    t0 = time.perf_counter()
+    mx.eval(indices)
+    try:
+        flat_np = np.array(indices, copy=False).reshape(-1)
+    except Exception:
+        flat_list = indices.tolist()  # type: ignore[attr-defined]
+
+        def _flatten(obj):
+            if isinstance(obj, list):
+                for v in obj:
+                    yield from _flatten(v)
+            else:
+                yield obj
+
+        flat_np = np.array(list(_flatten(flat_list)), dtype=np.int32)
+    t1 = time.perf_counter()
+    uniq_np = np.unique(flat_np)
+    uniq_list = uniq_np.tolist()
+    # compact remap via searchsorted (uniq is sorted ascending): vectorized C
+    # lookup, replaces the per-element np.vectorize dict indirection
+    remapped_np = np.searchsorted(uniq_np, flat_np).astype(np.int32)
+    t2 = time.perf_counter()
+    plan.indices_shape = tuple(indices.shape)
+    plan.flat_np = flat_np
+    plan.uniq_list = uniq_list
+    plan.remapped = mx.array(remapped_np.reshape(indices.shape))
+    plan.positions = int(flat_np.size)
+    plan.gate_s = t1 - t0
+    plan.unique_s = t2 - t1
+
+
+# ---------------------------------------------------------------------------
 # Streaming SwitchLinear variants
 # ---------------------------------------------------------------------------
 
@@ -402,47 +457,20 @@ class StreamingSwitchLinear(nn.Module):
     def set_bias(self, bias: mx.array | None) -> None:
         self._bias = bias
 
-    def __call__(self, x, indices, sorted_indices=False):
-        # Streaming path: we need to build a mini-bank for the unique experts in this batch
-        # and remap indices.  To avoid host sync when indices is small, we still need to
-        # materialize indices to find unique set. Decode typically has K=8 and B*L<=64 so
-        # this is cheap; for large prefill (L>1k) we have many tokens but unique is bounded
-        # by num_experts.
-        # Evaluate indices to host for unique discovery
-        # NOTE: this forces a sync per MoE layer — the fundamental cost of streaming.
-        # Keep it on the same stream; caller already eval'd gate.
-        # Use mx.eval + tolist pattern?
-        # We avoid double eval by checking if indices is already evaluated (has no graph)
-        # For simplicity, eval indices.
+    def __call__(self, x, indices, sorted_indices=False, plan: _RemapPlan | None = None):
         p = self.cache.profile
-        t0 = time.perf_counter()
-        mx.eval(indices)
-        # Convert to numpy for unique
-        try:
-            flat_np = np.array(indices, copy=False).reshape(-1)  # device->host copy via mlx->numpy?
-        except Exception:
-            # fallback via tolist
-            flat_list = indices.tolist()  # type: ignore[attr-defined]
-            # flatten
-            def _flatten(obj):
-                if isinstance(obj, list):
-                    for v in obj:
-                        yield from _flatten(v)
-                else:
-                    yield obj
-            flat_np = np.array(list(_flatten(flat_list)), dtype=np.int32)
-        t1 = time.perf_counter()
-        uniq = np.unique(flat_np)
-        uniq_list = uniq.tolist()
-        # Map global expert id -> compact id
-        id_to_compact = {int(e): i for i, e in enumerate(uniq_list)}
+        if plan is None:
+            plan = _RemapPlan()
+        built = plan.flat_np is None
+        if built:
+            _build_plan_into(plan, indices)
         t2 = time.perf_counter()
         # Load each unique expert weight
         mini_weights = []
         t_load = 0.0
         hits = 0
         misses = 0
-        for eid in uniq_list:
+        for eid in plan.uniq_list:
             was_hit = (self.layer_idx, eid, self.stacked_key) in self.cache
             t_l = time.perf_counter()
             w = self._load_expert_weight(int(eid))
@@ -457,33 +485,24 @@ class StreamingSwitchLinear(nn.Module):
             mini_bank = mx.expand_dims(mini_weights[0], 0)
         else:
             mini_bank = mx.stack(mini_weights, axis=0)
-        # Remap indices
-        # Build remapped array via numpy then mx.array
-        remapped_np = np.vectorize(lambda x: id_to_compact[int(x)], otypes=[np.int32])(flat_np)
-        remapped = mx.array(remapped_np.reshape(indices.shape))
+        remapped = plan.remapped
         # Call gather_mm with mini-bank
         out = mx.gather_mm(x, mini_bank.swapaxes(-1, -2), rhs_indices=remapped, sorted_indices=sorted_indices)
         if self._bias is not None and self._has_bias:
-            # bias slice per expert
-            # gather bias rows
-            # bias shape (E, O)
-            # mini bias = stack of needed biases
-            # we stored bias as mx.array[E,O] in _bias
-            # slice similarly
-            b_mini = mx.stack([self._bias[int(e)] for e in uniq_list], axis=0)  # (U,O)
+            b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)  # (U,O)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
-        p.record_observed(self.layer_idx, uniq_list)
+        p.record_observed(self.layer_idx, plan.uniq_list)
         p.add(
             self.layer_idx,
-            gate=t1 - t0,
-            unique=t2 - t1,
+            gate=plan.gate_s if built else 0.0,
+            unique=plan.unique_s if built else 0.0,
             load=t_load,
             stack=t4 - t2 - t_load,
             hits=hits,
             misses=misses,
-            experts=len(uniq_list),
-            positions=int(flat_np.size),
+            experts=len(plan.uniq_list),
+            positions=plan.positions,
         )
         return out
 
@@ -552,9 +571,10 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         if isinstance(v, mx.array):
             return v
         if dtype_str == "BF16" and v.dtype == np.uint16:
-            # bf16 stored as raw uint16 bits — reinterpret without extra ops
-            f32 = (v.astype(np.uint32) << np.uint32(16)).view(np.float32)
-            return mx.array(f32).astype(mx.bfloat16)
+            # bf16 stored as raw uint16 bits — reinterpret directly (matches
+            # mx.load; the old shift->f32->astype path flushed subnormals via
+            # Metal FTZ and cost ~9x more on 4 MB slices).
+            return mx.array(v).view(mx.bfloat16)
         return mx.array(v)  # np.ndarray -> mx.array copy on this thread
 
     def bundle_key(self, expert_id: int):
@@ -633,6 +653,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         return None
 
     def _load_expert_bundle(self, expert_id: int) -> tuple[mx.array, mx.array, mx.array | None]:
+        key = (self.layer_idx, expert_id, self.stacked_weight_key)
         # Cache / staging resolution (shared with the parallel demand-set path)
         resolved = self._bundle_cached_or_staged(expert_id)
         if resolved is not None:
@@ -680,43 +701,26 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             )
         return bundle
 
-    def __call__(self, x, indices, sorted_indices=False):
+    def __call__(self, x, indices, sorted_indices=False, plan: _RemapPlan | None = None):
         p = self.cache.profile
-        t0 = time.perf_counter()
-        mx.eval(indices)
-        try:
-            flat_np = np.array(indices, copy=False).reshape(-1)
-        except Exception:
-            flat_list = indices.tolist()  # type: ignore[attr-defined]
-            def _flatten(obj):
-                if isinstance(obj, list):
-                    for v in obj:
-                        yield from _flatten(v)
-                else:
-                    yield obj
-            flat_np = np.array(list(_flatten(flat_list)), dtype=np.int32)
-        t1 = time.perf_counter()
-        uniq = np.unique(flat_np)
-        uniq_list = uniq.tolist()
-        id_to_compact = {int(e): i for i, e in enumerate(uniq_list)}
+        if plan is None:
+            plan = _RemapPlan()
+        built = plan.flat_np is None
+        if built:
+            _build_plan_into(plan, indices)
         t2 = time.perf_counter()
-        # Load bundles
-        mini_w, mini_s, mini_b = [], [], []
-        has_b = False
-        t_load = 0.0
-        hits = 0
-        misses = 0
-
         # Load bundles: cache/staging resolution on this thread, then one
-        # parallel os.pread fetch per missing bundle (QD1 -> QD4). Pool
+        # parallel os.pread fetch per missing bundle (QD1 -> QD8). Pool
         # workers return raw np slices only; promotion to mx.array happens
         # in the loop below on the inference thread.
         bundles: Dict[int, tuple] = {}
+        mini_w, mini_s, mini_b = [], [], []
+        has_b = False
         hits = 0
         misses = 0
         missing: list[int] = []
         t_res_start = time.perf_counter()
-        for eid in uniq_list:
+        for eid in plan.uniq_list:
             eid = int(eid)
             b = self._bundle_cached_or_staged(eid)
             if b is not None:
@@ -726,6 +730,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 misses += 1
                 missing.append(eid)
         if missing:
+            # ascending expert id = ascending file offset within the stacked
+            # bank (row-major) — sorted reads keep the NVMe's locality
+            missing.sort()
             if hasattr(self.backing, "load_expert_slice"):
                 raws = list(_EXPERT_IO_POOL.map(self._load_expert_np, missing))
                 dt_per = time.perf_counter() - t_res_start
@@ -745,9 +752,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     bundles[eid] = self._load_expert_bundle(eid)
         t_load = time.perf_counter() - t_res_start
 
-        for eid in uniq_list:
+        dt = self._slice_dtypes_lazy()
+        for eid in plan.uniq_list:
             w, s, b = bundles[int(eid)]
-            dt = self._slice_dtypes_lazy()
             w = self._promote_np(w)
             s = self._promote_np(s, dt[0])
             if b is not None:
@@ -765,8 +772,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             w_bank = mx.stack(mini_w, axis=0)
             s_bank = mx.stack(mini_s, axis=0)
             b_bank = mx.stack(mini_b, axis=0) if has_b and mini_b else None
-        remapped_np = np.vectorize(lambda x: id_to_compact[int(x)], otypes=[np.int32])(flat_np)
-        remapped = mx.array(remapped_np.reshape(indices.shape))
+        remapped = plan.remapped
         out = mx.gather_qmm(
             x,
             w_bank,
@@ -780,20 +786,20 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             sorted_indices=sorted_indices,
         )
         if self._bias is not None and self._has_bias:
-            b_mini = mx.stack([self._bias[int(e)] for e in uniq_list], axis=0)
+            b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
-        p.record_observed(self.layer_idx, uniq_list)
+        p.record_observed(self.layer_idx, plan.uniq_list)
         p.add(
             self.layer_idx,
-            gate=t1 - t0,
-            unique=t2 - t1,
+            gate=plan.gate_s if built else 0.0,
+            unique=plan.unique_s if built else 0.0,
             load=t_load,
             stack=t4 - t2 - t_load,
             hits=hits,
             misses=misses,
-            experts=len(uniq_list),
-            positions=int(flat_np.size),
+            experts=len(plan.uniq_list),
+            positions=plan.positions,
         )
         return out
 
@@ -869,16 +875,20 @@ class StreamingSwitchGLU(nn.Module):
         if do_sort:
             x_exp, idx, inv_order = _gather_sort(x_exp, indices, inverse_scatter=self.inverse_scatter)
 
+        # One shared routing plan for the whole layer: the first linear
+        # invoked builds it (single mx.eval + unique + remap), the rest reuse.
+        plan = _RemapPlan()
+
         if has_fused:
-            x_gate_up = self.gate_up_proj(x_exp, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
+            x_gate_up = self.gate_up_proj(x_exp, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]
             x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
             x_act = self._apply_activation(x_up, x_gate)
-            x_out = self.down_proj(x_act, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
+            x_out = self.down_proj(x_act, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]
         else:
-            x_up = self.up_proj(x_exp, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
-            x_gate = self.gate_proj(x_exp, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
+            x_up = self.up_proj(x_exp, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]
+            x_gate = self.gate_proj(x_exp, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]
             x_act = self._apply_activation(x_up, x_gate)
-            x_out = self.down_proj(x_act, idx, sorted_indices=do_sort)  # type: ignore[attr-defined]
+            x_out = self.down_proj(x_act, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]
 
         # weighted sum fast path — keep compatible but may not use fast kernel when streaming
         if weighted_sum and scores is not None and do_sort:

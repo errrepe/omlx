@@ -651,3 +651,160 @@ def test_backing_store_extra_root_wins_for_mirrored_shards():
         # Mirrored shard is served from the stripe root (that copy is the
         # striped one the user placed there deliberately).
         assert backing._resolve_file("model.safetensors") == (extra / "model.safetensors").resolve()
+
+
+def test_np_to_mx_bf16_preserves_bits():
+    """BF16 promotion must reinterpret raw bits (like mx.load) — subnormals
+    included. The old shift->f32->astype path flushed them to zero (FTZ)."""
+    import mlx.core as mx
+    import numpy as np
+
+    from omlx.patches.expert_streaming.shard_bank import _np_to_mx
+
+    bits = np.array([0x0002, 0x0032, 0x0070, 0x3F80, 0xC000, 0x7F80], dtype=np.uint16)
+    out = _np_to_mx("k", bits, "BF16")
+    assert out.dtype == mx.bfloat16
+    assert np.array_equal(np.array(out.view(mx.uint16)), bits)
+
+
+def test_streaming_glu_matches_reference():
+    """Streaming SwitchGLU (shared routing plan across gate/up/down) must be
+    bit-exact against mlx-lm's reference SwitchGLU."""
+    import mlx.core as mx
+    import numpy as np
+
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingSwitchGLU,
+        StreamingSwitchLinear,
+    )
+
+    E, H, D = 8, 32, 16
+    ref = SwitchGLU(D, H, E)  # default SwiGLU activation
+    mx.eval(ref.parameters())
+
+    cache = ExpertLRUCache(1 << 26, 1 << 18, num_layers=1)
+    backing: dict = {}
+    glu = StreamingSwitchGLU(
+        input_dims=D,
+        hidden_dims=H,
+        num_experts=E,
+        layer_idx=0,
+        backing=backing,
+        cache=cache,
+        quantized=False,
+        activation=None,
+    )
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        ref_lin = getattr(ref, name)
+        backing[(0, name)] = ref_lin.weight
+        setattr(
+            glu,
+            name,
+            StreamingSwitchLinear(
+                layer_idx=0,
+                proj_name=name,
+                stacked_key=f"k.{name}",
+                num_experts=E,
+                input_dims=ref_lin.input_dims,
+                output_dims=ref_lin.output_dims,
+                backing=backing,
+                cache=cache,
+            ),
+        )
+
+    rng = np.random.default_rng(42)
+    for trial in range(3):
+        T = 40 if trial < 2 else 80  # second size crosses the sort threshold
+        x = mx.array(rng.standard_normal((1, T, D)).astype(np.float32))
+        idx = mx.array(rng.integers(0, E, size=(1, T, 1)).astype(np.int32))
+        out_ref = ref(x, idx)
+        out_s = glu(x, idx)
+        assert out_s.shape == out_ref.shape
+        assert mx.array_equal(out_ref, out_s), f"mismatch at trial {trial}"
+
+
+def test_streaming_quantized_glu_matches_reference():
+    """Quantized streaming GLU (f32 gate/up + qmm down, shared plan, sort
+    path) must be bit-exact against the reference composition."""
+    import mlx.core as mx
+    import numpy as np
+
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+        StreamingSwitchGLU,
+        StreamingSwitchLinear,
+    )
+
+    E, H, D = 8, 32, 16
+    ref = SwitchGLU(D, H, E)
+    ref.down_proj = QuantizedSwitchLinear(H, D, E, bias=False, group_size=32, bits=4)
+    mx.eval(ref.parameters())
+
+    cache = ExpertLRUCache(1 << 26, 1 << 18, num_layers=1)
+    backing: dict = {}
+    glu = StreamingSwitchGLU(
+        input_dims=D,
+        hidden_dims=H,
+        num_experts=E,
+        layer_idx=0,
+        backing=backing,
+        cache=cache,
+        quantized=True,
+        activation=None,
+    )
+    for name in ("gate_proj", "up_proj"):
+        ref_lin = getattr(ref, name)
+        backing[(0, name)] = ref_lin.weight
+        setattr(
+            glu,
+            name,
+            StreamingSwitchLinear(
+                layer_idx=0,
+                proj_name=name,
+                stacked_key=f"k.{name}",
+                num_experts=E,
+                input_dims=ref_lin.input_dims,
+                output_dims=ref_lin.output_dims,
+                backing=backing,
+                cache=cache,
+            ),
+        )
+    ref_down = ref.down_proj
+    backing[(0, "down_proj", "weight")] = ref_down.weight
+    backing[(0, "down_proj", "scales")] = ref_down.scales
+    backing[(0, "down_proj", "biases")] = ref_down.biases
+    setattr(
+        glu,
+        "down_proj",
+        StreamingQuantizedSwitchLinear(
+            layer_idx=0,
+            proj_name="down_proj",
+            stacked_weight_key="k.down_proj.weight",
+            stacked_scales_key="k.down_proj.scales",
+            stacked_biases_key="k.down_proj.biases",
+            num_experts=E,
+            input_dims=ref_down.input_dims,
+            output_dims=ref_down.output_dims,
+            backing=backing,
+            cache=cache,
+            group_size=32,
+            bits=4,
+            mode="affine",
+        ),
+    )
+
+    rng = np.random.default_rng(7)
+    for trial in range(3):
+        T = 40 if trial < 2 else 80
+        x = mx.array(rng.standard_normal((1, T, D)).astype(np.float32))
+        idx = mx.array(rng.integers(0, E, size=(1, T, 1)).astype(np.int32))
+        out_ref = ref(x, idx)
+        out_s = glu(x, idx)
+        assert out_s.shape == out_ref.shape
+        assert mx.array_equal(out_ref, out_s), f"mismatch at trial {trial}"
