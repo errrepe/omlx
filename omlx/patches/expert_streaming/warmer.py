@@ -45,6 +45,11 @@ PIN_BUDGET_BYTES = int(
     float(os.environ.get("OMLX_EXPERT_STREAMING_PIN_GIB", "1.25")) * 1024**3
 )
 PIN_OBSERVE_CALLS = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_TOKENS", "8")))
+# Learned pin store (colibri-style): persist observed per-layer frequencies
+# to this JSON and reload them on the next load, skipping the observation
+# window so the hot set is wired from token 1.
+PIN_PROFILE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_PIN_PROFILE", "") or None
+_PIN_PROFILE_KEEP = 64
 
 _WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="omlx-expert-warm")
 
@@ -140,6 +145,55 @@ class PinController:
         self.calls = 0
         self.pinned = False
         self.pin_jobs = 0
+        self.profile_path = PIN_PROFILE_PATH
+        if self.profile_path and self._load_profile():
+            # Learned hot set available: pin immediately, no observation.
+            self._pin_all()
+
+    def _load_profile(self) -> bool:
+        try:
+            import json
+
+            data = json.loads(open(self.profile_path).read())
+            freq = data.get("freq") or {}
+            if not freq:
+                return False
+            self.freq = {
+                int(layer): Counter({int(e): int(c) for e, c in pairs})
+                for layer, pairs in freq.items()
+            }
+            if data.get("per_expert_bytes"):
+                self.per_expert_bytes = int(data["per_expert_bytes"])
+            logger.info(
+                "Expert streaming: loaded learned pin profile (%d layers) from %s",
+                len(self.freq),
+                self.profile_path,
+            )
+            return True
+        except Exception as e:
+            logger.debug("Failed to load pin profile %s: %s", self.profile_path, e)
+            return False
+
+    def save_profile(self) -> None:
+        if not self.profile_path or not self.freq:
+            return
+        try:
+            import json
+
+            data = {
+                "per_expert_bytes": self.per_expert_bytes,
+                "freq": {
+                    str(layer): counter.most_common(_PIN_PROFILE_KEEP)
+                    for layer, counter in sorted(self.freq.items())
+                },
+            }
+            tmp = self.profile_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.profile_path)
+            logger.info("Expert streaming: saved pin profile to %s", self.profile_path)
+        except Exception as e:
+            logger.debug("Failed to save pin profile %s: %s", self.profile_path, e)
 
     def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
         if self.pinned or positions > _MAX_WARM_ROWS:
@@ -181,6 +235,7 @@ class PinController:
                 except Exception:
                     pass
             self.pin_jobs = len(jobs)
+            self.save_profile()
             logger.info(
                 "Expert streaming: pinned %d expert slices (%.2f GiB wired) in %.1fs",
                 self.backing.pinned_count,
@@ -189,6 +244,69 @@ class PinController:
             )
 
         _WARM_POOL.submit(_run)
+
+
+def _infer_per_expert_bytes(linears_by_layer: Dict[int, list], backing: Any) -> int:
+    """Per-expert byte size from the first stacked weight key's header."""
+    for linears in linears_by_layer.values():
+        for lin in linears:
+            key = getattr(lin, "stacked_weight_key", None)
+            if key and hasattr(backing, "expert_bytes"):
+                try:
+                    n = int(backing.expert_bytes(key))
+                    if n > 0:
+                        return n
+                except Exception:
+                    pass
+    return 0
+
+
+def deterministic_warmup(
+    linears_by_layer: Dict[int, list],
+    backing: Any,
+    *,
+    budget_bytes: int,
+    num_experts: int,
+    max_rows: int = 64,
+) -> int:
+    """Control-arm warmup: fire discarded reads of an evenly spread expert
+    subset per layer until the byte budget is spent.
+
+    The first request's routing is unpredictable, so a deterministic sweep
+    has no correlation with what it needs — this measures exactly that
+    (expected ~0 gain). Returns the number of read jobs submitted.
+    """
+    if num_experts <= 0 or budget_bytes <= 0:
+        return 0
+    per_expert = max(
+        (getattr(l, "_per_expert_hint", 0) for ls in linears_by_layer.values() for l in ls),
+        default=0,
+    )
+    if per_expert <= 0:
+        per_expert = _infer_per_expert_bytes(linears_by_layer, backing)
+    if per_expert <= 0:
+        return 0
+    per_layer = max(1, budget_bytes // max(len(linears_by_layer), 1) // per_expert)
+    stride = max(1, num_experts // max(per_layer, 1))
+    eids = list(range(0, num_experts, stride))[:per_layer]
+    jobs = []
+    for linears in linears_by_layer.values():
+        for lin in linears:
+            for key in _proj_keys(lin):
+                for eid in eids:
+                    jobs.append((key, eid))
+    if not jobs:
+        return 0
+
+    def _run():
+        for key, eid in jobs:
+            try:
+                backing.load_expert_slice(key, eid)
+            except Exception:
+                pass
+
+    _WARM_POOL.submit(_run)
+    return len(jobs)
 
 
 class WarmPinHook:

@@ -339,6 +339,17 @@ class ExpertBackingStore:
         except Exception:
             return None
 
+    def expert_bytes(self, key: str) -> int:
+        """Bytes of one expert slice for a stacked (E, ...) key, or 0."""
+        try:
+            entry = self._reader_for_key(key).header[key]
+            shape = entry["shape"]
+            num_experts = shape[0] if shape else 1
+            start, end = entry["data_offsets"]
+            return (end - start) // num_experts
+        except Exception:
+            return 0
+
     def load_expert(self, key: str, expert_id: int) -> mx.array:
         np_view = self.load_expert_slice(key, expert_id)
         return _np_to_mx(key, np_view, self._reader_for_key(key).header[key]["dtype"])

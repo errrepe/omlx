@@ -116,6 +116,7 @@ async def run(
     prompt_len: str = "short",
     mtp_block: int | None = None,
     ane: bool = False,
+    warm_control: float = 0.0,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -157,6 +158,50 @@ async def run(
 
     vlm_model = getattr(engine, "_vlm_model", None)
     cache = find_streaming_cache(vlm_model)
+    if warm_control:
+        # E3 control arm: deterministic warmup (evenly spread experts) fired
+        # post-load. Uncorrelated with the first request's routing by design.
+        from omlx.patches.expert_streaming import warmer as _warmer
+
+        linears_by_layer: dict[int, list] = {}
+        layers = None
+        for path in [
+            ("language_model", "model", "layers"),
+            ("language_model", "layers"),
+            ("model", "layers"),
+            ("layers",),
+        ]:
+            cur = vlm_model
+            ok = True
+            for a in path:
+                if not hasattr(cur, a):
+                    ok = False
+                    break
+                cur = getattr(cur, a)
+            if ok and cur is not None and len(cur) > 0:
+                layers = cur
+                break
+        if layers is not None:
+            for i, layer in enumerate(layers):
+                moe = getattr(layer, "mlp", None) or getattr(layer, "ffn", None)
+                sm = getattr(moe, "switch_mlp", None)
+                if sm is not None:
+                    linears_by_layer[i] = [
+                        getattr(sm, p)
+                        for p in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+                        if hasattr(sm, p)
+                    ]
+        lin0 = next((l for ls in linears_by_layer.values() for l in ls), None)
+        backing = getattr(lin0, "backing", None)
+        if backing is not None:
+            jobs = _warmer.deterministic_warmup(
+                linears_by_layer,
+                backing,
+                budget_bytes=int(warm_control * 1024**3),
+                num_experts=512,
+            )
+            time.sleep(3.0)  # let the 4-thread warm pool drain
+            print(f"warm-control: {jobs} discard-reads fired")
     results = {
         "model": model_key,
         "budget_gib": budget,
@@ -164,6 +209,7 @@ async def run(
         "mtp": mtp,
         "mtp_block": mtp_block,
         "ane": ane,
+        "warm_control_gib": warm_control,
         "prompt_len": prompt_len,
         "runtime_est_gib": runtime / 1024**3,
         "load_s": t_load,
@@ -287,6 +333,7 @@ def main():
     ap.add_argument("--prompt-len", choices=["short", "512", "2k", "8k"], default="short")
     ap.add_argument("--mtp-block", type=int, default=None, help="vlm_mtp_draft_block_size (MTP tokens per round)")
     ap.add_argument("--ane", action="store_true", help="enable qwen35 ANE prefill")
+    ap.add_argument("--warm-control", type=float, default=0.0, metavar="GIB", help="post-load deterministic warmup budget")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     asyncio.run(
@@ -300,6 +347,7 @@ def main():
             prompt_len=args.prompt_len,
             mtp_block=args.mtp_block,
             ane=args.ane,
+            warm_control=args.warm_control,
         )
     )
 
