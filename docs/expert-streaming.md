@@ -121,10 +121,46 @@ Protocol: cold page cache between runs (`bench/cache_cool.py` touches ~72 % of a
 
 On a 48 GiB Mac with one ~330 MB/s SSD, GLM-190G decode is pinned to the I/O floor and **every byte-adding strategy makes it worse** (MTP drafts, batch). The remaining levers are both physical: **bytes/token** (oQ2e requant of cold experts ≈ 2×) and **bandwidth** (multi-SSD striping, now supported — see below).
 
+> **Correction (post-Fase A):** the "I/O floor" above was an artifact of the
+> access method, not the hardware. The 4 TB external SSD is a ~3.7 GB/s
+> NVMe; `mmap` + `MADV_RANDOM` cold page faults deliver only 0.2–0.4 GB/s.
+> Switching to one `os.pread` per contiguous expert slice lifted decode from
+> 0.063 to 0.336 tok/s (5.3×) — see the next section.
+
+## pread + parallel demand loads (the real fix)
+
+Micro-benchmark on a GLM oQ4e shard (40 × 4 MB expert slices, cold page cache):
+
+| method | cold GB/s |
+|---|---|
+| mmap + MADV_RANDOM (page faults) | **0.35** |
+| `os.pread` (single contiguous read) | **10.6** |
+
+`_ShardReader.expert_slice` now uses one `os.pread` per expert slice, and the
+quantized streaming linear resolves the whole per-layer demand set with a
+thread pool (`_EXPERT_IO_POOL`, 8 workers, QD8) — workers return raw numpy
+slices, MLX promotion stays on the inference thread.
+
+GLM 190G oQ4e, 8 GiB budget, decode 16, cold cache, PILOT off:
+
+| load path | tok/s | TTFT | disk (decode) | load ms/call | GPU |
+|---|---|---|---|---|---|
+| mmap faults (Fase 0/1) | 0.063 | ~200 s | 330 MB/s | ~190 ms | 11 % |
+| pread, serial | 0.249 | ~40 s | 1.4 GB/s | 22.5 ms | 29 % |
+| pread, 4 workers | 0.313 | 22.9 s | 1.85 GB/s | 15.4 ms | 35 % |
+| pread, 8 workers | **0.336** | 22.8 s | 1.85–2.3 GB/s | 14.7 ms | 35 % |
+
+Qwen 4 GiB cold single generation: 0.853 tok/s (was 0.30). PILOT remains
+negative even on the fast path (38 ms vs 30 ms wall/call — 89 % of staged
+bundles dropped), so it stays default-off. Batch decode still amortizes
+nothing (see Fase A3). Remaining bottlenecks: disk random-read ceiling
+(~2.3 GB/s of the 3.7 sequential spec) and the mini-bank assemble/promote
+(~5 ms/call); bytes/token (oQ2e) is the next real lever.
+
 ## Trade-offs
 
 - **Prefill is burst-heavy**: a long prompt touches almost every expert once → many faults on first prefill. Keep the existing **paged SSD KV cache** on — a repeated prefix is restored from disk in milliseconds instead of re-faulting experts. The first prefill still warms the LRU, so the following decode hits more.
-- **Decode sync per layer**: the router's `top-k` indices are read back to the CPU to decide which experts to fault. Like slipstream's ~200 µs/layer wake cost, this is the floor; batch decode multiplies the per-step working set and makes it *worse* (Fase A3: aggregate falls with N), so streaming models effectively stay single-request.
+- **Decode sync per layer**: the router's `top-k` indices are read back to the CPU to decide which experts to fault. With pread + the parallel demand loader this sync overlaps useful I/O (QD8); batch decode still multiplies the per-step working set and makes it *worse* (Fase A3), so streaming models effectively stay single-request.
 - **Quantized path**: expert weight + scales + biases are restored as a co-located bundle. Fused `gate_up_proj` is handled as a single streaming bank when present; otherwise `gate/up/down` are three independent banks. The output is bit-exact versus the resident path (gather indices are remapped to a compact mini-bank).
 - **GLM memory bombs are fixed but still bounded**: without the per-layer eval+`clear_cache`, decode/prefill pins 42 layers × ~3.4 GB of mini-banks and swaps the machine (40–50 GB observed).
 
@@ -140,7 +176,7 @@ On a 48 GiB Mac with one ~330 MB/s SSD, GLM-190G decode is pinned to the I/O flo
 
 - No learned pin store (colibri's `.coli_usage` heat) yet — the LRU is cold after a restart. A sidecar that persists routing heat per model is queued. Note: inter-token reuse is model-dependent (Qwen hits 23–32 %, GLM 0 %) — pins pay on Qwen-like routing, not GLM.
 - Async prefetch (PILOT) exists behind `OMLX_EXPERT_STREAMING_PILOT=1` but is **negative by default**: on a saturated SSD it wastes bandwidth (see phase-1 A/B above).
-- Dual-SSD striping is supported: copy alternating shards to a second disk (`python bench/stripe_model.py --model <dir> --target <dir2>`) and run with `OMLX_EXPERT_STREAMING_EXTRA_ROOTS=<dir2>`. Mirrored shards are served from the stripe root, the rest fall back to the primary — no RAID, original dir untouched.
+- Dual-SSD striping is supported: copy alternating shards to a second disk (`python bench/stripe_model.py --model <dir> --target <dir2>`) and run with `OMLX_EXPERT_STREAMING_EXTRA_ROOTS=<dir2>`. Mirrored shards are served from the stripe root, the rest fall back to the primary — no RAID, original dir untouched. Note: only pays if the second disk is *fast* — in our setup the 4 TB NVMe (~3.7 GB/s) is the fast one and the 2 TB (~875 MB/s) would slow reads down.
 - TTFT on GLM-class models is high (prefill faults ~all experts once); KV snapshot helps repeated prompts only.
 
 ## References

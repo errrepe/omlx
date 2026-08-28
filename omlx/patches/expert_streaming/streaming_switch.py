@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
@@ -24,6 +25,12 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _PROFILE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
+
+# Parallel os.pread pool for the demand-set of one MoE layer call. Workers
+# return raw numpy slices only — MLX promotion happens on the inference
+# thread. 8 workers lift a single 13 MB pread stream (QD1, ~1.4 GB/s) toward
+# the NVMe's sequential ceiling.
+_EXPERT_IO_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="omlx-expert-io")
 
 
 @dataclass
@@ -575,8 +582,12 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         except Exception:
             return None
 
-    def _load_expert_bundle(self, expert_id: int) -> tuple[mx.array, mx.array, mx.array | None]:
-        # Bundle cache: one LRU slot holds (weight, scales, biases) together — avoids 3× capacity waste
+    def _bundle_cached_or_staged(self, expert_id: int):
+        """Resolve a bundle without touching the disk (inference thread only).
+
+        Returns the cached bundle (mx or raw np tuple) or None when the expert
+        must be fetched from the backing store.
+        """
         key = (self.layer_idx, expert_id, self.stacked_weight_key)
         cached = self.cache.get(key)
         if cached is not None:
@@ -600,7 +611,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                         pass
                     self.cache.put(key, bundle)  # type: ignore[arg-type]
                     return bundle  # type: ignore[return-value]
-        # 2) prefetch staging: worker already read the np slices — promote here
+        # prefetch staging: worker already read the np slices — promote here
         # (inference thread) instead of re-reading from the backing.
         pf = getattr(self, "_prefetcher", None)
         if pf is not None:
@@ -619,6 +630,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                         self.layer_idx, staged=True, dt=time.perf_counter() - t_st
                     )
                 return bundle
+        return None
+
+    def _load_expert_bundle(self, expert_id: int) -> tuple[mx.array, mx.array, mx.array | None]:
+        # Cache / staging resolution (shared with the parallel demand-set path)
+        resolved = self._bundle_cached_or_staged(expert_id)
+        if resolved is not None:
+            return resolved  # type: ignore[return-value]
         # 3) synchronous load from backing
         t_sy = time.perf_counter()
         if hasattr(self.backing, "load_expert_slice"):
@@ -689,15 +707,46 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         hits = 0
         misses = 0
 
+        # Load bundles: cache/staging resolution on this thread, then one
+        # parallel os.pread fetch per missing bundle (QD1 -> QD4). Pool
+        # workers return raw np slices only; promotion to mx.array happens
+        # in the loop below on the inference thread.
+        bundles: Dict[int, tuple] = {}
+        hits = 0
+        misses = 0
+        missing: list[int] = []
+        t_res_start = time.perf_counter()
         for eid in uniq_list:
-            was_hit = (self.layer_idx, eid, self.stacked_weight_key) in self.cache
-            t_l = time.perf_counter()
-            w, s, b = self._load_expert_bundle(int(eid))
-            t_load += time.perf_counter() - t_l
-            if was_hit:
+            eid = int(eid)
+            b = self._bundle_cached_or_staged(eid)
+            if b is not None:
+                bundles[eid] = b
                 hits += 1
             else:
                 misses += 1
+                missing.append(eid)
+        if missing:
+            if hasattr(self.backing, "load_expert_slice"):
+                raws = list(_EXPERT_IO_POOL.map(self._load_expert_np, missing))
+                dt_per = time.perf_counter() - t_res_start
+                for eid, raw in zip(missing, raws):
+                    if raw is None:
+                        bundles[eid] = self._load_expert_bundle(eid)
+                        continue
+                    w, s, b = raw
+                    bundle = (w, s, b)
+                    self.cache.put((self.layer_idx, eid, self.stacked_weight_key), bundle)  # type: ignore[arg-type]
+                    if p is not None:
+                        p.add_load_source(self.layer_idx, staged=False, dt=dt_per / len(missing))
+                    bundles[eid] = bundle
+            else:
+                # dict-backed test doubles: sequential fallback
+                for eid in missing:
+                    bundles[eid] = self._load_expert_bundle(eid)
+        t_load = time.perf_counter() - t_res_start
+
+        for eid in uniq_list:
+            w, s, b = bundles[int(eid)]
             dt = self._slice_dtypes_lazy()
             w = self._promote_np(w)
             s = self._promote_np(s, dt[0])
