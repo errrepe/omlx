@@ -634,7 +634,7 @@ def convert_model_to_streaming(
         # fallback is in use or OMLX_EXPERT_STREAMING_PILOT=0.
         import os
 
-        if os.environ.get("OMLX_EXPERT_STREAMING_PILOT", "1") == "1" and not isinstance(
+        if os.environ.get("OMLX_EXPERT_STREAMING_PILOT", "0") == "1" and not isinstance(
             backing, dict
         ):
             try:
@@ -643,14 +643,12 @@ def convert_model_to_streaming(
                 prefetcher = ExpertPrefetcher(cache)
                 prefetcher.start()
                 for obj_ in (
-                    model,
-                    getattr(model, "language_model", None),
                     getattr(getattr(model, "language_model", None), "model", None),
+                    getattr(model, "language_model", None),
+                    model,
                 ):
-                    if (
-                        obj_ is not None
-                        and getattr(obj_, "layers", None) is layers
-                    ):
+                    match_ = obj_ is not None and getattr(obj_, "layers", None) is layers
+                    if match_:
                         obj_._expert_prefetcher = prefetcher  # type: ignore[attr-defined]
                         break
                 else:
@@ -660,13 +658,30 @@ def convert_model_to_streaming(
                         "Expert streaming: PILOT prefetch attach point not found; disabled"
                     )
                 if prefetcher is not None:
-                    logger.info("Expert streaming: PILOT async prefetch active")
+                    # Wire streaming linears to their prefetcher so the
+                    # demand path can drain staged np bundles before a
+                    # synchronous backing read.
+                    wired = 0
+                    for lyr_ in layers:
+                        mlp_ = getattr(lyr_, "mlp", None)
+                        sm_ = getattr(mlp_, "switch_mlp", None)
+                        for proj_ in ("gate_proj", "up_proj", "down_proj"):
+                            lin_ = getattr(sm_, proj_, None)
+                            if lin_ is not None and hasattr(lin_, "_load_expert_np"):
+                                lin_._prefetcher = prefetcher  # type: ignore[attr-defined]
+                                wired += 1
+                    logger.info(
+                        "Expert streaming: PILOT async prefetch active (%d linears wired)",
+                        wired,
+                    )
             except Exception as e:
                 logger.warning("Expert streaming: PILOT prefetch init failed: %s", e)
     else:
         logger.info("Expert streaming: no MoE layers converted")
 
-    return model, backing
+    # ram-dict backing is internal only — never part of the public return
+    # (existing contract; file-backed store is the only returned backing).
+    return model, backing if not isinstance(backing, dict) else None
 
 
 __all__ = [

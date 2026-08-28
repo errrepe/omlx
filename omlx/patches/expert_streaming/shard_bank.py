@@ -29,6 +29,17 @@ _DTYPE_MAP: dict[str, tuple[np.dtype, int]] = {
 }
 
 
+def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
+    """Promote an expert's np.ndarray slice to the MLX representation."""
+    if dtype_str == "BF16":
+        u32 = np_view.astype(np.uint32) << np.uint32(16)
+        f32 = u32.view(np.float32)
+        return mx.array(f32).astype(mx.bfloat16)
+    if dtype_str == "F8_E4M3":
+        return mx.from_fp8(mx.array(np_view), dtype=mx.bfloat16)
+    return mx.array(np_view)
+
+
 class _ShardReader:
     def __init__(self, path: Path):
         self.path = path
@@ -155,19 +166,28 @@ class ExpertBackingStore:
                 return tuple(hdr[key]["shape"])
         raise KeyError(key)
 
+    def tensor_dtype(self, key: str) -> str | None:
+        """Safetensors dtype string for *key* (e.g. "U32", "BF16"), or None."""
+        try:
+            reader = self._reader_for_key(key)
+            return str(reader.header[key]["dtype"])
+        except Exception:
+            return None
+
     def load_expert(self, key: str, expert_id: int) -> mx.array:
+        np_view = self.load_expert_slice(key, expert_id)
+        return _np_to_mx(key, np_view, self._reader_for_key(key).header[key]["dtype"])
+
+    def load_expert_slice(self, key: str, expert_id: int) -> np.ndarray:
+        """Return a fresh np.ndarray copy of one expert's slice (mmap-backed).
+
+        Use this when the caller (e.g. the async prefetcher) does not want
+        MLX ops allocated off the inference thread — they stay on the caller
+        thread as plain numpy buffers and the inference thread promotes them
+        to mx.array at use time, avoiding cross-thread stream errors.
+        """
         reader = self._reader_for_key(key)
-        slc = reader.expert_slice(key, expert_id)
-        dtype_str = reader.header[key]["dtype"]
-        if dtype_str == "BF16":
-            # bf16 stored as uint16
-            u32 = slc.astype(np.uint32) << np.uint32(16)
-            f32 = u32.view(np.float32)
-            return mx.array(f32).astype(mx.bfloat16)
-        if dtype_str == "F8_E4M3":
-            return mx.from_fp8(mx.array(slc), dtype=mx.bfloat16)
-        # For U32 quantized weights, keep as uint32 mx array
-        return mx.array(slc)
+        return reader.expert_slice(key, expert_id)
 
     def close(self) -> None:
         for r in list(self._readers.values()):

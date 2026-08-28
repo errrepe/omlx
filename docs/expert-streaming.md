@@ -68,6 +68,25 @@ Per-stage profile (per call): Qwen — `gate_eval 1.5 ms` + `load 16 ms`; GLM �
 - **Bigger caches go negative** past the knee (8 GiB on Qwen): expert cache competes with the OS page cache that makes misses cheap.
 - Default `1 GiB` is right; invest in overlap/prefetch (next phase), not more memory.
 
+## Cold-cache baseline + PILOT A/B (phase 1 result)
+
+Same bench with a cold page cache (SSD delivering ~320–390 MB/s sustained, `bench/resource_sampler.py` measuring GPU/CPU/disk/RSS per phase), decode 8–16, GLM 190G:
+
+| config | tok/s | disk read (decode) | GPU util | sync load |
+|---|---|---|---|---|
+| GLM 4 GiB, PILOT off | 0.037 | 386 MB/s | 13 % | 10.9 ms/miss |
+| GLM 4 GiB, PILOT on (staging) | 0.011 | 326 MB/s | 8 % | 13.1 ms/miss |
+| GLM 8 GiB, PILOT off | 0.063 | 316 MB/s | 11 % | 9.2 ms/miss |
+
+Key findings:
+
+- **Decode is I/O-bound at the SSD, not latency-bound**: GPU idles at 8–13 %, disk read saturates at ~330 MB/s. The working set per token (42 layers × 10 experts × 13 MB ≈ 5.5 GB) ÷ 330 MB/s ≈ 16.6 s/token ≈ **0.06 tok/s — the measured 8 GiB result sits on the physical I/O floor**. No software overlap can beat this without reducing bytes per token.
+- **PILOT (router-lookahead prefetch) is strictly negative in this regime.** Workers read numpy slices into a staging buffer (0.49 ms/staged hit vs 10.9 ms sync — the mechanics work), but the router predicts one layer ahead and the disk is already saturated: 94 % of staged bundles were dropped unconsumed (~380 GB of wasted reads) and the demand path slowed by contention. A/B: 0.037 → 0.011 tok/s.
+- **No inter-token expert reuse on GLM**: hit rate stays 0 % even with 606 slots (14/layer, 63 % of one token's per-layer demand) at temperature 0. GLM routers change completely between tokens (unlike Qwen's 23–32 % inter-token hits at 4 GiB).
+- PILOT is therefore **default OFF** (`OMLX_EXPERT_STREAMING_PILOT=1` to opt in). It only pays when I/O is *not* saturated (warm cache, budget ≥ working set) — the exact regime where slipstream found prefetch didn't pay either.
+
+Strategic conclusion: for models ≫ RAM the levers that matter are (a) **batch decode** (amortizes the per-token working set across requests), (b) budgets ≥ the batch working set, and (c) reducing bytes/token (lower-bit requant of cold experts). Prefetch/overlap alone cannot.
+
 ## Trade-offs
 
 - **Prefill is burst-heavy**: a long prompt touches almost every expert once → many faults on first prefill. Keep the existing **paged SSD KV cache** on — a repeated prefix is restored from disk in milliseconds instead of re-faulting experts. The first prefill still warms the LRU, so the following decode hits more.
@@ -78,14 +97,14 @@ Per-stage profile (per call): Qwen — `gate_eval 1.5 ms` + `load 16 ms`; GLM �
 ## Measuring
 
 - `GET /admin/api/models` returns `expert_streaming_bytes` vs `expert_resident_bytes` so you can size the budget before enabling.
-- `OMLX_EXPERT_STREAMING_PROFILE=1` prints a per-layer, per-stage profile (gate_eval / unique / load hit+miss / stack / wall ms) with hit rate per layer.
-- `python bench/bench_expert_streaming.py --model qwen|glm --budget N --decode M [--out file.json]` reproduces the table above (TTFT, steady-state tok/s, cache stats, profile, phys).
+- `OMLX_EXPERT_STREAMING_PROFILE=1` prints a per-layer, per-stage profile (gate_eval / unique / load hit+miss / staged vs sync split / stack / wall ms) with hit rate per layer.
+- `python bench/bench_expert_streaming.py --model qwen|glm --budget N --decode M [--out file.json]` reproduces the tables above (TTFT, steady-state tok/s, cache stats, profile, prefetcher stats, phys) and samples GPU/CPU/disk/RSS per phase via `bench/resource_sampler.py` (per-phase means/max saved into the result JSON).
 - Future: per-model hit-rate / slots-in-use counters in the status payload (v1 currently counts via `ExpertLRUCache.stats`; expose is a follow-up).
 
 ## Limitations
 
-- No learned pin store (colibri's `.coli_usage` heat) yet — the LRU is cold after a restart. A sidecar that persists routing heat per model is queued.
-- No async overlap: expert loads wait on the GPU pipeline instead of prefetching the next layer's union (slipstream notes this pays exactly when the model doesn't fit — our case).
+- No learned pin store (colibri's `.coli_usage` heat) yet — the LRU is cold after a restart. A sidecar that persists routing heat per model is queued. Note: inter-token reuse is model-dependent (Qwen hits 23–32 %, GLM 0 %) — pins pay on Qwen-like routing, not GLM.
+- Async prefetch (PILOT) exists behind `OMLX_EXPERT_STREAMING_PILOT=1` but is **negative by default**: on a saturated SSD it wastes bandwidth (see phase-1 A/B above).
 - No dual-SSD striping.
 - TTFT on GLM-class models is high (prefill faults ~all experts once); KV snapshot helps repeated prompts only.
 

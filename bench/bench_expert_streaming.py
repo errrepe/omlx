@@ -11,7 +11,11 @@ Controls:
 import argparse
 import asyncio
 import json
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 MODEL_PATHS = {
     "qwen": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-oQ4e-mtp",
@@ -139,9 +143,21 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
         results["cache_per_layer_cap"] = getattr(cache, "_per_layer_cap", None)
 
     messages = PROMPTS[model_key]
+    from resource_sampler import ResourceSampler
+
+    sampler = ResourceSampler(
+        interval=1.0,
+        mlx_callbacks={
+            "mlx_active_gib": mx.get_active_memory,
+            "mlx_cache_gib": mx.get_cache_memory,
+        },
+    )
+    sampler.start()
     t1 = time.perf_counter()
+    sampler.mark("prefill")
     out1 = await engine.chat(messages, max_tokens=1, temperature=0.0)
     ttft = time.perf_counter() - t1
+    sampler.mark("decode")
     print(f"TTFT (1 tok) {ttft:.1f}s prompt {out1.prompt_tokens}")
 
     t2 = time.perf_counter()
@@ -149,10 +165,21 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
     t_decode = time.perf_counter() - t2
     n = out2.completion_tokens or decode
     tokps = n / t_decode
+    sampler.mark("teardown")
+    sampler.stop()
     print(f"decode {n} tok in {t_decode:.1f}s -> {tokps:.3f} tok/s")
+    res_summary = sampler.summary()
+    print(f"resources {res_summary['phases']}")
+    import json as _json
+
+    _json.dump(
+        sampler.samples(),
+        open(f"bench/results/{model_key}_{budget}g_samples.json", "w"),
+    )
 
     stats = None
     profile = None
+    pf_stats = None
     if cache is not None:
         stats = {
             "hits": cache.stats.hits,
@@ -166,6 +193,20 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
         if cache.profile.enabled:
             profile = cache.profile.report()
             print(f"profile totals {profile['totals']}")
+        # PILOT prefetcher stats (attached on language_model.model or wrapper)
+        pf = None
+        for holder in (
+            getattr(vlm_model, "language_model", None),
+            getattr(getattr(vlm_model, "language_model", None), "model", None),
+            vlm_model,
+        ):
+            cand = getattr(holder, "_expert_prefetcher", None)
+            if cand is not None:
+                pf = cand
+                break
+        if pf is not None:
+            pf_stats = dict(pf.stats)
+            print(f"prefetcher {pf_stats}")
 
     phys_end = get_phys_footprint() / 1024**3
     results.update(
@@ -178,6 +219,8 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
             "active_after_decode_gib": round(mx.get_active_memory() / 1024**3, 2),
             "cache_stats": stats,
             "profile": profile,
+            "prefetcher": pf_stats,
+            "resources": res_summary,
         }
     )
 

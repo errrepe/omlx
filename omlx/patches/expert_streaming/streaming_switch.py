@@ -37,6 +37,11 @@ class LayerProfile:
     load_misses: int = 0
     experts_requested: int = 0
     positions: int = 0
+    # load-source split: staging (prefetch) vs synchronous backing read
+    staged_hits: int = 0
+    staged_s: float = 0.0  # take + promote (np -> mx on this thread)
+    sync_loads: int = 0
+    sync_s: float = 0.0  # backing read (np copy) + promote
 
 
 class ProfileAccumulator:
@@ -56,6 +61,18 @@ class ProfileAccumulator:
         self.enabled = enabled
         self.layers: Dict[int, LayerProfile] = {}
         self.wall_s: Dict[int, float] = {}
+        self.predicted: Dict[int, set] = {}
+        self.observed: Dict[int, set] = {}
+
+    def record_predicted(self, idx: int, ids: Any) -> None:
+        if not self.enabled:
+            return
+        self.predicted.setdefault(idx, set()).update(int(v) for v in ids)
+
+    def record_observed(self, idx: int, ids: Any) -> None:
+        if not self.enabled:
+            return
+        self.observed.setdefault(idx, set()).update(int(v) for v in ids)
 
     def add(
         self,
@@ -88,6 +105,17 @@ class ProfileAccumulator:
             return
         self.wall_s[idx] = self.wall_s.get(idx, 0.0) + dt
 
+    def add_load_source(self, idx: int, *, staged: bool, dt: float) -> None:
+        if not self.enabled:
+            return
+        lp = self.layers.setdefault(idx, LayerProfile())
+        if staged:
+            lp.staged_hits += 1
+            lp.staged_s += dt
+        else:
+            lp.sync_loads += 1
+            lp.sync_s += dt
+
     def report(self) -> dict:
         per: Dict[str, dict] = {}
         totals = LayerProfile()
@@ -104,6 +132,10 @@ class ProfileAccumulator:
                 "load_hits": lp.load_hits,
                 "load_misses": lp.load_misses,
                 "hit_rate": lp.load_hits / max(lp.load_hits + lp.load_misses, 1),
+                "staged_hits": lp.staged_hits,
+                "staged_ms_per_hit": lp.staged_s / max(lp.staged_hits, 1) * 1e3,
+                "sync_loads": lp.sync_loads,
+                "sync_ms_per_load": lp.sync_s / max(lp.sync_loads, 1) * 1e3,
                 "experts_req_per_call": lp.experts_requested / c,
                 "positions_per_call": lp.positions / c,
             }
@@ -116,6 +148,10 @@ class ProfileAccumulator:
             totals.load_misses += lp.load_misses
             totals.experts_requested += lp.experts_requested
             totals.positions += lp.positions
+            totals.staged_hits += lp.staged_hits
+            totals.staged_s += lp.staged_s
+            totals.sync_loads += lp.sync_loads
+            totals.sync_s += lp.sync_s
         n = max(totals.calls, 1)
         tots = {
             "calls": totals.calls,
@@ -126,10 +162,42 @@ class ProfileAccumulator:
             "load_hits": totals.load_hits,
             "load_misses": totals.load_misses,
             "hit_rate_global": totals.load_hits / max(totals.load_hits + totals.load_misses, 1),
+            "staged_hits": totals.staged_hits,
+            "staged_ms_per_hit": totals.staged_s / max(totals.staged_hits, 1) * 1e3,
+            "sync_loads": totals.sync_loads,
+            "sync_ms_per_load": totals.sync_s / max(totals.sync_loads, 1) * 1e3,
             "wall_ms_per_call": sum(self.wall_s.values()) / n * 1e3,
             "layers": len(self.layers),
         }
-        return {"per_layer": per, "totals": tots}
+        # Prediction accuracy: of the ids actually requested per layer, how
+        # many had been predicted by the lookahead at least once
+        pred_acc = {}
+        pred_tot = obs_tot = hit_tot = 0
+        for idx in sorted(set(self.predicted) | set(self.observed)):
+            pr = self.predicted.get(idx, set())
+            ob = self.observed.get(idx, set())
+            hit = len(pr & ob)
+            pred_tot += len(pr)
+            obs_tot += len(ob)
+            hit_tot += hit
+            pred_acc[str(idx)] = {
+                "predicted": len(pr),
+                "observed": len(ob),
+                "hit": hit,
+                "recall": hit / max(len(ob), 1),
+                "precision": hit / max(len(pr), 1),
+            }
+        return {
+            "per_layer": per,
+            "totals": tots,
+            "prediction": pred_acc,
+            "prediction_totals": {
+                "predicted": pred_tot,
+                "observed": obs_tot,
+                "hit": hit_tot,
+                "recall": hit_tot / max(obs_tot, 1),
+            },
+        }
 
 try:
     from .shard_bank import ExpertBackingStore
@@ -398,6 +466,7 @@ class StreamingSwitchLinear(nn.Module):
             b_mini = mx.stack([self._bias[int(e)] for e in uniq_list], axis=0)  # (U,O)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
+        p.record_observed(self.layer_idx, uniq_list)
         p.add(
             self.layer_idx,
             gate=t1 - t0,
@@ -460,6 +529,52 @@ class StreamingQuantizedSwitchLinear(nn.Module):
     def set_bias(self, bias: mx.array | None) -> None:
         self._bias = bias
 
+    def _slice_dtypes_lazy(self):
+        if not hasattr(self, "_slice_dtypes"):
+            td = getattr(self.backing, "tensor_dtype", None)
+            self._slice_dtypes = (
+                td(self.stacked_scales_key) if td else None,
+                td(self.stacked_biases_key) if td and self.stacked_biases_key else None,
+            )
+        return self._slice_dtypes
+
+    def _promote_np(self, v, dtype_str: str | None = None):
+        """Promote a cached/staged np.ndarray to mx.array on this thread."""
+        if v is None:
+            return None
+        if isinstance(v, mx.array):
+            return v
+        if dtype_str == "BF16" and v.dtype == np.uint16:
+            # bf16 stored as raw uint16 bits — reinterpret without extra ops
+            f32 = (v.astype(np.uint32) << np.uint32(16)).view(np.float32)
+            return mx.array(f32).astype(mx.bfloat16)
+        return mx.array(v)  # np.ndarray -> mx.array copy on this thread
+
+    def bundle_key(self, expert_id: int):
+        return (self.layer_idx, expert_id, self.stacked_weight_key)
+
+    def _load_expert_np(self, expert_id: int) -> tuple | None:
+        """Numpy-only load for the prefetch worker.
+
+        Never touches the LRU and never allocates MLX arrays (worker threads
+        must not bind MLX ops to a non-existent default stream). Returns None
+        when the backing has no slice-level API or the read fails.
+        """
+        if not hasattr(self.backing, "load_expert_slice"):
+            return None
+        try:
+            w = self.backing.load_expert_slice(self.stacked_weight_key, expert_id)
+            s = self.backing.load_expert_slice(self.stacked_scales_key, expert_id)
+            b = None
+            if self.stacked_biases_key:
+                try:
+                    b = self.backing.load_expert_slice(self.stacked_biases_key, expert_id)
+                except Exception:
+                    b = None
+            return (w, s, b)
+        except Exception:
+            return None
+
     def _load_expert_bundle(self, expert_id: int) -> tuple[mx.array, mx.array, mx.array | None]:
         # Bundle cache: one LRU slot holds (weight, scales, biases) together — avoids 3× capacity waste
         key = (self.layer_idx, expert_id, self.stacked_weight_key)
@@ -485,8 +600,41 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                         pass
                     self.cache.put(key, bundle)  # type: ignore[arg-type]
                     return bundle  # type: ignore[return-value]
-        # load from backing
-        if hasattr(self.backing, "load_expert"):
+        # 2) prefetch staging: worker already read the np slices — promote here
+        # (inference thread) instead of re-reading from the backing.
+        pf = getattr(self, "_prefetcher", None)
+        if pf is not None:
+            t_st = time.perf_counter()
+            staged = pf.take(key)
+            if staged is not None:
+                dt = self._slice_dtypes_lazy()
+                bundle = (
+                    self._promote_np(staged[0]),
+                    self._promote_np(staged[1], dt[0]),
+                    self._promote_np(staged[2], dt[1]) if staged[2] is not None else None,
+                )
+                self.cache.put(key, bundle)  # type: ignore[arg-type]
+                if getattr(self.cache, "profile", None) is not None:
+                    self.cache.profile.add_load_source(
+                        self.layer_idx, staged=True, dt=time.perf_counter() - t_st
+                    )
+                return bundle
+        # 3) synchronous load from backing
+        t_sy = time.perf_counter()
+        if hasattr(self.backing, "load_expert_slice"):
+            # Async-friendly: store plain np.ndarray slices in the cache and
+            # promote them to mx.array on the inference thread at use time
+            # (avoids cross-thread stream errors from MLX op allocation —
+            # the prefetch worker must never allocate MLX arrays).
+            w = self.backing.load_expert_slice(self.stacked_weight_key, expert_id)
+            s = self.backing.load_expert_slice(self.stacked_scales_key, expert_id)
+            b = None
+            if self.stacked_biases_key:
+                try:
+                    b = self.backing.load_expert_slice(self.stacked_biases_key, expert_id)
+                except Exception:
+                    b = None
+        elif hasattr(self.backing, "load_expert"):
             w = self.backing.load_expert(self.stacked_weight_key, expert_id)
             s = self.backing.load_expert(self.stacked_scales_key, expert_id)
             b = None
@@ -508,6 +656,10 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 b = bb if isinstance(bb, mx.array) else mx.array(bb)
         bundle = (w, s, b)
         self.cache.put(key, bundle)  # type: ignore[arg-type]
+        if getattr(self.cache, "profile", None) is not None:
+            self.cache.profile.add_load_source(
+                self.layer_idx, staged=False, dt=time.perf_counter() - t_sy
+            )
         return bundle
 
     def __call__(self, x, indices, sorted_indices=False):
@@ -536,6 +688,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         t_load = 0.0
         hits = 0
         misses = 0
+
         for eid in uniq_list:
             was_hit = (self.layer_idx, eid, self.stacked_weight_key) in self.cache
             t_l = time.perf_counter()
@@ -545,10 +698,15 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 hits += 1
             else:
                 misses += 1
+            dt = self._slice_dtypes_lazy()
+            w = self._promote_np(w)
+            s = self._promote_np(s, dt[0])
+            if b is not None:
+                has_b = True
+                b = self._promote_np(b, dt[1])
             mini_w.append(w)
             mini_s.append(s)
             if b is not None:
-                has_b = True
                 mini_b.append(b)
         if len(mini_w) == 1:
             w_bank = mx.expand_dims(mini_w[0], 0)
@@ -576,6 +734,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             b_mini = mx.stack([self._bias[int(e)] for e in uniq_list], axis=0)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
+        p.record_observed(self.layer_idx, uniq_list)
         p.add(
             self.layer_idx,
             gate=t1 - t0,
