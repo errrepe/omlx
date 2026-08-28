@@ -823,27 +823,20 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 else:
                     raws = list(_EXPERT_IO_POOL.map(self._load_expert_np, missing))
                 dt_per = time.perf_counter() - t_res_start
-                dtypes = self._slice_dtypes_lazy()
                 for eid, raw in zip(missing, raws):
                     if raw is None:
                         bundles[eid] = self._load_expert_bundle(eid)
                         continue
-                    w, s, b = raw
-                    # Promote once at cache-fill time (F2): a cached bundle is
-                    # now a live mx.array, so repeat hits across decode steps
-                    # and prefill chunks pay neither the np->Metal copy nor a
-                    # second pread. With a positive LRU budget the banks also
-                    # persist across chunks, which is what bounds the
-                    # chunk-spiral re-streaming (docs F-series F1).
-                    bundle = (
-                        self._promote_np(w),
-                        self._promote_np(s, dtypes[0]),
-                        self._promote_np(b, dtypes[1]) if b is not None else None,
-                    )
-                    self.cache.put((self.layer_idx, eid, self.stacked_weight_key), bundle)  # type: ignore[arg-type]
+                    # Raw np bundles in the LRU by design: Metal only holds the
+                    # per-call stack. Caching promoted mx copies here double-
+                    # holds the same weights in wired memory when the budget
+                    # is positive — measured: LRU(mx) + stacks summed 37GB
+                    # Metal active on a 6GiB budget and the guard killed the
+                    # second prefill outright (F2 post-mortem).
+                    bundles[eid] = raw
+                    self.cache.put((self.layer_idx, eid, self.stacked_weight_key), raw)  # type: ignore[arg-type]
                     if p is not None:
                         p.add_load_source(self.layer_idx, staged=False, dt=dt_per / len(missing))
-                    bundles[eid] = bundle
             else:
                 # dict-backed test doubles: sequential fallback
                 for eid in missing:
