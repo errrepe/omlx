@@ -25,12 +25,16 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _PROFILE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
+_COALESCE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_COALESCE", "") != "0"
 
 # Parallel os.pread pool for the demand-set of one MoE layer call. Workers
 # return raw numpy slices only — MLX promotion happens on the inference
-# thread. 8 workers lift a single 13 MB pread stream (QD1, ~1.4 GB/s) toward
-# the NVMe's sequential ceiling.
-_EXPERT_IO_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="omlx-expert-io")
+# thread. QD8 sustains ~1.5 GB/s on the reference NVMe; QD16 plateaus near
+# ~2.5 GB/s (+34% decode) — see E1. OMLX_EXPERT_STREAMING_QD overrides.
+_EXPERT_IO_POOL = ThreadPoolExecutor(
+    max_workers=max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_QD", "") or 16)),
+    thread_name_prefix="omlx-expert-io",
+)
 
 
 @dataclass
@@ -602,6 +606,50 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         except Exception:
             return None
 
+    def _load_expert_run_np(self, first_id: int, count: int) -> list[tuple] | None:
+        """Numpy-only load of *count* consecutive experts in one pread per key.
+
+        Returns None when the run read is unsupported/fails (caller falls
+        back to per-expert loads). Runs exploit row-major contiguity: one
+        sequential transfer instead of *count* scattered ones.
+        """
+        if not hasattr(self.backing, "load_expert_run"):
+            return None
+        try:
+            ws = self.backing.load_expert_run(self.stacked_weight_key, first_id, count)
+            ss = self.backing.load_expert_run(self.stacked_scales_key, first_id, count)
+            bs: list | None = None
+            if self.stacked_biases_key:
+                try:
+                    bs = self.backing.load_expert_run(self.stacked_biases_key, first_id, count)
+                except Exception:
+                    bs = None
+            return [
+                (w, s, bs[i] if bs is not None and i < len(bs) else None)
+                for i, (w, s) in enumerate(zip(ws, ss))
+            ]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _group_runs(sorted_ids: list[int], max_run: int = 16) -> list[tuple[int, int]]:
+        """Split ascending expert ids into (first, count) contiguous runs."""
+        runs: list[tuple[int, int]] = []
+        i = 0
+        n = len(sorted_ids)
+        while i < n:
+            first = sorted_ids[i]
+            count = 1
+            while (
+                count < max_run
+                and i + count < n
+                and sorted_ids[i + count] == first + count
+            ):
+                count += 1
+            runs.append((first, count))
+            i += count
+        return runs
+
     def _bundle_cached_or_staged(self, expert_id: int):
         """Resolve a bundle without touching the disk (inference thread only).
 
@@ -734,7 +782,30 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # bank (row-major) — sorted reads keep the NVMe's locality
             missing.sort()
             if hasattr(self.backing, "load_expert_slice"):
-                raws = list(_EXPERT_IO_POOL.map(self._load_expert_np, missing))
+                raws: list = [None] * len(missing)
+                # Coalesce consecutive ids into single-pread runs (dense in
+                # long-prompt prefill; rare in decode, where runs are size 1
+                # and the path degenerates to the per-expert fetch).
+                runs = self._group_runs(missing)
+                if _COALESCE_ENV and len(runs) < len(missing):
+                    results_by_run = list(
+                        _EXPERT_IO_POOL.map(lambda r: (r, self._load_expert_run_np(r[0], r[1])), runs)
+                    )
+                    idx_of = {eid: i for i, eid in enumerate(missing)}
+                    leftover: list[int] = []
+                    for (first, count), out in results_by_run:
+                        if out is not None:
+                            for j in range(count):
+                                raws[idx_of[first + j]] = out[j]
+                        else:
+                            leftover.extend(range(first, first + count))
+                    if leftover:
+                        for eid, raw in zip(
+                            leftover, _EXPERT_IO_POOL.map(self._load_expert_np, leftover)
+                        ):
+                            raws[idx_of[eid]] = raw
+                else:
+                    raws = list(_EXPERT_IO_POOL.map(self._load_expert_np, missing))
                 dt_per = time.perf_counter() - t_res_start
                 for eid, raw in zip(missing, raws):
                     if raw is None:

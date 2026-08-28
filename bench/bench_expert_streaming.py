@@ -30,6 +30,21 @@ PROMPTS = {
     "glm": [{"role": "user", "content": "Hello, how are you?"}],
 }
 
+_FILLER = (
+    "The scientist wrote a detailed report about the river ecosystem, "
+    "describing how the water temperature changes with the seasons and "
+    "which fish species migrate through the valley each year. "
+)
+
+
+def build_prompt(model_key: str, prompt_len: str) -> list[dict]:
+    """Synthetic prompts: short (7 tok), 512, 2k, 8k (approximate word targets)."""
+    if prompt_len == "short":
+        return list(PROMPTS[model_key])
+    words = {"512": 400, "2k": 1600, "8k": 6400}[prompt_len]
+    content = (_FILLER * (words // 26 + 1))[: words * 7]
+    return [{"role": "user", "content": content}]
+
 
 class FakeEnforcer:
     memory_guard_tier = "balanced"
@@ -91,7 +106,17 @@ def find_streaming_cache(vlm_model):
     return None
 
 
-async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | None, topk: float | None = None):
+async def run(
+    model_key: str,
+    budget: float,
+    decode: int,
+    mtp: bool,
+    out: str | None,
+    topk: float | None = None,
+    prompt_len: str = "short",
+    mtp_block: int | None = None,
+    ane: bool = False,
+):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
     from omlx.scheduler import SchedulerConfig
@@ -101,7 +126,7 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
     model_path = MODEL_PATHS[model_key]
     entry_name = DEFAULT_ENTRIES[model_key]
 
-    print(f"=== {model_key} budget {budget}G decode {decode} mtp {mtp} ===")
+    print(f"=== {model_key} budget {budget}G decode {decode} mtp {mtp} block {mtp_block} ane {ane} prompt {prompt_len} ===")
     pool = EnginePool(scheduler_config=SchedulerConfig(hot_cache_max_size=0))
     pool._process_memory_enforcer = FakeEnforcer()
     pool.discover_models("/Volumes/SSD 4TB/AI Models")
@@ -117,6 +142,8 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
         expert_streaming_topk_threshold=topk,
         qwen4_ple_ssd_offload=True,
         vlm_mtp_enabled=mtp,
+        vlm_mtp_draft_block_size=mtp_block,
+        qwen35_ane_prefill_enabled=ane,
     )
     runtime = pool._entry_runtime_resident_size(entry, settings)
     print(f"runtime est {runtime / 1024**3:.2f}G")
@@ -135,6 +162,9 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
         "budget_gib": budget,
         "topk_threshold": topk,
         "mtp": mtp,
+        "mtp_block": mtp_block,
+        "ane": ane,
+        "prompt_len": prompt_len,
         "runtime_est_gib": runtime / 1024**3,
         "load_s": t_load,
         "phys_before_gib": round(phys0, 2),
@@ -144,7 +174,7 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
         results["cache_per_expert_cap"] = getattr(cache, "capacity", None)
         results["cache_per_layer_cap"] = getattr(cache, "_per_layer_cap", None)
 
-    messages = PROMPTS[model_key]
+    messages = build_prompt(model_key, prompt_len)
     from resource_sampler import ResourceSampler
 
     sampler = ResourceSampler(
@@ -254,9 +284,24 @@ def main():
     ap.add_argument("--decode", type=int, default=96)
     ap.add_argument("--mtp", action="store_true")
     ap.add_argument("--topk", type=float, default=None, help="adaptive top-k mass threshold (default exact)")
+    ap.add_argument("--prompt-len", choices=["short", "512", "2k", "8k"], default="short")
+    ap.add_argument("--mtp-block", type=int, default=None, help="vlm_mtp_draft_block_size (MTP tokens per round)")
+    ap.add_argument("--ane", action="store_true", help="enable qwen35 ANE prefill")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    asyncio.run(run(args.model, args.budget, args.decode, args.mtp, args.out, args.topk))
+    asyncio.run(
+        run(
+            args.model,
+            args.budget,
+            args.decode,
+            args.mtp,
+            args.out,
+            args.topk,
+            prompt_len=args.prompt_len,
+            mtp_block=args.mtp_block,
+            ane=args.ane,
+        )
+    )
 
 
 if __name__ == "__main__":

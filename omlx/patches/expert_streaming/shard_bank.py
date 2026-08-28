@@ -181,6 +181,38 @@ class _ShardReader:
         off = self.data_start + int(start) + expert_id * expert_bytes
         return off, off + expert_bytes
 
+    def expert_run(self, key: str, first_id: int, count: int) -> list:
+        """One pread covering experts [first_id, first_id+count), sliced per expert.
+
+        Row-major stacked banks give consecutive ids contiguous offsets, so a
+        run reads back as one sequential transfer — fewer syscalls and larger
+        requests than per-expert preads (matters most when the demand set is
+        dense, i.e. long-prompt prefill).
+        """
+        entry = self.header[key]
+        shape = tuple(entry["shape"])
+        dtype_str = str(entry["dtype"])
+        start, end = entry["data_offsets"]
+        np_dtype, item = _DTYPE_MAP.get(dtype_str, (None, None))  # type: ignore[assignment]
+        if np_dtype is None:
+            raise TypeError(f"Unsupported dtype {dtype_str} for {key}")
+        num_experts = shape[0] if shape else 1
+        count = max(1, min(int(count), num_experts - first_id))
+        expert_bytes = (end - start) // num_experts
+        off = self.data_start + int(start) + first_id * expert_bytes
+        buf = os.pread(self._file.fileno(), expert_bytes * count, off)
+        if len(buf) != expert_bytes * count:
+            raise OSError(f"Short run read for {key}[{first_id}+{count}]: {len(buf)}")
+        per_shape = shape[1:] if len(shape) > 1 else shape
+        n_elements = 1
+        for d in shape:
+            n_elements *= int(d)
+        n_elements //= num_experts
+        return [
+            np.frombuffer(buf, dtype=np_dtype, count=n_elements, offset=i * expert_bytes).reshape(per_shape)
+            for i in range(count)
+        ]
+
     def pin_expert(self, key: str, expert_id: int) -> int:
         """mlock the page-aligned file range of one expert slice.
 
@@ -321,6 +353,17 @@ class ExpertBackingStore:
         """
         reader = self._reader_for_key(key)
         return reader.expert_slice(key, expert_id)
+
+    def load_expert_run(self, key: str, first_id: int, count: int) -> list[np.ndarray]:
+        """Read *count* consecutive experts starting at *first_id* in one pread.
+
+        Adjacent expert ids occupy contiguous byte ranges in a row-major
+        stacked bank, so a run of ids collapses into a single sequential
+        read instead of *count* separate ones. Returns per-expert numpy
+        views into the run buffer (views are safe: promotion copies).
+        """
+        reader = self._reader_for_key(key)
+        return reader.expert_run(key, first_id, count)
 
     def pin_expert(self, key: str, expert_id: int) -> int:
         """mlock one expert's file range across the resolved shard.
