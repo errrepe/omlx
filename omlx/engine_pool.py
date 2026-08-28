@@ -690,6 +690,11 @@ class EnginePool:
             add("expert_streaming_enabled", exp_enabled)
             if exp_enabled:
                 add("expert_streaming_budget_gib", data.get("expert_streaming_budget_gib"))
+                # Approximate routing changes outputs — part of the runtime
+                # signature so a threshold change triggers reload.
+                thr = data.get("expert_streaming_topk_threshold", None)
+                if thr is not None and float(thr) < 1.0:
+                    add("expert_streaming_topk_threshold", thr)
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)

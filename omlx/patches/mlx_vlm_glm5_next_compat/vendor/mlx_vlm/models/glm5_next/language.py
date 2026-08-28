@@ -790,6 +790,16 @@ class Glm5NextMoE(nn.Module):
 
     def __call__(self, x):
         indices, scores = self.gate(x)
+        # Opt-in adaptive top-k truncation (cumulative mass). Exact mode
+        # (None/1.0) leaves the routing untouched — zero overhead.
+        from omlx.patches.expert_streaming.adaptive_topk import (
+            current_threshold as _topk_threshold,
+            truncate_topk_mass as _topk_truncate,
+        )
+
+        _thr = _topk_threshold()
+        if _thr is not None and _thr < 1.0:
+            indices, scores = _topk_truncate(indices, scores, _thr)
         y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
         if y.ndim == x.ndim + 1:
             y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)

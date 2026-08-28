@@ -1135,5 +1135,7 @@
   "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
   "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
-  "modal.model_settings.expert_streaming_budget_hint": "可选的专家 LRU。留空或 0 = 仅用系统页缓存（默认；实测更快且占用更少内存）。>0 固定 GiB 大小的专家缓存。"
+  "modal.model_settings.expert_streaming_budget_hint": "可选的专家 LRU。留空或 0 = 仅用系统页缓存（默认；实测更快且占用更少内存）。>0 固定 GiB 大小的专家缓存。",
+  "modal.model_settings.expert_streaming_topk": "Top-k 质量阈值",
+  "modal.model_settings.expert_streaming_topk_hint": "可选的近似路由：保留按分数降序的 top-k 前缀中达到该质量比例的最小集合。1.0 或留空 = 精确（位级一致）。~0.85 是实测的速度拐点（约 1.8x，0.70 时 10 个 token 中 7 个一致）。"
 }

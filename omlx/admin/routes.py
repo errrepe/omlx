@@ -132,6 +132,7 @@ class ModelSettingsRequest(BaseModel):
     qwen4_ple_ssd_offload: bool | None = None
     expert_streaming_enabled: bool | None = None
     expert_streaming_budget_gib: float | None = None
+    expert_streaming_topk_threshold: float | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -2409,6 +2410,19 @@ async def update_model_settings(
                 raise HTTPException(status_code=400, detail="expert_streaming_budget_gib must be between 0 and 64 GiB")
             # 0 = page-cache only (no app-level LRU); null = engine default
             current_settings.expert_streaming_budget_gib = float(gib)
+    if "expert_streaming_topk_threshold" in sent:
+        v = request.expert_streaming_topk_threshold
+        if v is None:
+            current_settings.expert_streaming_topk_threshold = None
+        else:
+            try:
+                thr = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expert_streaming_topk_threshold must be a number")
+            if not 0.05 <= thr <= 1.0:
+                raise HTTPException(status_code=400, detail="expert_streaming_topk_threshold must be between 0.05 and 1.0")
+            # >= 1.0 normalizes to exact routing (None)
+            current_settings.expert_streaming_topk_threshold = float(thr) if thr < 1.0 else None
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False

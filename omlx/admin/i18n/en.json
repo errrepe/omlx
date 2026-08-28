@@ -1135,5 +1135,7 @@
   "js.success.download_started": "Download started: {repo_id}",
   "js.success.settings_saved": "Settings saved successfully",
   "settings.mcp.expose_tools": "Expose backend MCP tools to clients",
-  "settings.mcp.expose_tools_hint": "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers."
+  "settings.mcp.expose_tools_hint": "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers.",
+  "modal.model_settings.expert_streaming_topk": "Top-k mass threshold",
+  "modal.model_settings.expert_streaming_topk_hint": "Opt-in approximate routing: keep the smallest score-descending top-k prefix reaching this mass share. 1.0 or empty = exact (bit-identical). ~0.85 is the speed cliff measured on FlashNext-class models (~1.8x, 7/10 tokens identical at 0.70)."
 }

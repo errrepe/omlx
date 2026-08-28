@@ -1135,5 +1135,7 @@
   "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
   "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
-  "modal.model_settings.expert_streaming_budget_hint": "LRU de expertos opcional. Vacío o 0 = solo caché de página del SO (predeterminado; medido más rápido con menos RAM). >0 fija un caché de expertos en GiB."
+  "modal.model_settings.expert_streaming_budget_hint": "LRU de expertos opcional. Vacío o 0 = solo caché de página del SO (predeterminado; medido más rápido con menos RAM). >0 fija un caché de expertos en GiB.",
+  "modal.model_settings.expert_streaming_topk": "Umbral de masa del top-k",
+  "modal.model_settings.expert_streaming_topk_hint": "Enrutamiento aproximado opcional: mantiene el prefijo del top-k (score descendente) que alcanza esta fracción de masa. 1.0 o vacío = exacto (bit-idéntico). ~0.85 es el punto de aceleración medido (~1.8x, 7/10 tokens idénticos a 0.70)."
 }

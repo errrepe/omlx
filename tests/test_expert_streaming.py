@@ -861,3 +861,101 @@ async def test_expert_streaming_budget_zero_persists():
         admin_routes.ModelSettingsRequest(expert_streaming_budget_gib=0),
     )
     assert settings.expert_streaming_budget_gib == 0.0
+
+
+def test_adaptive_topk_configure_semantics():
+    from omlx.patches.expert_streaming import adaptive_topk
+
+    adaptive_topk.configure(None)
+    assert adaptive_topk.current_threshold() is None
+    adaptive_topk.configure(1.0)  # >= 1.0 normalizes to exact
+    assert adaptive_topk.current_threshold() is None
+    adaptive_topk.configure(0.85)
+    assert adaptive_topk.current_threshold() == 0.85
+    with pytest.raises(ValueError):
+        adaptive_topk.configure(0.01)
+    adaptive_topk.configure(None)
+    assert adaptive_topk.configure_from_settings(ModelSettings()) is None
+    assert (
+        adaptive_topk.configure_from_settings(
+            ModelSettings(expert_streaming_topk_threshold=0.9)
+        )
+        == 0.9
+    )
+    adaptive_topk.configure(None)
+
+
+def test_adaptive_topk_truncate_math():
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming.adaptive_topk import truncate_topk_mass
+
+    # sorted input, threshold 0.7: keep 0.5 + 0.3 (cum_before 0.8 crosses at 3rd)
+    inds = mx.array([[7, 3, 5]], dtype=mx.uint32)
+    scores = mx.array([[0.5, 0.3, 0.2]], dtype=mx.float32)
+    i2, s2, keeps = truncate_topk_mass(inds, scores, 0.7, return_keeps=True)
+    assert keeps == 2.0
+    assert i2.tolist() == [[7, 3, 7]]  # dropped slot padded with top expert
+    assert s2.shape == scores.shape
+    # renormalized to the ORIGINAL total mass (1.0)
+    total = mx.sum(s2, axis=-1)
+    assert abs(float(total) - 1.0) < 1e-6
+    assert s2[0][0].item() == pytest.approx(0.625, abs=1e-6)
+    assert s2[0][1].item() == pytest.approx(0.375, abs=1e-6)
+    assert s2[0][2].item() == 0.0
+
+    # unsorted input: same kept SET, scores reordered descending
+    inds3 = mx.array([[5, 7, 3]], dtype=mx.uint32)
+    scores3 = mx.array([[0.2, 0.5, 0.3]], dtype=mx.float32)
+    i3, s3 = truncate_topk_mass(inds3, scores3, 0.7)
+    assert i3.tolist() == [[7, 3, 7]]
+
+    # scale invariance (GLM routed_scaling_factor): x10 scores -> same split
+    i4, s4 = truncate_topk_mass(inds, scores * 10.0, 0.7)
+    assert i4.tolist() == [[7, 3, 7]]
+    assert s4[0][0].item() == pytest.approx(6.25, abs=1e-5)
+
+    # threshold >= total mass keeps everything (order changes only)
+    i5, s5 = truncate_topk_mass(inds3, scores3, 0.999)
+    assert sorted(i5[0].tolist()) == [3, 5, 7]
+    assert abs(float(mx.sum(s5, axis=-1)) - 1.0) < 1e-6
+
+
+def test_adaptive_topk_qwen_block_patch():
+    """The patched Qwen3_5MoeSparseMoeBlock must bypass at exact threshold
+    and produce finite, same-shape output when truncation engages."""
+    import mlx.core as mx
+    from types import SimpleNamespace
+
+    pytest.importorskip("mlx_vlm")
+    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+    from omlx.patches.expert_streaming import adaptive_topk
+
+    cfg = SimpleNamespace(
+        hidden_size=32,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=32,
+        num_experts=8,
+        num_experts_per_tok=2,
+    )
+    block = Qwen3_5MoeSparseMoeBlock(cfg)
+    mx.eval(block.parameters())
+
+    applied = adaptive_topk.apply_qwen35_moe_topk_patch()
+    if not applied:
+        pytest.skip("qwen3_5_moe language module not patchable here")
+
+    rng = __import__("numpy").random.default_rng(3)
+    x = mx.array(rng.standard_normal((1, 4, 32)).astype("float32"))
+
+    adaptive_topk.configure(None)
+    out_exact = block(x)
+    mx.eval(out_exact)
+
+    adaptive_topk.configure(0.6)
+    out_trunc = block(x)
+    mx.eval(out_trunc)
+
+    assert out_trunc.shape == out_exact.shape
+    assert bool(mx.isfinite(out_trunc).all())
+    adaptive_topk.configure(None)

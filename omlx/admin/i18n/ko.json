@@ -1135,5 +1135,7 @@
   "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
   "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
-  "modal.model_settings.expert_streaming_budget_hint": "선택적 전문가 LRU. 비우거나 0 = OS 페이지 캐시만 사용(기본값; 측정상 더 빠르고 RAM 적게 사용). >0이면 고정 GiB 캐시 유지."
+  "modal.model_settings.expert_streaming_budget_hint": "선택적 전문가 LRU. 비우거나 0 = OS 페이지 캐시만 사용(기본값; 측정상 더 빠르고 RAM 적게 사용). >0이면 고정 GiB 캐시 유지.",
+  "modal.model_settings.expert_streaming_topk": "Top-k 질량 임계값",
+  "modal.model_settings.expert_streaming_topk_hint": "옵트인 근사 라우팅: 점수 내림차순 top-k 접두사 중 이 질량 비율에 도달하는 최소치를 유지. 1.0 또는 비움 = 정확(비트 동일). ~0.85은 측정된 속도 절벽(약 1.8배, 0.70에서 10토큰 중 7개 일치)."
 }

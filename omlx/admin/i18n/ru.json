@@ -1135,5 +1135,7 @@
   "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
   "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
-  "modal.model_settings.expert_streaming_budget_hint": "Опциональный LRU для экспертов. Пусто или 0 — только страничный кэш ОС (по умолчанию; замерено быстрее и с меньшим расходом RAM). >0 — фиксированный кэш экспертов в ГиБ."
+  "modal.model_settings.expert_streaming_budget_hint": "Опциональный LRU для экспертов. Пусто или 0 — только страничный кэш ОС (по умолчанию; замерено быстрее и с меньшим расходом RAM). >0 — фиксированный кэш экспертов в ГиБ.",
+  "modal.model_settings.expert_streaming_topk": "Порог массы top-k",
+  "modal.model_settings.expert_streaming_topk_hint": "Опциональный приблизительный роутинг: сохраняет наименьший префикс top-k (по убыванию score), набирающий эту долю массы. 1.0 или пусто — точный (бит-в-бит). ~0.85 — измеренный порог ускорения (~1.8x, 7/10 токенов совпадают при 0.70)."
 }

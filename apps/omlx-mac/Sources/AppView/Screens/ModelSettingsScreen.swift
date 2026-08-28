@@ -775,6 +775,23 @@ private struct AdvancedTab: View {
                             ), mono: true, suffix: "GiB", width: 110)
                         }
                     }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.topk.label",
+                                          defaultValue: "Top-k mass threshold",
+                                          comment: "Row label for the adaptive top-k routing threshold field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.topk.sub",
+                                             defaultValue: "Opt-in approximate routing: keep the smallest score-descending top-k prefix reaching this mass share. 1.0 or empty = exact.",
+                                             comment: "Sublabel for the adaptive top-k routing threshold field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingTopkThreshold,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingTopkThreshold, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
                 }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",

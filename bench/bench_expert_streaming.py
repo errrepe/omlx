@@ -91,7 +91,7 @@ def find_streaming_cache(vlm_model):
     return None
 
 
-async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | None):
+async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | None, topk: float | None = None):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
     from omlx.scheduler import SchedulerConfig
@@ -114,6 +114,7 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
     settings = ModelSettings(
         expert_streaming_enabled=True,
         expert_streaming_budget_gib=budget,
+        expert_streaming_topk_threshold=topk,
         qwen4_ple_ssd_offload=True,
         vlm_mtp_enabled=mtp,
     )
@@ -132,6 +133,7 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
     results = {
         "model": model_key,
         "budget_gib": budget,
+        "topk_threshold": topk,
         "mtp": mtp,
         "runtime_est_gib": runtime / 1024**3,
         "load_s": t_load,
@@ -175,6 +177,17 @@ async def run(model_key: str, budget: float, decode: int, mtp: bool, out: str | 
     _json.dump(
         sampler.samples(),
         open(f"bench/results/{model_key}_{budget}g_samples.json", "w"),
+    )
+    # Generated output for bit-exactness comparison across runs
+    _text = getattr(out2, "text", None)
+    _ids = getattr(out2, "completion_tokens", None) or getattr(out2, "token_ids", None)
+    _json.dump(
+        {
+            "text": _text if isinstance(_text, str) else None,
+            "completion_tokens": n,
+            "token_ids": _ids if isinstance(_ids, list) else None,
+        },
+        open(f"bench/results/{model_key}_{budget}g_output.json", "w"),
     )
 
     stats = None
@@ -240,9 +253,10 @@ def main():
     ap.add_argument("--budget", type=float, default=1.0)
     ap.add_argument("--decode", type=int, default=96)
     ap.add_argument("--mtp", action="store_true")
+    ap.add_argument("--topk", type=float, default=None, help="adaptive top-k mass threshold (default exact)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    asyncio.run(run(args.model, args.budget, args.decode, args.mtp, args.out))
+    asyncio.run(run(args.model, args.budget, args.decode, args.mtp, args.out, args.topk))
 
 
 if __name__ == "__main__":

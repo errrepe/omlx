@@ -7385,6 +7385,7 @@
                     expert_streaming_forced:
                         model?.expert_streaming_forced === true,
                     expert_streaming_budget_gib: s.expert_streaming_budget_gib ?? null,
+                    expert_streaming_topk_threshold: s.expert_streaming_topk_threshold ?? null,
                     expert_dense_bytes: model?.expert_dense_bytes || 0,
                     expert_total_bytes: model?.expert_total_bytes || 0,
                     expert_moe_layers: model?.expert_moe_layers || 0,
@@ -8315,6 +8316,9 @@
                                 expert_streaming_enabled: !!this.modelSettings.expert_streaming_enabled,
                                 expert_streaming_budget_gib: this.modelSettings.expert_streaming_budget_gib != null && String(this.modelSettings.expert_streaming_budget_gib).length
                                     ? parseFloat(this.modelSettings.expert_streaming_budget_gib)
+                                    : null,
+                                expert_streaming_topk_threshold: this.modelSettings.expert_streaming_topk_threshold != null && String(this.modelSettings.expert_streaming_topk_threshold).length
+                                    ? parseFloat(this.modelSettings.expert_streaming_topk_threshold)
                                     : null,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget

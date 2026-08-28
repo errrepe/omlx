@@ -645,6 +645,13 @@ def convert_model_to_streaming(
 
         mx.clear_cache()
         logger.info("Expert streaming: converted %d MoE layers (backing=%s, cache_capacity=%d experts)", converted, backing_kind, cache.capacity)
+        # Opt-in adaptive top-k routing truncation (cumulative mass). Exact
+        # (None/1.0) by default — no patch engagement, zero overhead.
+        from .adaptive_topk import apply_qwen35_moe_topk_patch, configure_from_settings
+
+        thr = configure_from_settings(model_settings)
+        if thr is not None:
+            apply_qwen35_moe_topk_patch()
         # PILOT: async router-lookahead prefetch into the LRU (glm5_next's
         # Glm5NextModel loop scores the next MoE layer's router against the
         # current layer output). mmap backing only; off when the RAM dict

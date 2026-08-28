@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -245,6 +245,7 @@ final class ModelSettingsScreenVM {
     var expertStreamingSupported: Bool = false
     var expertStreamingForced: Bool = false
     var expertStreamingBudgetGib: String = ""
+    var expertStreamingTopkThreshold: String = ""
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -391,7 +392,7 @@ final class ModelSettingsScreenVM {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
         case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib,
-             .thinkingBudgetEnabled, .thinkingBudgetTokens:
+             .expertStreamingTopkThreshold, .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
@@ -529,6 +530,7 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingEnabled = self.expertStreamingForced
                     || (s?.expertStreamingEnabled ?? false)
                 self.expertStreamingBudgetGib = s?.expertStreamingBudgetGib.map { String($0) } ?? ""
+                self.expertStreamingTopkThreshold = s?.expertStreamingTopkThreshold.map { String($0) } ?? ""
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -684,6 +686,16 @@ final class ModelSettingsScreenVM {
                 patch.expertStreamingBudgetGib = v
             } else {
                 lastError = "Cache budget must be between 0 and 64 GiB"
+                return
+            }
+        case .expertStreamingTopkThreshold:
+            guard expertStreamingSupported else { return }
+            if expertStreamingTopkThreshold.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                patch.expertStreamingTopkThreshold = nil
+            } else if let v = Double(expertStreamingTopkThreshold), v >= 0.05, v <= 1.0 {
+                patch.expertStreamingTopkThreshold = v < 1.0 ? v : nil
+            } else {
+                lastError = "Top-k threshold must be between 0.05 and 1.0"
                 return
             }
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled

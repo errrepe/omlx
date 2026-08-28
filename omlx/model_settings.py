@@ -218,9 +218,16 @@ class ModelSettings:
     qwen4_ple_ssd_offload: bool = False
     # MoE expert streaming (SSD): keep hot experts resident, stream the rest
     # from SSD. Hardware-specific; may be auto-forced when resident load cannot
-    # fit under the memory ceiling but streaming fits. Budget 0/None = auto 2 GiB.
+    # fit under the memory ceiling but streaming fits. Budget None/0 =
+    # page-cache only (OS file cache serves expert reuse); >0 pins a fixed
+    # GiB app-level LRU.
     expert_streaming_enabled: bool = False
     expert_streaming_budget_gib: Optional[float] = None
+    # Opt-in approximate MoE routing: keep the smallest score-descending
+    # prefix of the top-k experts whose cumulative mass reaches this
+    # threshold. None/1.0 = exact routing (bit-identical to the reference
+    # path); <1.0 trades output fidelity for fewer streamed expert bytes.
+    expert_streaming_topk_threshold: Optional[float] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

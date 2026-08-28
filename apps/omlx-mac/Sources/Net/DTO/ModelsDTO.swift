@@ -102,6 +102,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen4PleSsdOffload: Bool?
     let expertStreamingEnabled: Bool?
     let expertStreamingBudgetGib: Double?
+    let expertStreamingTopkThreshold: Double?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -191,6 +192,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen4PleSsdOffload: Bool? = nil
     var expertStreamingEnabled: Bool? = nil
     var expertStreamingBudgetGib: Double? = nil
+    var expertStreamingTopkThreshold: Double? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil

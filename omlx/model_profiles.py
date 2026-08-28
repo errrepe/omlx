@@ -106,6 +106,7 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "qwen4_ple_ssd_offload",
         "expert_streaming_enabled",
         "expert_streaming_budget_gib",
+        "expert_streaming_topk_threshold",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }
