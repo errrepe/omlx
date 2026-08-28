@@ -118,6 +118,8 @@ async def run(
     ane: bool = False,
     warm_control: float = 0.0,
     mem_ceiling: float = 28.0,
+    specprefill_draft: str | None = None,
+    specprefill_keep: float | None = None,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -146,6 +148,12 @@ async def run(
         vlm_mtp_enabled=mtp,
         vlm_mtp_draft_block_size=mtp_block,
         qwen35_ane_prefill_enabled=ane,
+        specprefill_enabled=bool(specprefill_draft),
+        specprefill_draft_model=specprefill_draft,
+        specprefill_keep_pct=specprefill_keep,
+        # The bench prompt is 7440 tokens; the product default threshold
+        # (8192) would never trigger. Score any long-prompt run.
+        specprefill_threshold=2048,
     )
     runtime = pool._entry_runtime_resident_size(entry, settings)
     print(f"runtime est {runtime / 1024**3:.2f}G")
@@ -355,6 +363,10 @@ def main():
     ap.add_argument("--prompt-len", choices=["short", "512", "2k", "8k"], default="short")
     ap.add_argument("--mtp-block", type=int, default=None, help="vlm_mtp_draft_block_size (MTP tokens per round)")
     ap.add_argument("--ane", action="store_true", help="enable qwen35 ANE prefill")
+    ap.add_argument("--specprefill", default=None, metavar="PATH",
+                    help="draft model path for SpecPrefill (scores the prompt and prefills only the important tokens)")
+    ap.add_argument("--specprefill-keep", type=float, default=None, metavar="PCT",
+                    help="keep rate for SpecPrefill (default 0.2)")
     ap.add_argument("--warm-control", type=float, default=0.0, metavar="GIB", help="post-load deterministic warmup budget")
     ap.add_argument("--min-free-gb", type=float, default=22.0, metavar="GB",
                     help="abort when available memory is below this (memory-starved runs fragment prefill "
@@ -388,6 +400,8 @@ def main():
             prompt_len=args.prompt_len,
             mtp_block=args.mtp_block,
             ane=args.ane,
+            specprefill_draft=args.specprefill,
+            specprefill_keep=args.specprefill_keep,
             warm_control=args.warm_control,
             mem_ceiling=args.mem_ceiling_gib,
         )
