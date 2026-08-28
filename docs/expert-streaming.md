@@ -102,11 +102,11 @@ Protocol: cold page cache between runs (`bench/cache_cool.py` touches ~72 % of a
 
 - Inter-token reuse on GLM **exists** (0 % → 16 % → 19.5 % as capacity grows — the diagonal from Patterns Ob2 is real), but capturing ≥ 2 tokens of working set needs ≥ 16 GiB of heap, which pushes the 48 GiB box into swap: the *capacity point sits below the reuse point* on this hardware. The budget sweet spot stays ≤ 8 GiB.
 
-### A2 — MTP (SP-MoE amortization)
+### A2 — MTP (SP-MoE amortization) — SUPERSEDED, see Fase B retest
 
 - GLM-oQ4e 8 GiB + `--mtp`: 0.073 tok/s (+16 %) — within noise; the checkpoint has no `-mtp` suffix (draft weights likely stripped by the publisher).
 - Qwen 4 GiB + `--mtp`: 0.326 tok/s ≈ the no-MTP cold single run. Draft steps fault *their own* experts → bytes/step rise faster than accepted tokens pay back, in this I/O-bound regime.
-- Verdict: **MTP stays opt-in** (not default) for streaming models.
+- Fase A verdict "MTP stays opt-in" was an **access-method artifact**: the mmap+LRU stack put wall/call at 30 ms, so the cycle's 3.4 forwards/token (164 calls / 48 layers) dominated. Retested after pread + page-cache-only (B2) — see Fase B below: MTP is now a **win (+27–37 %)**.
 
 ### A3 — concurrent (batched) decode, GLM 8 GiB, distinct prompts
 
@@ -126,7 +126,8 @@ On a 48 GiB Mac with one ~330 MB/s SSD, GLM-190G decode is pinned to the I/O flo
 > access method, not the hardware. The 4 TB external SSD is a ~3.7 GB/s
 > NVMe; `mmap` + `MADV_RANDOM` cold page faults deliver only 0.2–0.4 GB/s.
 > Switching to one `os.pread` per contiguous expert slice lifted decode from
-> 0.063 to 0.336 tok/s (5.3×) — see the next section.
+> 0.063 to 0.336 tok/s (5.3×) — see the next section. Byte-adding strategies
+> (MTP drafts) also flipped sign once the per-call cost dropped — see B5.
 
 ## pread + parallel demand loads (the real fix)
 
@@ -203,13 +204,24 @@ Outputs diverge by design below 1.0 (FlashNext measured 7/10 identical tokens at
 - **Pins** (`OMLX_EXPERT_STREAMING_PIN=1`): observe routing for the first 8 decode calls, then `mlock` the page-aligned file ranges of the most frequent experts per layer within `OMLX_EXPERT_STREAMING_PIN_GIB` (default 1.25 GiB, `OMLX_EXPERT_STREAMING_PIN_TOKENS` for the window). Zero-copy — the locked pages ARE the file cache pages — but they become wired memory. The mapping address is obtained via `PyObject_GetBuffer` (read-only mmap cannot expose a writable buffer). Qwen 48-token decode: **1.538 → 1.764 tok/s (+15%)**; GLM short decode: neutral (13 MB experts → the budget covers ~2 experts/layer, and the 8-token observation eats half a 16-token run).
 - **Warm-only prefetch** (`OMLX_EXPERT_STREAMING_WARM=1`): before a layer's demand loads, fire discarded reads for the previous token's next-layer experts (independent routing repeats ~35% across adjacent tokens). On the 48 GiB Mac: **neutral to negative** (1.531 vs 1.538 alone; drags pins 1.764 → 1.624) — the QD8 demand path already saturates the NVMe, and warming adds read traffic. It exists for the 16 GB-class case FlashNext targets (small page cache, less demand pressure); leave it off otherwise. The old PILOT staging prefetcher (default OFF) is superseded by this.
 
+### B5 — MTP retest after the pread/page-cache stack: now a win
+
+Upstream v0.6.3 fixed Qwen4 Lightning MTP weight detection (#3200: qwen4_exp binds only the embedded `mtp.*` head; the draft layer carries its own `switch_mlp` bank, so the draft pass streams its experts like any other layer). Retested on the Fase B stack — Qwen, 0G page-cache-only, 48-token decode, cold:
+
+| config | tok/s | vs no-MTP (1.538) |
+|---|---|---|
+| MTP | 1.958 / 2.110 (with profile) | **+27–37 %** |
+| MTP + pins | 2.058 | **+34 %** |
+
+Why it flipped: the draft/verify cycle runs **3.4 target forwards per generated token** (164 MoE-layer calls / 48 layers — acceptance is modest), but the B1/B2 stack cut wall/call from 30 ms to **3.97 ms**. Per-token cost went from ~4.9 s (unpayable) to ~0.65 s of MoE I/O, and the wider verify reads reuse page-cache-resident experts from the draft rounds (`sync_ms_per_load` 0.16 ms). TTFT unchanged (~10 s cold). Conclusion: **enable Lightning MTP by default for streaming qwen4_exp checkpoints that ship `mtp.*` weights**; keep it opt-in elsewhere (GLM has no draft weights, DeepSeek untested on the new stack).
+
 ### Recommendation matrix
 
-| hardware | budget | pins | threshold |
-|---|---|---|---|
-| 48 GB+, model >> RAM | default (0) | optional (+15% Qwen) | 1.0 exact |
-| 48 GB+, quality flexible | default | optional | 0.85 |
-| 16 GB-class | default | `PIN=1` | 0.85 (+ `WARM=1` to test) |
+| hardware | budget | pins | threshold | MTP |
+|---|---|---|---|---|
+| 48 GB+, model >> RAM | default (0) | optional (+15% Qwen) | 1.0 exact | on (qwen4_exp with `mtp.*`) |
+| 48 GB+, quality flexible | default | optional | 0.85 | on (qwen4_exp with `mtp.*`) |
+| 16 GB-class | default | `PIN=1` | 0.85 (+ `WARM=1` to test) | on (qwen4_exp with `mtp.*`) |
 
 ## Trade-offs
 
