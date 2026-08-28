@@ -498,9 +498,16 @@ def convert_model_to_streaming(
     backing_kind = "ram"
     if use_file_backing:
         try:
+            import os
+
             from .shard_bank import ExpertBackingStore
 
-            backing = ExpertBackingStore(model_path)
+            extra_roots = [
+                p
+                for p in os.environ.get("OMLX_EXPERT_STREAMING_EXTRA_ROOTS", "").split(":")
+                if p.strip()
+            ]
+            backing = ExpertBackingStore(model_path, extra_roots=extra_roots)
             backing_kind = "mmap"
         except Exception as e:
             logger.warning("Expert streaming: file backing failed (%s), falling back to RAM dict", e)

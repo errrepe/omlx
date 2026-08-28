@@ -93,8 +93,12 @@ class _ShardReader:
 class ExpertBackingStore:
     """Open shard readers and serve per-expert mx.arrays on demand."""
 
-    def __init__(self, model_path: str | Path):
+    def __init__(self, model_path: str | Path, extra_roots: list[str | Path] | None = None):
         self.model_path = Path(model_path).expanduser().resolve()
+        # Optional stripe roots: per-shard files are resolved primary-first;
+        # roots listed here win for shards mirrored onto them (see
+        # _resolve_file) — used to stripe a big MoE across two SSDs.
+        self._extra_roots = [Path(r).expanduser().resolve() for r in (extra_roots or [])]
         self._readers: Dict[str, _ShardReader] = {}
         self._key_to_reader: Dict[str, _ShardReader] = {}
         self._key_to_shape_dtype: Dict[str, Tuple[Tuple[int, ...], str]] = {}
@@ -105,6 +109,18 @@ class ExpertBackingStore:
         self._weight_map = weight_map
         # Build header cache lazily
         self._header_cache: Dict[str, dict] = {}
+
+    def _roots(self) -> list[Path]:
+        return [self.model_path, *self._extra_roots]
+
+    def _resolve_file(self, fname: str) -> Path | None:
+        """Resolve a shard filename across roots (extra roots win: mirrored
+        shards on the stripe SSD are the ones we want served from there)."""
+        for root in reversed(self._roots()):
+            p = root / fname
+            if p.is_file():
+                return p
+        return None
 
     def _load_weight_map(self) -> Dict[str, str]:
         idx = self.model_path / "model.safetensors.index.json"
@@ -143,14 +159,19 @@ class ExpertBackingStore:
         if fname is None:
             # key may be a stacked name not in weight_map for sharded raw experts case;
             # try to find file containing key by scanning headers
-            for shard in self.model_path.glob("*.safetensors"):
-                hdr = self._header_for_file(shard)
-                if key in hdr:
-                    fname = shard.name
+            for root in self._roots():
+                for shard in root.glob("*.safetensors"):
+                    hdr = self._header_for_file(shard)
+                    if key in hdr:
+                        fname = shard.name
+                        break
+                if fname is not None:
                     break
         if fname is None:
             raise KeyError(f"Expert key {key!r} not in weight_map and not found in any shard")
-        fpath = self.model_path / fname
+        fpath = self._resolve_file(fname)
+        if fpath is None:
+            raise FileNotFoundError(f"Shard {fname!r} not found in any root of {self.model_path}")
         reader = self._readers.get(str(fpath))
         if reader is None:
             reader = _ShardReader(fpath)
@@ -160,10 +181,11 @@ class ExpertBackingStore:
 
     def tensor_shape(self, key: str) -> tuple[int, ...]:
         # try cached headers
-        for shard in self.model_path.glob("*.safetensors"):
-            hdr = self._header_for_file(shard)
-            if key in hdr:
-                return tuple(hdr[key]["shape"])
+        for root in self._roots():
+            for shard in root.glob("*.safetensors"):
+                hdr = self._header_for_file(shard)
+                if key in hdr:
+                    return tuple(hdr[key]["shape"])
         raise KeyError(key)
 
     def tensor_dtype(self, key: str) -> str | None:

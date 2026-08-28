@@ -574,3 +574,80 @@ def test_streaming_glu_uses_custom_activation():
     assert len(calls) == 1
     assert glu._activation is act
     assert out.shape == (1, 3, 2, hidden)
+
+
+def _write_shard(path: Path, tensors: dict[str, tuple[tuple[int, ...], str]]) -> None:
+    """Write a minimal safetensors file: valid headers + zero data."""
+    import numpy as np
+
+    _DTY_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "U32": 4, "U8": 1}
+    header: dict = {}
+    offset = 0
+    data: dict[str, int] = {}
+    for key, (shape, dtype) in tensors.items():
+        nbytes = int(np.prod(shape)) * _DTY_BYTES[dtype]
+        header[key] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + nbytes]}
+        offset += nbytes
+        data[key] = nbytes
+    hb = json.dumps(header).encode()
+    with path.open("wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+        f.write(b"\x00" * offset)
+
+
+def test_backing_store_multi_root_resolution():
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        primary = root / "model"
+        extra = root / "stripe"
+        extra.mkdir()
+        primary.mkdir()
+
+        # Primary shard: dense tensor only. Expert bank lives on the stripe root.
+        _write_shard(primary / "model.safetensors", {"model.embed_tokens.weight": ((64, 32), "BF16")})
+        _write_shard(extra / "experts.safetensors", {"model.layers.0.mlp.switch_mlp.gate_proj.weight": ((4, 16, 32), "BF16")})
+        (primary / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "model.embed_tokens.weight": "model.safetensors",
+                        "model.layers.0.mlp.switch_mlp.gate_proj.weight": "experts.safetensors",
+                    }
+                }
+            )
+        )
+
+        backing = ExpertBackingStore(primary, extra_roots=[extra])
+        assert backing._resolve_file("experts.safetensors") == (extra / "experts.safetensors").resolve()
+        slc = backing.load_expert_slice("model.layers.0.mlp.switch_mlp.gate_proj.weight", 2)
+        assert slc.shape == (16, 32)
+
+        # Without the extra root the expert key cannot resolve.
+        from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore as BS
+
+        primary_only = BS(primary)
+        with pytest.raises((KeyError, FileNotFoundError)):
+            primary_only.load_expert_slice("model.layers.0.mlp.switch_mlp.gate_proj.weight", 0)
+
+
+def test_backing_store_extra_root_wins_for_mirrored_shards():
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        primary = root / "model"
+        extra = root / "stripe"
+        primary.mkdir()
+        extra.mkdir()
+        _write_shard(primary / "model.safetensors", {"model.embed_tokens.weight": ((64, 32), "BF16")})
+        _write_shard(extra / "model.safetensors", {"model.embed_tokens.weight": ((64, 32), "BF16")})
+        (primary / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"model.embed_tokens.weight": "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(primary, extra_roots=[extra])
+        # Mirrored shard is served from the stripe root (that copy is the
+        # striped one the user placed there deliberately).
+        assert backing._resolve_file("model.safetensors") == (extra / "model.safetensors").resolve()
