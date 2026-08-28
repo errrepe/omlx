@@ -3524,7 +3524,7 @@ class Scheduler:
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
 
-            _throttle_pre = get_phys_footprint()
+            _throttle_pre = self._throttle_probe_bytes()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
@@ -3558,7 +3558,7 @@ class Scheduler:
                     if extra_kwargs:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
-            _throttle_post = get_phys_footprint()
+            _throttle_post = self._throttle_probe_bytes()
             self._record_chunk_transient(
                 n_to_process,
                 _throttle_pre,
@@ -3788,8 +3788,70 @@ class Scheduler:
     # scales with query_len * kv_len, so per-token cost grows with context
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
+
+    # Streaming expert mini-banks: predicted unique experts touched per layer
+    # per chunk, as a fraction of chunk tokens. Measured ~0.145 on qwen4_exp
+    # (215 uniq experts/layer at 1488-token chunks — real-text expert selection
+    # follows a power law and saturates far below 512); 0.2 keeps ~40%
+    # headroom without over-predicting mid-size chunks into guard rejection.
+    # Env-overridable.
+    _STREAMING_BANK_TOKEN_RATIO: float = float(
+        os.environ.get("OMLX_STREAMING_BANK_TOKEN_RATIO", "") or 0.2
+    )
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
+
+    _streaming_guard_info: dict | None = None
+
+    def _streaming_bank_bytes(self, n_tokens: int) -> int:
+        """Predicted live expert mini-bank bytes for one streaming chunk.
+
+        The chunk forward is lazy: every MoE layer's assembled mini-bank stays
+        referenced by the graph until the chunk-end eval, so the peak carries
+        roughly one bank per layer simultaneously. The static transient model
+        (SDPA + KV) cannot see this term — without it the guard admits 400+
+        token chunks whose real peak reaches ~26 GB on qwen4_exp (48 layers x
+        ~215 uniq experts x ~2.5 MB) and starves the machine (F1 finding).
+        """
+        info = self._streaming_guard_info
+        if info is None:
+            info = self._resolve_streaming_guard_info()
+        if not info:
+            return 0
+        uniq = min(
+            int(info["experts_per_layer"]),
+            int(self._STREAMING_BANK_TOKEN_RATIO * max(0, n_tokens)),
+        )
+        return int(info["num_moe_layers"]) * uniq * int(info["per_expert_bytes"])
+
+    def _resolve_streaming_guard_info(self) -> dict:
+        """Find the streaming backing's guard metadata on the model tree.
+
+        The scheduler's model may be a bare language model, a VLM wrapper, or
+        the VLMModelAdapter (which holds the VLM under ``_vlm_model`` /
+        ``_language_model``) — walk whichever exists. The backing lives on
+        the converted model (engine/vlm.py sets ``_expert_streaming_backing``).
+        """
+        self._streaming_guard_info = {}
+        cur: Any = getattr(self, "model", None)
+        seen = 0
+        while cur is not None and seen < 5:
+            backing = getattr(cur, "_expert_streaming_backing", None)
+            info = getattr(backing, "streaming_guard_info", None)
+            if info:
+                self._streaming_guard_info = dict(info)
+                break
+            cur = (
+                getattr(cur, "language_model", None)
+                or getattr(cur, "model", None)
+                or getattr(cur, "_vlm_model", None)
+                or getattr(cur, "_language_model", None)
+            )
+            # VLMModelAdapter._vlm_model IS the model the engine set the
+            # backing on — but its .model property chain could loop; each hop
+            # above moves to a distinct object, and the depth cap bounds it.
+            seen += 1
+        return self._streaming_guard_info
 
     def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
@@ -3820,12 +3882,19 @@ class Scheduler:
             if tracker.bytes_per_token > 0:
                 per_token = max(per_token, tracker.bytes_per_token)
             recent_reclaim = tracker.recent_reclaim_bytes
+        static_total = 0.0
         if self.memory_monitor is not None:
-            static = self.memory_monitor.estimate_chunk_transient_bytes(
-                n_tokens, kv_len + n_tokens
+            static_total = float(
+                self.memory_monitor.estimate_chunk_transient_bytes(
+                    n_tokens, kv_len + n_tokens
+                )
             )
-            static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
-            static_per_token = float(static) / n_tokens
+            static_total += float(
+                self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
+            )
+        bank_bytes = self._streaming_bank_bytes(n_tokens)
+        if bank_bytes > 0 or static_total > 0:
+            static_per_token = (static_total + bank_bytes) / n_tokens
             per_token = max(per_token, static_per_token)
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
@@ -3857,7 +3926,16 @@ class Scheduler:
         bound = self._predicted_chunk_transient(n_tokens, kv_len)
         tracker = self._prefill_transient_tracker
         if tracker is not None:
-            bound = max(bound, float(tracker.observed_max_bytes))
+            floor = float(tracker.observed_max_bytes)
+            if floor > 0 and self._streaming_bank_bytes(n_tokens) > 0:
+                # Streaming bank transients scale ~linearly with chunk size
+                # (uniq experts per layer grows with tokens), so a large
+                # chunk's measured transient must not floor-limit smaller
+                # chunks — otherwise the guard rejects every shrunken chunk
+                # and the prefill dies with PrefillMemoryExceededError.
+                n_obs = max(int(tracker.last_n_tokens), 1)
+                floor = min(floor, floor * n_tokens / n_obs)
+            bound = max(bound, floor)
         return bound
 
     def _prefill_abort_cap(self) -> int:
@@ -4371,11 +4449,26 @@ class Scheduler:
         Scheduler steps run on the MLX executor thread, so they can refresh
         mx.get_active_memory() safely. Event-loop callers such as early
         preflight use the cached executor sample and phys_footprint instead.
+
+        Streaming models (budget-0 page-cache mode): the phys footprint also
+        carries the clean, evictable file pages of every expert slice read
+        from the mmap'd shards — pages the OS drops under pressure without
+        swapping, not a memory commitment. Charging them makes the guard
+        reject every long prompt once enough experts have streamed through
+        (measured: phys 21.5GB while Metal active stayed 4.5GB). For a
+        streaming backing, only the live Metal allocation counts.
         """
         active = self._last_mlx_active_memory_bytes
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
             self._last_mlx_active_memory_bytes = active
+        if self._streaming_guard_info is None:
+            # Lazy-resolve so even the first guard/throttle call (before any
+            # _streaming_bank_bytes invocation) sees the streaming model.
+            self._resolve_streaming_guard_info()
+        if self._streaming_guard_info:
+            # Streaming backing resolved: active Metal is the real commitment.
+            return active
         hot_cache_cpu_bytes = getattr(self, "_hot_cache_cpu_bytes", None)
         if callable(hot_cache_cpu_bytes):
             hot_cache_bytes = hot_cache_cpu_bytes()
@@ -4578,6 +4671,24 @@ class Scheduler:
             logger.debug("Failed to sample memory for hot-cache pressure bypass")
             return False
         return current >= self._memory_limit_bytes
+
+    def _throttle_probe_bytes(self) -> int:
+        """Footprint probe for the per-chunk transient tracker.
+
+        The phys footprint delta is the legacy signal, but on streaming models
+        it also carries the mmap'd shard's clean file pages that ride along
+        with every expert read — evictable cache, not a commitment (measured:
+        a 512-token chunk "grew" 20GB of phys while Metal active grew ~5GB).
+        That poisons the tracker into charging the page cache at admission
+        and rejecting every later chunk. For a streaming backing, track the
+        Metal active high-water instead: exactly the banks + activations the
+        chunk really commits.
+        """
+        if self._streaming_guard_info is None:
+            self._resolve_streaming_guard_info()
+        if self._streaming_guard_info:
+            return max(0, int(mx.get_active_memory()))
+        return get_phys_footprint()
 
     def _record_chunk_transient(
         self,
@@ -5106,7 +5217,7 @@ class Scheduler:
             state.request.benchmark_prefill_chunks.append(int(n))
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
-        _throttle_pre = get_phys_footprint()
+        _throttle_pre = self._throttle_probe_bytes()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
@@ -5121,7 +5232,7 @@ class Scheduler:
                 self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
-        _throttle_post = get_phys_footprint()
+        _throttle_post = self._throttle_probe_bytes()
         self._record_chunk_transient(
             n,
             _throttle_pre,

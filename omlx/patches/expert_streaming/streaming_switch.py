@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 _PROFILE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
 _COALESCE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_COALESCE", "") != "0"
+# Prefill attribution diag: sync the GPU at every prefill-sized MoE GLU call
+# and record the drain as a per-layer gpu bucket. Serializes CPU/GPU overlap
+# (wall inflates), so use it for attribution only — never for latency claims.
+_PREFILL_DIAG_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PREFILL_DIAG", "") == "1"
+# Routes above this count are treated as prefill-sized for the diag sync.
+_PREFILL_DIAG_MIN_ROUTES = 512
 
 # Parallel os.pread pool for the demand-set of one MoE layer call. Workers
 # return raw numpy slices only — MLX promotion happens on the inference
@@ -44,6 +50,7 @@ class LayerProfile:
     unique_s: float = 0.0
     load_s: float = 0.0
     stack_s: float = 0.0
+    gpu_s: float = 0.0
     load_hits: int = 0
     load_misses: int = 0
     experts_requested: int = 0
@@ -116,6 +123,12 @@ class ProfileAccumulator:
             return
         self.wall_s[idx] = self.wall_s.get(idx, 0.0) + dt
 
+    def add_gpu(self, idx: int, dt: float) -> None:
+        if not self.enabled:
+            return
+        lp = self.layers.setdefault(idx, LayerProfile())
+        lp.gpu_s += dt
+
     def add_load_source(self, idx: int, *, staged: bool, dt: float) -> None:
         if not self.enabled:
             return
@@ -139,6 +152,7 @@ class ProfileAccumulator:
                 "unique_ms": lp.unique_s / c * 1e3,
                 "load_ms": lp.load_s / c * 1e3,
                 "stack_ms": lp.stack_s / c * 1e3,
+                "gpu_ms": lp.gpu_s / c * 1e3,
                 "wall_ms": self.wall_s.get(idx, 0.0) / c * 1e3,
                 "load_hits": lp.load_hits,
                 "load_misses": lp.load_misses,
@@ -155,6 +169,7 @@ class ProfileAccumulator:
             totals.unique_s += lp.unique_s
             totals.load_s += lp.load_s
             totals.stack_s += lp.stack_s
+            totals.gpu_s += lp.gpu_s
             totals.load_hits += lp.load_hits
             totals.load_misses += lp.load_misses
             totals.experts_requested += lp.experts_requested
@@ -170,6 +185,7 @@ class ProfileAccumulator:
             "unique_ms": totals.unique_s / n * 1e3,
             "load_ms": totals.load_s / n * 1e3,
             "stack_ms": totals.stack_s / n * 1e3,
+            "gpu_ms": totals.gpu_s / n * 1e3,
             "load_hits": totals.load_hits,
             "load_misses": totals.load_misses,
             "hit_rate_global": totals.load_hits / max(totals.load_hits + totals.load_misses, 1),
@@ -968,6 +984,21 @@ class StreamingSwitchGLU(nn.Module):
 
         if hook is not None:
             hook.on_layer_plan(self.layer_idx, plan.uniq_list, plan.positions)
+
+        if (
+            _PREFILL_DIAG_ENV
+            and p is not None
+            and p.enabled
+            and int(indices.size) >= _PREFILL_DIAG_MIN_ROUTES
+        ):
+            # Force-eval the layer's graph (everything upstream is a lazy
+            # dependency of x_out, so with a sync at every MoE GLU each eval
+            # covers exactly one layer's segment: attention + dense + GLU
+            # QMMs). CPU buckets measured inside the linears remain valid;
+            # absolute wall inflates because the CPU/GPU overlap is gone.
+            t_gpu0 = time.perf_counter()
+            mx.eval(x_out)
+            p.add_gpu(self.layer_idx, time.perf_counter() - t_gpu0)
 
         # weighted sum fast path — keep compatible but may not use fast kernel when streaming
         if weighted_sum and scores is not None and do_sort:

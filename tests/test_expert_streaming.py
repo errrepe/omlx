@@ -1105,3 +1105,110 @@ def test_pin_controller_pins_within_budget():
             time.sleep(0.05)
         assert backing.pinned_count > 0
         assert 0 < backing.pinned_bytes <= (1 << 20) + (1 << 12)
+
+
+class _GuardBackingStub:
+    """Minimal backing exposing only streaming_guard_info for the scheduler."""
+
+    def __init__(self, num_moe_layers, experts_per_layer, per_expert_bytes):
+        self.streaming_guard_info = {
+            "num_moe_layers": num_moe_layers,
+            "experts_per_layer": experts_per_layer,
+            "per_expert_bytes": per_expert_bytes,
+        }
+
+
+def _guard_scheduler(model):
+    """A Scheduler via __new__ with only the transient-model attrs wired."""
+    from omlx.scheduler import Scheduler
+
+    sched = Scheduler.__new__(Scheduler)
+    sched.model = model
+    sched._prefill_transient_tracker = None
+    sched.memory_monitor = None
+    return sched
+
+
+def test_streaming_bank_bytes_bound_and_saturation():
+    back = _GuardBackingStub(48, 512, 2_500_000)
+    model = MagicMock()
+    model._expert_streaming_backing = back
+    sched = _guard_scheduler(model)
+    ratio = sched._STREAMING_BANK_TOKEN_RATIO
+
+    # Small chunk: banks scale with tokens (uniq ~ ratio * n per layer).
+    small = sched._streaming_bank_bytes(100)
+    assert small == 48 * int(ratio * 100) * 2_500_000
+    # Saturation at experts_per_layer.
+    big = sched._streaming_bank_bytes(10_000)
+    assert big == 48 * 512 * 2_500_000
+    # Monotone in between.
+    assert small < sched._streaming_bank_bytes(413) < big
+
+
+def test_streaming_bank_bytes_absent_without_backing():
+    model = MagicMock()
+    del model._expert_streaming_backing  # MagicMock: raise AttributeError
+    sched = _guard_scheduler(model)
+    assert sched._streaming_bank_bytes(413) == 0
+    assert sched._predicted_chunk_transient(413, 0) == 0.0
+
+
+def test_predicted_chunk_transient_includes_bank_term():
+    back = _GuardBackingStub(48, 512, 2_500_000)
+    model = MagicMock()
+    model._expert_streaming_backing = back
+    sched = _guard_scheduler(model)
+
+    pred = sched._predicted_chunk_transient(413, 0)
+    uniq = min(512, int(sched._STREAMING_BANK_TOKEN_RATIO * 413))
+    expected = 48 * uniq * 2_500_000 * sched._PREFILL_TRANSIENT_SAFETY
+    assert pred == pytest.approx(expected)
+
+
+def test_admission_floor_scales_down_for_streaming_chunks():
+    """A big chunk's measured transient must not floor-limit smaller chunks
+    when streaming banks dominate (they scale ~linearly with tokens)."""
+    from types import SimpleNamespace
+
+    from omlx.scheduler import Scheduler
+    from omlx.prefill_transient_tracker import PrefillTransientTracker
+
+    back = _GuardBackingStub(48, 512, 2_500_000)
+    model = MagicMock()
+    model._expert_streaming_backing = back
+    sched = _guard_scheduler(model)
+    tracker = PrefillTransientTracker()
+    tracker.update(1897, int(17_385_500))  # measured 17.4MB/token at 1.9k chunk
+    tracker._observed_max_bytes = float(1897 * 17_385_500)  # ~32GB
+    tracker._last_n_tokens = 1897
+    sched._prefill_transient_tracker = tracker
+
+    n_small = 512
+    bound = Scheduler._admission_transient_bound(sched, n_small, 0)
+    # The floor is discounted linearly (never the raw ~32GB)...
+    floor = tracker.observed_max_bytes * n_small / 1897
+    assert floor < tracker.observed_max_bytes
+    # ...so the bound is the bank-aware predicted term, which itself stays
+    # below the raw observed max.
+    uniq = min(512, int(sched._STREAMING_BANK_TOKEN_RATIO * n_small))
+    expected_pred = 48 * uniq * 2_500_000 * sched._PREFILL_TRANSIENT_SAFETY
+    assert bound == pytest.approx(max(expected_pred, floor))
+    assert bound < tracker.observed_max_bytes
+
+
+def test_admission_floor_kept_without_streaming():
+    """Non-streaming keeps the conservative size-invariant observed_max floor."""
+    from omlx.scheduler import Scheduler
+    from omlx.prefill_transient_tracker import PrefillTransientTracker
+
+    sched = _guard_scheduler(MagicMock())
+    del sched.model._expert_streaming_backing
+    tracker = PrefillTransientTracker()
+    tracker.update(1897, int(17_385_500))
+    tracker._observed_max_bytes = 32.0 * 1024**3
+    tracker._last_n_tokens = 1897
+    sched._prefill_transient_tracker = tracker
+
+    bound = Scheduler._admission_transient_bound(sched, 512, 0)
+    assert bound == pytest.approx(32.0 * 1024**3)

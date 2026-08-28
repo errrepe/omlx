@@ -117,6 +117,7 @@ async def run(
     mtp_block: int | None = None,
     ane: bool = False,
     warm_control: float = 0.0,
+    mem_ceiling: float = 28.0,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -155,6 +156,27 @@ async def run(
     t_load = time.perf_counter() - t0
     phys_loaded = get_phys_footprint() / 1024**3
     print(f"engine loaded {t_load:.1f}s phys {phys_loaded:.2f}G active {mx.get_active_memory() / 1024**3:.2f}G")
+
+    # Honest memory limits: without an enforcer the scheduler's prefill
+    # throttle/guard never engage (limits stay 0) and the lazy chunk forward's
+    # measured ~17MB/token transient (streaming expert mini-banks) runs
+    # unbounded — the Metal buffer pool reached ~30 GiB on 8k prompts and
+    # squeezed the machine into swap (F-series F1). Set the same watermarks
+    # the server's ProcessMemoryEnforcer would propagate.
+    try:
+        _eng = pool.get_entry(entry_name).engine
+        _sched = getattr(getattr(getattr(_eng, "_engine", None), "engine", None), "scheduler", None)
+        if _sched is not None:
+            gib = 1024**3
+            _sched._memory_hard_limit_bytes = int(mem_ceiling * gib)
+            _sched._memory_limit_bytes = int(mem_ceiling * 0.9 * gib)
+            _sched._memory_abort_limit_bytes = int(mem_ceiling * 0.95 * gib)
+            print(
+                f"scheduler memory limits: hard {mem_ceiling:.0f}G "
+                f"soft {mem_ceiling * 0.9:.0f}G abort {mem_ceiling * 0.95:.0f}G"
+            )
+    except Exception as e:
+        print(f"scheduler limit setup skipped: {e}")
 
     vlm_model = getattr(engine, "_vlm_model", None)
     cache = find_streaming_cache(vlm_model)
@@ -334,8 +356,27 @@ def main():
     ap.add_argument("--mtp-block", type=int, default=None, help="vlm_mtp_draft_block_size (MTP tokens per round)")
     ap.add_argument("--ane", action="store_true", help="enable qwen35 ANE prefill")
     ap.add_argument("--warm-control", type=float, default=0.0, metavar="GIB", help="post-load deterministic warmup budget")
+    ap.add_argument("--min-free-gb", type=float, default=22.0, metavar="GB",
+                    help="abort when available memory is below this (memory-starved runs fragment prefill "
+                         "into many chunks, re-stream experts, and thrash the page cache)")
+    ap.add_argument("--mem-ceiling-gib", type=float, default=28.0, metavar="GIB",
+                    help="scheduler memory ceiling propagated as throttle/guard watermarks (the server "
+                         "gets this from the ProcessMemoryEnforcer; the bench has no enforcer)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    try:
+        import psutil
+
+        free_gb = psutil.virtual_memory().available / 1024**3
+        if free_gb < args.min_free_gb:
+            raise SystemExit(
+                f"bench aborted: only {free_gb:.1f} GB available (need {args.min_free_gb:.0f}+). "
+                "Memory-starved runs fragment prefill into many chunks and re-stream experts — "
+                "close apps or lower --min-free-gb to override."
+            )
+        print(f"memory preflight ok: {free_gb:.1f} GB available", flush=True)
+    except ImportError:
+        pass
     asyncio.run(
         run(
             args.model,
@@ -348,6 +389,7 @@ def main():
             mtp_block=args.mtp_block,
             ane=args.ane,
             warm_control=args.warm_control,
+            mem_ceiling=args.mem_ceiling_gib,
         )
     )
 

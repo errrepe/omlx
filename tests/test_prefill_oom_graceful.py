@@ -131,6 +131,11 @@ def _throttle_ctx(
     # Bind the real helper methods so the stand-in behaves like a Scheduler.
     ns._snap_chunk_size = Scheduler._snap_chunk_size.__get__(ns, Scheduler)
     ns._current_usage_bytes = Scheduler._current_usage_bytes.__get__(ns, Scheduler)
+    ns._streaming_guard_info = None
+    ns._streaming_bank_bytes = Scheduler._streaming_bank_bytes.__get__(ns, Scheduler)
+    ns._resolve_streaming_guard_info = Scheduler._resolve_streaming_guard_info.__get__(
+        ns, Scheduler
+    )
     ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
         ns, Scheduler
     )
@@ -732,6 +737,11 @@ def test_record_chunk_transient_skips_partial_speed_sample():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
+    ns._streaming_guard_info = None
+    ns._streaming_bank_bytes = Scheduler._streaming_bank_bytes.__get__(ns, Scheduler)
+    ns._resolve_streaming_guard_info = Scheduler._resolve_streaming_guard_info.__get__(
+        ns, Scheduler
+    )
 
     full_delta = 512 * 1024**2
     ns._record_chunk_transient(
@@ -857,6 +867,11 @@ def test_step_prefill_reclaims_before_first_guard():
     ns._decode_time_owed_s = 0.0
     ns._decode_activity_key = "test-engine"
     ns._prefill_tps_best = None
+    ns._streaming_guard_info = None
+    ns._resolve_streaming_guard_info = Scheduler._resolve_streaming_guard_info.__get__(
+        ns, Scheduler
+    )
+    ns._throttle_probe_bytes = Scheduler._throttle_probe_bytes.__get__(ns, Scheduler)
     for _name in (
         "_prefill_step_size_for_progress",
         "_base_prefill_step_size",

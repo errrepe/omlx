@@ -518,6 +518,18 @@ def convert_model_to_streaming(
                 if p.strip()
             ]
             backing = ExpertBackingStore(model_path, extra_roots=extra_roots)
+            # Guard metadata for the scheduler's prefill chunk sizing: the
+            # lazy chunk forward holds every MoE layer's assembled mini-bank
+            # until the chunk-end eval, so the peak carries ~one bank per
+            # layer simultaneously. Without this term the guard under-predicts
+            # and admits chunks whose real peak reaches ~26 GB on qwen4_exp
+            # (48 layers x ~215 uniq experts x ~2.5 MB) and squeezes the
+            # machine (docs F-series F1).
+            backing.streaming_guard_info = {
+                "num_moe_layers": estimate.num_moe_layers,
+                "experts_per_layer": estimate.experts_per_layer,
+                "per_expert_bytes": estimate.per_expert_bytes,
+            }
             backing_kind = "mmap"
         except Exception as e:
             logger.warning("Expert streaming: file backing failed (%s), falling back to RAM dict", e)
