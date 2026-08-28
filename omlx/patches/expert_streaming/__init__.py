@@ -501,7 +501,11 @@ def convert_model_to_streaming(
     from .streaming_switch import ExpertLRUCache
 
     per_expert = estimate.per_expert_bytes or 0
-    cache = ExpertLRUCache(budget_bytes, per_expert, num_layers=estimate.num_moe_layers)
+    # One cache slot holds ONE projection's slice (gate/up/down are separate
+    # keys), so slot sizing must divide by the projections per expert —
+    # otherwise the LRU holds a third of the budget it was promised (F2).
+    per_slot = max(1, per_expert // 3) if per_expert else 0
+    cache = ExpertLRUCache(budget_bytes, per_slot, num_layers=estimate.num_moe_layers)
 
     # Backing store
     backing = None
