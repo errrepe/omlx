@@ -485,6 +485,32 @@ the resident measurement represents the streamed path. This is the quality
 gate for I5: compare the oQ4e checkpoint against its cold-tier variant on the
 same corpus before trusting the tier.
 
+`--streaming` loads through the omlx streaming engine instead — for the
+production checkpoints (GLM 190 GB, Qwen 99 GB) the expert banks far exceed
+RAM, so the resident path cannot load them at all. `--cold-tier none|2|3`
+selects the arm; `--ctx 1000` is used for the GLM gate (see the affine-tile
+bug below for why not 1024).
+
+**Affine-tile corruption at T >= 1024 (found by this harness).** The first
+long streaming run read ppl ~28k: uniform logits, NLL ≈ ln(vocab). A causal
+differential (hidden states at positions 0..511 must be bit-identical between
+a 512- and a 1024-token forward) traced the divergence to layer 0 of
+glm5_next — a linear-attention layer with a dense FFN, i.e. before any MoE
+— and a capture of the layer-0 `gated_delta_update` inputs showed the kernel
+inputs q/k/v/b bit-identical while `a` (from the fused in-proj) differed by
+~8.0. The fused in-proj (N = 24896, 64-aligned) routes through the shared
+`qwen35_q4_affine_qmm_t` custom tile at T >= 128; the tile is exact for that
+weight up to T = 1000 and corrupts segments at T >= 1024. The production
+chat path is unaffected — the scheduler's streaming bank guard steps prefill
+chunks down to <= 512 tokens, and a 2.5k-token GLM chat completion verified
+coherent — but any direct >= 1024-token forward (raw evals, future kernels)
+produced garbage. Guard added in
+`patches/mlx_vlm_glm5_next_compat/.../glm5_next/linear.py`
+(`_tile_corrupts_at_long_prefill`): wide weights (> 8192 rows) at T >= 1024
+fall back to `mx.quantized_matmul`; narrow shapes (the q8 indexer,
+N = 4096/T = 1024, test-pinned) keep the tile. The underlying tile bug is
+still open — the guard is containment, not a fix.
+
 ### I5 — cold precision tier (uniform)
 
 `tools/requant_cold_tier.py` writes `<model>/expert_cold/`: the full switch_mlp
@@ -511,6 +537,10 @@ that caps GLM decode.
 - Runtime-signature governed; excluded from profiles.
 - **Quality gate before any default**: run I4 on the oQ4e checkpoint and the
   cold variant; publish the delta before enabling the tier anywhere.
+- Tiers generated (3-bit, same group size as source): GLM-5.3-Flash-oQ4e
+  141.8 → 106.3 GiB (0.75×, 126 banks / 33 shards, requant err ≤ ~0.03
+  typical), Qwen3.8-Flash-Next 57.4 → 43.1 GiB (0.75×). 2-bit halves the
+  4-bit bytes instead if the 3-bit quality delta proves too small to ship.
 - Pending measurement: tok/s / TTFT A/B (idle window) + the I4 ppl delta.
 
 ## References

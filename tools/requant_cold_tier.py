@@ -151,6 +151,9 @@ def requant_shard(
         arrays[f"{prefix}.biases"] = b2.astype(mx.bfloat16)
         src_bytes += w.nbytes
         dst_bytes += w2.nbytes
+        # Drop the dense/requant transients from the Metal buffer pool —
+        # banks are multi-GiB and the pool would otherwise grow to OOM.
+        mx.clear_cache()
 
     dst_dir.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(

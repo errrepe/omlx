@@ -6,6 +6,18 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def _tile_corrupts_at_long_prefill(x: mx.array, weight: mx.array) -> bool:
+    """The shared affine tile silently corrupts wide glm5_next weights in
+    long single-shot forwards: the 24896-row fused in-proj is exact up to
+    T=1000 and produces wrong segments at T >= 1024 (I4 ppl harness: ppl
+    ~28k at ctx 1024 vs 4.7 at 1000; the corruption amplifies through the
+    stack). Narrow, proven-healthy shapes keep the tile (the q8 indexer at
+    N=4096/T=1024 is pinned by a test). Chat never sends chunks this large —
+    the streaming bank guard steps prefill down to <= 512 — so the guard
+    only affects direct >= 1024-token forwards, which are wrong today."""
+    return x.shape[-2] >= 1024 and weight.shape[0] > 8192
+
+
 def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
     bits = int(getattr(linear, "bits", 0) or 0)
     group_size = int(getattr(linear, "group_size", 0) or 0)
@@ -15,6 +27,8 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
         return None
     min_tokens = 1024 if bits == 8 else 128
     if x.ndim < 2 or x.shape[-2] < min_tokens:
+        return None
+    if _tile_corrupts_at_long_prefill(x, linear.weight):
         return None
 
     try:
@@ -73,6 +87,7 @@ def fused_quantized_matmul(
     if (
         x.ndim >= 2
         and x.shape[-2] >= min_tokens
+        and not _tile_corrupts_at_long_prefill(x, weight)
         and bits in (2, 4, 5, 6, 8)
         and group_size in (64, 128)
         and weight.ndim == scales.ndim == biases.ndim == 2

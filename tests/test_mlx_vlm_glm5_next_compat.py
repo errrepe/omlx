@@ -650,3 +650,42 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
 
     assert calls == 1
     assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+def test_glm5_next_wide_fused_projection_skips_tile_at_long_prefill():
+    """Regression (I4 ppl harness): the shared affine tile corrupts the
+    24896-row fused in-proj on >= 1024-token single-shot forwards — layer 0
+    of glm5_next diverged while its q/k/v/b kernel inputs stayed
+    bit-identical, and the ppl harness read ~28k at ctx 1024 vs 4.7 at 1000.
+    The guard must block wide weights at T >= 1024 while narrow ones (the
+    q8 indexer, pinned above) keep the tile."""
+    import mlx.nn as nn
+    from mlx_vlm.models.glm5_next.linear import (
+        _tile_corrupts_at_long_prefill,
+        linear_forward,
+    )
+
+    mx.random.seed(37)
+    # Same shape family as the real fused in-proj: N = 3*8192 + 128 + 128 + 64.
+    base = nn.Linear(4096, 24896, bias=False)
+    base.set_dtype(mx.float16)
+    linear = base.to_quantized(group_size=64, bits=4, mode="affine")
+    weight = linear.weight
+
+    assert _tile_corrupts_at_long_prefill(
+        mx.zeros((1, 1024, 4096), dtype=mx.float16), weight
+    )
+    assert not _tile_corrupts_at_long_prefill(
+        mx.zeros((1, 1000, 4096), dtype=mx.float16), weight
+    )
+    assert not _tile_corrupts_at_long_prefill(
+        mx.zeros((1, 1024, 1536), dtype=mx.float16),
+        mx.zeros((4096, 768), dtype=mx.uint32),
+    )
+
+    # The 1024-token forward of the wide weight must match the reference path.
+    x = mx.random.normal((1, 1024, 4096), dtype=mx.float16)
+    reference = linear(x)
+    actual = linear_forward(linear, x)
+    mx.eval(actual, reference)
+    assert mx.allclose(actual, reference, atol=5e-3, rtol=5e-3).item()
