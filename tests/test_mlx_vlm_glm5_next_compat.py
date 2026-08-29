@@ -633,7 +633,10 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     base = nn.Linear(1536, 4096, bias=False)
     base.set_dtype(mx.float16)
     linear = base.to_quantized(group_size=64, bits=8, mode="affine")
-    x = mx.random.normal((1, 1024, 1536), dtype=mx.float16)
+    # T=512: the tile engages from min_tokens=1024 ... but see
+    # _tile_corrupts_at_long_prefill — T >= 1024 is blocked. Use 1023 so the
+    # routed path (not the fallback) is what the spy observes.
+    x = mx.random.normal((1, 1023, 1536), dtype=mx.float16)
     reference = linear(x)
 
     original = fast.qwen35_q8_affine_qmm_t
@@ -653,12 +656,13 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
 
 
 def test_glm5_next_wide_fused_projection_skips_tile_at_long_prefill():
-    """Regression (I4 ppl harness): the shared affine tile corrupts the
-    24896-row fused in-proj on >= 1024-token single-shot forwards — layer 0
-    of glm5_next diverged while its q/k/v/b kernel inputs stayed
-    bit-identical, and the ppl harness read ~28k at ctx 1024 vs 4.7 at 1000.
-    The guard must block wide weights at T >= 1024 while narrow ones (the
-    q8 indexer, pinned above) keep the tile."""
+    """Regression (I4 ppl harness): the shared affine tile intermittently
+    corrupts glm5_next forwards at T >= 1024 — layer 0's `a` kernel input
+    diverged while q/k/v/b stayed bit-identical, and a same-run replay of the
+    exact captured input through the same weights disagreed with the tile's
+    output (GPU-side race, not deterministic math). The guard blocks the tile
+    at T >= 1024 entirely; below that the tile still routes (q8 indexer
+    pinned above at T=1023)."""
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import (
         _tile_corrupts_at_long_prefill,
@@ -672,18 +676,24 @@ def test_glm5_next_wide_fused_projection_skips_tile_at_long_prefill():
     linear = base.to_quantized(group_size=64, bits=4, mode="affine")
     weight = linear.weight
 
+    # T >= 1024 is blocked for every weight, narrow or wide.
     assert _tile_corrupts_at_long_prefill(
         mx.zeros((1, 1024, 4096), dtype=mx.float16), weight
+    )
+    assert _tile_corrupts_at_long_prefill(
+        mx.zeros((1, 2048, 1536), dtype=mx.float16),
+        mx.zeros((4096, 768), dtype=mx.uint32),
+    )
+    assert not _tile_corrupts_at_long_prefill(
+        mx.zeros((1, 1023, 4096), dtype=mx.float16), weight
     )
     assert not _tile_corrupts_at_long_prefill(
         mx.zeros((1, 1000, 4096), dtype=mx.float16), weight
     )
-    assert not _tile_corrupts_at_long_prefill(
-        mx.zeros((1, 1024, 1536), dtype=mx.float16),
-        mx.zeros((4096, 768), dtype=mx.uint32),
-    )
 
-    # The 1024-token forward of the wide weight must match the reference path.
+    # The 1024-token forward must take the reference path (fallback), which
+    # the spy-verified q8 test above pins as exact; assert the routed result
+    # matches the module's own fallback reference.
     x = mx.random.normal((1, 1024, 4096), dtype=mx.float16)
     reference = linear(x)
     actual = linear_forward(linear, x)

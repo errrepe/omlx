@@ -7,15 +7,16 @@ import mlx.nn as nn
 
 
 def _tile_corrupts_at_long_prefill(x: mx.array, weight: mx.array) -> bool:
-    """The shared affine tile silently corrupts wide glm5_next weights in
-    long single-shot forwards: the 24896-row fused in-proj is exact up to
-    T=1000 and produces wrong segments at T >= 1024 (I4 ppl harness: ppl
-    ~28k at ctx 1024 vs 4.7 at 1000; the corruption amplifies through the
-    stack). Narrow, proven-healthy shapes keep the tile (the q8 indexer at
-    N=4096/T=1024 is pinned by a test). Chat never sends chunks this large —
-    the streaming bank guard steps prefill down to <= 512 — so the guard
-    only affects direct >= 1024-token forwards, which are wrong today."""
-    return x.shape[-2] >= 1024 and weight.shape[0] > 8192
+    """The shared affine tile intermittently corrupts glm5_next forwards at
+    T >= 1024 (I4 ppl harness: ppl ~28k at ctx 1024 vs 4.38 base at 1000,
+    layer-0 `a` diverging while every other kernel input stays bit-identical;
+    same-run replay of the exact captured input through the same weights
+    disagrees with the tile's own output — a GPU-side race in the tile, not a
+    deterministic math error, and not reproducible in isolation). Chat never
+    sends chunks this large (the streaming bank guard steps prefill down to
+    <= 512), so blocking the tile at T >= 1024 only affects raw >= 1024-token
+    forwards, which are wrong today."""
+    return x.shape[-2] >= 1024
 
 
 def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):

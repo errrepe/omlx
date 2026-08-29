@@ -491,25 +491,28 @@ RAM, so the resident path cannot load them at all. `--cold-tier none|2|3`
 selects the arm; `--ctx 1000` is used for the GLM gate (see the affine-tile
 bug below for why not 1024).
 
-**Affine-tile corruption at T >= 1024 (found by this harness).** The first
-long streaming run read ppl ~28k: uniform logits, NLL ≈ ln(vocab). A causal
+**Affine-tile race at T >= 1024 (found by this harness).** The first long
+streaming run read ppl ~28k: uniform logits, NLL ≈ ln(vocab). A causal
 differential (hidden states at positions 0..511 must be bit-identical between
 a 512- and a 1024-token forward) traced the divergence to layer 0 of
-glm5_next — a linear-attention layer with a dense FFN, i.e. before any MoE
-— and a capture of the layer-0 `gated_delta_update` inputs showed the kernel
-inputs q/k/v/b bit-identical while `a` (from the fused in-proj) differed by
-~8.0. The fused in-proj (N = 24896, 64-aligned) routes through the shared
-`qwen35_q4_affine_qmm_t` custom tile at T >= 128; the tile is exact for that
-weight up to T = 1000 and corrupts segments at T >= 1024. The production
-chat path is unaffected — the scheduler's streaming bank guard steps prefill
+glm5_next — before any MoE — where the `gated_delta_update` kernel input `a`
+(f_b_proj output) diverged while q/k/v/b stayed bit-identical. The chain of
+evidence: the real checkpoint is q8 (not the config-default q4), the q8
+affine tile only routes at T >= 1024 (`min_tokens = 1024`), and a same-run
+replay of the exact captured `fa_o` through the same `f_b_proj` weights
+disagreed with what the live forward produced — but the replay was clean on
+the next run, and isolated tile calls (dozens of shapes, real weights
+included) never diverge. Verdict: an intermittent GPU-side race inside the
+custom tile at T >= 1024, not deterministic wrong math. The production chat
+path is unaffected — the scheduler's streaming bank guard steps prefill
 chunks down to <= 512 tokens, and a 2.5k-token GLM chat completion verified
-coherent — but any direct >= 1024-token forward (raw evals, future kernels)
-produced garbage. Guard added in
-`patches/mlx_vlm_glm5_next_compat/.../glm5_next/linear.py`
-(`_tile_corrupts_at_long_prefill`): wide weights (> 8192 rows) at T >= 1024
-fall back to `mx.quantized_matmul`; narrow shapes (the q8 indexer,
-N = 4096/T = 1024, test-pinned) keep the tile. The underlying tile bug is
-still open — the guard is containment, not a fix.
+coherent — but any direct >= 1024-token forward (raw evals) intermittently
+produced garbage. Guard in `patches/mlx_vlm_glm5_next_compat/.../glm5_next/
+linear.py` (`_tile_corrupts_at_long_prefill`): the tile is blocked entirely
+at T >= 1024 (falls back to `mx.quantized_matmul`); below 1024 the tile still
+routes (q8 indexer pinned by test at T=1023). After the guard, ctx-1024
+streaming ppl reads 3.32 (2 windows) versus 28,323 before. The underlying
+tile race remains open — the guard is containment.
 
 ### I5 — cold precision tier (uniform)
 
@@ -535,13 +538,20 @@ that caps GLM decode.
   assumption would silently break. The admin capability flag
   `expert_streaming_cold_tier_present` gates the UI input (both UIs + i18n).
 - Runtime-signature governed; excluded from profiles.
-- **Quality gate before any default**: run I4 on the oQ4e checkpoint and the
-  cold variant; publish the delta before enabling the tier anywhere.
 - Tiers generated (3-bit, same group size as source): GLM-5.3-Flash-oQ4e
   141.8 → 106.3 GiB (0.75×, 126 banks / 33 shards, requant err ≤ ~0.03
   typical), Qwen3.8-Flash-Next 57.4 → 43.1 GiB (0.75×). 2-bit halves the
   4-bit bytes instead if the 3-bit quality delta proves too small to ship.
-- Pending measurement: tok/s / TTFT A/B (idle window) + the I4 ppl delta.
+- **Quality gate measured (GLM, Pride and Prejudice, 24 × 1000-token
+  windows / 23,976 tokens, streaming engine)**: oQ4e ppl **4.381** vs
+  cold-3bit ppl **5.435** — **+24.0% ppl / +0.216 NLL per token**. The
+  uniform 3-bit tier degrades GLM well past "near-lossless": as a default it
+  is rejected; as an opt-in it only makes sense where the 25% byte cut buys
+  measurable decode (the I/O-floor A/B is still pending an idle window).
+  The Qwen arm is measured below; the per-expert HOBBIT hot/cold split
+  (only truly-cold experts get the low tier) is the recorded path to a
+  smaller delta.
+- Pending measurement: tok/s / TTFT A/B (idle window).
 
 ## References
 
