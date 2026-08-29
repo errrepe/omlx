@@ -542,15 +542,18 @@ that caps GLM decode.
   141.8 → 106.3 GiB (0.75×, 126 banks / 33 shards, requant err ≤ ~0.03
   typical), Qwen3.8-Flash-Next 57.4 → 43.1 GiB (0.75×). 2-bit halves the
   4-bit bytes instead if the 3-bit quality delta proves too small to ship.
-- **Quality gate measured (GLM, Pride and Prejudice, 24 × 1000-token
-  windows / 23,976 tokens, streaming engine)**: oQ4e ppl **4.381** vs
-  cold-3bit ppl **5.435** — **+24.0% ppl / +0.216 NLL per token**. The
-  uniform 3-bit tier degrades GLM well past "near-lossless": as a default it
-  is rejected; as an opt-in it only makes sense where the 25% byte cut buys
-  measurable decode (the I/O-floor A/B is still pending an idle window).
-  The Qwen arm is measured below; the per-expert HOBBIT hot/cold split
-  (only truly-cold experts get the low tier) is the recorded path to a
-  smaller delta.
+- **Quality gate measured (Pride and Prejudice, streaming engine)**:
+  - GLM (24 × 1000-token windows, 23,976 tokens): oQ4e ppl **4.381** vs
+    cold-3bit **5.435** — **+24.0% ppl / +0.216 NLL per token**.
+  - Qwen (12 × 2048-token windows, 24,564 tokens): oQ4e ppl **1.312** vs
+    cold-3bit **1.372** — **+4.6% ppl / +0.045 NLL per token**.
+  Verdict: the uniform 3-bit tier is far from "near-lossless" on GLM (13 MB
+  experts, 288/layer) and borderline on Qwen (2.7 MB experts, 512/layer) —
+  the smaller-per-expert, wider-routing model tolerates it much better. As a
+  default it is rejected for GLM; for Qwen it stays opt-in pending the
+  tok/s A/B that decides whether 4.6% ppl buys a real decode win. The
+  per-expert HOBBIT hot/cold split (only truly-cold experts get the low
+  tier) is the recorded path to shrink both deltas.
 - Pending measurement: tok/s / TTFT A/B (idle window).
 
 ## References
