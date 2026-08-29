@@ -11,6 +11,7 @@ Controls:
 import argparse
 import asyncio
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -357,6 +358,9 @@ async def run(
 
 
 def main():
+    # INFO logs (streaming conversion, pool releases) are bench evidence —
+    # without a handler Python drops them below WARNING.
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=list(MODEL_PATHS))
     ap.add_argument("--budget", type=float, default=1.0)

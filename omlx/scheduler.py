@@ -2322,8 +2322,30 @@ class Scheduler:
         gating semantics are preserved.
         """
         if not self._resolve_streaming_guard_info():
+            # Diagnostic: the streaming hooks are inert without the backing's
+            # guard info — surface a skip when the pool is obviously large.
+            if mx.get_cache_memory() > 4 * 1024**3:
+                now = time.monotonic()
+                if now - getattr(self, "_last_streaming_skip_log", 0.0) > 30.0:
+                    self._last_streaming_skip_log = now
+                    logger.info(
+                        "Streaming pool release skipped: no streaming guard "
+                        "info on the model tree (pool %.1f GiB)",
+                        mx.get_cache_memory() / 1024**3,
+                    )
             return False
         return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
+
+    def _note_streaming_release(self) -> None:
+        """Rate-limited log (30s) for the off-boundary streaming release."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_streaming_release_log", 0.0) < 30.0:
+            return
+        self._last_streaming_release_log = now
+        logger.info(
+            "Streaming pool release: %.1f GiB MLX buffer pool (off-boundary)",
+            mx.get_cache_memory() / 1024**3,
+        )
 
     @staticmethod
     def _collect_arrays_from_extracted_cache(
@@ -5359,6 +5381,8 @@ class Scheduler:
                 )
 
         if self._should_clear_after_chunk() or self._should_release_streaming_pool():
+            if not self._should_clear_after_chunk():
+                self._note_streaming_release()
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
         if getattr(state.request, "benchmark_trace", False):
@@ -11946,6 +11970,7 @@ class Scheduler:
         # byte threshold — Fase G.
         if not should_clear and self._should_release_streaming_pool():
             should_clear = True
+            self._note_streaming_release()
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
         if (
