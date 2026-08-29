@@ -1137,5 +1137,7 @@
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
   "modal.model_settings.expert_streaming_budget_hint": "LRU d'experts optionnel. Vide ou 0 = cache fichier de l'OS uniquement (défaut ; mesuré plus rapide avec moins de RAM). >0 épingle un cache d'experts en GiB.",
   "modal.model_settings.expert_streaming_topk": "Seuil de masse du top-k",
-  "modal.model_settings.expert_streaming_topk_hint": "Routage approximatif optionnel : conserve le préfixe du top-k (scores décroissants) atteignant cette fraction de masse. 1.0 ou vide = exact (bit-identique). ~0.85 est le point d'accélération mesuré (~1.8x, 7/10 tokens identiques à 0.70)."
+  "modal.model_settings.expert_streaming_topk_hint": "Routage approximatif optionnel : conserve le préfixe du top-k (scores décroissants) atteignant cette fraction de masse. 1.0 ou vide = exact (bit-identique). ~0.85 est le point d'accélération mesuré (~1.8x, 7/10 tokens identiques à 0.70).",
+  "modal.model_settings.expert_streaming_eval": "Synchro par couche en préremplissage (Qwen)",
+  "modal.model_settings.expert_streaming_eval_hint": "Évalue chaque couche du décodeur pendant le préremplissage en streaming et purge le cache d'allocation. Bit-exact ; limite les pics mémoire sur les longs prompts pour préserver le cache disque. Désactiver uniquement pour les tests A/B."
 }

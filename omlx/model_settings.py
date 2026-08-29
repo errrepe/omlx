@@ -248,6 +248,11 @@ class ModelSettings:
     expert_streaming_pilot: Optional[bool] = (
         None  # Async router-lookahead prefetcher (PILOT)
     )
+    expert_streaming_per_layer_eval: Optional[bool] = (
+        None  # Qwen4-exp per-layer eval+clear_cache boundary during streaming prefill
+        # (default env OMLX_EXPERT_STREAMING_PER_LAYER_EVAL or on). GLM/DeepSeek
+        # decoders honor the boundary natively and are unaffected by this knob.
+    )
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

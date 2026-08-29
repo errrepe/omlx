@@ -792,6 +792,25 @@ private struct AdvancedTab: View {
                             ), mono: true, width: 110)
                         }
                     }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.eval.label",
+                                          defaultValue: "Prefill per-layer sync (Qwen)",
+                                          comment: "Row label for the streaming prefill per-layer eval toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.eval.sub",
+                                             defaultValue: "Evaluate each decoder layer during streaming prefill and trim the allocator cache. Bit-exact; bounds memory peaks on long prompts.",
+                                             comment: "Sublabel for the streaming prefill per-layer eval toggle")) {
+                            Toggle("", isOn: vm.bind(
+                                $vm.expertStreamingPerLayerEval,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingPerLayerEval, client: client)
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                        }
+                    }
                 }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",

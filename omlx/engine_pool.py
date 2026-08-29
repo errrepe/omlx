@@ -720,6 +720,7 @@ class EnginePool:
                     "expert_streaming_readahead",
                     "expert_streaming_seed",
                     "expert_streaming_pilot",
+                    "expert_streaming_per_layer_eval",
                 ):
                     add(_io_key, data.get(_io_key))
 

@@ -409,6 +409,42 @@ Two swap incidents during this phase (user visible). The bench runs at ceiling 2
 
 Machine-probe datapoint (2026-08-29, shared 48 GiB box under active use): static ceiling 42 GiB (balanced tier), Metal cap 37.4 GiB, SSD sequential ~16 GB/s with the bank's shards warm in page cache (random QD1 ~15 GB/s — the QD sweep was pruned as near-saturated; cold-cache random bandwidth is lower, so the prune is conservative for cached servers). The tuner refused a real session at 21.5 GB available, as designed.
 
+## Fase I — qwen prefill eval boundary (G4)
+
+Follow-up to the G series, prioritized by the paper survey
+([expert-streaming-papers.md](expert-streaming-papers.md)). The qwen4_exp finding:
+the installed `mlx_vlm` decoder ignored the converter's `_stream_eval` flag — only
+the vendored GLM decoder honors it — so long prefill chunks accumulated one
+streaming mini-bank per layer in the lazy graph until the chunk-end eval
+(~17 MB/token, intra-chunk pool peaks ~29 GiB: the Fase G "machine honesty" root
+cause), and the retained allocator pool could grow big enough to evict the page
+cache the run itself depends on (the post-F 341 s/8k case).
+
+### I1 — per-layer eval boundary for qwen4_exp (bit-exact)
+
+`patches/expert_streaming/qwen35_stream_eval.py` wraps the installed
+`Qwen3_5MoeDecoderLayer.__call__` (same class-patch mechanism as the adaptive
+top-k patch): when the layer carries `_stream_eval`, the call is prefill-shaped
+(`x.shape[1] > 1`; decode is `[B, 1, H]`) and not an MTP verify pass
+(`target_verify`), the layer output is `mx.eval`'d and `mx.clear_cache()` trims
+the allocator cache — the DeepSeek/GLM per-layer pattern. Bit-exact by
+construction (`mx.eval` materializes what the next layer reads anyway). Decode
+and verify stay lazy: 48 forced syncs/token would erode the QD16 win and their
+graphs are small.
+
+- Knob: `expert_streaming_per_layer_eval` (`None` = env
+  `OMLX_EXPERT_STREAMING_PER_LAYER_EVAL`, default **on**) — a runtime-signature
+  knob like the other IO overrides (a change rebuilds the engine); excluded from
+  profiles. Toggle exposed in the WebUI Expert Streaming card and in the macOS
+  app's Model Settings → Advanced (a stored null renders as on, the built-in
+  default).
+- GLM/DeepSeek decoders honor the boundary natively and are unaffected by the knob.
+- Tests: boundary gating (prefill fires; decode / verify / un-flagged layer /
+  knob-off skip), idempotent wrap, settings round-trip + profile exclusion +
+  API persist.
+- Pending measurement: TTFT 2k/8k cold + pool-peak A/B needs an idle window
+  (Fase G lesson: shared-box numbers are machine-state-dominated).
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.

@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold, expertStreamingPerLayerEval
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -246,6 +246,7 @@ final class ModelSettingsScreenVM {
     var expertStreamingForced: Bool = false
     var expertStreamingBudgetGib: String = ""
     var expertStreamingTopkThreshold: String = ""
+    var expertStreamingPerLayerEval: Bool = true
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -392,7 +393,7 @@ final class ModelSettingsScreenVM {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
         case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib,
-             .expertStreamingTopkThreshold, .thinkingBudgetEnabled, .thinkingBudgetTokens:
+             .expertStreamingTopkThreshold, .expertStreamingPerLayerEval, .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
@@ -531,6 +532,9 @@ final class ModelSettingsScreenVM {
                     || (s?.expertStreamingEnabled ?? false)
                 self.expertStreamingBudgetGib = s?.expertStreamingBudgetGib.map { String($0) } ?? ""
                 self.expertStreamingTopkThreshold = s?.expertStreamingTopkThreshold.map { String($0) } ?? ""
+                // Null means the env/built-in default, which is on — show the
+                // effective state so the toggle is never a lie.
+                self.expertStreamingPerLayerEval = s?.expertStreamingPerLayerEval ?? true
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -698,6 +702,9 @@ final class ModelSettingsScreenVM {
                 lastError = "Top-k threshold must be between 0.05 and 1.0"
                 return
             }
+        case .expertStreamingPerLayerEval:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingPerLayerEval = expertStreamingPerLayerEval
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:

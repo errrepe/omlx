@@ -1488,6 +1488,7 @@ def test_io_overrides_resolution_and_clamping():
         "expert_streaming_readahead": None,
         "expert_streaming_seed": None,
         "expert_streaming_pilot": None,
+        "expert_streaming_per_layer_eval": None,
     }
 
     # Depth clamping and boolean pass-through
@@ -1498,6 +1499,7 @@ def test_io_overrides_resolution_and_clamping():
             expert_streaming_readahead=False,
             expert_streaming_seed=False,
             expert_streaming_pilot=True,
+            expert_streaming_per_layer_eval=False,
         )
     )
     assert ov["expert_streaming_io_depth"] == 64
@@ -1505,6 +1507,7 @@ def test_io_overrides_resolution_and_clamping():
     assert ov["expert_streaming_readahead"] is False
     assert ov["expert_streaming_seed"] is False
     assert ov["expert_streaming_pilot"] is True
+    assert ov["expert_streaming_per_layer_eval"] is False
 
     # Invalid depth → None (env default); None settings object → all None
     ov = _io_overrides(ModelSettings(expert_streaming_io_depth=0))
@@ -1607,3 +1610,139 @@ def test_io_pool_for_clamps_and_caches():
     assert io_pool_for(3) is pool
     assert io_pool_for("5") is io_pool_for(5)
     assert io_pool_for(999)._max_workers == 64
+
+
+# --- Qwen per-layer eval boundary (G4 / qwen35_stream_eval) -----------------
+
+
+def _stream_eval_recorder(monkeypatch):
+    """Swap the module's mx for a recorder so the wrapper's eval/clear calls
+    are observable without touching the real allocator."""
+    import types
+
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+
+    calls = {"eval": 0, "clear": 0}
+
+    def _bump(key):
+        def _f(*args, **kwargs):
+            calls[key] += 1
+
+        return _f
+
+    monkeypatch.setattr(
+        qse, "mx", types.SimpleNamespace(eval=_bump("eval"), clear_cache=_bump("clear"))
+    )
+    return qse, calls
+
+
+def test_qwen_stream_eval_fires_on_prefill(monkeypatch):
+    import numpy as np
+
+    qse, calls = _stream_eval_recorder(monkeypatch)
+    assert qse.configure_from_settings(True) is True
+
+    class Layer:
+        _stream_eval = True
+
+    wrapped = qse._wrap_call(lambda self, x, *a, **k: x + 1)
+    out = wrapped(Layer(), np.zeros((1, 8, 4), dtype=np.float32))
+    assert calls == {"eval": 1, "clear": 1}
+    # The passthrough result is untouched.
+    assert out.shape == (1, 8, 4)
+
+
+def test_qwen_stream_eval_skips_decode_verify_and_gating(monkeypatch):
+    import numpy as np
+
+    qse, calls = _stream_eval_recorder(monkeypatch)
+
+    class Layer:
+        _stream_eval = True
+
+    wrapped = qse._wrap_call(lambda self, x, *a, **k: x + 1)
+    qse.configure_from_settings(True)
+
+    # Decode shape [1, 1, H]: forced syncs/token would erode the QD16 win.
+    wrapped(Layer(), np.zeros((1, 1, 4), dtype=np.float32))
+    assert calls == {"eval": 0, "clear": 0}
+
+    # MTP verify passes stay lazy for the same reason.
+    wrapped(Layer(), np.zeros((1, 6, 4), dtype=np.float32), target_verify=True)
+    assert calls == {"eval": 0, "clear": 0}
+
+    # A layer without the converter's _stream_eval flag is untouched
+    # (non-streaming loads never see the boundary).
+    class Plain:
+        pass
+
+    wrapped(Plain(), np.zeros((1, 6, 4), dtype=np.float32))
+    assert calls == {"eval": 0, "clear": 0}
+
+    # Knob off disables the boundary entirely.
+    assert qse.configure_from_settings(False) is False
+    wrapped(Layer(), np.zeros((1, 6, 4), dtype=np.float32))
+    assert calls == {"eval": 0, "clear": 0}
+
+
+def test_qwen_stream_eval_configure_none_restores_env_default(monkeypatch):
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+
+    # The env default is captured at import; simulate both captured values and
+    # confirm None defers to them while explicit values override.
+    monkeypatch.setattr(qse, "_PER_LAYER_EVAL_DEFAULT", False)
+    assert qse.configure_from_settings(None) is False
+    monkeypatch.setattr(qse, "_PER_LAYER_EVAL_DEFAULT", True)
+    assert qse.configure_from_settings(None) is True
+    assert qse.configure_from_settings(False) is False
+    assert qse.configure_from_settings(True) is True
+    qse.configure_from_settings(None)
+
+
+def test_qwen_stream_eval_patch_idempotent():
+    try:
+        from mlx_vlm.models.qwen3_5_moe import language as q35
+    except ImportError:
+        pytest.skip("mlx_vlm not installed")
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+
+    cls = q35.Qwen3_5MoeDecoderLayer
+    orig_call = cls.__call__
+    try:
+        assert qse.apply_qwen35_moe_stream_eval() is True
+        wrapped_once = cls.__call__
+        # Second apply must not stack a second wrapper.
+        assert qse.apply_qwen35_moe_stream_eval() is True
+        assert cls.__call__ is wrapped_once
+        assert getattr(cls, "_omlx_stream_eval_wrapped", False) is True
+    finally:
+        cls.__call__ = orig_call
+        if hasattr(cls, "_omlx_stream_eval_wrapped"):
+            del cls._omlx_stream_eval_wrapped
+
+
+def test_expert_streaming_per_layer_eval_round_trip():
+    s = ModelSettings(expert_streaming_per_layer_eval=False)
+    d = s.to_dict()
+    assert d["expert_streaming_per_layer_eval"] is False
+    assert ModelSettings.from_dict(d).expert_streaming_per_layer_eval is False
+    assert ModelSettings().expert_streaming_per_layer_eval is None
+
+
+def test_expert_streaming_per_layer_eval_excluded_from_profiles():
+    from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+
+    assert "expert_streaming_per_layer_eval" in EXCLUDED_FROM_PROFILES
+
+
+@pytest.mark.asyncio
+async def test_expert_streaming_per_layer_eval_persists_via_api():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(expert_streaming_per_layer_eval=False),
+    )
+    assert settings.expert_streaming_per_layer_eval is False

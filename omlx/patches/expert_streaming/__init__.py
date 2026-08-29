@@ -75,6 +75,7 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
         "expert_streaming_readahead": None,
         "expert_streaming_seed": None,
         "expert_streaming_pilot": None,
+        "expert_streaming_per_layer_eval": None,
     }
     if model_settings is None:
         return raw
@@ -744,6 +745,22 @@ def convert_model_to_streaming(
         thr = configure_from_settings(model_settings)
         if thr is not None:
             apply_qwen35_moe_topk_patch()
+        # Qwen3.5/3.8 prefill eval boundary (G4): the installed qwen decoder
+        # ignores _stream_eval; wrap it so long prefill chunks evaluate per
+        # layer instead of pinning every layer's mini-bank in the lazy graph
+        # and retaining an allocator pool big enough to evict the page cache.
+        # Bit-exact; prefill-shaped calls only (decode/MTP verify stay lazy).
+        from .qwen35_stream_eval import (
+            apply_qwen35_moe_stream_eval,
+            configure_from_settings as configure_stream_eval,
+        )
+
+        eval_on = configure_stream_eval(io_ov["expert_streaming_per_layer_eval"])
+        if apply_qwen35_moe_stream_eval():
+            logger.info(
+                "Expert streaming: qwen per-layer eval boundary %s",
+                "on" if eval_on else "off",
+            )
         # PILOT: async router-lookahead prefetch into the LRU (glm5_next's
         # Glm5NextModel loop scores the next MoE layer's router against the
         # current layer output). mmap backing only; off when the RAM dict

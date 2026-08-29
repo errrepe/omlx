@@ -139,6 +139,7 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_readahead: bool | None = None
     expert_streaming_seed: bool | None = None
     expert_streaming_pilot: bool | None = None
+    expert_streaming_per_layer_eval: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -2445,6 +2446,10 @@ async def update_model_settings(
         current_settings.expert_streaming_seed = request.expert_streaming_seed
     if "expert_streaming_pilot" in sent:
         current_settings.expert_streaming_pilot = request.expert_streaming_pilot
+    if "expert_streaming_per_layer_eval" in sent:
+        current_settings.expert_streaming_per_layer_eval = (
+            request.expert_streaming_per_layer_eval
+        )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
