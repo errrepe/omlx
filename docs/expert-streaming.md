@@ -443,7 +443,75 @@ graphs are small.
   knob-off skip), idempotent wrap, settings round-trip + profile exclusion +
   API persist.
 - Pending measurement: TTFT 2k/8k cold + pool-peak A/B needs an idle window
-  (Fase G lesson: shared-box numbers are machine-state-dominated).
+  (Fase G lesson: shared-box numbers are machine-state-dominated). Ready-to-run
+  when idle — the two arms differ only in the env:
+  ```
+  OMLX_EXPERT_STREAMING_PER_LAYER_EVAL=0 .venv/bin/python bench/bench_expert_streaming.py \
+      --model qwen --prompt-tokens 2048 --decode 48 --min-free-gib 22 --mem-ceiling-gib <available-6>
+  OMLX_EXPERT_STREAMING_PER_LAYER_EVAL=1 .venv/bin/python bench/bench_expert_streaming.py \
+      --model qwen --prompt-tokens 2048 --decode 48 --min-free-gib 22 --mem-ceiling-gib <available-6>
+  ```
+
+### I2 — learned pin store server integration (E3 follow-up)
+
+`PinController` takes a per-model profile path now:
+`<model>/.omlx/expert_pin_profile.json` (env `OMLX_EXPERT_STREAMING_PIN_PROFILE`
+stays the bench override and wins when set). Loaded at convert — the hot set is
+wired from token 1 — and saved on engine `stop()` while the backing store is
+still reachable (`save_expert_pin_profile`; BatchedEngine + VLM wrapper).
+Settings `expert_streaming_pins` (None = env `OMLX_EXPERT_STREAMING_PIN`,
+default off) + `expert_streaming_pin_gib` (None = env
+`OMLX_EXPERT_STREAMING_PIN_GIB`, default 1.25): runtime-signature governed,
+profile-excluded, toggles in both UIs. mlock only — zero output change.
+Measured in E3: +6–10% decode, −22% TTFT with a same-prompt profile.
+
+### I3 — routing trace + LRC analysis (SRP/SCH)
+
+`OMLX_EXPERT_STREAMING_TRACE=<path>` appends one JSONL row per MoE layer call
+(`{call, layer, positions, uniq}`); `bench/lrc_analysis.py` computes the
+routing-consistency metrics of arXiv:2505.16056 — SCH (Belady oracle-cache hit
+rate per cache size; the paper's ≈2× active-experts sweet spot is directly
+sweepable) and SRP (fixed-group coverage per segment, demand-weighted and
+distinct). Purpose: per-model defaults for pins/seed/top-k and a pre-flight
+"does streaming pay" check, calibrated against the known Qwen 23–32% / GLM 0%
+inter-token reuse. Offline only — no UI.
+
+### I4 — perplexity harness
+
+`bench/ppl_expert_streaming.py`: token NLL / perplexity over a local corpus
+via mlx_lm's resident path (disjoint ctx-token windows, context-only first
+position). Streaming compute is bit-exact versus resident (test-pinned), so
+the resident measurement represents the streamed path. This is the quality
+gate for I5: compare the oQ4e checkpoint against its cold-tier variant on the
+same corpus before trusting the tier.
+
+### I5 — cold precision tier (uniform)
+
+`tools/requant_cold_tier.py` writes `<model>/expert_cold/`: the full switch_mlp
+expert set requantized at `--bits 3` (or 2) with the source group size, same
+shard filenames / key names, packing recorded in the shard `__metadata__`
+(`omlx_cold_bits` / `omlx_cold_group_size`). Only affine banks with a
+`.biases` key convert — the affine bias must ride along or the runtime's
+dequantize reconstructs shifted values.
+
+Runtime: `expert_streaming_cold_tier` ("2"/"3"; None = off) makes the backing
+resolve expert-bank keys from `expert_cold/` first
+(`ExpertBackingStore(cold_root=...)`) — slices, coalesced runs, pins, F_RDADVISE
+and dtype reads all funnel through the same reader choke point — and the
+converter overrides the streaming linears' bits/group size with the tier's
+recorded packing, so the single gather_qmm per projection stays uniform.
+Every expert reads the tier; the per-expert hot(4-bit)/cold(low) split from
+HOBBIT is the recorded follow-up once a quality verdict exists. Bytes per
+token drop 25% (3-bit) or ~50% (2-bit) — the direct lever on the I/O floor
+that caps GLM decode.
+
+- Partial tiers are refused (`cold_tier_status`): the uniform-packing
+  assumption would silently break. The admin capability flag
+  `expert_streaming_cold_tier_present` gates the UI input (both UIs + i18n).
+- Runtime-signature governed; excluded from profiles.
+- **Quality gate before any default**: run I4 on the oQ4e checkpoint and the
+  cold variant; publish the delta before enabling the tier anywhere.
+- Pending measurement: tok/s / TTFT A/B (idle window) + the I4 ppl delta.
 
 ## References
 

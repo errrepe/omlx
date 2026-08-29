@@ -842,6 +842,23 @@ private struct AdvancedTab: View {
                             }
                         }
                     }
+                    if vm.expertStreamingEnabled && vm.expertStreamingColdTierPresent {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.cold_tier.label",
+                                          defaultValue: "Cold expert tier (bits)",
+                                          comment: "Row label for the cold precision tier field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.cold_tier.sub",
+                                             defaultValue: "Requires tools/requant_cold_tier.py (expert_cold/ present). Reads streamed experts from the low-precision tier — fewer bytes per token. Approximate: gate with the perplexity harness. Empty = off.",
+                                             comment: "Sublabel for the cold precision tier field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingColdTier,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingColdTier, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
                 }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",

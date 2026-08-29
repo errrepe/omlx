@@ -810,6 +810,12 @@
                                             <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_pin_gib_hint') }}</p>
                                         </div>
                                     </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled && modelSettings.expert_streaming_cold_tier_present" x-transition class="pt-1">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_cold_tier') }}</label>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_cold_tier" placeholder="off (4-bit)" min="2" max="3" step="1"
+                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_cold_tier_hint') }}</p>
+                                    </div>
                                 </div>
 
                                 <!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->

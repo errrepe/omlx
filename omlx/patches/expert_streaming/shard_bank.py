@@ -262,15 +262,78 @@ class _ShardReader:
         return end_pg - start
 
 
+_COLD_BANK_MARKERS = (
+    ".switch_mlp.gate_proj.",
+    ".switch_mlp.up_proj.",
+    ".switch_mlp.down_proj.",
+    ".switch_mlp.gate_up_proj.",
+)
+
+
+def cold_tier_status(model_path: str | Path) -> tuple[bool, str]:
+    """Is a complete cold tier present for *model_path*?
+
+    Complete = every switch_mlp bank weight key of the checkpoint exists in
+    some expert_cold/ shard header (partial tiers are rejected: the runtime
+    uniform-packing assumption would silently break)."""
+    model_path = Path(model_path)
+    cold_dir = model_path / "expert_cold"
+    if not cold_dir.is_dir():
+        return False, "expert_cold/ missing"
+    index = model_path / "model.safetensors.index.json"
+    if not index.is_file():
+        return False, "no model.safetensors.index.json"
+    try:
+        weight_map = json.loads(index.read_text()).get("weight_map") or {}
+    except Exception as e:
+        return False, f"unreadable index: {e}"
+    needed = {
+        key
+        for key in weight_map
+        if key.endswith(".weight") and any(m in key for m in _COLD_BANK_MARKERS)
+    }
+    if not needed:
+        return False, "no expert banks in the checkpoint"
+    have: set[str] = set()
+    for shard in cold_dir.glob("*.safetensors"):
+        try:
+            have.update(_read_header_keys(shard))
+        except Exception:
+            continue
+    missing = needed - have
+    if missing:
+        return False, f"{len(missing)} bank key(s) missing from expert_cold/"
+    return True, f"complete ({len(needed)} banks)"
+
+
+def _read_header_keys(path: Path) -> set[str]:
+    with path.open("rb") as f:
+        hsize = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(hsize))
+    return {k for k in hdr if k != "__metadata__"}
+
+
 class ExpertBackingStore:
     """Open shard readers and serve per-expert mx.arrays on demand."""
 
-    def __init__(self, model_path: str | Path, extra_roots: list[str | Path] | None = None):
+    def __init__(
+        self,
+        model_path: str | Path,
+        extra_roots: list[str | Path] | None = None,
+        cold_root: str | Path | None = None,
+    ):
         self.model_path = Path(model_path).expanduser().resolve()
         # Optional stripe roots: per-shard files are resolved primary-first;
         # roots listed here win for shards mirrored onto them (see
         # _resolve_file) — used to stripe a big MoE across two SSDs.
         self._extra_roots = [Path(r).expanduser().resolve() for r in (extra_roots or [])]
+        # Cold precision tier (Fase I5): when set, expert-bank keys that
+        # exist under <model>/expert_cold/ resolve there FIRST — the whole
+        # runtime (slices, runs, pins, readahead, dtypes) reads the cold
+        # packing uniformly. Same filenames/key names, lower bit width.
+        self.cold_root = Path(cold_root).expanduser().resolve() if cold_root else None
+        self._cold_readers: Dict[str, _ShardReader] = {}
+        self._cold_key_to_reader: Dict[str, _ShardReader] = {}
         self._readers: Dict[str, _ShardReader] = {}
         self._key_to_reader: Dict[str, _ShardReader] = {}
         self._key_to_shape_dtype: Dict[str, Tuple[Tuple[int, ...], str]] = {}
@@ -327,9 +390,36 @@ class ExpertBackingStore:
         except Exception:
             return {}
 
+    def _cold_reader_for_key(self, key: str) -> _ShardReader | None:
+        """Cold-tier reader for *key*, or None (not in the cold root)."""
+        if self.cold_root is None:
+            return None
+        if key in self._cold_key_to_reader:
+            return self._cold_key_to_reader[key]
+        fname = self._weight_map.get(key)
+        if fname is None:
+            return None
+        cold_path = self.cold_root / fname
+        if not cold_path.is_file():
+            return None
+        reader = self._cold_readers.get(str(cold_path))
+        if reader is None:
+            try:
+                reader = _ShardReader(cold_path)
+            except Exception:
+                return None
+            self._cold_readers[str(cold_path)] = reader
+        if key not in reader.header:
+            return None
+        self._cold_key_to_reader[key] = reader
+        return reader
+
     def _reader_for_key(self, key: str) -> _ShardReader:
         if key in self._key_to_reader:
             return self._key_to_reader[key]
+        cold = self._cold_reader_for_key(key)
+        if cold is not None:
+            return cold
         fname = self._weight_map.get(key)
         if fname is None:
             # key may be a stacked name not in weight_map for sharded raw experts case;
@@ -353,6 +443,18 @@ class ExpertBackingStore:
             self._readers[str(fpath)] = reader
         self._key_to_reader[key] = reader
         return reader
+
+    def cold_quant_params(self, key: str) -> Tuple[int, int] | None:
+        """(bits, group_size) of the cold packing for *key*, from the cold
+        shard's __metadata__ — None when the cold tier is not active for it."""
+        cold = self._cold_reader_for_key(key)
+        if cold is None:
+            return None
+        meta = cold.header.get("__metadata__") or {}
+        try:
+            return int(meta["omlx_cold_bits"]), int(meta["omlx_cold_group_size"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def tensor_shape(self, key: str) -> tuple[int, ...]:
         # try cached headers

@@ -142,6 +142,7 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_per_layer_eval: bool | None = None
     expert_streaming_pins: bool | None = None
     expert_streaming_pin_gib: float | None = None
+    expert_streaming_cold_tier: str | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -2008,6 +2009,18 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         except Exception:
             logger.debug("Could not inspect expert streaming for %s", model_id, exc_info=True)
 
+        # Cold precision tier presence (I5): a complete expert_cold/ requant
+        # set exists for this checkpoint — the UI only offers the tier then.
+        expert_cold_tier_present = False
+        try:
+            from ..patches.expert_streaming.shard_bank import cold_tier_status
+
+            expert_cold_tier_present = cold_tier_status(
+                model_info.get("model_path", "") or ""
+            )[0]
+        except Exception:
+            pass
+
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
@@ -2068,6 +2081,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "expert_total_bytes": expert_total_bytes,
             "expert_resident_bytes": expert_resident_bytes,
             "expert_streaming_bytes": expert_streaming_bytes,
+            "expert_streaming_cold_tier_present": expert_cold_tier_present,
             "expert_moe_layers": expert_moe_layers,
             "experts_per_layer": experts_per_layer,
             "per_expert_bytes": per_expert_bytes,
@@ -2462,6 +2476,14 @@ async def update_model_settings(
             if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 <= v <= 64:
                 raise HTTPException(status_code=400, detail="expert_streaming_pin_gib must be a number between 0 and 64 GiB")
             current_settings.expert_streaming_pin_gib = float(v)
+    if "expert_streaming_cold_tier" in sent:
+        v = request.expert_streaming_cold_tier
+        if v is None or str(v).strip() == "":
+            current_settings.expert_streaming_cold_tier = None
+        elif str(v) in ("2", "3"):
+            current_settings.expert_streaming_cold_tier = str(v)
+        else:
+            raise HTTPException(status_code=400, detail="expert_streaming_cold_tier must be '2' or '3'")
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False

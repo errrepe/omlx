@@ -60,6 +60,7 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// Expert streaming (SSD) capability for MoE models (glm_moe_dsa etc.).
     let expertStreamingSupported: Bool?
     let expertStreamingForced: Bool?
+    let expertStreamingColdTierPresent: Bool?
     let expertStreamingReason: String?
     let expertDenseBytes: Int64?
     let expertTotalBytes: Int64?
@@ -106,6 +107,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let expertStreamingPerLayerEval: Bool?
     let expertStreamingPins: Bool?
     let expertStreamingPinGib: Double?
+    let expertStreamingColdTier: String?
+    let expertStreamingColdTierPresent: Bool?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -199,6 +202,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var expertStreamingPerLayerEval: Bool? = nil
     var expertStreamingPins: Bool? = nil
     var expertStreamingPinGib: Double? = nil
+    var expertStreamingColdTier: String? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil

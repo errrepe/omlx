@@ -723,6 +723,7 @@ class EnginePool:
                     "expert_streaming_per_layer_eval",
                     "expert_streaming_pins",
                     "expert_streaming_pin_gib",
+                    "expert_streaming_cold_tier",
                 ):
                     add(_io_key, data.get(_io_key))
 

@@ -262,6 +262,12 @@ class ModelSettings:
     expert_streaming_pin_gib: Optional[float] = (
         None  # Pin budget in GiB (default env OMLX_EXPERT_STREAMING_PIN_GIB or 1.25)
     )
+    expert_streaming_cold_tier: Optional[str] = (
+        None  # Cold precision tier for streamed experts: "2"/"3" reads expert
+        # banks from <model>/expert_cold/ (tools/requant_cold_tier.py) — fewer
+        # bytes per token on the NVMe I/O floor, at the tier's fidelity
+        # (gate with the perplexity harness). None/"" = off.
+    )
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

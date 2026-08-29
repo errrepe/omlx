@@ -7389,6 +7389,8 @@
                     expert_streaming_per_layer_eval: s.expert_streaming_per_layer_eval ?? true,
                     expert_streaming_pins: s.expert_streaming_pins ?? false,
                     expert_streaming_pin_gib: s.expert_streaming_pin_gib ?? null,
+                    expert_streaming_cold_tier_present: model?.expert_streaming_cold_tier_present === true,
+                    expert_streaming_cold_tier: s.expert_streaming_cold_tier ?? null,
                     expert_dense_bytes: model?.expert_dense_bytes || 0,
                     expert_total_bytes: model?.expert_total_bytes || 0,
                     expert_moe_layers: model?.expert_moe_layers || 0,
@@ -8327,6 +8329,9 @@
                                 expert_streaming_pins: !!this.modelSettings.expert_streaming_pins,
                                 expert_streaming_pin_gib: this.modelSettings.expert_streaming_pin_gib != null && String(this.modelSettings.expert_streaming_pin_gib).length
                                     ? parseFloat(this.modelSettings.expert_streaming_pin_gib)
+                                    : null,
+                                expert_streaming_cold_tier: (this.modelSettings.expert_streaming_cold_tier != null && String(this.modelSettings.expert_streaming_cold_tier).length && Number(this.modelSettings.expert_streaming_cold_tier) >= 2)
+                                    ? String(Math.min(3, Math.floor(Number(this.modelSettings.expert_streaming_cold_tier))))
                                     : null,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget

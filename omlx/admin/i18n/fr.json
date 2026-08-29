@@ -1143,5 +1143,7 @@
   "modal.model_settings.expert_streaming_pins": "Épinglage d'experts (mlock)",
   "modal.model_settings.expert_streaming_pins_hint": "Verrouille en RAM les experts les plus chauds par couche (zéro copie) et apprend un profil d'épinglage par modèle, sauvegardé au déchargement — le jeu chaud est prêt dès le premier token au chargement suivant. Aucun changement de sortie.",
   "modal.model_settings.expert_streaming_pin_gib": "Budget d'épinglage (GiB)",
-  "modal.model_settings.expert_streaming_pin_gib_hint": "Plafond mémoire pour les experts épinglés. Vide = 1,25 GiB par défaut."
+  "modal.model_settings.expert_streaming_pin_gib_hint": "Plafond mémoire pour les experts épinglés. Vide = 1,25 GiB par défaut.",
+  "modal.model_settings.expert_streaming_cold_tier": "Niveau froid d'experts (bits)",
+  "modal.model_settings.expert_streaming_cold_tier_hint": "Nécessite tools/requant_cold_tier.py (expert_cold/ présent). Lit les experts streamés depuis le niveau basse précision — moins d'octets par token au plancher I/O. Approximatif : validez avec le harnais de perplexité. Vide = désactivé."
 }

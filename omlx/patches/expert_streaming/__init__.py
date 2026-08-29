@@ -311,6 +311,31 @@ def _convert_switch_mlp_module(
                 mode = getattr(proj, "mode", "affine")
                 break
 
+    # Cold precision tier (I5): when the backing serves this layer's banks
+    # from expert_cold/, every projection of the layer computes at the
+    # tier's packing — override the source bits/group size once, here, so
+    # the fused and split branches both build with the tier parameters.
+    if hasattr(backing, "cold_quant_params"):
+        first_attr = next(
+            (
+                a
+                for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+                if getattr(switch_mlp, a, None) is not None
+            ),
+            None,
+        )
+        if first_attr is not None:
+            probe_key = _resolve_stacked_key(
+                candidates_for(first_attr, "weight"),
+                first_attr,
+                "weight",
+                backing,
+                needle,
+            )
+            cold_params = backing.cold_quant_params(probe_key)
+            if cold_params is not None:
+                bits, group_size = cold_params
+
     streaming_glu = StreamingSwitchGLU(
         input_dims=hidden,
         hidden_dims=moe_hidden,
@@ -580,14 +605,33 @@ def convert_model_to_streaming(
         try:
             import os
 
-            from .shard_bank import ExpertBackingStore
+            from .shard_bank import ExpertBackingStore, cold_tier_status
 
             extra_roots = [
                 p
                 for p in os.environ.get("OMLX_EXPERT_STREAMING_EXTRA_ROOTS", "").split(":")
                 if p.strip()
             ]
-            backing = ExpertBackingStore(model_path, extra_roots=extra_roots)
+            # Cold precision tier (I5): expert_streaming_cold_tier ("2"/"3")
+            # routes expert reads to <model>/expert_cold/ — a requantized
+            # full expert set (tools/requant_cold_tier.py) that cuts the
+            # bytes per token pinning decode to the NVMe I/O floor. Partial
+            # tiers are rejected: the uniform-packing assumption the linears
+            # build on would silently break.
+            cold_root = None
+            cold_setting = getattr(model_settings, "expert_streaming_cold_tier", None)
+            if cold_setting and str(cold_setting) in ("2", "3"):
+                ok, why = cold_tier_status(model_path)
+                if ok:
+                    cold_root = Path(model_path) / "expert_cold"
+                    logger.info("Expert streaming: cold tier %s-bit active (%s)", cold_setting, why)
+                else:
+                    logger.warning(
+                        "Expert streaming: cold tier %s requested but %s — disabled",
+                        cold_setting,
+                        why,
+                    )
+            backing = ExpertBackingStore(model_path, extra_roots=extra_roots, cold_root=cold_root)
             # Guard metadata for the scheduler's prefill chunk sizing: the
             # lazy chunk forward holds every MoE layer's assembled mini-bank
             # until the chunk-end eval, so the peak carries ~one bank per

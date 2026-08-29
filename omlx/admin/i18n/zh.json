@@ -1143,5 +1143,7 @@
   "modal.model_settings.expert_streaming_pins": "专家页锁定（mlock）",
   "modal.model_settings.expert_streaming_pins_hint": "将每层最热门的专家零拷贝锁定进内存，并学习按模型保存的锁定画像（卸载时写入）——下次加载从第一个 token 起即预热。不改变输出。",
   "modal.model_settings.expert_streaming_pin_gib": "锁定预算（GiB）",
-  "modal.model_settings.expert_streaming_pin_gib_hint": "锁定专家所占用的内存上限。留空 = 默认 1.25 GiB。"
+  "modal.model_settings.expert_streaming_pin_gib_hint": "锁定专家所占用的内存上限。留空 = 默认 1.25 GiB。",
+  "modal.model_settings.expert_streaming_cold_tier": "冷专家层（位宽）",
+  "modal.model_settings.expert_streaming_cold_tier_hint": "需要先运行 tools/requant_cold_tier.py（expert_cold/ 已存在）。从低精度层读取流式专家——降低 I/O 下限上的每 token 字节。近似计算：请用困惑度基准把关。留空 = 关闭。"
 }
