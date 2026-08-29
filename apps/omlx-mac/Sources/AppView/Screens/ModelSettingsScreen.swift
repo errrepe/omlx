@@ -720,8 +720,8 @@ private struct AdvancedTab: View {
                                      defaultValue: "Required because resident loading exceeds the configured model-memory limit.",
                                      comment: "Sublabel when Qwen4 PLE SSD offload is forced by memory limits")
                             : String(localized: "settings.advanced.qwen4_ssd_offload.sub",
-                                     defaultValue: "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes.",
-                                     comment: "Sublabel for the Qwen4 PLE SSD mmap toggle")) {
+                                     defaultValue: "On by default: the PLE N-gram table is read from SSD via mmap. Lookups are pure row gathers, so throughput is unaffected. Turn off to pin the table in memory.",
+                                     comment: "Sublabel for the Qwen4 PLE SSD mmap toggle, which is on by default")) {
                         Toggle("", isOn: vm.bind(
                             $vm.qwen4PleSsdOffload,
                             save: {

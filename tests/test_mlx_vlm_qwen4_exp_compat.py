@@ -746,3 +746,22 @@ def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
         from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
 
         configure_ple_runtime(compute, mode="resident")
+
+
+def test_ple_runtime_auto_defaults_to_mmap():
+    """auto resolves to SSD mmap regardless of checkpoint size; resident
+    remains reachable only as an explicit choice."""
+    from mlx_vlm.models.qwen4_exp.language import resolve_ple_runtime_mode
+
+    assert (
+        resolve_ple_runtime_mode("auto", checkpoint_bytes=1, physical_memory=1 << 40)
+        == "mmap"
+    )
+    assert (
+        resolve_ple_runtime_mode("resident", checkpoint_bytes=1, physical_memory=1)
+        == "resident"
+    )
+    assert (
+        resolve_ple_runtime_mode("mmap", checkpoint_bytes=1, physical_memory=1)
+        == "mmap"
+    )

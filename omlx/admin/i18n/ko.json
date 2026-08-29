@@ -612,7 +612,7 @@
   "modal.model_settings.enable_thinking_default": "모델 기본값 사용 중",
   "modal.model_settings.enable_thinking_reset": "모델 기본값으로 재설정",
   "modal.model_settings.qwen4_ple_ssd_offload": "SSD N-gram 오프로딩 (Qwen4 전용)",
-  "modal.model_settings.qwen4_ple_ssd_offload_hint": "큰 PLE N-gram 테이블을 SSD에 두고 필요한 행만 읽습니다. 메모리를 절약하지만 컨텍스트가 바뀐 뒤 prefill이 느려질 수 있습니다.",
+  "modal.model_settings.qwen4_ple_ssd_offload_hint": "기본값으로 활성화: 큰 PLE N-gram 테이블은 mmap으로 SSD에서 읽습니다. 조회는 순수한 행 gather이므로 처리량에는 영향이 없습니다. 메모리에 상주시키려면 끄세요.",
   "modal.model_settings.qwen4_ple_ssd_offload_forced": "resident 로드가 설정된 모델 메모리 한도를 초과하므로 이 옵션이 필요합니다.",
   "modal.model_settings.thinking_budget": "Thinking 토큰 제한",
   "modal.model_settings.thinking_budget_hint": "추론 모델의 thinking 토큰 수를 제한합니다. 초과 시 thinking을 강제 종료합니다.",

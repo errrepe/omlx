@@ -670,7 +670,7 @@ def maybe_apply_pre_load_patches(
             mode=(
                 "mmap"
                 if model_settings is not None
-                and getattr(model_settings, "qwen4_ple_ssd_offload", False)
+                and getattr(model_settings, "qwen4_ple_ssd_offload", True)
                 else "resident" if model_settings is not None else None
             ),
             mtp_enabled=mtp_active,

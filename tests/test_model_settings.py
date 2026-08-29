@@ -33,6 +33,11 @@ class TestModelSettings:
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
 
+    def test_qwen4_ple_ssd_offload_default(self):
+        """SSD mmap is the default PLE residency; opt-out keeps it resident."""
+        settings = ModelSettings()
+        assert settings.qwen4_ple_ssd_offload is True
+
     def test_trust_remote_code_roundtrip(self):
         """Test trust_remote_code field survives to_dict -> from_dict roundtrip."""
         original = ModelSettings(trust_remote_code=True)
@@ -331,6 +336,35 @@ class TestModelSettingsManager:
             assert settings.temperature == 0.7
             assert settings.is_pinned is True
             assert settings.is_default is True
+
+    def test_v1_file_coerces_ple_ssd_offload_default(self):
+        """v1 blobs persisted qwen4_ple_ssd_offload=False because False was
+        the field default; loading coerces them to the new SSD-mmap default."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({
+                "version": 1,
+                "models": {
+                    "qwen4-a": {"qwen4_ple_ssd_offload": False},
+                    "qwen4-b": {"temperature": 0.5},
+                },
+            }))
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            assert manager.get_settings("qwen4-a").qwen4_ple_ssd_offload is True
+            assert manager.get_settings("qwen4-b").qwen4_ple_ssd_offload is True
+
+    def test_v2_file_keeps_explicit_ple_ssd_offload_opt_out(self):
+        """An opt-out saved on v2 stays resident across loads."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({
+                "version": 2,
+                "models": {"qwen4-a": {"qwen4_ple_ssd_offload": False}},
+            }))
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            assert manager.get_settings("qwen4-a").qwen4_ple_ssd_offload is False
 
     def test_set_settings(self):
         """Test setting and saving settings."""

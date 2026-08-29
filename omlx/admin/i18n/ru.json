@@ -612,7 +612,7 @@
   "modal.model_settings.enable_thinking_default": "Использовать значение модели по умолчанию",
   "modal.model_settings.enable_thinking_reset": "Сбросить к значению модели по умолчанию",
   "modal.model_settings.qwen4_ple_ssd_offload": "SSD N-gram Offload (Qwen4 only)",
-  "modal.model_settings.qwen4_ple_ssd_offload_hint": "Keep the large PLE N-gram table on SSD and read only the required rows. This saves memory but can slow prefill after context changes.",
+  "modal.model_settings.qwen4_ple_ssd_offload_hint": "Включено по умолчанию: большая N-gram-таблица PLE читается с SSD через mmap. Поиск — это чистая построчная выборка, поэтому пропускная способность не страдает. Отключите, чтобы держать таблицу в памяти.",
   "modal.model_settings.qwen4_ple_ssd_offload_forced": "Required because resident loading exceeds the configured model-memory limit.",
   "modal.model_settings.thinking_budget": "Бюджет мышления",
   "modal.model_settings.thinking_budget_hint": "Ограничьте число токенов мышления для моделей рассуждения. Принудительно завершает мышление при превышении лимита.",

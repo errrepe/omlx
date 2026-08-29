@@ -78,7 +78,14 @@ def resolve_ple_runtime_mode(
         raise ValueError("OMLX_QWEN4_PLE_MODE must be auto, resident, or mmap")
     if requested != "auto":
         return requested
-    return "mmap" if checkpoint_bytes > physical_memory * 0.70 else "resident"
+    # mmap is the default residency: PLE lookups are pure row gathers with no
+    # matmuls, so SSD paging costs no throughput while freeing the ~25-30% of
+    # RAM the table would otherwise pin (matching llama.cpp's --mmap
+    # measurements on the same checkpoint family). Resident loading remains
+    # available as an explicit choice via OMLX_QWEN4_PLE_MODE / ple_residency.
+    # checkpoint_bytes/physical_memory stay in the signature for callers that
+    # report residency estimates.
+    return "mmap"
 
 
 def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> str:

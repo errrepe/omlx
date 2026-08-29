@@ -159,3 +159,25 @@ def test_qwen4_exp_loader_uses_explicit_ple_ssd_offload_setting(tmp_path):
         for_vlm=True,
     )
     assert get_ple_runtime_mode() == "mmap"
+
+
+def test_qwen4_exp_loader_defaults_to_ple_mmap_without_flag(tmp_path):
+    """SSD mmap is the default PLE residency: default ModelSettings and
+    settings objects without the flag both load the PLE table from SSD."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
+    )
+
+    from omlx.model_settings import ModelSettings
+
+    assert ModelSettings().qwen4_ple_ssd_offload is True
+
+    maybe_apply_pre_load_patches(
+        str(tmp_path),
+        SimpleNamespace(mtp_enabled=False),
+        for_vlm=True,
+    )
+    from mlx_vlm.models.qwen4_exp.language import get_ple_runtime_mode
+
+    assert get_ple_runtime_mode() == "mmap"
