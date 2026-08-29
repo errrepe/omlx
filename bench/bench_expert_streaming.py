@@ -124,6 +124,7 @@ async def run(
     mem_ceiling: float = 28.0,
     specprefill_draft: str | None = None,
     specprefill_keep: float | None = None,
+    out_dir: str = "bench/results",
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -284,9 +285,13 @@ async def run(
     print(f"resources {res_summary['phases']}")
     import json as _json
 
+    # Side-effect artifacts land in out_dir so concurrent/sequential trials
+    # (autotune) never overwrite each other's raw sampler series.
+    out_dir_p = Path(out_dir)
+    out_dir_p.mkdir(parents=True, exist_ok=True)
     _json.dump(
         sampler.samples(),
-        open(f"bench/results/{model_key}_{budget}g_samples.json", "w"),
+        open(out_dir_p / f"{model_key}_{budget}g_samples.json", "w"),
     )
     # Generated output for bit-exactness comparison across runs
     _text = getattr(out2, "text", None)
@@ -297,7 +302,7 @@ async def run(
             "completion_tokens": n,
             "token_ids": _ids if isinstance(_ids, list) else None,
         },
-        open(f"bench/results/{model_key}_{budget}g_output.json", "w"),
+        open(out_dir_p / f"{model_key}_{budget}g_output.json", "w"),
     )
 
     stats = None
@@ -382,6 +387,8 @@ def main():
                     help="scheduler memory ceiling propagated as throttle/guard watermarks (the server "
                          "gets this from the ProcessMemoryEnforcer; the bench has no enforcer)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--out-dir", default="bench/results", metavar="DIR",
+                    help="directory for the _samples/_output side-effect files (default bench/results)")
     args = ap.parse_args()
     try:
         import psutil
@@ -411,6 +418,7 @@ def main():
             specprefill_keep=args.specprefill_keep,
             warm_control=args.warm_control,
             mem_ceiling=args.mem_ceiling_gib,
+            out_dir=args.out_dir,
         )
     )
 
