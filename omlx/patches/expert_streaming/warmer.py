@@ -486,16 +486,25 @@ class PrefillHotnessRecorder:
         hot = self._hot_top(experts_per_layer)
 
         def _run():
+            t0 = time.perf_counter()
+            n = 0
             for layer, eids in hot.items():
                 for lin in self.linears_by_layer.get(layer) or []:
-                    backing = getattr(lin, "backing", None)
+                    b = getattr(lin, "backing", None)
                     for key in _proj_keys(lin):
                         # ids from Counter.most_common — sort for run grouping.
                         for eid in sorted(eids):
                             try:
-                                backing.load_expert_slice(key, eid)
+                                b.load_expert_slice(key, eid)
+                                n += 1
                             except Exception:
                                 pass
+            self.seeded_s = time.perf_counter() - t0
+            logger.info(
+                "Expert streaming: page-cache seed burst done: %d slices in %.2fs",
+                n,
+                self.seeded_s,
+            )
 
         _WARM_POOL.submit(_run)
         return sum(len(eids) for eids in hot.values())

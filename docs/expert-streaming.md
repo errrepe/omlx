@@ -350,6 +350,31 @@ Remeasuring the 8k idle TTFT after F1 on a machine whose owner was actively usin
 - **The E4-era ~87 s is not the post-F1 target — and ~40 GB available is not a realistic condition.** The 87 s was measured *pre*-F1 (no watermarks engaged: fixed 2048-token chunks); under honest watermarks even a 40 GB-available machine would chunk smaller and sweep more, so no settings knob buys it back. The realistic state of the shared box is ~22 GB available, and the honest post-F1 8k number there is the 341 s datapoint above.
 - **KV is not what blows the envelope on these checkpoints.** qwen4_exp is a hybrid: 36×GDN layers carry O(1) recurrent state (not per-token) and only 12×full-attention layers keep KV — 2 KV heads × head_dim 256 bf16 ≈ 2 KB/token → **~0.17 GiB at 8k**. dsv4 uses MLA (1 KV head × 512 latent ≈ 1 KB/token/layer) → **~0.3 GiB at 8k**. The long-context memory that matters is (a) the expert mini-bank transients (~17 MB/token, charged by the guard) and (b) the **unreleased MLX allocator pool** (30.4 GiB above) — which is a code lever (release between chunks / at the prefill→decode boundary, the DeepSeek per-layer `eval+clear` pattern generalized), not a settings knob.
 
+## Fase G — pool release, kernel readahead, hotness seeding (after a ds4 study)
+
+Studied antirez/ds4 (Metal SSD streaming for the same checkpoint class). It independently reaches the same architecture conclusions as our E/F phases — pread + parallel demand loads, single-size-class slab (= F2's `per_slot = per_expert//3`), cache budget sized from the backend's recommended working set minus context (= F1's "size to available"), and the "short token-major prefill spends most of its time in VM/driver synchronization" wall we hit as page-cache eviction. Three of its ideas were adopted:
+
+### G1 — off-boundary MLX pool release (`844cb4dc`)
+
+`_should_release_streaming_pool()` fires for streaming models (guard info resolved from the backing) whenever `mx.get_cache_memory()` crosses `max(memory_limit/3, 2 GiB)`, off the 512-step periodic boundary — hooked into the chunked prefill chunk tail and the `step()` tail. **Measured reality on the bench's external prefill path: a no-op.** The release-arm log shows the tail sees pool ≈ 0 GiB: the ~29 GiB pool peaks are *intra*-chunk/step allocator high-water (freed lazy-graph intermediates, trimmed by MLX's own cache limit before the tail looks). Where it does engage: the chunked path's chunk tail holds the just-freed chunk — that is the multi-request server case. Bounding the intra-step churn itself is the per-layer `mx.eval + clear_cache` pattern (G4, not built for qwen4_exp).
+
+### G2 — F_RDADVISE kernel readahead (`c33d820`)
+
+`_ShardReader.advise_range()` issues `fcntl F_RDADVISE` (Darwin cmd 44 — not exported by Python's fcntl module; radvisory packed `=qi4x`, best-effort) and `ExpertBackingStore.advise_expert_run()` collapses contiguous expert ids into one advisory per run (row-major banks make runs contiguous). Rides the warmer's next-layer previous-token prediction flow in advise-only mode — the kernel pulls the predicted ranges into the page cache with zero userspace copy (`OMLX_EXPERT_STREAMING_RA`, default on, `=0` disables). Prefill keeps plain pread (prediction is useless there — F3; ds4 defaults the same way). Effect at 512/2k scale: within run noise.
+
+### G3 — prefill-hotness cache seed (`c33d820`)
+
+ds4's cache seeding. `PrefillHotnessRecorder` accumulates per-layer expert frequency during prefill-sized calls (decode rows excluded), then at the first decode-sized call swaps the cache to the prompt-wide hot set:
+
+- budget > 0: `ExpertLRUCache.retain_hot()` evicts everything outside the hot set and missing hot bundles load from the backing — attacks F2's cold-start (hit_rate 0.002: the prefill demand path fills the LRU with the *last* chunks' experts, then decode misses).
+- budget 0 (default): a bounded discarded-read burst into the page cache (`OMLX_EXPERT_STREAMING_SEED_GIB`, 2 GiB cap), async on the warm pool.
+
+Measured live on qwen 512: 720 slices seeded at the prefill→decode boundary. `OMLX_EXPERT_STREAMING_SEED=0` disables.
+
+### Machine honesty for the G-series benches
+
+Two swap incidents during this phase (user visible). The bench runs at ceiling 20 GiB with ~24 GB available still over-commit: the intra-step pool peaks (~29 GiB wired) ride above any tail watermark, so on this shared box the G-series A/B numbers are dominated by machine state, not code — identical 2k workloads measured TTFT 118.3 / 96.8 / 112.2 s across the session as available memory moved 21.9 → 27.5 GB. Real lever A/B needs either an idle window or G4 first. Survival notes: preflight on psutil available (not `memory_pressure` free-%), ceiling sized to available, and treat the first `memory_pressure` complaint as a stop signal.
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.
