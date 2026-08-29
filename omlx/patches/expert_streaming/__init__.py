@@ -76,6 +76,8 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
         "expert_streaming_seed": None,
         "expert_streaming_pilot": None,
         "expert_streaming_per_layer_eval": None,
+        "expert_streaming_pins": None,
+        "expert_streaming_pin_gib": None,
     }
     if model_settings is None:
         return raw
@@ -830,10 +832,20 @@ def convert_model_to_streaming(
         seed_enabled = (
             _warmer_mod.SEED_ENABLED if seed_setting is None else bool(seed_setting)
         )
+        pins_setting = io_ov["expert_streaming_pins"]
+        pins_enabled = (
+            _warmer_mod.PIN_ENABLED if pins_setting is None else bool(pins_setting)
+        )
+        pin_gib = io_ov["expert_streaming_pin_gib"]
+        pin_budget_bytes = (
+            _warmer_mod.PIN_BUDGET_BYTES
+            if pin_gib is None
+            else max(0, min(64.0, float(pin_gib))) * 1024**3
+        )
 
         if (
             _warmer_mod.WARM_ENABLED
-            or _warmer_mod.PIN_ENABLED
+            or pins_enabled
             or ra_enabled
             or seed_enabled
         ):
@@ -861,14 +873,25 @@ def convert_model_to_streaming(
                 else:
                     warmer = None
                 pinner = None
-                if _warmer_mod.PIN_ENABLED and backing is not None and not isinstance(backing, dict):
+                if pins_enabled and backing is not None and not isinstance(backing, dict):
+                    # Per-model learned-pin profile so the hot set is wired
+                    # from token 1 on the next load (E3). The env path (bench
+                    # override) wins when set; otherwise a .omlx sidecar in
+                    # the model directory.
+                    pin_profile_path = _warmer_mod.PIN_PROFILE_PATH or str(
+                        Path(model_path) / ".omlx" / "expert_pin_profile.json"
+                    )
                     pinner = _warmer_mod.PinController(
                         linears_by_layer,
                         backing,
-                        budget_bytes=_warmer_mod.PIN_BUDGET_BYTES,
+                        budget_bytes=int(pin_budget_bytes),
                         observe_calls=_warmer_mod.PIN_OBSERVE_CALLS,
                         per_expert_bytes=estimate.per_expert_bytes,
+                        profile_path=pin_profile_path,
                     )
+                    # Save-on-unload hook: engines call save_expert_pin_profile()
+                    # in stop() while the backing is still reachable.
+                    backing._pin_controller = pinner  # type: ignore[attr-defined]
                 recorder = None
                 if seed_enabled and backing is not None and not isinstance(backing, dict):
                     recorder = _warmer_mod.PrefillHotnessRecorder(
@@ -899,9 +922,37 @@ def convert_model_to_streaming(
     return model, backing if not isinstance(backing, dict) else None
 
 
+def save_expert_pin_profile(engine: Any) -> None:
+    """Persist the learned pin profile of a streaming engine, if any.
+
+    Called from the engine ``stop()`` paths while the backing store (and the
+    PinController attached to it) is still reachable — before teardown drops
+    the references. Never raises: a failed save only costs the learned hot
+    set, never correctness.
+    """
+    for holder in (
+        engine,
+        getattr(engine, "_model", None),
+        getattr(engine, "_vlm_model", None),
+    ):
+        if holder is None:
+            continue
+        backing = getattr(holder, "_expert_streaming_backing", None)
+        pinner = getattr(backing, "_pin_controller", None)
+        if pinner is not None:
+            try:
+                pinner.save_profile()
+            except Exception:
+                logger.debug(
+                    "Expert streaming: pin profile save failed", exc_info=True
+                )
+            return
+
+
 __all__ = [
     "apply_expert_streaming_patch",
     "convert_model_to_streaming",
+    "save_expert_pin_profile",
     "is_supported_model_type",
     "SUPPORTED_TYPES",
 ]

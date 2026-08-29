@@ -1489,6 +1489,8 @@ def test_io_overrides_resolution_and_clamping():
         "expert_streaming_seed": None,
         "expert_streaming_pilot": None,
         "expert_streaming_per_layer_eval": None,
+        "expert_streaming_pins": None,
+        "expert_streaming_pin_gib": None,
     }
 
     # Depth clamping and boolean pass-through
@@ -1500,6 +1502,8 @@ def test_io_overrides_resolution_and_clamping():
             expert_streaming_seed=False,
             expert_streaming_pilot=True,
             expert_streaming_per_layer_eval=False,
+            expert_streaming_pins=True,
+            expert_streaming_pin_gib=3.0,
         )
     )
     assert ov["expert_streaming_io_depth"] == 64
@@ -1508,6 +1512,8 @@ def test_io_overrides_resolution_and_clamping():
     assert ov["expert_streaming_seed"] is False
     assert ov["expert_streaming_pilot"] is True
     assert ov["expert_streaming_per_layer_eval"] is False
+    assert ov["expert_streaming_pins"] is True
+    assert ov["expert_streaming_pin_gib"] == 3.0
 
     # Invalid depth → None (env default); None settings object → all None
     ov = _io_overrides(ModelSettings(expert_streaming_io_depth=0))
@@ -1746,3 +1752,117 @@ async def test_expert_streaming_per_layer_eval_persists_via_api():
         admin_routes.ModelSettingsRequest(expert_streaming_per_layer_eval=False),
     )
     assert settings.expert_streaming_per_layer_eval is False
+
+
+# --- Learned pin store server integration (I2) -------------------------------
+
+
+def test_pin_controller_profile_round_trip(tmp_path):
+    """An explicitly wired per-model profile path persists observed frequencies
+    and a fresh controller wires the learned hot set from token 1."""
+    from collections import Counter
+    from unittest.mock import MagicMock
+
+    from omlx.patches.expert_streaming import warmer as warmer_mod
+
+    profile = str(tmp_path / ".omlx" / "expert_pin_profile.json")
+    linears = {0: [MagicMock()], 1: [MagicMock()]}
+    ctl = warmer_mod.PinController(
+        linears,
+        MagicMock(),
+        per_expert_bytes=1024,
+        profile_path=profile,
+    )
+    ctl.freq = {0: Counter({3: 9, 5: 2}), 1: Counter({7: 4})}
+    ctl.save_profile()
+
+    import json
+    import os
+
+    assert os.path.exists(profile)
+    data = json.loads(open(profile).read())
+    assert data["freq"]["0"] == [[3, 9], [5, 2]]
+
+    ctl2 = warmer_mod.PinController(
+        linears,
+        MagicMock(),
+        per_expert_bytes=1024,
+        profile_path=profile,
+    )
+    assert ctl2.freq == {0: Counter({3: 9, 5: 2}), 1: Counter({7: 4})}
+    # Learned hot set available: pinned immediately, no observation window.
+    assert ctl2.pinned is True
+    # Env path (explicit opt-in) wins over the per-model derived path.
+    assert warmer_mod.PinController(
+        linears, MagicMock(), profile_path=profile
+    ).profile_path == profile or warmer_mod.PIN_PROFILE_PATH == ""
+
+
+def test_expert_streaming_pins_io_overrides():
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.expert_streaming import _io_overrides
+
+    ov = _io_overrides(
+        ModelSettings(expert_streaming_pins=True, expert_streaming_pin_gib=3.0)
+    )
+    assert ov["expert_streaming_pins"] is True
+    assert ov["expert_streaming_pin_gib"] == 3.0
+    ov = _io_overrides(ModelSettings())
+    assert ov["expert_streaming_pins"] is None
+    assert ov["expert_streaming_pin_gib"] is None
+
+
+@pytest.mark.asyncio
+async def test_expert_streaming_pins_persist_via_api():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            expert_streaming_pins=True, expert_streaming_pin_gib=2.5
+        ),
+    )
+    assert settings.expert_streaming_pins is True
+    assert settings.expert_streaming_pin_gib == 2.5
+
+
+@pytest.mark.asyncio
+async def test_expert_streaming_pin_gib_validation():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+    with pytest.raises(admin_routes.HTTPException, match="between 0 and 64"):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(expert_streaming_pin_gib=99),
+        )
+
+
+def test_expert_streaming_pins_excluded_from_profiles():
+    from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+
+    assert "expert_streaming_pins" in EXCLUDED_FROM_PROFILES
+    assert "expert_streaming_pin_gib" in EXCLUDED_FROM_PROFILES
+
+
+def test_save_expert_pin_profile_hook():
+    """The engine stop() helper saves via the backing's attached controller
+    and never raises, even when nothing is attached."""
+    from omlx.patches.expert_streaming import save_expert_pin_profile
+
+    engine = MagicMock()
+    backing = MagicMock()
+    engine._expert_streaming_backing = backing
+    save_expert_pin_profile(engine)  # no controller attached -> no-op
+    backing._pin_controller = None
+    save_expert_pin_profile(engine)
+    ctl = MagicMock()
+    backing._pin_controller = ctl
+    save_expert_pin_profile(engine)
+    ctl.save_profile.assert_called_once()
+
+    # Nothing attached anywhere: silent no-op (and the model-side holder path).
+    bare = MagicMock(spec=object)
+    save_expert_pin_profile(bare)

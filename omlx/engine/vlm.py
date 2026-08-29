@@ -2280,6 +2280,11 @@ class VLMBatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        # Persist the learned expert-pin profile while the backing is still
+        # reachable (teardown below drops it with the model).
+        from omlx.patches.expert_streaming import save_expert_pin_profile
+
+        save_expert_pin_profile(self)
         engine = self._engine
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):

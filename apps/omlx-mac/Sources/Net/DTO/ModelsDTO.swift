@@ -104,6 +104,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let expertStreamingBudgetGib: Double?
     let expertStreamingTopkThreshold: Double?
     let expertStreamingPerLayerEval: Bool?
+    let expertStreamingPins: Bool?
+    let expertStreamingPinGib: Double?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -195,6 +197,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var expertStreamingBudgetGib: Double? = nil
     var expertStreamingTopkThreshold: Double? = nil
     var expertStreamingPerLayerEval: Bool? = nil
+    var expertStreamingPins: Bool? = nil
+    var expertStreamingPinGib: Double? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil

@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold, expertStreamingPerLayerEval
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -247,6 +247,8 @@ final class ModelSettingsScreenVM {
     var expertStreamingBudgetGib: String = ""
     var expertStreamingTopkThreshold: String = ""
     var expertStreamingPerLayerEval: Bool = true
+    var expertStreamingPins: Bool = false
+    var expertStreamingPinGib: String = ""
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -393,7 +395,8 @@ final class ModelSettingsScreenVM {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
         case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib,
-             .expertStreamingTopkThreshold, .expertStreamingPerLayerEval, .thinkingBudgetEnabled, .thinkingBudgetTokens:
+             .expertStreamingTopkThreshold, .expertStreamingPerLayerEval, .expertStreamingPins, .expertStreamingPinGib,
+             .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
@@ -535,6 +538,8 @@ final class ModelSettingsScreenVM {
                 // Null means the env/built-in default, which is on — show the
                 // effective state so the toggle is never a lie.
                 self.expertStreamingPerLayerEval = s?.expertStreamingPerLayerEval ?? true
+                self.expertStreamingPins = s?.expertStreamingPins ?? false
+                self.expertStreamingPinGib = s?.expertStreamingPinGib.map { String($0) } ?? ""
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -705,6 +710,19 @@ final class ModelSettingsScreenVM {
         case .expertStreamingPerLayerEval:
             guard expertStreamingSupported, expertStreamingEnabled else { return }
             patch.expertStreamingPerLayerEval = expertStreamingPerLayerEval
+        case .expertStreamingPins:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingPins = expertStreamingPins
+        case .expertStreamingPinGib:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            if expertStreamingPinGib.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                patch.expertStreamingPinGib = nil
+            } else if let v = Double(expertStreamingPinGib), v >= 0, v <= 64 {
+                patch.expertStreamingPinGib = v
+            } else {
+                lastError = "Pin budget must be between 0 and 64 GiB"
+                return
+            }
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:

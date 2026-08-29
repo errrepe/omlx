@@ -720,6 +720,11 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        # Persist the learned expert-pin profile while the backing is still
+        # reachable (teardown below drops it with the model).
+        from omlx.patches.expert_streaming import save_expert_pin_profile
+
+        save_expert_pin_profile(self)
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:

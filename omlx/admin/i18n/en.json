@@ -1139,5 +1139,9 @@
   "modal.model_settings.expert_streaming_topk": "Top-k mass threshold",
   "modal.model_settings.expert_streaming_topk_hint": "Opt-in approximate routing: keep the smallest score-descending top-k prefix reaching this mass share. 1.0 or empty = exact (bit-identical). ~0.85 is the speed cliff measured on FlashNext-class models (~1.8x, 7/10 tokens identical at 0.70).",
   "modal.model_settings.expert_streaming_eval": "Prefill per-layer sync (Qwen)",
-  "modal.model_settings.expert_streaming_eval_hint": "Evaluate each decoder layer during streaming prefill and trim the allocator cache. Bit-exact; bounds memory peaks on long prompts so the page cache survives. Disable only for A/B testing."
+  "modal.model_settings.expert_streaming_eval_hint": "Evaluate each decoder layer during streaming prefill and trim the allocator cache. Bit-exact; bounds memory peaks on long prompts so the page cache survives. Disable only for A/B testing.",
+  "modal.model_settings.expert_streaming_pins": "Expert pins (mlock)",
+  "modal.model_settings.expert_streaming_pins_hint": "Wire the hottest experts per layer into RAM (zero-copy page locking) and learn a per-model pin profile saved on unload — the hot set is warm from the first token next load. No output change.",
+  "modal.model_settings.expert_streaming_pin_gib": "Pin budget (GiB)",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "Wired-memory cap for pinned experts. Empty = 1.25 GiB default."
 }

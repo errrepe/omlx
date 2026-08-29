@@ -193,6 +193,7 @@ class PinController:
         budget_bytes: int = PIN_BUDGET_BYTES,
         observe_calls: int = PIN_OBSERVE_CALLS,
         per_expert_bytes: int = 0,
+        profile_path: str | None = None,
     ):
         self.linears_by_layer = linears_by_layer
         self.backing = backing
@@ -203,7 +204,9 @@ class PinController:
         self.calls = 0
         self.pinned = False
         self.pin_jobs = 0
-        self.profile_path = PIN_PROFILE_PATH
+        # Server wiring passes a per-model path (<model>/.omlx/...); the env
+        # path stays the explicit bench/override opt-in and wins when set.
+        self.profile_path = PIN_PROFILE_PATH or profile_path
         if self.profile_path and self._load_profile():
             # Learned hot set available: pin immediately, no observation.
             self._pin_all()
@@ -237,7 +240,9 @@ class PinController:
             return
         try:
             import json
+            from pathlib import Path
 
+            Path(self.profile_path).parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "per_expert_bytes": self.per_expert_bytes,
                 "freq": {

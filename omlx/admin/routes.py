@@ -140,6 +140,8 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_seed: bool | None = None
     expert_streaming_pilot: bool | None = None
     expert_streaming_per_layer_eval: bool | None = None
+    expert_streaming_pins: bool | None = None
+    expert_streaming_pin_gib: float | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -2450,6 +2452,16 @@ async def update_model_settings(
         current_settings.expert_streaming_per_layer_eval = (
             request.expert_streaming_per_layer_eval
         )
+    if "expert_streaming_pins" in sent:
+        current_settings.expert_streaming_pins = request.expert_streaming_pins
+    if "expert_streaming_pin_gib" in sent:
+        v = request.expert_streaming_pin_gib
+        if v is None:
+            current_settings.expert_streaming_pin_gib = None
+        else:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 <= v <= 64:
+                raise HTTPException(status_code=400, detail="expert_streaming_pin_gib must be a number between 0 and 64 GiB")
+            current_settings.expert_streaming_pin_gib = float(v)
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False

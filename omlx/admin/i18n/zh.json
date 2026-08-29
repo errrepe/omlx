@@ -1139,5 +1139,9 @@
   "modal.model_settings.expert_streaming_topk": "Top-k 质量阈值",
   "modal.model_settings.expert_streaming_topk_hint": "可选的近似路由：保留按分数降序的 top-k 前缀中达到该质量比例的最小集合。1.0 或留空 = 精确（位级一致）。~0.85 是实测的速度拐点（约 1.8x，0.70 时 10 个 token 中 7 个一致）。",
   "modal.model_settings.expert_streaming_eval": "预填充逐层同步（Qwen）",
-  "modal.model_settings.expert_streaming_eval_hint": "流式预填充时逐层求值解码层并清理分配器缓存。位级一致；限制长提示的内存峰值，保护页缓存。仅在 A/B 测试时关闭。"
+  "modal.model_settings.expert_streaming_eval_hint": "流式预填充时逐层求值解码层并清理分配器缓存。位级一致；限制长提示的内存峰值，保护页缓存。仅在 A/B 测试时关闭。",
+  "modal.model_settings.expert_streaming_pins": "专家页锁定（mlock）",
+  "modal.model_settings.expert_streaming_pins_hint": "将每层最热门的专家零拷贝锁定进内存，并学习按模型保存的锁定画像（卸载时写入）——下次加载从第一个 token 起即预热。不改变输出。",
+  "modal.model_settings.expert_streaming_pin_gib": "锁定预算（GiB）",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "锁定专家所占用的内存上限。留空 = 默认 1.25 GiB。"
 }

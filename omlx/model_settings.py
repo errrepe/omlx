@@ -253,6 +253,15 @@ class ModelSettings:
         # (default env OMLX_EXPERT_STREAMING_PER_LAYER_EVAL or on). GLM/DeepSeek
         # decoders honor the boundary natively and are unaffected by this knob.
     )
+    expert_streaming_pins: Optional[bool] = (
+        None  # mlock-pin the observed/learned hot experts per layer (default env
+        # OMLX_EXPERT_STREAMING_PIN or off). Enables the learned pin profile
+        # (<model>/.omlx/expert_pin_profile.json): saved on unload, reloaded on
+        # load so the hot set is wired from token 1. Zero output change.
+    )
+    expert_streaming_pin_gib: Optional[float] = (
+        None  # Pin budget in GiB (default env OMLX_EXPERT_STREAMING_PIN_GIB or 1.25)
+    )
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

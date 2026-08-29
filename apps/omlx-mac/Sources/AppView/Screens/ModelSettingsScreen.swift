@@ -811,6 +811,37 @@ private struct AdvancedTab: View {
                             .toggleStyle(.switch)
                         }
                     }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.pins.label",
+                                          defaultValue: "Expert pins (mlock)",
+                                          comment: "Row label for the expert pinning toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.pins.sub",
+                                             defaultValue: "Wire the hottest experts per layer into RAM and learn a per-model pin profile saved on unload — warm from the first token next load. No output change.",
+                                             comment: "Sublabel for the expert pinning toggle")) {
+                            VStack(alignment: .trailing, spacing: 6) {
+                                if vm.expertStreamingPins {
+                                    TextInput(text: vm.bind(
+                                        $vm.expertStreamingPinGib,
+                                        save: {
+                                            Task {
+                                                await vm.save(.expertStreamingPinGib, client: client)
+                                            }
+                                        }
+                                    ), mono: true, suffix: "GiB", width: 110)
+                                }
+                                Toggle("", isOn: vm.bind(
+                                    $vm.expertStreamingPins,
+                                    save: {
+                                        Task {
+                                            await vm.save(.expertStreamingPins, client: client)
+                                        }
+                                    }
+                                ))
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                            }
+                        }
+                    }
                 }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",

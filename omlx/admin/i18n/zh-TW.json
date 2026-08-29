@@ -1139,5 +1139,9 @@
   "modal.model_settings.expert_streaming_topk": "Top-k 質量門檻",
   "modal.model_settings.expert_streaming_topk_hint": "可選的近似路由：保留按分數降序的 top-k 前綴中達到該質量比例的最小集合。1.0 或留空 = 精確（位元級一致）。~0.85 是實測的速度拐點（約 1.8x，0.70 時 10 個 token 中 7 個一致）。",
   "modal.model_settings.expert_streaming_eval": "預填充逐層同步（Qwen）",
-  "modal.model_settings.expert_streaming_eval_hint": "串流預填充時逐層求值解碼層並清理分配器快取。位元級一致；限制長提示的記憶體峰值，保護頁面快取。僅在 A/B 測試時關閉。"
+  "modal.model_settings.expert_streaming_eval_hint": "串流預填充時逐層求值解碼層並清理分配器快取。位元級一致；限制長提示的記憶體峰值，保護頁面快取。僅在 A/B 測試時關閉。",
+  "modal.model_settings.expert_streaming_pins": "專家頁鎖定（mlock）",
+  "modal.model_settings.expert_streaming_pins_hint": "將每層最熱門的專家零拷貝鎖定進記憶體，並學習按模型儲存的鎖定畫像（卸載時寫入）——下次載入從第一個 token 起即預熱。不改變輸出。",
+  "modal.model_settings.expert_streaming_pin_gib": "鎖定預算（GiB）",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "鎖定專家所佔用的記憶體上限。留空 = 預設 1.25 GiB。"
 }
