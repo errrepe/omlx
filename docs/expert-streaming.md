@@ -375,6 +375,40 @@ Measured live on qwen 512: 720 slices seeded at the prefill→decode boundary. `
 
 Two swap incidents during this phase (user visible). The bench runs at ceiling 20 GiB with ~24 GB available still over-commit: the intra-step pool peaks (~29 GiB wired) ride above any tail watermark, so on this shared box the G-series A/B numbers are dominated by machine state, not code — identical 2k workloads measured TTFT 118.3 / 96.8 / 112.2 s across the session as available memory moved 21.9 → 27.5 GB. Real lever A/B needs either an idle window or G4 first. Survival notes: preflight on psutil available (not `memory_pressure` free-%), ceiling sized to available, and treat the first `memory_pressure` complaint as a stop signal.
 
+## Fase H — Autotune (per-machine parameter profiles)
+
+`bench/autotune_expert_streaming.py` turns the hand-run bench A/Bs above into an automated, safety-railed search. It exists because the G-series showed this machine's numbers are dominated by memory state: the only honest way to pick parameters is a tool that (a) measures the machine first, (b) refuses to run when the box is loaded, and (c) never pushes it into swap.
+
+**What it tunes.** The streaming knobs that measured meaningful deltas in E–G: `expert_streaming_budget_gib`, IO depth (QD), run coalescing, F_RDADVISE readahead, prefill-hotness seed, and the PILOT prefetcher. `topk` is opt-in (`--sweep-topk`) because it trades output fidelity.
+
+**How a session runs** (~1.5–2 h for the default shape):
+
+1. **Probe** (no model load): RAM/available/swap; the enforcer's static + Metal ceilings for the configured tier; sequential and random-expert-size read bandwidth on the model's own shard. A near-saturated random probe prunes the QD sweep.
+2. **Calibration** (discarded): default config at the screening context (2k/32 tokens) — warms the page cache and measures the loaded runtime footprint used by every later preflight.
+3. **Screening**: one-factor-at-a-time trials, each scored against the calibration reference (TTFT 50% + decode tok/s 50%, minus a penalty for any observed swap growth). Budget candidates are filtered by the memory actually left after load + reserve.
+4. **Head-to-head + validation**: the screening winner reruns against the default, then both run at the long context (8k/96) — a winner that regresses there is not recommended.
+5. **Recommendation**: `bench/results/autotune/<model>_<stamp>/recommendation.json` with every trial row, the winning config, and machine probe numbers.
+
+**Memory safety is the design constraint, not a feature:**
+
+- Per-trial ceiling = `min(static/metal cap, available − reserve)` — sized to the machine's *available* memory, never its capacity (the F1 lesson).
+- A watchdog thread samples the trial process every 2 s: swap growth > 2 GiB (immediate) or available < 5 GiB for 2 consecutive samples → SIGKILL the trial, record a safe-failure, and raise the reserve for the remaining trials.
+- Each trial is skipped (not failed) when available memory can't hold the loaded runtime + reserve + margin; the session aborts after two consecutive watchdog kills or if the machine fails to drain between trials.
+- Nothing runs on its own — a human launches the tuner; `--dry-run` prints the probe and the trial plan without loading the model.
+
+**Where the result lives.** `--apply` writes the winning knobs into the model's per-model settings (`ModelSettingsManager` → `~/.omlx/model_settings.json`) — the same configuration the app's model settings UI edits. The IO knobs are real per-model settings since Fase H (`expert_streaming_io_depth`, `_coalesce`, `_readahead`, `_seed`, `_pilot`; unset = env/default behavior), part of the engine runtime signature (changing one reloads the engine), and excluded from cross-model profile templates like the other hardware-specific streaming fields. Apply with the server stopped (or reload the model afterwards): a running server keeps its own in-memory settings manager and would overwrite the file on its next save.
+
+```bash
+# preview the machine profile and trial plan (no model load)
+.venv/bin/python bench/autotune_expert_streaming.py --model qwen --dry-run
+# full session; artifacts under bench/results/autotune/
+.venv/bin/python bench/autotune_expert_streaming.py --model qwen
+# persist the winner as the model's configuration
+.venv/bin/python bench/autotune_expert_streaming.py --model qwen --apply
+```
+
+Machine-probe datapoint (2026-08-29, shared 48 GiB box under active use): static ceiling 42 GiB (balanced tier), Metal cap 37.4 GiB, SSD sequential ~16 GB/s with the bank's shards warm in page cache (random QD1 ~15 GB/s — the QD sweep was pruned as near-saturated; cold-cache random bandwidth is lower, so the prune is conservative for cached servers). The tuner refused a real session at 21.5 GB available, as designed.
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.
