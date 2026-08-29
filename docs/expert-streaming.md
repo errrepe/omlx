@@ -34,7 +34,8 @@ Loading a glm5_next / qwen4_exp checkpoint with `expert_streaming_enabled` uses 
 - **Residency**: the `mtp.<stage>` banks count as expert bytes in `expert_streaming_estimate`, so `resident_bytes`/`streaming_bytes` and the admin capability flags stay accurate for the `-mtp` checkpoints (~9.7 GB of draft-stage experts at oQ4e would otherwise sit resident). When the runtime MTP is inactive the converter simply converts fewer layers and the per-layer LRU split is rebalanced.
 - **Activation**: DeepSeek V4's `SwitchGLU` uses `LimitedSwiGLU(swiglu_limit)` (fp32 on draft stages); the streaming GLU copies the original activation, keeping output bit-exact with the resident path.
 - **Gate**: layers `0..2` are hash-routed (`tid2eid[input_ids]`); routing is untouched by streaming — only the expert banks are swapped.
-- **Budget**: dense ≈ 5 GB, ~12.6 MB/expert × 256 experts × 46 layers. The default 1 GiB gives ~1 slot/layer (GLM-class numbers, ~0.07 tok/s on the measured baseline); 4–8 GiB is the sensible range if you have the RAM headroom.
+- **Budget (measured estimate)**: dense 7.82 GiB resident + streaming total 8.21 GiB; per-expert 12.75 MiB × 256 experts × 46 banks (43 layers + 3 DSpark stages — the checkpoint ships 3, `num_nextn_predict_layers` notwithstanding). The default 1 GiB gives ~1 slot/layer (GLM-class numbers, ~0.07 tok/s on the measured baseline); 4–8 GiB is the sensible range if you have the RAM headroom.
+- **First measured streaming run** (`dsv4_short_f.json`, 48 GiB shared box, budget 0 / page-cache only, QD16): load 2.9 s (dense only — the 150+ GiB expert banks stay on SSD), short-prompt TTFT 8.0 s, decode **1.223 tok/s** (16 tokens, disk 1.1 GB/s — page-cache hits from the prefill sweep cover most expert reads). Fastest short-TTFT of the three supported families (qwen ~10 s, GLM ~18.5 s); steady-state decode beats GLM-5.3's 0.697 tok/s despite the larger per-expert banks. Long prompts (2k/8k) are a different regime: at oQ4e a full 46-bank sweep is ~150 GiB, and the chunked guard re-sweeps per chunk when the page cache cannot hold the bank — measure on an idle machine before quoting numbers.
 
 ## Settings
 
@@ -338,6 +339,15 @@ Sparse selected tokens spread routing across the bank (4× unique experts per fo
 - The levers that survived: QD16, coalesced runs, learned pins (E3), and the honest chunk watermarks (F1) that trade chunk size for machine safety under pressure.
 - The remaining prefill cost is the expert QMM itself and the one full-bank sweep — chunked prefill sizing amortizes assembly but cannot remove compute; only fewer/cheaper expert-token pairs can (none of the tested accelerators — ANE, SpecPrefill, MTP at prefill — reduce it for streaming).
 - DeepSeek V4's per-layer `mx.eval` + `clear_cache` pattern (already in its loader) is the known-good answer for the lazy-graph accumulation; a qwen4_exp equivalent would bound intra-chunk peaks if ever needed.
+
+### Post-F machine-state reality check (shared 48 GiB box, 2026-08)
+
+Remeasuring the 8k idle TTFT after F1 on a machine whose owner was actively using it (`memory_pressure -Q` 88-90 % free, but **psutil available 21.9 GB**) — `qwen8k_f_idle.json`, budget 0, ceiling 28 GiB:
+
+- TTFT **341.1 s** (vs the E4-era idle ~87 s and the F1 busy 296.9 s), decode **0.303 tok/s**. The prefill read **~546 GB from disk** — a full 66 GiB bank sweep re-executed ~8× — because the MLX allocator cache rode to 30.4 GiB under the honest watermark and evicted the page cache the run itself depends on; every later chunk then re-streamed the full bank from SSD.
+- **Decode kept the squeeze**: MLX cache was still holding ~16 GiB during decode (the periodic clear gate — every 512 steps *and* above a threshold — never fires for a 96-token decode), so budget-0 decode was fully disk-bound. Candidate lever: `_sync_and_clear_cache()` (or a `get_cache_memory()`-aware throttle probe) at the prefill→decode boundary.
+- **Two preflight lessons.** (1) `memory_pressure -Q` free-% is the wrong gate for streaming runs — it counts ~24 GiB of inactive page cache as free that the run can't actually commit without evicting itself; the bench's psutil-based `--min-free-gb` (default 22) is the right signal, and overriding it to 20 is what let the starved run through. (2) The ceiling default (28 GiB) presumes an idle machine: at 21.9 GB available, a 2k prompt fits a *single* ~34 GiB transient chunk under that watermark and wired memory hit 38 GiB into swap. Size `--mem-ceiling-gib` to the machine's *available*, not its capacity.
+- The true idle 8k number (~87 s) remains the E4-era measurement; reproducing it needs ~40 GB available (heavy apps closed). The post-F1 contended number is the 341 s datapoint above — the 2.3-3× machine-state sensitivity documented in F1, now confirmed with the honest watermarks.
 
 ## References
 

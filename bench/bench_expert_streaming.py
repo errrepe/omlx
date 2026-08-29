@@ -20,14 +20,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 MODEL_PATHS = {
     "qwen": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-oQ4e-mtp",
     "glm": "/Volumes/SSD 4TB/AI Models/GLM-5.3-Flash-oQ4e",
+    "dsv4": "/Volumes/SSD 4TB/AI Models/DeepSeek-V4-Flash-0731-oQ4e-mtp",
 }
 DEFAULT_ENTRIES = {
     "qwen": "Qwen3.8-Flash-Next-oQ4e-mtp",
     "glm": "GLM-5.3-Flash-oQ4e",
+    "dsv4": "DeepSeek-V4-Flash-0731-oQ4e-mtp",
 }
 PROMPTS = {
     "qwen": [{"role": "user", "content": "Hello, how are you?"}],
     "glm": [{"role": "user", "content": "Hello, how are you?"}],
+    "dsv4": [{"role": "user", "content": "Hello, how are you?"}],
 }
 
 _FILLER = (
