@@ -958,6 +958,7 @@ def _streaming_chunk_ns(events):
         "_others_decoding",
         "_should_release_streaming_pool",
         "_periodic_clear_threshold_bytes",
+        "_note_streaming_release",
         "_accrue_decode_debt",
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))

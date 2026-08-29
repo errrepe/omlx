@@ -379,3 +379,4 @@ Two swap incidents during this phase (user visible). The bench runs at ceiling 2
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.
 - colibri expert atlas: routing heat is measurably structured and therefore cacheable.
+- Paper survey & gap analysis (2024–26 MoE-offloading literature vs this implementation, prioritized next levers): [expert-streaming-papers.md](expert-streaming-papers.md).

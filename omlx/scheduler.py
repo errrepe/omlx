@@ -2321,20 +2321,31 @@ class Scheduler:
         clear, ``_mx_buffer_access_lock``), so the #978/#1040 panic-class
         gating semantics are preserved.
         """
-        if not self._resolve_streaming_guard_info():
+        info = self._resolve_streaming_guard_info()
+        pool = mx.get_cache_memory()
+        if not info:
             # Diagnostic: the streaming hooks are inert without the backing's
-            # guard info — surface a skip when the pool is obviously large.
-            if mx.get_cache_memory() > 4 * 1024**3:
-                now = time.monotonic()
-                if now - getattr(self, "_last_streaming_skip_log", 0.0) > 30.0:
-                    self._last_streaming_skip_log = now
-                    logger.info(
-                        "Streaming pool release skipped: no streaming guard "
-                        "info on the model tree (pool %.1f GiB)",
-                        mx.get_cache_memory() / 1024**3,
-                    )
+            # guard info — surface it (rate-limited) whenever the tail runs.
+            now = time.monotonic()
+            if now - getattr(self, "_last_streaming_skip_log", 0.0) > 30.0:
+                self._last_streaming_skip_log = now
+                logger.info(
+                    "Streaming pool release skipped: no streaming guard info "
+                    "on the model tree (pool %.1f GiB)",
+                    pool / 1024**3,
+                )
             return False
-        return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
+        if not getattr(self, "_streaming_release_armed_logged", False):
+            self._streaming_release_armed_logged = True
+            logger.info(
+                "Streaming pool release armed: layers=%s experts/layer=%s "
+                "threshold=%.1f GiB (pool %.1f GiB)",
+                info.get("num_moe_layers"),
+                info.get("experts_per_layer"),
+                self._periodic_clear_threshold_bytes() / 1024**3,
+                pool / 1024**3,
+            )
+        return pool > self._periodic_clear_threshold_bytes()
 
     def _note_streaming_release(self) -> None:
         """Rate-limited log (30s) for the off-boundary streaming release."""
