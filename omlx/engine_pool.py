@@ -500,6 +500,22 @@ class EnginePool:
         setattr(effective, "expert_streaming_enabled", True)
         return effective
 
+    def _dflash_blocked_by_expert_streaming(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> bool:
+        """True when expert streaming wins over DFlash for this entry.
+
+        DFlash's own pipeline loads the target fully resident and never
+        applies the oMLX streaming patches, so the two are mutually
+        exclusive — an explicitly requested or memory-forced streaming
+        model must not be silently loaded resident (GLM-5.3 at 190G on a
+        48GiB machine would OOM inside DFlashEngine.start()).
+        """
+        enabled, forced, _ = self._expert_streaming_status(entry, settings)
+        return enabled or forced
+
     @staticmethod
     def _streaming_budget_bytes(settings: object | None) -> int:
         """Expert LRU budget in bytes from settings.
@@ -2675,44 +2691,58 @@ class EnginePool:
                         model_id,
                     )
                 elif dflash_enabled and dflash_draft:
-                    try:
-                        from .engine.dflash import DFlashEngine
+                    if self._dflash_blocked_by_expert_streaming(entry, model_settings):
+                        logger.warning(
+                            "Expert streaming is active for %s; DFlash would load "
+                            "the target fully resident and bypass streaming — "
+                            "skipping DFlash and using the native engine",
+                            model_id,
+                        )
+                    else:
+                        try:
+                            from .engine.dflash import DFlashEngine
 
-                        engine = DFlashEngine(
-                            model_name=entry.model_path,
-                            draft_model_path=dflash_draft,
-                            draft_quant_enabled=getattr(
-                                model_settings, "dflash_draft_quant_enabled", False
-                            ),
-                            draft_quant_weight_bits=getattr(
-                                model_settings, "dflash_draft_quant_weight_bits", 4
-                            ),
-                            draft_quant_activation_bits=getattr(
-                                model_settings, "dflash_draft_quant_activation_bits", 16
-                            ),
-                            draft_quant_group_size=getattr(
-                                model_settings, "dflash_draft_quant_group_size", 64
-                            ),
-                            model_settings=model_settings,
-                            fallback_engine_type=effective_type,
-                            scheduler_config=self._scheduler_config,
-                            omlx_ssd_cache_dir=getattr(
-                                self._scheduler_config, "paged_ssd_cache_dir", None
-                            ),
-                        )
-                        logger.info(
-                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
-                        )
-                    except ImportError:
-                        logger.warning(
-                            f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
-                            f"Falling back to default engine."
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"DFlash init failed for {model_id}: {e}. "
-                            f"Falling back to default engine."
-                        )
+                            engine = DFlashEngine(
+                                model_name=entry.model_path,
+                                draft_model_path=dflash_draft,
+                                draft_quant_enabled=getattr(
+                                    model_settings, "dflash_draft_quant_enabled", False
+                                ),
+                                draft_quant_weight_bits=getattr(
+                                    model_settings, "dflash_draft_quant_weight_bits", 4
+                                ),
+                                draft_quant_activation_bits=getattr(
+                                    model_settings,
+                                    "dflash_draft_quant_activation_bits",
+                                    16,
+                                ),
+                                draft_quant_group_size=getattr(
+                                    model_settings,
+                                    "dflash_draft_quant_group_size",
+                                    64,
+                                ),
+                                model_settings=model_settings,
+                                fallback_engine_type=effective_type,
+                                scheduler_config=self._scheduler_config,
+                                omlx_ssd_cache_dir=getattr(
+                                    self._scheduler_config,
+                                    "paged_ssd_cache_dir",
+                                    None,
+                                ),
+                            )
+                            logger.info(
+                                f"DFlash enabled for {model_id}, draft={dflash_draft}"
+                            )
+                        except ImportError:
+                            logger.warning(
+                                f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
+                                f"Falling back to default engine."
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"DFlash init failed for {model_id}: {e}. "
+                                f"Falling back to default engine."
+                            )
 
             # Per-model trust_remote_code (security opt-in, issue #926).
             # When unset, defaults to False -- repos with custom modeling_*.py

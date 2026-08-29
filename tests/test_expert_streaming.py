@@ -247,6 +247,49 @@ def test_engine_pool_forced_streaming_status(monkeypatch):
         assert eff.expert_streaming_enabled is True
 
 
+def test_engine_pool_dflash_blocked_by_expert_streaming(monkeypatch):
+    """DFlash selection must yield to expert streaming (requested or forced):
+    DFlash's pipeline loads the target fully resident and never applies the
+    streaming patches, so the two settings are mutually exclusive."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_glm_checkpoint(tmp, num_layers=4, experts=8, hidden=64, moe_hidden=32)
+        pool = EnginePool()
+        entry = EngineEntry(
+            model_id="m",
+            model_path=str(tmp),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1,
+            config_model_type="glm_moe_dsa",
+        )
+
+        # Requested streaming: the explicit setting wins over DFlash.
+        dflash_settings = ModelSettings(
+            dflash_enabled=True, dflash_draft_model="/tmp/draft"
+        )
+        assert pool._dflash_blocked_by_expert_streaming(entry, dflash_settings) is False
+        dflash_settings.expert_streaming_enabled = True
+        assert pool._dflash_blocked_by_expert_streaming(entry, dflash_settings) is True
+
+        # Forced streaming: memory ceiling forces it without an explicit setting.
+        est = expert_streaming_estimate(tmp)
+        ceiling = (est.resident_bytes + est.streaming_bytes) // 2
+        monkeypatch.setattr(pool, "_fallback_admission_ceiling", lambda: ceiling)
+        monkeypatch.setattr(pool, "_current_ceiling", lambda: ceiling)
+        unrequested = ModelSettings(
+            dflash_enabled=True, dflash_draft_model="/tmp/draft"
+        )
+        assert pool._dflash_blocked_by_expert_streaming(entry, unrequested) is True
+
+        # Streaming that cannot fit streamed (streaming_bytes > ceiling) does
+        # not force, so DFlash stays eligible.
+        tiny_ceiling = est.streaming_bytes // 2
+        monkeypatch.setattr(pool, "_fallback_admission_ceiling", lambda: tiny_ceiling)
+        monkeypatch.setattr(pool, "_current_ceiling", lambda: tiny_ceiling)
+        assert pool._dflash_blocked_by_expert_streaming(entry, unrequested) is False
+
+
 # ---------------------------------------------------------------------------
 # DeepSeek V4 (ffn-nested MoE + MTP/DSpark stages)
 # ---------------------------------------------------------------------------
