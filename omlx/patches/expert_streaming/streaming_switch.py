@@ -10,6 +10,7 @@ is global per model.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -33,6 +34,31 @@ _COALESCE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_COALESCE", "") != "0"
 _PREFILL_DIAG_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PREFILL_DIAG", "") == "1"
 # Routes above this count are treated as prefill-sized for the diag sync.
 _PREFILL_DIAG_MIN_ROUTES = 512
+
+# Routing trace (Fase I3): when OMLX_EXPERT_STREAMING_TRACE is set, append one
+# JSONL row per MoE layer call ({call, layer, positions, uniq}) so
+# bench/lrc_analysis.py can compute routing-consistency (SRP/SCH) offline.
+_TRACE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_TRACE", "") or None
+_TRACE_FILE = None
+_TRACE_CALL = 0
+
+
+def _trace_row(layer_idx: int, uniq_list: list, positions: int) -> None:
+    global _TRACE_FILE, _TRACE_CALL
+    if _TRACE_FILE is None:
+        _TRACE_FILE = open(_TRACE_PATH, "a", buffering=1)  # noqa: SIM115
+    _TRACE_CALL += 1
+    _TRACE_FILE.write(
+        json.dumps(
+            {
+                "call": _TRACE_CALL,
+                "layer": layer_idx,
+                "positions": positions,
+                "uniq": [int(e) for e in uniq_list],
+            }
+        )
+        + "\n"
+    )
 
 # Parallel os.pread pool for the demand-set of one MoE layer call. Workers
 # return raw numpy slices only — MLX promotion happens on the inference
@@ -1056,6 +1082,8 @@ class StreamingSwitchGLU(nn.Module):
 
         if hook is not None:
             hook.on_layer_plan(self.layer_idx, plan.uniq_list, plan.positions)
+        if _TRACE_PATH is not None:
+            _trace_row(self.layer_idx, plan.uniq_list, plan.positions)
 
         if (
             _PREFILL_DIAG_ENV
