@@ -91,6 +91,11 @@ public:
   AneLinearBankBuilder &operator=(const AneLinearBankBuilder &) = delete;
 
   void add(const mlx::core::array &weight);
+  // Stage one SwiGLU procedure: two row-matched fp32 projections that the
+  // program folds into silu(gate)*up. Both are quantized into their own int8
+  // chunk pair and the resulting procedure returns hidden activation rows.
+  void add_swiglu(const mlx::core::array &gate,
+                  const mlx::core::array &up);
   int size() const;
   std::vector<std::shared_ptr<AneLinearModel>>
   compile(int ane_instance, int start, int stop);

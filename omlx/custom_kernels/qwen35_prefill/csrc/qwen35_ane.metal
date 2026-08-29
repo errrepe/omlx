@@ -143,6 +143,73 @@ template <typename T>
       static_cast<T>(gate * up / (1.0f + exp(-gate)));
 }
 
+// SwiGLU-in-ANE variant: the ANE procedure already applied silu(gate)*up, so
+// its rows are the activation and are copied verbatim. The GPU suffix still
+// arrives as raw gate/up rows and is activated here before concatenation.
+// ``ane_hidden`` is therefore activation rows, not the doubled gate+up rows
+// the plain swiglu merge consumes.
+template <typename T>
+[[kernel]] void qwen35_ane_merge_act_output(
+    const device float16_t *ane_planar [[buffer(0)]],
+    const device T *gpu_rows [[buffer(1)]], device T *activation [[buffer(2)]],
+    constant int &M [[buffer(3)]], constant int &ane_hidden [[buffer(4)]],
+    constant int &gpu_hidden [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const uint n = gid.x;
+  const uint m = gid.y;
+  const uint total_hidden = static_cast<uint>(ane_hidden + gpu_hidden);
+  if (m >= static_cast<uint>(M) || n >= total_hidden) {
+    return;
+  }
+  if (n < static_cast<uint>(ane_hidden)) {
+    activation[m * total_hidden + n] = static_cast<T>(ane_planar[n * M + m]);
+    return;
+  }
+  const uint suffix = n - static_cast<uint>(ane_hidden);
+  const uint base = m * static_cast<uint>(2 * gpu_hidden);
+  const float gate = static_cast<float>(gpu_rows[base + suffix]);
+  const float up = static_cast<float>(
+      gpu_rows[base + static_cast<uint>(gpu_hidden) + suffix]);
+  activation[m * total_hidden + n] =
+      static_cast<T>(gate * up / (1.0f + exp(-gate)));
+}
+
+template <typename T>
+[[kernel]] void qwen35_ane_merge_dual_act_output(
+    const device float16_t *ane0_planar [[buffer(0)]],
+    const device float16_t *ane1_planar [[buffer(1)]],
+    const device T *gpu_rows [[buffer(2)]],
+    device T *activation [[buffer(3)]], constant int &M [[buffer(4)]],
+    constant int &ane0_hidden [[buffer(5)]],
+    constant int &ane1_hidden [[buffer(6)]],
+    constant int &gpu_hidden [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const uint n = gid.x;
+  const uint m = gid.y;
+  const uint ane_hidden = static_cast<uint>(ane0_hidden + ane1_hidden);
+  const uint total_hidden = ane_hidden + static_cast<uint>(gpu_hidden);
+  if (m >= static_cast<uint>(M) || n >= total_hidden) {
+    return;
+  }
+  if (n < static_cast<uint>(ane0_hidden)) {
+    activation[m * total_hidden + n] = static_cast<T>(ane0_planar[n * M + m]);
+    return;
+  }
+  if (n < ane_hidden) {
+    const uint local = n - static_cast<uint>(ane0_hidden);
+    activation[m * total_hidden + n] =
+        static_cast<T>(ane1_planar[local * M + m]);
+    return;
+  }
+  const uint suffix = n - ane_hidden;
+  const uint base = m * static_cast<uint>(2 * gpu_hidden);
+  const float gate = static_cast<float>(gpu_rows[base + suffix]);
+  const float up = static_cast<float>(
+      gpu_rows[base + static_cast<uint>(gpu_hidden) + suffix]);
+  activation[m * total_hidden + n] =
+      static_cast<T>(gate * up / (1.0f + exp(-gate)));
+}
+
 template <typename T>
 [[kernel]] void qwen35_ane_merge_dual_output(
     const device float16_t *ane0_planar [[buffer(0)]],
@@ -440,6 +507,10 @@ template <typename T>
                      qwen35_ane_merge_output, type);                            \
   instantiate_kernel("qwen35_ane_merge_swiglu_output_" #type,                  \
                      qwen35_ane_merge_swiglu_output, type);                     \
+  instantiate_kernel("qwen35_ane_merge_act_output_" #type,                     \
+                     qwen35_ane_merge_act_output, type);                        \
+  instantiate_kernel("qwen35_ane_merge_dual_act_output_" #type,                \
+                     qwen35_ane_merge_dual_act_output, type);                   \
   instantiate_kernel("qwen35_ane_merge_dual_output_" #type,                   \
                      qwen35_ane_merge_dual_output, type);                      \
   instantiate_kernel("qwen35_ane_merge_dual_swiglu_output_" #type,            \

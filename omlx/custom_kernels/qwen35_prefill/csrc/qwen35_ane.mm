@@ -485,6 +485,102 @@ NSString *int8_linear_bank_mil(
   return mil;
 }
 
+// Procedure bank for the SwiGLU-in-ANE path. A SwiGLU procedure folds the
+// activation into the program: two convs (gate and up, each with its own
+// int8 data/scale chunk pair in the shared weight.bin) followed by silu+mul,
+// so the program returns hidden activation rows instead of the doubled
+// gate+up rows of int8_linear_bank_mil.
+//
+// One bank may hold both forms. GDN procedures stay single-conv and are
+// emitted verbatim, so an ANE bank can mix MLP/SwiGLU and GDN procedures in
+// stage order. ``swiglu[index]`` selects the form; for a plain procedure
+// ``weight_offsets[index]`` uses only the first two slots.
+NSString *int8_swiglu_bank_mil(
+    const std::vector<std::pair<int, int>> &shapes,
+    const std::vector<std::array<uint64_t, 4>> &weight_offsets,
+    const std::vector<bool> &swiglu, int sequence_length) {
+  NSMutableString *mil = [NSMutableString
+      stringWithString:
+          @"program(1.3)\n"
+           "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", "
+           "\"3520.4.1\"}, {\"coremlc-version\", \"3520.5.1\"}})]\n{\n"];
+  for (size_t index = 0; index < shapes.size(); ++index) {
+    const int input_dim = shapes[index].first;
+    const int output_dim = shapes[index].second;
+    [mil appendFormat:
+             @"  func procedure%03zu<ios18>(tensor<fp16, [1, %d, 1, %d]> "
+              "x) {\n"
+              "    tensor<fp16, [%d, %d, 1, 1]> w = "
+              "constexpr_blockwise_shift_scale(data=tensor<int8, [%d, %d, 1, "
+              "1]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), "
+              "offset=uint64(%llu))), "
+              "scale=tensor<fp16, [%d, 1, 1, 1]>(BLOBFILE(path=string("
+              "\"@model_path/weights/weight.bin\"), "
+              "offset=uint64(%llu))))"
+              "[name=string(\"dequant\")];\n",
+         index, input_dim, sequence_length, output_dim, input_dim, output_dim,
+         input_dim,
+         static_cast<unsigned long long>(weight_offsets[index][0]),
+         output_dim,
+         static_cast<unsigned long long>(weight_offsets[index][1])];
+    if (!swiglu[index]) {
+      [mil appendFormat:
+               @"    string pt = const()[name=string(\"pt\"), "
+                "val=string(\"valid\")];\n"
+                "    tensor<int32, [2]> st = const()[name=string(\"st\"), "
+                "val=tensor<int32, [2]>([1,1])];\n"
+                "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), "
+                "val=tensor<int32, [4]>([0,0,0,0])];\n"
+                "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), "
+                "val=tensor<int32, [2]>([1,1])];\n"
+                "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+                "    tensor<fp16, [1, %d, 1, %d]> y = "
+                "conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, "
+                "strides=st, weight=w, x=x)[name=string(\"conv\")];\n"
+                "  } -> (y);\n",
+               output_dim, sequence_length];
+      continue;
+    }
+    [mil appendFormat:
+             @"    tensor<fp16, [%d, %d, 1, 1]> uw = "
+              "constexpr_blockwise_shift_scale(data=tensor<int8, [%d, %d, 1, "
+              "1]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), "
+              "offset=uint64(%llu))), "
+              "scale=tensor<fp16, [%d, 1, 1, 1]>(BLOBFILE(path=string("
+              "\"@model_path/weights/weight.bin\"), "
+              "offset=uint64(%llu))))"
+              "[name=string(\"dequant_up\")];\n"
+              "    string pt = const()[name=string(\"pt\"), "
+              "val=string(\"valid\")];\n"
+              "    tensor<int32, [2]> st = const()[name=string(\"st\"), "
+              "val=tensor<int32, [2]>([1,1])];\n"
+              "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), "
+              "val=tensor<int32, [4]>([0,0,0,0])];\n"
+              "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), "
+              "val=tensor<int32, [2]>([1,1])];\n"
+              "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+              "    tensor<fp16, [1, %d, 1, %d]> gate = conv(dilations=dl, "
+              "groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)"
+              "[name=string(\"gate\")];\n"
+              "    tensor<fp16, [1, %d, 1, %d]> up = conv(dilations=dl, "
+              "groups=gr, pad=pd, pad_type=pt, strides=st, weight=uw, x=x)"
+              "[name=string(\"up\")];\n"
+              "    tensor<fp16, [1, %d, 1, %d]> silu_out = silu(x=gate)"
+              "[name=string(\"silu\")];\n"
+              "    tensor<fp16, [1, %d, 1, %d]> y = mul(x=silu_out, y=up)"
+              "[name=string(\"swiglu\")];\n"
+              "  } -> (y);\n",
+         output_dim, input_dim, output_dim, input_dim,
+         static_cast<unsigned long long>(weight_offsets[index][2]),
+         output_dim,
+         static_cast<unsigned long long>(weight_offsets[index][3]),
+         output_dim, sequence_length, output_dim, sequence_length,
+         output_dim, sequence_length, output_dim, sequence_length];
+  }
+  [mil appendString:@"}\n"];
+  return mil;
+}
+
 NSString *fp16_linear_mil(int input_dim, int output_dim, int sequence_length) {
   return [NSString
       stringWithFormat:
@@ -1453,6 +1549,10 @@ struct AneLinearBankBuilder::Impl {
     QuantizedMatrix quantized;
     int input_dim;
     int output_dim;
+    // SwiGLU-in-ANE procedures carry a second weight and fold the activation
+    // into the program. Plain procedures leave quantized_up empty.
+    QuantizedMatrix quantized_up;
+    bool swiglu = false;
   };
   int sequence_length = 0;
   std::vector<Chunk> chunks;
@@ -1489,6 +1589,31 @@ void AneLinearBankBuilder::add(const array &weight) {
   impl_->chunks.emplace_back(std::move(chunk));
 }
 
+void AneLinearBankBuilder::add_swiglu(const array &gate, const array &up) {
+  for (const array *weight : {&gate, &up}) {
+    if (weight->dtype() != float32 || weight->ndim() != 2 ||
+        !row_contiguous(*weight) || weight->shape(0) <= 0 ||
+        weight->shape(1) <= 0) {
+      throw std::invalid_argument(
+          "ANE bank weights must be contiguous rank-2 float32 MLX arrays.");
+    }
+  }
+  if (gate.shape(0) != up.shape(0) || gate.shape(1) != up.shape(1)) {
+    throw std::invalid_argument(
+        "ANE SwiGLU bank needs row-matched gate and up projections.");
+  }
+  Impl::Chunk chunk{
+      quantize_rows(gate.data<float>(), static_cast<int>(gate.shape(0)),
+                    static_cast<int>(gate.shape(1))),
+      static_cast<int>(gate.shape(1)),
+      static_cast<int>(gate.shape(0)),
+      quantize_rows(up.data<float>(), static_cast<int>(up.shape(0)),
+                    static_cast<int>(up.shape(1))),
+      true,
+  };
+  impl_->chunks.emplace_back(std::move(chunk));
+}
+
 int AneLinearBankBuilder::size() const {
   return static_cast<int>(impl_->chunks.size());
 }
@@ -1503,34 +1628,60 @@ AneLinearBankBuilder::compile(int ane_instance, int start, int stop) {
   const int span = stop - start;
   std::vector<std::pair<int, int>> shapes;
   shapes.reserve(span);
+  std::vector<bool> swiglu;
+  swiglu.reserve(span);
+  int swiglu_count = 0;
   for (int index = start; index < stop; ++index) {
     const auto &chunk = impl_->chunks[index];
     shapes.emplace_back(chunk.input_dim, chunk.output_dim);
+    swiglu.push_back(chunk.swiglu);
+    swiglu_count += chunk.swiglu ? 1 : 0;
   }
 
   @autoreleasepool {
     load_ane_framework();
     NSDictionary *execution_options = ane_execution_options(ane_instance);
     NSMutableData *weight_blob = [NSMutableData dataWithLength:64];
+    // Plain procedures need one int8 data/scale chunk pair; SwiGLU procedures
+    // need a second pair for the up projection.
     std::vector<std::pair<uint64_t, uint64_t>> weight_offsets;
+    std::vector<std::array<uint64_t, 4>> swiglu_offsets;
     weight_offsets.reserve(span);
+    swiglu_offsets.reserve(span);
     for (int index = start; index < stop; ++index) {
       const auto &quantized = impl_->chunks[index].quantized;
-      uint64_t data_offset = append_blob_chunk(
+      std::array<uint64_t, 4> offsets{0, 0, 0, 0};
+      offsets[0] = append_blob_chunk(
           weight_blob,
           quantized.data.data(),
           quantized.data.size() * sizeof(quantized.data.front()), 4);
-      uint64_t scale_offset = append_blob_chunk(
+      offsets[1] = append_blob_chunk(
           weight_blob,
           quantized.scales.data(),
           quantized.scales.size() * sizeof(quantized.scales.front()), 1);
-      weight_offsets.emplace_back(data_offset, scale_offset);
+      if (swiglu[index - start]) {
+        const auto &up = impl_->chunks[index].quantized_up;
+        offsets[2] = append_blob_chunk(
+            weight_blob, up.data.data(),
+            up.data.size() * sizeof(up.data.front()), 4);
+        offsets[3] = append_blob_chunk(
+            weight_blob, up.scales.data(),
+            up.scales.size() * sizeof(up.scales.front()), 1);
+      }
+      weight_offsets.emplace_back(offsets[0], offsets[1]);
+      swiglu_offsets.push_back(offsets);
     }
     auto *weight_header = static_cast<uint32_t *>(weight_blob.mutableBytes);
-    weight_header[0] = static_cast<uint32_t>(span * 2);
+    weight_header[0] = static_cast<uint32_t>(span * 2 + swiglu_count * 2);
     weight_header[1] = 2;
+    // A bank without SwiGLU procedures keeps byte-identical MIL to the
+    // pre-feature build, so enabling the feature cannot regress the default
+    // path even before the new program is exercised.
     NSData *mil =
-        [int8_linear_bank_mil(shapes, weight_offsets, sequence_length)
+        [(swiglu_count ? int8_swiglu_bank_mil(shapes, swiglu_offsets, swiglu,
+                                             sequence_length)
+                       : int8_linear_bank_mil(shapes, weight_offsets,
+                                              sequence_length))
             dataUsingEncoding:NSUTF8StringEncoding];
     NSDictionary *weight_map = @{
       @"@model_path/weights/weight.bin" :
@@ -2255,17 +2406,24 @@ private:
 
 class AneHybridQ4Primitive : public Primitive {
 public:
+  // ``ane_act`` selects the SwiGLU-in-ANE layout: the ANE procedure already
+  // returned silu(gate)*up rows, so only the GPU suffix is activated and the
+  // ANE rows are copied verbatim. It is mutually exclusive with fuse_swiglu
+  // and with CPU sharing (the CPU branch cannot produce pre-activated rows
+  // without a second fused kernel).
   AneHybridQ4Primitive(Stream stream, std::shared_ptr<AneLinearModel> model,
                        int bits, int variant, int group_size,
                        bool fuse_swiglu = false, int profile_category = -1,
                        bool cpu_fp16 = false, int cpu_threads = 0,
-                       bool cpu_shared_resource = false)
+                       bool cpu_shared_resource = false,
+                       bool ane_act = false)
       : Primitive(stream), model_(std::move(model)), variant_(variant),
         bits_(bits), group_size_(group_size), fuse_swiglu_(fuse_swiglu),
-        profile_category_(profile_category >= 0 ? profile_category
-                                                : (fuse_swiglu ? 0 : 1)),
+        profile_category_(profile_category >= 0
+                              ? profile_category
+                              : ((fuse_swiglu || ane_act) ? 0 : 1)),
         cpu_fp16_(cpu_fp16), cpu_threads_(cpu_threads),
-        cpu_shared_resource_(cpu_shared_resource) {}
+        cpu_shared_resource_(cpu_shared_resource), ane_act_(ane_act) {}
 
   void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
     throw std::runtime_error("ANE hybrid qmm has no CPU implementation.");
@@ -2495,8 +2653,10 @@ public:
         std::string(cpu_weight
                         ? (fuse_swiglu_ ? "qwen35_ane_merge_cpu_swiglu_output_"
                                         : "qwen35_ane_merge_cpu_output_")
-                        : (fuse_swiglu_ ? "qwen35_ane_merge_swiglu_output_"
-                                        : "qwen35_ane_merge_output_")) +
+                        : (ane_act_ ? "qwen35_ane_merge_act_output_"
+                                    : (fuse_swiglu_
+                                           ? "qwen35_ane_merge_swiglu_output_"
+                                           : "qwen35_ane_merge_output_"))) +
             metal_type_name(x.dtype()),
         library);
     encoder.set_compute_pipeline_state(merge);
@@ -2512,10 +2672,12 @@ public:
       encoder.set_bytes(M, 3);
     }
     const int output_n =
-        fuse_swiglu_ ? (ane_n + cpu_n + gpu_n) / 2 : ane_n + cpu_n + gpu_n;
-    const int merge_ane_n = fuse_swiglu_ ? ane_n / 2 : ane_n;
+        ane_act_ ? ane_n + gpu_n / 2
+                 : (fuse_swiglu_ ? (ane_n + cpu_n + gpu_n) / 2
+                                 : ane_n + cpu_n + gpu_n);
+    const int merge_ane_n = ane_act_ ? ane_n : (fuse_swiglu_ ? ane_n / 2 : ane_n);
     const int merge_cpu_n = fuse_swiglu_ ? cpu_n / 2 : cpu_n;
-    const int merge_gpu_n = fuse_swiglu_ ? gpu_n / 2 : gpu_n;
+    const int merge_gpu_n = gpu_n / (ane_act_ || fuse_swiglu_ ? 2 : 1);
     if (cpu_weight) {
       encoder.set_bytes(merge_ane_n, 5);
       encoder.set_bytes(merge_cpu_n, 6);
@@ -2557,13 +2719,14 @@ public:
            fuse_swiglu_ == rhs.fuse_swiglu_ &&
            profile_category_ == rhs.profile_category_ &&
            cpu_fp16_ == rhs.cpu_fp16_ && cpu_threads_ == rhs.cpu_threads_ &&
-           cpu_shared_resource_ == rhs.cpu_shared_resource_;
+           cpu_shared_resource_ == rhs.cpu_shared_resource_ &&
+           ane_act_ == rhs.ane_act_;
   }
   auto state() const {
     return std::make_tuple(reinterpret_cast<uintptr_t>(model_.get()), bits_,
                            variant_, group_size_, fuse_swiglu_,
                            profile_category_, cpu_fp16_, cpu_threads_,
-                           cpu_shared_resource_);
+                           cpu_shared_resource_, ane_act_);
   }
 
 private:
@@ -2576,6 +2739,7 @@ private:
   bool cpu_fp16_;
   int cpu_threads_;
   bool cpu_shared_resource_;
+  bool ane_act_;
 };
 
 class DualAneHybridPrimitive : public Primitive {
@@ -2586,14 +2750,16 @@ public:
                          int variant, int group_size, bool fuse_swiglu = false,
                          int profile_category = -1, bool cpu_fp16 = false,
                          int cpu_threads = 0,
-                         bool cpu_shared_resource = false)
+                         bool cpu_shared_resource = false,
+                         bool ane_act = false)
       : Primitive(stream), model0_(std::move(model0)),
         model1_(std::move(model1)), variant_(variant), bits_(bits),
         group_size_(group_size), fuse_swiglu_(fuse_swiglu),
-        profile_category_(profile_category >= 0 ? profile_category
-                                                : (fuse_swiglu ? 0 : 1)),
+        profile_category_(profile_category >= 0
+                              ? profile_category
+                              : ((fuse_swiglu || ane_act) ? 0 : 1)),
         cpu_fp16_(cpu_fp16), cpu_threads_(cpu_threads),
-        cpu_shared_resource_(cpu_shared_resource) {}
+        cpu_shared_resource_(cpu_shared_resource), ane_act_(ane_act) {}
 
   void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
     throw std::runtime_error("Dual ANE hybrid qmm has no CPU implementation.");
@@ -2810,13 +2976,15 @@ public:
     }
 
     auto merge = device.get_kernel(
-        std::string(cpu_weight
-                        ? (fuse_swiglu_
-                               ? "qwen35_ane_merge_dual_cpu_swiglu_output_"
-                               : "qwen35_ane_merge_dual_cpu_output_")
-                        : (fuse_swiglu_
-                               ? "qwen35_ane_merge_dual_swiglu_output_"
-                               : "qwen35_ane_merge_dual_output_")) +
+        std::string(
+            cpu_weight
+                ? (fuse_swiglu_
+                       ? "qwen35_ane_merge_dual_cpu_swiglu_output_"
+                       : "qwen35_ane_merge_dual_cpu_output_")
+                : (ane_act_ ? "qwen35_ane_merge_dual_act_output_"
+                            : (fuse_swiglu_
+                                   ? "qwen35_ane_merge_dual_swiglu_output_"
+                                   : "qwen35_ane_merge_dual_output_"))) +
             metal_type_name(x.dtype()),
         library);
     encoder.set_compute_pipeline_state(merge);
@@ -2832,11 +3000,15 @@ public:
       encoder.set_output_array(output, 3);
       encoder.set_bytes(M, 4);
     }
-    const int output_n = fuse_swiglu_ ? (ane0_n + ane1_n + cpu_n + gpu_n) / 2
-                                      : ane0_n + ane1_n + cpu_n + gpu_n;
-    const int merge_ane0_n = fuse_swiglu_ ? ane0_n / 2 : ane0_n;
-    const int merge_ane1_n = fuse_swiglu_ ? ane1_n / 2 : ane1_n;
-    const int merge_gpu_n = fuse_swiglu_ ? gpu_n / 2 : gpu_n;
+    const int output_n =
+        ane_act_ ? ane0_n + ane1_n + gpu_n / 2
+                 : (fuse_swiglu_ ? (ane0_n + ane1_n + cpu_n + gpu_n) / 2
+                                 : ane0_n + ane1_n + cpu_n + gpu_n);
+    const int merge_ane0_n =
+        ane_act_ ? ane0_n : (fuse_swiglu_ ? ane0_n / 2 : ane0_n);
+    const int merge_ane1_n =
+        ane_act_ ? ane1_n : (fuse_swiglu_ ? ane1_n / 2 : ane1_n);
+    const int merge_gpu_n = gpu_n / (ane_act_ || fuse_swiglu_ ? 2 : 1);
     if (cpu_weight) {
       const int merge_cpu_n = fuse_swiglu_ ? cpu_n / 2 : cpu_n;
       encoder.set_bytes(merge_ane0_n, 6);
