@@ -924,3 +924,56 @@ def test_ple_runtime_auto_defaults_to_mmap():
         resolve_ple_runtime_mode("mmap", checkpoint_bytes=1, physical_memory=1)
         == "mmap"
     )
+
+
+def _make_bound_qwen4_language_model(config):
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpMTPModule
+
+    class MTPOwner:
+        pass
+
+    model = LanguageModel(config.text_config, config)
+    owner = MTPOwner()
+    owner.mtp = Qwen4ExpMTPModule(config.text_config)
+    model.bind_mtp_owner(owner)
+    return model, owner
+
+
+def _assert_qwen4_lightning_mtp_hidden_width(model, text_config):
+    expected_width = text_config.hc_count * text_config.hidden_size
+    output = model(
+        mx.array([[2, 3, 4]], dtype=mx.int32),
+        cache=model.make_cache(),
+        return_hidden=True,
+    )
+    hidden = output.hidden_states[-1]
+    logits, head_hidden = model.mtp_forward(
+        hidden[:, -1:],
+        mx.array([[7]], dtype=mx.uint32),
+        model.make_mtp_cache(),
+        return_hidden=True,
+        logits_keep=1,
+    )
+    mx.eval(hidden, logits, head_hidden)
+
+    assert hidden.shape == (1, 3, expected_width)
+    assert logits.shape == (1, 1, text_config.vocab_size)
+    assert head_hidden.shape == (1, 1, expected_width)
+
+
+def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
+    """Qwen3.5 patching must preserve resident and later Qwen4 MTP models."""
+    from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
+    config = _tiny_config()
+    resident_model, resident_owner = _make_bound_qwen4_language_model(config)
+    _assert_qwen4_lightning_mtp_hidden_width(resident_model, config.text_config)
+
+    apply_mlx_vlm_mtp_runtime_patch()
+    _assert_qwen4_lightning_mtp_hidden_width(resident_model, config.text_config)
+
+    later_model, later_owner = _make_bound_qwen4_language_model(config)
+    _assert_qwen4_lightning_mtp_hidden_width(later_model, config.text_config)
+
+    assert resident_owner.mtp is not None
+    assert later_owner.mtp is not None
