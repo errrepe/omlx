@@ -473,8 +473,25 @@ routing-consistency metrics of arXiv:2505.16056 — SCH (Belady oracle-cache hit
 rate per cache size; the paper's ≈2× active-experts sweet spot is directly
 sweepable) and SRP (fixed-group coverage per segment, demand-weighted and
 distinct). Purpose: per-model defaults for pins/seed/top-k and a pre-flight
-"does streaming pay" check, calibrated against the known Qwen 23–32% / GLM 0%
-inter-token reuse. Offline only — no UI.
+"does streaming pay" check. Offline only — no UI.
+
+**Measured (Pride and Prejudice, streaming engine):**
+
+- Qwen, continuous decode (96 tokens, short prompt; the bench workload):
+  SCH(S=8..128) = 33.9 / 44.8 / 54.3 / 64.0 / 73.6%; the real LRU cache in
+  the same run measured 26.8% hit rate — inside the known 23–32% reuse
+  band, with Belady's ceiling ~2.7× above the LRU at the sweet spot.
+- Same protocol on both models (24 disjoint 64-token windows — the
+  cross-document regime a multi-user server actually sees):
+  GLM SCH(S=128) = **76.0%**, Qwen = **73.2%** — essentially identical.
+
+The old "GLM 0% inter-token reuse" calibration does NOT reproduce in the
+disjoint-window regime: it was an artifact of single-text continuous decode.
+Cross-document routing is highly reusable for both models — a pinned/cacheable
+expert set can pay on GLM too, not only on Qwen. The remaining regime
+difference is within one document (decode), where Qwen keeps reuse (SCH ~34–74%)
+and GLM's continuous-decode reuse stays to be re-measured with this harness
+before any GLM pin-budget default changes.
 
 ### I4 — perplexity harness
 
