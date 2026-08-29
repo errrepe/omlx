@@ -117,6 +117,7 @@ async def run(
     mtp: bool,
     out: str | None,
     topk: float | None = None,
+    cold_tier: str | None = None,
     prompt_len: str = "short",
     mtp_block: int | None = None,
     ane: bool = False,
@@ -149,6 +150,7 @@ async def run(
         expert_streaming_enabled=True,
         expert_streaming_budget_gib=budget,
         expert_streaming_topk_threshold=topk,
+        expert_streaming_cold_tier=cold_tier,
         qwen4_ple_ssd_offload=True,
         vlm_mtp_enabled=mtp,
         vlm_mtp_draft_block_size=mtp_block,
@@ -241,6 +243,7 @@ async def run(
         "model": model_key,
         "budget_gib": budget,
         "topk_threshold": topk,
+        "cold_tier": cold_tier,
         "mtp": mtp,
         "mtp_block": mtp_block,
         "ane": ane,
@@ -372,6 +375,8 @@ def main():
     ap.add_argument("--decode", type=int, default=96)
     ap.add_argument("--mtp", action="store_true")
     ap.add_argument("--topk", type=float, default=None, help="adaptive top-k mass threshold (default exact)")
+    ap.add_argument("--cold-tier", default=None, metavar="BITS",
+                    help="route expert reads to the <model>/expert_cold/ 3/2-bit tier (I5)")
     ap.add_argument("--prompt-len", choices=["short", "512", "2k", "8k"], default="short")
     ap.add_argument("--mtp-block", type=int, default=None, help="vlm_mtp_draft_block_size (MTP tokens per round)")
     ap.add_argument("--ane", action="store_true", help="enable qwen35 ANE prefill")
@@ -411,6 +416,7 @@ def main():
             args.mtp,
             args.out,
             args.topk,
+            args.cold_tier,
             prompt_len=args.prompt_len,
             mtp_block=args.mtp_block,
             ane=args.ane,

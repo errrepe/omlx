@@ -442,15 +442,14 @@ graphs are small.
 - Tests: boundary gating (prefill fires; decode / verify / un-flagged layer /
   knob-off skip), idempotent wrap, settings round-trip + profile exclusion +
   API persist.
-- Pending measurement: TTFT 2k/8k cold + pool-peak A/B needs an idle window
-  (Fase G lesson: shared-box numbers are machine-state-dominated). Ready-to-run
-  when idle — the two arms differ only in the env:
-  ```
-  OMLX_EXPERT_STREAMING_PER_LAYER_EVAL=0 .venv/bin/python bench/bench_expert_streaming.py \
-      --model qwen --prompt-tokens 2048 --decode 48 --min-free-gib 22 --mem-ceiling-gib <available-6>
-  OMLX_EXPERT_STREAMING_PER_LAYER_EVAL=1 .venv/bin/python bench/bench_expert_streaming.py \
-      --model qwen --prompt-tokens 2048 --decode 48 --min-free-gib 22 --mem-ceiling-gib <available-6>
-  ```
+- **Measured (idle window, Qwen 2k prompt, 96-token decode, warm page cache —
+  the Fase G confound controlled by repeating the OFF arm after the ON arm)**:
+  TTFT 119.2 s (off) vs 120.9 s (on) — a tie; the apparent 211 s → 121 s
+  improvement in the first cold-cache run was page-cache warming, not the
+  boundary. Decode: **0.405 (off) vs 0.580 tok/s (on) — the boundary is
+  +43% decode**, releasing each layer's expert mini-bank from the lazy graph
+  instead of accumulating 48 layers × uniq × 2.7 MB per chunk. Default **on**
+  confirmed; artifacts `bench/results/qwen_2k_pleval_{off,on,off2}.json`.
 
 ### I2 — learned pin store server integration (E3 follow-up)
 
@@ -571,7 +570,22 @@ that caps GLM decode.
   tok/s A/B that decides whether 4.6% ppl buys a real decode win. The
   per-expert HOBBIT hot/cold split (only truly-cold experts get the low
   tier) is the recorded path to shrink both deltas.
-- Pending measurement: tok/s / TTFT A/B (idle window).
+- **tok/s / TTFT A/B measured (idle window, short prompt, 48-token decode;
+  `--cold-tier` added to the bench)**:
+  - GLM: base 0.452–0.479 vs cold-3bit 0.572–0.602 tok/s across two
+    repetitions — **+26–33% decode**, TTFT 20.3 → 19.0 s. The 13 MB-expert
+    I/O floor is exactly where the 25% byte cut pays.
+  - Qwen: base 1.436 vs cold-3bit 1.575 tok/s — **+9.7%**, TTFT 10.8 → 9.5 s.
+  Decision: cold tier stays **opt-in** everywhere (GLM +24% ppl / Qwen +4.6%
+  ppl are real costs); the GLM decode win is large enough that GLM users on
+  the I/O floor who accept the quality hit get a real option. Artifacts
+  `bench/results/{qwen,glm}_i5_{base,cold3}*.json`.
+- **G2/PILOT re-test with the tier (idle window)**: prefetch stays negative
+  in the new byte regime — GLM cold-3bit + PILOT measured 0.370 tok/s vs
+  0.572–0.602 without (−35%; `staged_dropped` 94% of 77.5k staged bundles).
+  The saturated-NVMe verdict of Fase E/G holds: concurrent prefetch cannot
+  buy what the disk cannot serve. Closed — do not revisit without a
+  different disk. Artifact `bench/results/glm_i5_cold3_pilot.json`.
 
 ## References
 
