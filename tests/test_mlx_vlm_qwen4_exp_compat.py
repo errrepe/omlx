@@ -513,6 +513,165 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.index_position_ids.shape[-1] == 4
 
 
+def _assert_ple_state_matches(actual_cache, expected_cache):
+    mx.eval(
+        actual_cache[2],
+        actual_cache[3],
+        expected_cache[2],
+        expected_cache[3],
+    )
+    assert mx.array_equal(actual_cache[3], expected_cache[3]).item()
+    assert mx.allclose(actual_cache[2], expected_cache[2], rtol=1e-3, atol=1e-3).item()
+
+
+def test_qwen4_ple_rollback_keeps_only_committed_verify_prefix():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    verify_cache = model.make_cache()
+    replay_cache = model.make_cache()
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    confirmed = mx.array([[5]], dtype=mx.int32)
+    draft = mx.array([[6]], dtype=mx.int32)
+    next_token = mx.array([[7]], dtype=mx.int32)
+    model(prefix, cache=verify_cache)
+    model(prefix, cache=replay_cache)
+
+    verified = model(
+        mx.concatenate([confirmed, draft], axis=1),
+        cache=verify_cache,
+        return_hidden=True,
+    )
+    model(confirmed, cache=replay_cache)
+    model.rollback_speculative_cache(
+        verify_cache,
+        verified.gdn_states,
+        accepted=0,
+        block_size=2,
+    )
+
+    _assert_ple_state_matches(verify_cache[0], replay_cache[0])
+    rolled_back = model(next_token, cache=verify_cache)
+    replayed = model(next_token, cache=replay_cache)
+    mx.eval(rolled_back.logits, replayed.logits)
+    assert mx.allclose(rolled_back.logits, replayed.logits, rtol=1e-3, atol=1e-3).item()
+
+
+def test_qwen4_ple_partial_rollback_and_accept_match_sequential_replay():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    verify_tokens = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
+
+    accepted_cache = model.make_cache()
+    sequential_cache = model.make_cache()
+    model(prefix, cache=accepted_cache)
+    model(prefix, cache=sequential_cache)
+    model(verify_tokens, cache=accepted_cache, return_hidden=True)
+    for token in (5, 6, 7, 8):
+        model(mx.array([[token]], dtype=mx.int32), cache=sequential_cache)
+    _assert_ple_state_matches(accepted_cache[0], sequential_cache[0])
+
+    partial_cache = model.make_cache()
+    replay_cache = model.make_cache()
+    model(prefix, cache=partial_cache)
+    model(prefix, cache=replay_cache)
+    verified = model(verify_tokens, cache=partial_cache, return_hidden=True)
+    for token in (5, 6, 7):
+        model(mx.array([[token]], dtype=mx.int32), cache=replay_cache)
+    model.rollback_speculative_cache(
+        partial_cache,
+        verified.gdn_states,
+        accepted=2,
+        block_size=4,
+    )
+
+    _assert_ple_state_matches(partial_cache[0], replay_cache[0])
+
+
+def test_qwen4_ple_ordinary_forward_disarms_stale_snapshot():
+    """A fully accepted verify cycle never calls rollback. The snapshot it armed
+    must be dropped by the next ordinary forward so it cannot be mistaken for the
+    current committed position by a later rollback."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    ple_cache = cache[0]
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+
+    model(mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True)
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is not None
+
+    # ordinary decode forward (no verify): the stale snapshot must be gone
+    model(mx.array([[7]], dtype=mx.int32), cache=cache)
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
+
+
+def test_qwen4_ple_rollback_fails_closed_on_incomplete_snapshot():
+    """An aborted verify forward can leave a half-written snapshot. Rollback must
+    reject it before mutating any cache, not apply a mixed-epoch state."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import (
+        LanguageModel,
+        _PLESpeculativeRollbackError,
+    )
+
+    model = LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+    verified = model(
+        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
+    )
+
+    ple_cache, qsa_cache = cache[0], cache[1]
+    before_hist = mx.array(ple_cache[3])
+    before_conv = mx.array(ple_cache[2])
+    before_offset = int(qsa_cache.offset)
+
+    ple_cache._qwen4_exp_ple_speculative_state.complete = False
+    with pytest.raises(_PLESpeculativeRollbackError):
+        model.rollback_speculative_cache(
+            cache, verified.gdn_states, accepted=0, block_size=2
+        )
+
+    mx.eval(ple_cache[3], ple_cache[2])
+    assert mx.array_equal(ple_cache[3], before_hist).item()
+    assert mx.array_equal(ple_cache[2], before_conv).item()
+    assert int(qsa_cache.offset) == before_offset
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
+
+
+def test_qwen4_ple_rollback_validates_snapshot_before_qsa_mutation():
+    """A malformed accepted-count aborts the whole rollback with QSA/GDN
+    untouched (validation runs before the inherited rollback)."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import (
+        LanguageModel,
+        _PLESpeculativeRollbackError,
+    )
+
+    model = LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+    verified = model(
+        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
+    )
+    before_offset = int(cache[1].offset)
+
+    # batch is 1, so a 2-element accepted list cannot match
+    with pytest.raises(_PLESpeculativeRollbackError):
+        model.rollback_speculative_cache(
+            cache, verified.gdn_states, accepted=[0, 0], block_size=2
+        )
+    assert int(cache[1].offset) == before_offset
+    assert getattr(cache[0], "_qwen4_exp_ple_speculative_state", None) is None
+
+
 def test_qwen4_lightning_mtp_rejects_nextn_only_layout(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
