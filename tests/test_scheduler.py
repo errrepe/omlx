@@ -3415,6 +3415,65 @@ class TestPeriodicClearGating:
         scheduler._memory_limit_bytes = 0
         assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
 
+    def test_streaming_pool_release_requires_streaming_model(
+        self, mock_model, mock_tokenizer
+    ):
+        """The off-boundary streaming release must not fire for non-streaming models."""
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._memory_limit_bytes = 0
+        # MagicMock models resolve to an empty (falsy) guard info dict.
+        assert scheduler._should_release_streaming_pool() is False
+
+    def test_streaming_pool_release_off_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        """Streaming models release the pool off the 512-step boundary.
+
+        A <512-step streaming prefill plus a short decode never lands on the
+        periodic boundary, so the freed-but-retained pool would never be
+        released (Fase G: 30.4 GiB pool evicting the page cache).
+        """
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._memory_limit_bytes = 0  # → 2 GiB absolute floor
+        scheduler._step_counter = 1  # deliberately NOT on the interval boundary
+        scheduler._resolve_streaming_guard_info = lambda: {
+            "num_moe_layers": 48,
+            "experts_per_layer": 512,
+            "per_expert_bytes": 2700000,
+        }
+
+        # 5 GiB pool, off-boundary → release fires (periodic gate alone: False).
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=5 * 1024**3):
+            assert scheduler._should_periodic_clear_cache() is False
+            assert scheduler._should_release_streaming_pool() is True
+
+        # 1 GiB pool → below the threshold, no release.
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=1 * 1024**3):
+            assert scheduler._should_release_streaming_pool() is False
+
+    def test_streaming_pool_release_threshold_scales_with_limit(
+        self, mock_model, mock_tokenizer
+    ):
+        """Streaming release uses the same max(limit/3, 2 GiB) threshold."""
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._memory_limit_bytes = 30 * 1024**3  # → threshold 10 GiB
+        scheduler._resolve_streaming_guard_info = lambda: {
+            "num_moe_layers": 48,
+            "experts_per_layer": 512,
+            "per_expert_bytes": 2700000,
+        }
+
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=9 * 1024**3):
+            assert scheduler._should_release_streaming_pool() is False
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=11 * 1024**3):
+            assert scheduler._should_release_streaming_pool() is True
+
 
 class TestExtractCacheStatesCacheList:
     """Tests for CacheList handling in _extract_cache_states."""

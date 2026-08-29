@@ -2303,6 +2303,28 @@ class Scheduler:
             return False
         return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
 
+    def _should_release_streaming_pool(self) -> bool:
+        """Byte-threshold pool release for expert-streaming models.
+
+        Streaming prefills/decodes leave a large freed-but-retained MLX
+        buffer pool (server.py sizes it to total memory) that the 512-step
+        periodic gate never reaches: a <512-step prefill plus a short
+        decode can end without a single release. That pool is real wired
+        memory the OS cannot otherwise reclaim, and on budget-0 expert
+        streaming it evicts the page cache the demand loads depend on
+        (measured 30.4 GiB pool, ~8x full-bank re-reads on an 8k prefill —
+        Fase G). Streaming models therefore release whenever the pool
+        exceeds the same threshold, off the step boundary.
+
+        The threshold (>= 2 GiB) bounds the clear frequency, and every
+        release still goes through ``_sync_and_clear_cache`` (sync before
+        clear, ``_mx_buffer_access_lock``), so the #978/#1040 panic-class
+        gating semantics are preserved.
+        """
+        if not self._resolve_streaming_guard_info():
+            return False
+        return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
+
     @staticmethod
     def _collect_arrays_from_extracted_cache(
         extracted_cache: list[Any],
@@ -5336,7 +5358,7 @@ class Scheduler:
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                 )
 
-        if self._should_clear_after_chunk():
+        if self._should_clear_after_chunk() or self._should_release_streaming_pool():
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
         if getattr(state.request, "benchmark_trace", False):
@@ -11917,6 +11939,13 @@ class Scheduler:
         # Periodic Metal cache cleanup
         self._step_counter += 1
         should_clear = self._should_periodic_clear_cache()
+        # Streaming pool release: expert-streaming prefills/decodes leave a
+        # large freed-but-retained pool that the step-boundary gate above
+        # never reaches (a <512-step prefill + short decode can end without
+        # a single release). Release it off-boundary once it crosses the
+        # byte threshold — Fase G.
+        if not should_clear and self._should_release_streaming_pool():
+            should_clear = True
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
         if (
