@@ -228,6 +228,26 @@ class ModelSettings:
     # threshold. None/1.0 = exact routing (bit-identical to the reference
     # path); <1.0 trades output fidelity for fewer streamed expert bytes.
     expert_streaming_topk_threshold: Optional[float] = None
+    # Per-model overrides for the expert-streaming IO layer. None keeps the
+    # env-var / built-in default behavior (see patches/expert_streaming).
+    # Autotune (bench/autotune_expert_streaming.py) writes the winning values
+    # here so a machine-tuned profile survives restarts like any other
+    # per-model setting.
+    expert_streaming_io_depth: Optional[int] = (
+        None  # Expert IO thread-pool depth (default env OMLX_EXPERT_STREAMING_QD or 16)
+    )
+    expert_streaming_coalesce: Optional[bool] = (
+        None  # Coalesce consecutive expert ids into single pread runs
+    )
+    expert_streaming_readahead: Optional[bool] = (
+        None  # F_RDADVISE kernel readahead hints for expert runs (decode)
+    )
+    expert_streaming_seed: Optional[bool] = (
+        None  # Seed expert LRU / page cache from prefill routing hotness
+    )
+    expert_streaming_pilot: Optional[bool] = (
+        None  # Async router-lookahead prefetcher (PILOT)
+    )
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

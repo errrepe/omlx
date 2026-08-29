@@ -752,3 +752,50 @@ class TestVlmMtpProcessorExclusivity:
             assert loaded.max_context_window == 8192
             assert loaded.is_pinned is True
             assert loaded.vlm_mtp_draft_model == "gemma-assistant"
+
+
+class TestStreamingIoFields:
+    """Fase H: expert-streaming IO knobs persist per model (autotune)."""
+
+    def test_defaults_are_none(self):
+        s = ModelSettings()
+        assert s.expert_streaming_io_depth is None
+        assert s.expert_streaming_coalesce is None
+        assert s.expert_streaming_readahead is None
+        assert s.expert_streaming_seed is None
+        assert s.expert_streaming_pilot is None
+
+    def test_roundtrip_through_dict(self, tmp_path):
+        s = ModelSettings(
+            expert_streaming_io_depth=8,
+            expert_streaming_coalesce=False,
+            expert_streaming_readahead=True,
+            expert_streaming_seed=False,
+            expert_streaming_pilot=True,
+        )
+        d = s.to_dict()
+        assert d["expert_streaming_io_depth"] == 8
+        assert d["expert_streaming_coalesce"] is False
+        r = ModelSettings.from_dict(dict(d))
+        assert r.expert_streaming_io_depth == 8
+        assert r.expert_streaming_coalesce is False
+        assert r.expert_streaming_readahead is True
+        assert r.expert_streaming_seed is False
+        assert r.expert_streaming_pilot is True
+
+    def test_none_values_dropped_from_dict(self):
+        d = ModelSettings().to_dict()
+        for field in (
+            "expert_streaming_io_depth",
+            "expert_streaming_coalesce",
+            "expert_streaming_readahead",
+            "expert_streaming_seed",
+            "expert_streaming_pilot",
+        ):
+            assert field not in d
+
+    def test_unknown_keys_ignored_on_load(self):
+        r = ModelSettings.from_dict(
+            {"expert_streaming_io_depth": 16, "bogus_future_field": 1}
+        )
+        assert r.expert_streaming_io_depth == 16

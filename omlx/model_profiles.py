@@ -107,6 +107,12 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "expert_streaming_enabled",
         "expert_streaming_budget_gib",
         "expert_streaming_topk_threshold",
+        # Machine/IO-tuned streaming knobs (autotune) — hardware-specific.
+        "expert_streaming_io_depth",
+        "expert_streaming_coalesce",
+        "expert_streaming_readahead",
+        "expert_streaming_seed",
+        "expert_streaming_pilot",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

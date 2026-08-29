@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,34 @@ _EXPERT_IO_POOL = ThreadPoolExecutor(
     max_workers=max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_QD", "") or 16)),
     thread_name_prefix="omlx-expert-io",
 )
+
+# Per-depth executors for models whose per-model settings override the pool
+# depth (autotune). One shared executor per distinct depth value — repeated
+# conversions of models tuned to the same depth must not multiply idle
+# worker threads. depth None → the env-default module pool above.
+_IO_POOLS: Dict[int, ThreadPoolExecutor] = {}
+_IO_POOLS_LOCK = threading.Lock()
+
+
+def io_pool_for(depth: int | None) -> ThreadPoolExecutor:
+    """Return the expert IO pool for a per-model depth override."""
+    if depth is None:
+        return _EXPERT_IO_POOL
+    try:
+        d = int(depth)
+    except (TypeError, ValueError):
+        return _EXPERT_IO_POOL
+    if d < 1:
+        return _EXPERT_IO_POOL
+    d = min(64, d)
+    with _IO_POOLS_LOCK:
+        pool = _IO_POOLS.get(d)
+        if pool is None:
+            pool = ThreadPoolExecutor(
+                max_workers=d, thread_name_prefix=f"omlx-expert-io-{d}"
+            )
+            _IO_POOLS[d] = pool
+        return pool
 
 
 @dataclass
@@ -471,6 +500,11 @@ class StreamingSwitchLinear(nn.Module):
         # Bias per expert (small, keep resident)
         self._bias: mx.array | None = None
         self._has_bias = bias
+        # Per-model IO overrides (expert_streaming_io_depth/coalesce settings).
+        # Consumed by the quantized demand path; inert here. None → module
+        # env defaults (_EXPERT_IO_POOL / _COALESCE_ENV).
+        self._io_pool_override: Any = None
+        self._coalesce_override: bool | None = None
 
     @property
     def input_dims(self) -> int:
@@ -587,6 +621,10 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         self.mode = mode
         self._has_bias = has_bias
         self._bias: mx.array | None = None
+        # Per-model IO overrides (expert_streaming_io_depth/coalesce settings).
+        # None → module env defaults (_EXPERT_IO_POOL / _COALESCE_ENV).
+        self._io_pool_override: Any = None
+        self._coalesce_override: bool | None = None
 
     @property
     def input_dims(self) -> int:
@@ -822,14 +860,20 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # bank (row-major) — sorted reads keep the NVMe's locality
             missing.sort()
             if hasattr(self.backing, "load_expert_slice"):
+                io_pool = self._io_pool_override or _EXPERT_IO_POOL
+                coalesce_on = (
+                    _COALESCE_ENV
+                    if self._coalesce_override is None
+                    else bool(self._coalesce_override)
+                )
                 raws: list = [None] * len(missing)
                 # Coalesce consecutive ids into single-pread runs (dense in
                 # long-prompt prefill; rare in decode, where runs are size 1
                 # and the path degenerates to the per-expert fetch).
                 runs = self._group_runs(missing)
-                if _COALESCE_ENV and len(runs) < len(missing):
+                if coalesce_on and len(runs) < len(missing):
                     results_by_run = list(
-                        _EXPERT_IO_POOL.map(lambda r: (r, self._load_expert_run_np(r[0], r[1])), runs)
+                        io_pool.map(lambda r: (r, self._load_expert_run_np(r[0], r[1])), runs)
                     )
                     idx_of = {eid: i for i, eid in enumerate(missing)}
                     leftover: list[int] = []
@@ -841,11 +885,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                             leftover.extend(range(first, first + count))
                     if leftover:
                         for eid, raw in zip(
-                            leftover, _EXPERT_IO_POOL.map(self._load_expert_np, leftover)
+                            leftover, io_pool.map(self._load_expert_np, leftover)
                         ):
                             raws[idx_of[eid]] = raw
                 else:
-                    raws = list(_EXPERT_IO_POOL.map(self._load_expert_np, missing))
+                    raws = list(io_pool.map(self._load_expert_np, missing))
                 dt_per = time.perf_counter() - t_res_start
                 for eid, raw in zip(missing, raws):
                     if raw is None:

@@ -63,6 +63,69 @@ def _get_budget_bytes(model_settings: Any | None, estimate: Any | None) -> int:
     return 0
 
 
+def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
+    """Per-model streaming IO overrides with env-fallback semantics.
+
+    Returns a dict whose values are None when the setting is unset (keep the
+    env-var / built-in default) or the requested override otherwise.
+    """
+    raw = {
+        "expert_streaming_io_depth": None,
+        "expert_streaming_coalesce": None,
+        "expert_streaming_readahead": None,
+        "expert_streaming_seed": None,
+        "expert_streaming_pilot": None,
+    }
+    if model_settings is None:
+        return raw
+    for key in raw:
+        raw[key] = getattr(model_settings, key, None)
+    depth = raw["expert_streaming_io_depth"]
+    if depth is not None:
+        try:
+            depth = int(depth)
+        except (TypeError, ValueError):
+            depth = None
+        else:
+            depth = max(1, min(64, depth)) if depth >= 1 else None
+        raw["expert_streaming_io_depth"] = depth
+    return raw
+
+
+def _wire_streaming_io_overrides(
+    layers: Any,
+    mtp_stages: Any,
+    io_depth: int | None,
+    coalesce: bool | None,
+) -> int:
+    """Attach per-model IO pool / coalesce overrides to streaming linears.
+
+    Returns the number of linears wired (0 when both overrides are unset —
+    the module env defaults stay in effect).
+    """
+    if io_depth is None and coalesce is None:
+        return 0
+    from .streaming_switch import io_pool_for
+
+    pool = io_pool_for(io_depth) if io_depth is not None else None
+    wired = 0
+    targets = list(layers or []) + list(mtp_stages or [])
+    for lyr in targets:
+        moe = getattr(lyr, "mlp", None) or getattr(lyr, "ffn", None)
+        sm = getattr(moe, "switch_mlp", None)
+        if sm is None:
+            continue
+        for proj in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+            lin = getattr(sm, proj, None)
+            if lin is not None and hasattr(lin, "_io_pool_override"):
+                if pool is not None:
+                    lin._io_pool_override = pool  # type: ignore[attr-defined]
+                if coalesce is not None:
+                    lin._coalesce_override = bool(coalesce)  # type: ignore[attr-defined]
+                wired += 1
+    return wired
+
+
 # SwitchGLU bank key prefixes per main layer. GLM/Qwen nest the MoE under
 # ``mlp``; DeepSeek V4 nests it under ``ffn`` (and MTP stages under
 # ``mtp.<stage>`` — see _mtp_candidate_stacked_keys).
@@ -661,6 +724,19 @@ def convert_model_to_streaming(
 
         mx.clear_cache()
         logger.info("Expert streaming: converted %d MoE layers (backing=%s, cache_capacity=%d experts)", converted, backing_kind, cache.capacity)
+        # Per-model IO overrides (autotune): pool depth + run coalescing ride
+        # the streaming linears; unset values keep the env-var defaults.
+        io_ov = _io_overrides(model_settings)
+        io_wired = _wire_streaming_io_overrides(
+            layers, mtp_stages, io_ov["expert_streaming_io_depth"], io_ov["expert_streaming_coalesce"]
+        )
+        if io_wired:
+            logger.info(
+                "Expert streaming: IO overrides wired (io_depth=%s coalesce=%s, %d linears)",
+                io_ov["expert_streaming_io_depth"],
+                io_ov["expert_streaming_coalesce"],
+                io_wired,
+            )
         # Opt-in adaptive top-k routing truncation (cumulative mass). Exact
         # (None/1.0) by default — no patch engagement, zero overhead.
         from .adaptive_topk import apply_qwen35_moe_topk_patch, configure_from_settings
@@ -671,10 +747,14 @@ def convert_model_to_streaming(
         # PILOT: async router-lookahead prefetch into the LRU (glm5_next's
         # Glm5NextModel loop scores the next MoE layer's router against the
         # current layer output). mmap backing only; off when the RAM dict
-        # fallback is in use or OMLX_EXPERT_STREAMING_PILOT=0.
+        # fallback is in use, the per-model setting disables it, or
+        # OMLX_EXPERT_STREAMING_PILOT=0.
         import os
 
-        if os.environ.get("OMLX_EXPERT_STREAMING_PILOT", "0") == "1" and not isinstance(
+        pilot_requested = io_ov["expert_streaming_pilot"]
+        if pilot_requested is None:
+            pilot_requested = os.environ.get("OMLX_EXPERT_STREAMING_PILOT", "0") == "1"
+        if pilot_requested and not isinstance(
             backing, dict
         ):
             try:
@@ -721,14 +801,24 @@ def convert_model_to_streaming(
         # complements; replaces the LRU's "keep hot experts in RAM" role).
         # F_RDADVISE readahead (RA) rides the same prediction flow with
         # kernel hints instead of reads and defaults ON, as does the
-        # prefill-hotness cache seed (SEED).
+        # prefill-hotness cache seed (SEED). The per-model readahead/seed
+        # settings (autotune) override the env defaults when set.
         from . import warmer as _warmer_mod
+
+        ra_setting = io_ov["expert_streaming_readahead"]
+        ra_enabled = (
+            _warmer_mod.RA_ENABLED if ra_setting is None else bool(ra_setting)
+        )
+        seed_setting = io_ov["expert_streaming_seed"]
+        seed_enabled = (
+            _warmer_mod.SEED_ENABLED if seed_setting is None else bool(seed_setting)
+        )
 
         if (
             _warmer_mod.WARM_ENABLED
             or _warmer_mod.PIN_ENABLED
-            or _warmer_mod.RA_ENABLED
-            or _warmer_mod.SEED_ENABLED
+            or ra_enabled
+            or seed_enabled
         ):
             try:
                 glus: dict[int, Any] = {}
@@ -747,7 +837,7 @@ def convert_model_to_streaming(
                 }
                 if _warmer_mod.WARM_ENABLED:
                     warmer = _warmer_mod.PageCacheWarmer(linears_by_layer)
-                elif _warmer_mod.RA_ENABLED:
+                elif ra_enabled:
                     warmer = _warmer_mod.PageCacheWarmer(
                         linears_by_layer, advise_only=True
                     )
@@ -763,7 +853,7 @@ def convert_model_to_streaming(
                         per_expert_bytes=estimate.per_expert_bytes,
                     )
                 recorder = None
-                if _warmer_mod.SEED_ENABLED and backing is not None and not isinstance(backing, dict):
+                if seed_enabled and backing is not None and not isinstance(backing, dict):
                     recorder = _warmer_mod.PrefillHotnessRecorder(
                         linears_by_layer,
                         backing,

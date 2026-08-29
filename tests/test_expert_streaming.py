@@ -1468,3 +1468,142 @@ def test_admission_floor_kept_without_streaming():
 
     bound = Scheduler._admission_transient_bound(sched, 512, 0)
     assert bound == pytest.approx(32.0 * 1024**3)
+
+
+# ---------------------------------------------------------------------------
+# Fase H: per-model IO overrides (autotune)
+# ---------------------------------------------------------------------------
+
+
+def test_io_overrides_resolution_and_clamping():
+    """Settings resolution: unset keys stay None, depth clamps to 1..64."""
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.expert_streaming import _io_overrides
+
+    # All defaults → every override None
+    ov = _io_overrides(ModelSettings())
+    assert ov == {
+        "expert_streaming_io_depth": None,
+        "expert_streaming_coalesce": None,
+        "expert_streaming_readahead": None,
+        "expert_streaming_seed": None,
+        "expert_streaming_pilot": None,
+    }
+
+    # Depth clamping and boolean pass-through
+    ov = _io_overrides(
+        ModelSettings(
+            expert_streaming_io_depth=999,
+            expert_streaming_coalesce=False,
+            expert_streaming_readahead=False,
+            expert_streaming_seed=False,
+            expert_streaming_pilot=True,
+        )
+    )
+    assert ov["expert_streaming_io_depth"] == 64
+    assert ov["expert_streaming_coalesce"] is False
+    assert ov["expert_streaming_readahead"] is False
+    assert ov["expert_streaming_seed"] is False
+    assert ov["expert_streaming_pilot"] is True
+
+    # Invalid depth → None (env default); None settings object → all None
+    ov = _io_overrides(ModelSettings(expert_streaming_io_depth=0))
+    assert ov["expert_streaming_io_depth"] is None
+    assert _io_overrides(None)["expert_streaming_io_depth"] is None
+
+
+def test_convert_applies_io_overrides():
+    """convert_model_to_streaming wires per-model io_depth/coalesce to linears."""
+    from omlx.model_settings import ModelSettings  # noqa: F811
+    from omlx.patches.expert_streaming import convert_model_to_streaming
+    from omlx.patches.expert_streaming.streaming_switch import (
+        StreamingSwitchLinear,
+        io_pool_for,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        num_layers, experts, hidden, moe_hidden, stages = 2, 4, 8, 4, 1
+        _write_fake_dsv4_checkpoint(
+            tmp,
+            num_layers=num_layers,
+            experts=experts,
+            hidden=hidden,
+            moe_hidden=moe_hidden,
+            mtp_stages=stages,
+        )
+        layers = [_FakeLayer(experts, moe_hidden, hidden) for _ in range(num_layers)]
+        mtp = [_FakeDSparkStage(experts, moe_hidden, hidden) for _ in range(stages)]
+        model = _FakeTextModel(
+            layers,
+            mtp,
+            {
+                "model_type": "deepseek_v4",
+                "hidden_size": hidden,
+                "moe_intermediate_size": moe_hidden,
+            },
+        )
+        convert_model_to_streaming(
+            model,
+            str(tmp),
+            ModelSettings(expert_streaming_io_depth=8, expert_streaming_coalesce=False),
+            use_file_backing=False,
+        )
+
+        pool = io_pool_for(8)
+        assert pool._max_workers == 8
+        # Registry dedup: same depth → same executor instance
+        assert io_pool_for(8) is pool
+        assert io_pool_for(None)._max_workers >= 1
+
+        for lyr in layers:
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                lin = getattr(lyr.ffn.switch_mlp, proj)
+                assert isinstance(lin, StreamingSwitchLinear)
+                assert lin._io_pool_override is pool
+                assert lin._coalesce_override is False
+        for stage in mtp:
+            lin = stage.ffn.switch_mlp.down_proj
+            assert lin._io_pool_override is pool
+            assert lin._coalesce_override is False
+
+
+def test_convert_without_io_overrides_keeps_defaults():
+    """No settings overrides → linears keep the env-default IO behavior."""
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.expert_streaming import convert_model_to_streaming
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_dsv4_checkpoint(
+            tmp, num_layers=2, experts=4, hidden=8, moe_hidden=4, mtp_stages=0
+        )
+        layers = [_FakeLayer(4, 4, 8) for _ in range(2)]
+        model = _FakeTextModel(
+            layers,
+            [],
+            {
+                "model_type": "deepseek_v4",
+                "hidden_size": 8,
+                "moe_intermediate_size": 4,
+            },
+        )
+        convert_model_to_streaming(model, str(tmp), ModelSettings(), use_file_backing=False)
+        for lyr in layers:
+            lin = lyr.ffn.switch_mlp.down_proj
+            assert lin._io_pool_override is None
+            assert lin._coalesce_override is None
+
+
+def test_io_pool_for_clamps_and_caches():
+    """io_pool_for clamps invalid depths and caches one executor per depth."""
+    from omlx.patches.expert_streaming.streaming_switch import io_pool_for
+
+    fallback = io_pool_for(None)
+    assert io_pool_for("bogus") is fallback
+    assert io_pool_for(-3) is fallback  # invalid depth → env-default pool
+    pool = io_pool_for(3)
+    assert pool._max_workers == 3
+    assert io_pool_for(3) is pool
+    assert io_pool_for("5") is io_pool_for(5)
+    assert io_pool_for(999)._max_workers == 64

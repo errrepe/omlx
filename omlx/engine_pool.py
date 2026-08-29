@@ -711,6 +711,17 @@ class EnginePool:
                 thr = data.get("expert_streaming_topk_threshold", None)
                 if thr is not None and float(thr) < 1.0:
                     add("expert_streaming_topk_threshold", thr)
+                # IO-layer tuning knobs (autotune): the IO pool depth is fixed
+                # at conversion time and warmer/prefetcher attach is decided
+                # at load, so any of these changes must rebuild the engine.
+                for _io_key in (
+                    "expert_streaming_io_depth",
+                    "expert_streaming_coalesce",
+                    "expert_streaming_readahead",
+                    "expert_streaming_seed",
+                    "expert_streaming_pilot",
+                ):
+                    add(_io_key, data.get(_io_key))
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)

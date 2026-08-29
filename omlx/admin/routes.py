@@ -133,6 +133,12 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_enabled: bool | None = None
     expert_streaming_budget_gib: float | None = None
     expert_streaming_topk_threshold: float | None = None
+    # Expert-streaming IO knobs (autotune-tuned, per model; None = env/default)
+    expert_streaming_io_depth: int | None = None
+    expert_streaming_coalesce: bool | None = None
+    expert_streaming_readahead: bool | None = None
+    expert_streaming_seed: bool | None = None
+    expert_streaming_pilot: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -2423,6 +2429,22 @@ async def update_model_settings(
                 raise HTTPException(status_code=400, detail="expert_streaming_topk_threshold must be between 0.05 and 1.0")
             # >= 1.0 normalizes to exact routing (None)
             current_settings.expert_streaming_topk_threshold = float(thr) if thr < 1.0 else None
+    if "expert_streaming_io_depth" in sent:
+        v = request.expert_streaming_io_depth
+        if v is None:
+            current_settings.expert_streaming_io_depth = None
+        else:
+            if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 64:
+                raise HTTPException(status_code=400, detail="expert_streaming_io_depth must be an integer between 1 and 64")
+            current_settings.expert_streaming_io_depth = int(v)
+    if "expert_streaming_coalesce" in sent:
+        current_settings.expert_streaming_coalesce = request.expert_streaming_coalesce
+    if "expert_streaming_readahead" in sent:
+        current_settings.expert_streaming_readahead = request.expert_streaming_readahead
+    if "expert_streaming_seed" in sent:
+        current_settings.expert_streaming_seed = request.expert_streaming_seed
+    if "expert_streaming_pilot" in sent:
+        current_settings.expert_streaming_pilot = request.expert_streaming_pilot
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
