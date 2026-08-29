@@ -327,6 +327,30 @@ class ExpertLRUCache:
         self._layer_counts.clear()
         self.stats = CacheStats()
 
+    def retain_hot(self, hot_pairs: set) -> int:
+        """Keep only entries whose (layer_idx, expert_id) is in hot_pairs.
+
+        The prefill demand path fills the cache with the *last* chunks'
+        experts; the hotness seeder replaces those contents with the
+        prompt-wide hot set. Rebuilds per-layer counts; returns the number
+        of evicted entries.
+        """
+        if self.capacity <= 0 or not self._store:
+            return 0
+        evicted = 0
+        for key in list(self._store.keys()):
+            if (key[0], key[1]) not in hot_pairs:
+                del self._store[key]
+                evicted += 1
+        if evicted:
+            counts: Dict[int, int] = {}
+            for key in self._store:
+                layer = self._layer_of(key)
+                counts[layer] = counts.get(layer, 0) + 1
+            self._layer_counts = counts
+            self.stats.evictions += evicted
+        return evicted
+
     @property
     def size(self) -> int:
         return len(self._store)

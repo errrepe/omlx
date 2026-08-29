@@ -719,9 +719,17 @@ def convert_model_to_streaming(
 
         # Opt-in warm-only page-cache prefetch + mlock pins (page-cache
         # complements; replaces the LRU's "keep hot experts in RAM" role).
+        # F_RDADVISE readahead (RA) rides the same prediction flow with
+        # kernel hints instead of reads and defaults ON, as does the
+        # prefill-hotness cache seed (SEED).
         from . import warmer as _warmer_mod
 
-        if _warmer_mod.WARM_ENABLED or _warmer_mod.PIN_ENABLED:
+        if (
+            _warmer_mod.WARM_ENABLED
+            or _warmer_mod.PIN_ENABLED
+            or _warmer_mod.RA_ENABLED
+            or _warmer_mod.SEED_ENABLED
+        ):
             try:
                 glus: dict[int, Any] = {}
                 for layer_idx_, layer_ in enumerate(layers):
@@ -737,11 +745,14 @@ def convert_model_to_streaming(
                     ]
                     for i, g in glus.items()
                 }
-                warmer = (
-                    _warmer_mod.PageCacheWarmer(linears_by_layer)
-                    if _warmer_mod.WARM_ENABLED
-                    else None
-                )
+                if _warmer_mod.WARM_ENABLED:
+                    warmer = _warmer_mod.PageCacheWarmer(linears_by_layer)
+                elif _warmer_mod.RA_ENABLED:
+                    warmer = _warmer_mod.PageCacheWarmer(
+                        linears_by_layer, advise_only=True
+                    )
+                else:
+                    warmer = None
                 pinner = None
                 if _warmer_mod.PIN_ENABLED and backing is not None and not isinstance(backing, dict):
                     pinner = _warmer_mod.PinController(
@@ -751,14 +762,24 @@ def convert_model_to_streaming(
                         observe_calls=_warmer_mod.PIN_OBSERVE_CALLS,
                         per_expert_bytes=estimate.per_expert_bytes,
                     )
-                if warmer is not None or pinner is not None:
-                    hook = _warmer_mod.WarmPinHook(warmer, pinner)
+                recorder = None
+                if _warmer_mod.SEED_ENABLED and backing is not None and not isinstance(backing, dict):
+                    recorder = _warmer_mod.PrefillHotnessRecorder(
+                        linears_by_layer,
+                        backing,
+                        cache,
+                        per_expert_bytes=estimate.per_expert_bytes,
+                    )
+                if warmer is not None or pinner is not None or recorder is not None:
+                    hook = _warmer_mod.WarmPinHook(warmer, pinner, recorder)
                     for sm_ in glus.values():
                         sm_._warm_pins = hook  # type: ignore[attr-defined]
                     logger.info(
-                        "Expert streaming: warm=%s pin=%s attached (%d layers)",
-                        bool(warmer),
+                        "Expert streaming: warm=%s pin=%s readahead=%s seed=%s attached (%d layers)",
+                        bool(warmer and not warmer.advise_only),
                         bool(pinner),
+                        bool(warmer and warmer.advise_only),
+                        bool(recorder),
                         len(glus),
                     )
             except Exception as e:

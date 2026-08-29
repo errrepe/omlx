@@ -8,11 +8,13 @@ but slices a stacked bank (E, O, I) per expert id.
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import json
 import logging
 import mmap
 import os
 import struct
+import sys
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -22,6 +24,14 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
+
+# macOS kernel readahead (fcntl F_RDADVISE / struct radvisory): an async hint
+# that pulls a file range into the page cache without copying into userspace
+# — the zero-copy alternative to the warmer's discarded preads (ds4's
+# metal_graph_stream_readahead). Best-effort: any failure is silent.
+# F_RDADVISE is 44 on Darwin (not exported by Python's fcntl module).
+_F_RDADVISE = getattr(fcntl, "F_RDADVISE", 44 if sys.platform == "darwin" else None)
+_RADVISORY = struct.Struct("=qi4x")  # off_t ra_offset; int ra_count; + tail pad
 
 _libc = ctypes.CDLL(None, use_errno=True)
 _libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
@@ -180,6 +190,28 @@ class _ShardReader:
         expert_bytes = (end - start) // num_experts
         off = self.data_start + int(start) + expert_id * expert_bytes
         return off, off + expert_bytes
+
+    def advise_range(self, offset: int, length: int) -> bool:
+        """Kernel readahead hint (F_RDADVISE) for one file range.
+
+        Tells macOS to start pulling [offset, offset+length) into the page
+        cache asynchronously — no userspace copy, no buffer, nothing to
+        free. Used to overlap the NVMe fetch of a predicted demand set with
+        GPU compute. Best-effort: returns False on any failure.
+        """
+        if _F_RDADVISE is None or length <= 0:
+            return False
+        try:
+            fd = self._file.fileno()
+            end = offset + length
+            pos = offset
+            while pos < end:
+                chunk = min(end - pos, 0x7FFFFFFF)
+                fcntl.fcntl(fd, _F_RDADVISE, _RADVISORY.pack(pos, chunk))
+                pos += chunk
+            return True
+        except Exception:
+            return False
 
     def expert_run(self, key: str, first_id: int, count: int) -> list:
         """One pread covering experts [first_id, first_id+count), sliced per expert.
@@ -375,6 +407,24 @@ class ExpertBackingStore:
         """
         reader = self._reader_for_key(key)
         return reader.expert_run(key, first_id, count)
+
+    def advise_expert_run(self, key: str, first_id: int, count: int) -> bool:
+        """Kernel readahead of experts [first_id, first_id+count) of one bank.
+
+        Row-major stacked banks make a run of ids one contiguous byte range,
+        so the whole run collapses into a single F_RDADVISE — the zero-copy
+        readahead counterpart of load_expert_run. Returns False when the
+        platform lacks F_RDADVISE or the key cannot be resolved.
+        """
+        try:
+            reader = self._reader_for_key(key)
+            start, _ = reader.expert_byte_range(key, first_id)
+            _, end = reader.expert_byte_range(key, max(0, first_id + count - 1))
+            if end <= start:
+                return False
+            return reader.advise_range(start, end - start)
+        except Exception:
+            return False
 
     def pin_expert(self, key: str, expert_id: int) -> int:
         """mlock one expert's file range across the resolved shard.

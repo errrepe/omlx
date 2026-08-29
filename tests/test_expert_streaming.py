@@ -1097,6 +1097,219 @@ def test_page_cache_warmer_flow():
         assert w.last_uniq[0] == []
 
 
+def _ra_warmer_setup(budget_bytes: int = 0):
+    from omlx.patches.expert_streaming import warmer
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+    )
+
+    tmp = tempfile.mkdtemp()
+    tmpp = Path(tmp)
+    tensors = {}
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        tensors[f"model.layers.0.mlp.switch_mlp.{proj}.weight"] = ((4, 8, 16), "BF16")
+        tensors[f"model.layers.0.mlp.switch_mlp.{proj}.scales"] = ((4, 8, 1), "U32")
+        tensors[f"model.layers.0.mlp.switch_mlp.{proj}.biases"] = ((4, 8, 1), "U32")
+    tensors["model.layers.1.mlp.switch_mlp.gate_proj.weight"] = ((4, 8, 16), "BF16")
+    tensors["model.layers.1.mlp.switch_mlp.gate_proj.scales"] = ((4, 8, 1), "U32")
+    tensors["model.layers.1.mlp.switch_mlp.gate_proj.biases"] = ((4, 8, 1), "U32")
+    _write_shard(tmpp / "model.safetensors", tensors)
+    wm = {k: "model.safetensors" for k in tensors}
+    (tmpp / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm}))
+
+    backing = ExpertBackingStore(tmpp)
+    cache = ExpertLRUCache(budget_bytes, 1 << 12, num_layers=2)
+
+    def mk_lin(layer, proj):
+        return StreamingQuantizedSwitchLinear(
+            layer_idx=layer,
+            proj_name=proj,
+            stacked_weight_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.weight",
+            stacked_scales_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.scales",
+            stacked_biases_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.biases",
+            num_experts=4,
+            input_dims=16,
+            output_dims=8,
+            backing=backing,
+            cache=cache,
+        )
+
+    linears = {0: [mk_lin(0, p) for p in ("gate_proj", "up_proj", "down_proj")]}
+    linears[1] = [mk_lin(1, "gate_proj")]
+    return tmp, warmer, backing, linears
+
+
+def test_readahead_warmer_advises_contiguous_runs():
+    """advise-only warmer: contiguous expert ids collapse into one F_RDADVISE
+    run per projection key, and no discarded reads happen (Fase G)."""
+    from unittest.mock import patch
+
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    tmp, warmer, backing, linears = _ra_warmer_setup()
+    try:
+        advised = []
+        w = warmer.PageCacheWarmer(linears, advise_only=True)
+        hook = warmer.WarmPinHook(w, None)
+        hook.on_layer_plan(1, [2], 8)
+        hook.on_layer_plan(0, [1, 2, 3], 8)
+
+        import time
+
+        # The submit is async: the spy must be in place before the trigger.
+        with patch.object(
+            ExpertBackingStore,
+            "advise_expert_run",
+            side_effect=lambda key, first, count: advised.append((key, first, count)) or True,
+        ):
+            hook.on_layer_start(0, 8)  # fires advises for layer 1's [2]
+            deadline = time.time() + 5
+            while time.time() < deadline and not advised:
+                time.sleep(0.05)
+
+        assert advised, "advise jobs were not submitted"
+        # layer 1 has one linear (gate_proj family: weight+scales+biases keys),
+        # ids [2] -> single (2, 1) run per key.
+        assert all(count == 1 and first == 2 for _, first, count in advised)
+        assert all("model.layers.1." in key for key, _, _ in advised)
+        assert w.warmed == 0  # advise-only: no reads
+        assert w.advised == len(advised)
+    finally:
+        backing.close()
+
+
+def test_backing_advise_expert_run_real_range():
+    """Real F_RDADVISE against a temp shard: True on macOS, and a missing key
+    degrades to False instead of raising."""
+    import sys
+
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    tmp, warmer, backing, linears = _ra_warmer_setup()
+    try:
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        got = backing.advise_expert_run(key, 1, 2)  # experts 1..2 contiguous
+        if sys.platform == "darwin":
+            assert got is True
+        else:
+            assert got is False
+        assert backing.advise_expert_run("nope.missing.key", 0, 1) is False
+    finally:
+        backing.close()
+
+
+def test_expert_lru_retain_hot():
+    """retain_hot keeps only the (layer, expert) pairs given, rebuilding
+    per-layer counts — the hotness seeder's cache-swap primitive."""
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    cache = ExpertLRUCache(1 << 20, 4096, num_layers=2)
+    for eid in range(6):
+        cache.put((0, eid, "w"), ("w", "s", None))
+        cache.put((1, eid, "w"), ("w", "s", None))
+    evicted = cache.retain_hot({(0, 1), (0, 2), (1, 5)})
+    assert evicted == 9
+    assert cache.size == 3
+    assert (0, 1, "w") in cache
+    assert (0, 2, "w") in cache
+    assert (1, 5, "w") in cache
+    assert cache._layer_counts == {0: 2, 1: 1}
+    # Budget-0 caches are no-ops.
+    empty = ExpertLRUCache(0, 4096, num_layers=2)
+    assert empty.retain_hot({(0, 0)}) == 0
+
+
+def test_prefill_hotness_recorder_seeds_lru():
+    """Budget>0: the recorder swaps the cache to the prompt's hot set —
+    non-hot entries evicted, missing hot bundles loaded from the backing."""
+    tmp, warmer, backing, linears = _ra_warmer_setup(budget_bytes=4 << 20)
+    try:
+        cache = linears[0][0].cache
+        wkey0 = linears[0][0].stacked_weight_key
+        wkey1 = linears[1][0].stacked_weight_key
+        # Pre-fill with non-hot entries (what the last prefill chunks left).
+        cache.put((0, 0, wkey0), ("w", "s", None))
+        cache.put((1, 0, wkey1), ("w", "s", None))
+
+        rec = warmer.PrefillHotnessRecorder(linears, backing, cache, per_expert_bytes=0)
+        rec.on_layer_plan(0, [1, 2, 0, 3], 4096)  # prefill-sized: all experts seen
+        rec.on_layer_plan(1, [3, 2], 4096)
+        assert rec.saw_prefill is True
+        assert rec.seeded is False
+
+        # Decode-sized call triggers the one-shot seed.
+        rec.maybe_seed(0, 8)
+        assert rec.seeded is True
+        assert rec.seeded_experts > 0
+
+        # Non-hot entries evicted (layer 0 expert 0 was seen but 1,2 rank higher
+        # only if counts differ — with equal counts most_common is stable, so
+        # assert the hot bundles are present and junk-only layers are gone).
+        assert (1, 0, wkey1) not in cache
+        assert (1, 3, wkey1) in cache
+        assert cache.get((1, 3, wkey1)) is not None
+
+        # One-shot: a second decode call does not re-seed.
+        seeded_experts = rec.seeded_experts
+        rec.maybe_seed(1, 8)
+        assert rec.seeded_experts == seeded_experts
+    finally:
+        backing.close()
+
+
+def test_prefill_hotness_recorder_budget0_page_cache_seed():
+    """Budget-0: the seed issues bounded discarded reads (page-cache only),
+    async on the warm pool, and never touches the LRU."""
+    from unittest.mock import patch
+
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    tmp, warmer, backing, linears = _ra_warmer_setup(budget_bytes=0)
+    try:
+        cache = linears[0][0].cache
+        assert cache.capacity == 0
+        rec = warmer.PrefillHotnessRecorder(linears, backing, cache, per_expert_bytes=0)
+        rec.on_layer_plan(0, [0, 1, 2, 3], 4096)
+        rec.on_layer_plan(1, [1, 2], 4096)
+
+        reads = []
+        import time
+
+        with patch.object(
+            ExpertBackingStore,
+            "load_expert_slice",
+            side_effect=lambda key, eid: reads.append((key, eid)) or b"\0" * 8,
+        ):
+            rec.maybe_seed(0, 8)
+            deadline = time.time() + 5
+            while time.time() < deadline and not reads:
+                time.sleep(0.05)
+
+        assert reads, "page-cache seed burst was not submitted"
+        assert rec.seeded is True
+        assert cache.size == 0  # budget 0: nothing enters the LRU
+    finally:
+        backing.close()
+
+
+def test_prefill_hotness_recorder_ignores_decode_only():
+    """Without any prefill-sized call, the seed never fires (cheap no-op on
+    every decode call — saw_prefill stays False)."""
+    tmp, warmer, backing, linears = _ra_warmer_setup(budget_bytes=0)
+    try:
+        rec = warmer.PrefillHotnessRecorder(linears, backing, None)
+        rec.on_layer_plan(0, [0, 1], 8)  # decode-sized rows
+        rec.maybe_seed(0, 8)
+        rec.maybe_seed(1, 8)
+        assert rec.saw_prefill is False
+        assert rec.seeded is False
+        assert rec.seeded_experts == 0
+    finally:
+        backing.close()
+
+
 def test_pin_controller_pins_within_budget():
     from omlx.patches.expert_streaming import warmer
     from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
