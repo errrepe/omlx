@@ -547,12 +547,19 @@ subprocesso novo por braço, `--out-dir` isolado e verificação de saída greed
 | M0 Qwen B3b | 86,47 ms | 0,3939 | 0,0877 |
 | M0 Qwen A0b | 50,96 ms | 0,6835 | 0 |
 | C1 Qwen B3 | 114,98 ms | 0,3685 | 0,0877 |
+| Current C2–C12 Qwen A0 | 84,27 ms | 0,4514 | 0 |
+| Current C2–C12 Qwen B3 | 85,20 ms | 0,4141 | 0,0323 |
 
 O gate local registrou `bit_exact_kind=text`, 48 completion tokens e texto de
 253 caracteres em todos os braços. Como os IDs não atravessam a fronteira VLM,
 esses números comprovam determinismo textual greedy, não igualdade de token IDs.
 O C1 foi neutro dentro do ruído da máquina (swap já em uso); sua justificativa
 principal é corretude, robustez de leitura e eliminação da cópia intermediária.
+A campanha posterior, com mais de 32 GiB disponíveis, mediu o estado combinado
+C2–C12: A0=84,27 ms / 0,4514 tok/s e B3=85,20 ms / 0,4141 tok/s. Esses números
+são indicativos, não atribuição isolada por commit; o B3 teve hit-rate 0,0323,
+diferente do M0 0,0877, portanto precisa de repetição antes de qualquer claim
+de ganho causal.
 
 ### Itens rejeitados ou não mensuráveis
 
