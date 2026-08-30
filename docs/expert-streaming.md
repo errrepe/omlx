@@ -549,10 +549,15 @@ subprocesso novo por braço, `--out-dir` isolado e verificação de saída greed
 | C1 Qwen B3 | 114,98 ms | 0,3685 | 0,0877 |
 | Current C2–C12 Qwen A0 | 84,27 ms | 0,4514 | 0 |
 | Current C2–C12 Qwen B3 | 85,20 ms | 0,4141 | 0,0323 |
+| Single-request Qwen A0 | 81,01 ms | 2,6241 | 0 |
 
-O gate local registrou `bit_exact_kind=text`, 48 completion tokens e texto de
-253 caracteres em todos os braços. Como os IDs não atravessam a fronteira VLM,
-esses números comprovam determinismo textual greedy, não igualdade de token IDs.
+O gate histórico registrou `bit_exact_kind=text`, 48 completion tokens e texto
+de 253 caracteres porque os IDs não atravessavam a fronteira VLM. A fronteira
+agora também encaminha `RequestOutput.output_token_ids` para `GenerationOutput`;
+uma execução single-request posterior passou com `bit_exact_kind=tokens`,
+48 IDs e o mesmo texto de 253 caracteres. Os artefatos M0 antigos continuam
+sendo text-only, portanto a comparação token-a-token com o baseline ainda exige
+uma nova coleta M0.
 O C1 foi neutro dentro do ruído da máquina (swap já em uso); sua justificativa
 principal é corretude, robustez de leitura e eliminação da cópia intermediária.
 A campanha posterior, com mais de 32 GiB disponíveis, mediu o estado combinado

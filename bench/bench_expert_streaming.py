@@ -138,6 +138,7 @@ async def run(
     specprefill_draft: str | None = None,
     specprefill_keep: float | None = None,
     out_dir: str = "bench/results",
+    single_request: bool = False,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -158,9 +159,17 @@ async def run(
         return
     pool._process_memory_enforcer = None  # keep _propagate no-op path quiet
 
+    tq_raw = os.environ.get("OMLX_BENCH_TURBOQUANT_BITS")
+    tq_bits = float(tq_raw) if tq_raw else None
+    if tq_bits is not None and tq_bits not in (2.0, 2.5, 3.0, 3.5, 4.0, 6.0, 8.0):
+        raise SystemExit(
+            "OMLX_BENCH_TURBOQUANT_BITS must be one of 2, 2.5, 3, 3.5, 4, 6, 8"
+        )
     settings = ModelSettings(
         expert_streaming_enabled=True,
         expert_streaming_budget_gib=budget,
+        turboquant_kv_enabled=tq_bits is not None,
+        turboquant_kv_bits=tq_bits or 4.0,
         expert_streaming_topk_threshold=topk,
         qwen4_ple_ssd_offload=True,
         vlm_mtp_enabled=mtp,
@@ -258,6 +267,7 @@ async def run(
         "mtp_block": mtp_block,
         "ane": ane,
         "warm_control_gib": warm_control,
+        "single_request": single_request,
         "prompt_len": prompt_len,
         "runtime_est_gib": runtime / 1024**3,
         "load_s": t_load,
@@ -279,18 +289,49 @@ async def run(
         },
     )
     sampler.start()
-    t1 = time.perf_counter()
     sampler.mark("prefill")
-    out1 = await engine.chat(messages, max_tokens=1, temperature=0.0)
-    ttft = time.perf_counter() - t1
-    sampler.mark("decode")
-    print(f"TTFT (1 tok) {ttft:.1f}s prompt {out1.prompt_tokens}")
+    if single_request:
+        # One request avoids the historical second full prefill. The first
+        # streamed output marks the end of prefill; the final output carries
+        # cumulative text/token IDs for the correctness gate.
+        t_request = time.perf_counter()
+        first_output_at = None
+        out2 = None
+        async for output in engine.stream_chat(
+            messages, max_tokens=decode, temperature=0.0
+        ):
+            out2 = output
+            if first_output_at is None and (
+                output.completion_tokens > 0 or output.new_text or output.tokens
+            ):
+                first_output_at = time.perf_counter()
+                sampler.mark("decode")
+        if out2 is None:
+            raise SystemExit("single-request benchmark produced no output")
+        end_request = time.perf_counter()
+        if first_output_at is None:
+            first_output_at = end_request
+            sampler.mark("decode")
+        ttft = first_output_at - t_request
+        t_decode = end_request - first_output_at
+        n = int(out2.completion_tokens)
+        prompt_tokens = out2.prompt_tokens
+        print(f"TTFT (stream first token) {ttft:.1f}s prompt {prompt_tokens}")
+    else:
+        # Legacy two-request protocol retained for historical comparability.
+        t1 = time.perf_counter()
+        out1 = await engine.chat(messages, max_tokens=1, temperature=0.0)
+        ttft = time.perf_counter() - t1
+        sampler.mark("decode")
+        print(f"TTFT (1 tok) {ttft:.1f}s prompt {out1.prompt_tokens}")
 
-    t2 = time.perf_counter()
-    out2 = await engine.chat(messages, max_tokens=decode, temperature=0.0)
-    t_decode = time.perf_counter() - t2
-    n = out2.completion_tokens or decode
-    tokps = n / t_decode
+        t2 = time.perf_counter()
+        out2 = await engine.chat(messages, max_tokens=decode, temperature=0.0)
+        t_decode = time.perf_counter() - t2
+        n = int(out2.completion_tokens)
+    if n <= 0:
+        raise SystemExit("benchmark produced zero completion tokens")
+    tokps = n / max(t_decode, 1e-9)
     sampler.mark("teardown")
     sampler.stop()
     print(f"decode {n} tok in {t_decode:.1f}s -> {tokps:.3f} tok/s")
@@ -306,14 +347,11 @@ async def run(
         sampler.samples(),
         open(out_dir_p / f"{model_key}_{budget}g_samples.json", "w"),
     )
-    # Generated output for bit-exactness comparison across runs.
-    # The VLM/batched engine's `chat` populates `text` and `completion_tokens`
-    # but leaves `GenerationOutput.tokens` as [] (the underlying mlx-lm result's
-    # token ids are dropped at the omlx GenerationOutput boundary). So `text`
-    # is the real, populated field and — for greedy (temperature=0) decoding —
-    # is a faithful deterministic proxy for token-id equality, which is what the
-    # success criterion needs. Fail-high: a run with no comparable output must
-    # abort, never be accepted (the old gate recorded token_ids:null silently).
+    # Generated output for bit-exactness comparison across runs. The VLM path
+    # now forwards RequestOutput.output_token_ids when available. Prefer those
+    # IDs for the gate; retain a textual greedy fallback for older engines whose
+    # output boundary still drops token IDs. Fail-high: a run with no comparable
+    # output must abort, never be accepted.
     _text = getattr(out2, "text", None)
     _tokens = getattr(out2, "tokens", None)
     if isinstance(_tokens, list) and _tokens:
@@ -422,6 +460,11 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--out-dir", default="bench/results", metavar="DIR",
                     help="directory for the _samples/_output side-effect files (default bench/results)")
+    ap.add_argument(
+        "--single-request",
+        action="store_true",
+        help="measure TTFT and decode from one streaming request (avoids a second prefill)",
+    )
     args = ap.parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     import omlx
@@ -460,6 +503,7 @@ def main():
             warm_control=args.warm_control,
             mem_ceiling=args.mem_ceiling_gib,
             out_dir=args.out_dir,
+            single_request=args.single_request,
         )
     )
 

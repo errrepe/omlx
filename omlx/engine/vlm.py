@@ -3581,6 +3581,7 @@ class VLMBatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
+            tokens=list(getattr(output, "output_token_ids", ()) or ()),
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
@@ -3705,6 +3706,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 yield GenerationOutput(
                     text=text,
+                    tokens=list(getattr(output, "output_token_ids", ()) or ()),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
