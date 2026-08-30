@@ -278,6 +278,85 @@ def _make_affine_gdn(bits, group_size):
     )
 
 
+def _make_attention_with_oproj(output_dim=256):
+    return SimpleNamespace(
+        q_proj=_affine_linear(128, 128, 4, 64),
+        k_proj=_affine_linear(128, 128, 4, 64),
+        v_proj=_affine_linear(128, 128, 4, 64),
+        o_proj=_affine_linear(128, output_dim, 4, 64),
+    )
+
+
+def test_oproj_eligibility_and_row_plan_are_alignment_safe():
+    valid = _make_attention_with_oproj().o_proj
+    misaligned = _make_attention_with_oproj(192).o_proj
+
+    assert ane_patch._eligible_oproj(valid, dual_ane=True)
+    assert not ane_patch._eligible_oproj(misaligned, dual_ane=True)
+    assert ane_patch._eligible_oproj(misaligned, dual_ane=False)
+    assert ane_patch._oproj_split_plan(
+        valid, ane_patch._AneOProjConfig(2048, 0.5, 8, dual_ane=True)
+    ) == (128, 128)
+    assert ane_patch._oproj_split_plan(
+        valid, ane_patch._AneOProjConfig(2048, 1.0, 8, dual_ane=True)
+    ) is None
+
+
+def test_oproj_scan_collects_only_full_attention_output_projection():
+    attention = _make_attention_with_oproj()
+    gdn_like = SimpleNamespace(
+        in_proj_qkv=_affine_linear(128, 256, 4, 64),
+    )
+    model = SimpleNamespace(
+        named_modules=lambda: [
+            ("", model),
+            ("attention", attention),
+            ("linear_attn", gdn_like),
+        ]
+    )
+
+    assert list(ane_patch._iter_oproj_candidates(model)) == [attention.o_proj]
+
+
+def test_oproj_prepare_uses_dual_ane_affine_suffix():
+    linear = _make_attention_with_oproj().o_proj
+    prepared = ane_patch._prepare_oproj_for_bank(
+        linear, ane_patch._AneOProjConfig(2048, 0.5, 8, dual_ane=True)
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert (state.ane_outputs, state.gpu_outputs) == (128, 128)
+    assert dense0.shape == (64, 128)
+    assert dense1 is not None and dense1.shape == (64, 128)
+    assert state.weight.shape == (128, 16)
+    assert state.model is None and state.model1 is None
+
+
+def test_oproj_backend_uses_profiler_category_and_bypasses_verify(monkeypatch):
+    linear = _make_attention_with_oproj().o_proj
+    config = ane_patch._AneOProjConfig(2048, 0.5, 8, dual_ane=True)
+    prepared = ane_patch._prepare_oproj_for_bank(linear, config)
+    assert prepared is not None
+    state, _dense0, _dense1 = prepared
+    linear._omlx_ane_oproj_config = config
+    linear._omlx_ane_oproj_state = SimpleNamespace(
+        **{**state.__dict__, "model": object(), "model1": object()}
+    )
+    captured = {}
+    def fake_qmm(*args):
+        captured["args"] = args
+        return mx.zeros((1, 2048, 128), dtype=mx.bfloat16)
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", fake_qmm)
+    x = mx.zeros((1, 2048, 128), dtype=mx.bfloat16)
+
+    output = ane_patch._oproj_backend_exact(linear, x)
+    assert output is not None
+    assert captured["args"][-1] == ane_patch._OPROJ_PROFILE_CATEGORY
+    assert ane_patch._oproj_backend(linear, x, target_verify=True) is None
+
+
 @pytest.mark.parametrize("sequence_length", [2048, 4096])
 def test_configure_scheduler_preserves_wide_prompt_chunks(sequence_length):
     scheduler = SimpleNamespace(
@@ -2500,7 +2579,11 @@ def test_prefill_status_reports_configured_layers():
         "configured": True,
         "shed": False,
         "mlp_layers": 12,
+        "dense_mlp_layers": 0,
+        "moe_shared_expert_layers": 0,
+        "moe_routed_expert_layers": 0,
         "gdn_layers": 4,
+        "oproj_layers": 0,
         "dual_ane_layers": 8,
         "resident_programs": 24,
         "tail_padding_min_tokens": 0,
@@ -3385,3 +3468,510 @@ def test_tuner_floor_delegates_to_the_patch_rule():
     assert ane_tuning._min_viable_gdn_fraction(
         patch, gdn, 128
     ) == patch._min_viable_gdn_fraction(gdn, 128)
+
+
+# --- Feature A: SwiGLU inside the ANE program ---
+
+
+def _swiglu_mil_source(ane_mm: str) -> str:
+    start = ane_mm.index("NSString *int8_swiglu_bank_mil(")
+    return ane_mm[start : ane_mm.index("\nNSString *", start)]
+
+
+def _fp16_mlp():
+    """An affine q4 MLP whose scales/biases are FP16.
+
+    Eligibility requires the activation dtype, and a freshly constructed
+    ``nn.QuantizedLinear`` carries FP32 scales, so tests that exercise the
+    preparation helpers must cast like the other tests in this file do.
+    """
+    mlp = _MLP()
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.float16)
+        linear.biases = linear.biases.astype(mx.float16)
+    return mlp
+
+
+def test_int8_swiglu_bank_mil_folds_the_activation(ane_mm):
+    """The gate+up program must end in silu+mul and return a single `act`.
+
+    Precedent for the ops themselves is fp16_swiglu_down_mil, which already
+    runs silu/mul against the private runtime in production.
+    """
+    generator = _swiglu_mil_source(ane_mm)
+
+    assert "constexpr_blockwise_shift_scale" in generator
+    # Two convs for the SwiGLU form: gate uses the first int8 data/scale
+    # chunk pair, up the second. The MIL text is built from adjacent
+    # Objective-C literals, so match each conv's own literal.
+    assert "weight=w, x=x)" in generator
+    assert "weight=uw, x=x)" in generator
+    assert r'name=string(\"gate\")' in generator
+    assert r'name=string(\"up\")' in generator
+    assert "silu(x=gate)" in generator
+    assert "mul(x=silu_out, y=up)" in generator
+    # Four blob references: the gate and up data/scale pairs, all inside the
+    # single shared weight.bin and addressed by chunk offset.
+    assert generator.count("@model_path/weights/weight.bin") == 4
+    # One generator emits both the SwiGLU form and the plain (GDN) form,
+    # selected per procedure by the swiglu flag.
+    assert "dequant_up" in generator
+    assert r'name=string(\"conv\")' in generator
+    assert "-> (y);" in generator
+
+
+def test_int8_swiglu_bank_mil_keeps_plain_procedures_byte_identical(ane_mm):
+    """A bank with no SwiGLU procedure must keep using the original generator.
+
+    This is the non-regression anchor: enabling the feature cannot change the
+    MIL of the default path even before the new program is exercised.
+    """
+    start = ane_mm.index("AneLinearBankBuilder::compile(")
+    compile_body = ane_mm[
+        start : ane_mm.index("std::vector<std::shared_ptr<AneLinearModel>>", start)
+    ]
+    assert "swiglu_count ? int8_swiglu_bank_mil(" in compile_body
+    assert "int8_linear_bank_mil(shapes, weight_offsets," in compile_body
+    # Every SwiGLU procedure contributes one extra int8 data/scale pair.
+    assert (
+        "weight_header[0] = static_cast<uint32_t>(span * 2 + swiglu_count * 2)"
+        in compile_body
+    )
+
+
+@pytest.mark.parametrize(
+    ("bits", "dual", "symbol"),
+    [
+        (4, True, "qwen35_ane_dual_q4_act_t"),
+        (4, False, "qwen35_ane_q4_act_t"),
+        (5, True, "qwen35_ane_dual_affine_act_t"),
+        (6, True, "qwen35_ane_dual_affine_act_t"),
+        (8, True, "qwen35_ane_dual_affine_act_t"),
+        (8, False, "qwen35_ane_affine_act_t"),
+    ],
+)
+def test_act_symbol_tracks_bits_and_dual_mode(bits, dual, symbol):
+    assert ane_patch._act_symbol(bits, dual=dual) == symbol
+
+
+def test_act_symbol_rejects_unsupported_bits():
+    with pytest.raises(ValueError, match="Unsupported ANE activation bit width"):
+        ane_patch._act_symbol(2, dual=True)
+
+
+def test_prepare_swiglu_pair_halves_the_ane_rows(monkeypatch):
+    """One procedure returns activation rows, so each instance covers half the
+    rows of the plain gate+up concatenation for the same hidden coverage."""
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    mlp = _fp16_mlp()
+
+    prepared = ane_patch._prepare_swiglu_pair_for_bank(
+        mlp,
+        ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=True),
+    )
+
+    assert prepared is not None
+    state, (gate0, up0), (gate1, up1) = prepared
+    # gate 256 rows, fraction 0.5 -> 128 ANE rows split 64/64 across instances.
+    assert state.ane_outputs == 128
+    assert state.gpu_outputs == 128
+    assert state.ane_act is True
+    assert state.cpu_weight is None and state.cpu_outputs == 0
+    # Each staged projection is one half of the ANE prefix, not both halves
+    # concatenated the way the plain bank stages them.
+    for array in (gate0, up0, gate1, up1):
+        assert array.shape == (64, 128)
+    # The GPU suffix stays the doubled gate+up concatenation.
+    assert state.weight.shape == (256, 16)
+
+
+def test_prepare_swiglu_pair_requires_dual_ane_and_the_symbol(monkeypatch):
+    mlp = _fp16_mlp()
+
+    assert (
+        ane_patch._prepare_swiglu_pair_for_bank(
+            mlp, ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=False)
+        )
+        is None
+    )
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    assert (
+        ane_patch._prepare_swiglu_pair_for_bank(
+            mlp, ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=True)
+        )
+        is None
+    )
+
+
+def test_swiglu_in_ane_bank_stages_one_procedure_per_layer(monkeypatch):
+    """A SwiGLU pair is one procedure against the 256-procedure bank budget,
+    but both projections' bytes count toward the split ladder."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+
+    staged = []
+
+    class _Builder:
+        def __init__(self, sequence_length):
+            self.sequence_length = sequence_length
+
+        def add(self, weight):
+            raise AssertionError("SwiGLU-in-ANE must not use the plain staging")
+
+        def add_swiglu(self, gate, up):
+            staged.append((int(gate.shape[0]), int(up.shape[0])))
+
+        def compile(self, ane_instance, start, stop):
+            return [object() for _ in range(stop - start)]
+
+    monkeypatch.setattr(fast, "qwen35_ane_linear_bank_builder", _Builder)
+    model = _Model(2)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=2,
+        dual_ane=True,
+        swiglu_in_ane=True,
+    )
+
+    assert count == 2
+    # Four calls: two layers x two ANE instances.
+    assert len(staged) == 4
+    assert all(gate == up == 64 for gate, up in staged)
+    for layer in model.layers:
+        assert layer._omlx_ane_prefill_state.ane_act is True
+
+
+def test_backend_dispatches_the_act_merge_for_a_swiglu_state(monkeypatch):
+    captured = {}
+    mlp = _MLP()
+    config = ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=True)
+    mlp._omlx_ane_prefill_config = config
+    mlp._omlx_ane_prefill_state = SimpleNamespace(
+        model=object(),
+        model1=object(),
+        weight=mx.zeros((256, 16), dtype=mx.uint32),
+        scales=mx.zeros((256, 2), dtype=mx.float16),
+        biases=mx.zeros((256, 2), dtype=mx.float16),
+        ane_outputs=128,
+        gpu_outputs=128,
+        bits=4,
+        group_size=128,
+        cpu_weight=None,
+        cpu_outputs=0,
+        down_cpu=None,
+        down_ane=None,
+        ane_act=True,
+    )
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+
+    def fake_act(x, *args, **kwargs):
+        captured["symbol"] = "dual_q4_act"
+        return mx.zeros((1, 2048, 256), dtype=mx.float16)
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_q4_act_t", fake_act)
+    monkeypatch.setattr(fast, "qwen35_ane_dual_q4_swiglu_t",
+                        lambda *a, **k: pytest.fail("plain SwiGLU merge used"))
+    monkeypatch.setattr(ane_patch, "_post_ane_down",
+                        lambda *a, **k: mx.zeros((1, 2048, 128), dtype=mx.float16))
+
+    x = mx.zeros((1, 2048, 128), dtype=mx.float16)
+    output = ane_patch._backend_exact(mlp, x)
+
+    assert output is not None
+    assert captured["symbol"] == "dual_q4_act"
+
+
+def test_non_swiglu_state_keeps_the_standard_merge(monkeypatch):
+    """Non-regression: a state prepared without the feature must dispatch
+    through the existing SwiGLU symbol, exactly as before the feature."""
+    mlp = _MLP()
+    config = ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=True)
+    mlp._omlx_ane_prefill_config = config
+    mlp._omlx_ane_prefill_state = SimpleNamespace(
+        model=object(),
+        model1=object(),
+        weight=mx.zeros((256, 16), dtype=mx.uint32),
+        scales=mx.zeros((256, 2), dtype=mx.float16),
+        biases=mx.zeros((256, 2), dtype=mx.float16),
+        ane_outputs=128,
+        gpu_outputs=128,
+        bits=4,
+        group_size=128,
+        cpu_weight=None,
+        cpu_outputs=0,
+        down_cpu=None,
+        down_ane=None,
+        ane_act=False,
+    )
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "qwen35_ane_dual_q4_act_t",
+                        lambda *a, **k: pytest.fail("act merge used with the feature off"))
+    monkeypatch.setattr(fast, "qwen35_ane_dual_q4_swiglu_t",
+                        lambda *a, **k: mx.zeros((1, 2048, 128), dtype=mx.float16))
+    monkeypatch.setattr(ane_patch, "_post_ane_down",
+                        lambda *a, **k: mx.zeros((1, 2048, 128), dtype=mx.float16))
+
+    x = mx.zeros((1, 2048, 128), dtype=mx.float16)
+    assert ane_patch._backend_exact(mlp, x) is not None
+
+
+def test_swiglu_in_ane_forces_cpu_sharing_off(monkeypatch, caplog):
+    """The ANE returns pre-activated rows while the CPU branch returns raw
+    gate/up. Merging three such sources is out of scope, so CPU sharing is
+    disabled with an explicit warning rather than silently ignored."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    captured = {}
+
+    def capture_banks(model, candidates, config, **kwargs):
+        captured["config"] = config
+        return (0, 0, 0, 0)
+
+    monkeypatch.setattr(ane_patch, "_enable_dual_procedure_banks", capture_banks)
+    model = _Model(1)
+
+    with caplog.at_level(logging.WARNING):
+        ane_patch.enable_qwen35_ane_prefill(
+            model,
+            sequence_length=2048,
+            dual_ane=True,
+            cpu_fraction=0.2,
+            cpu_down_fraction=0.2,
+            swiglu_in_ane=True,
+        )
+
+    config = captured["config"]
+    assert config.cpu_fraction == 0.0
+    assert config.cpu_down_fraction == 0.0
+    assert config.swiglu_in_ane is True
+    assert "CPU gate/up and down sharing are disabled" in caplog.text
+
+
+def test_swiglu_in_ane_falls_back_when_the_act_symbol_is_missing(monkeypatch, caplog):
+    """A stale extension without the new merge must not lose ANE prefill
+    altogether -- it keeps the established SwiGLU merge."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name != "qwen35_ane_dual_q4_act_t",
+    )
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(fast, "qwen35_ane_linear_bank_builder", _no_bank_builder)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear",
+        lambda weight, sequence_length, *args: object(),
+    )
+    model = _Model(1)
+
+    with caplog.at_level(logging.WARNING):
+        count = ane_patch.enable_qwen35_ane_prefill(
+            model, sequence_length=2048, fraction=0.5, dual_ane=True,
+            swiglu_in_ane=True,
+        )
+
+    assert count == 1
+    assert "falling back to the standard ANE SwiGLU merge" in caplog.text
+    assert model.layers[0]._omlx_ane_prefill_state.ane_act is False
+
+
+# --- Feature C: MoE shared expert ---
+
+
+class _FP16MLP(nn.Module):
+    """Affine q4 MLP whose scales/biases are FP16, i.e. actually eligible."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=128, bits=4
+        )
+        self.up_proj = nn.QuantizedLinear(128, 256, bias=False, group_size=128, bits=4)
+        self.down_proj = nn.QuantizedLinear(
+            256, 128, bias=False, group_size=128, bits=4
+        )
+        for linear in (self.gate_proj, self.up_proj, self.down_proj):
+            linear.scales = linear.scales.astype(mx.float16)
+            linear.biases = linear.biases.astype(mx.float16)
+
+
+class _RoutedExperts(nn.Module):
+    """Stand-in for SwitchGLU: routed projections are not affine linears."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(128, 256)
+
+
+class _MoEBlock(nn.Module):
+    """Stand-in for Qwen3NextSparseMoeBlock / Qwen3_5MoeSparseMoeBlock."""
+
+    def __init__(self, with_gdn=True):
+        super().__init__()
+        self.gate = nn.Linear(128, 4)
+        self.switch_mlp = _RoutedExperts()
+        self.shared_expert = _FP16MLP()
+        self.shared_expert_gate = nn.Linear(128, 1)
+        if with_gdn:
+            gdn = _GDN()
+            # _GDN defaults to FP32 scales; eligibility needs the activation
+            # dtype, same as every other preparation helper in this file.
+            for linear in (
+                gdn.in_proj_qkv,
+                gdn.in_proj_z,
+                gdn.in_proj_b,
+                gdn.in_proj_a,
+            ):
+                linear.scales = linear.scales.astype(mx.float16)
+                linear.biases = linear.biases.astype(mx.float16)
+            self.linear_attn = gdn
+
+
+class _MoEModel(nn.Module):
+    def __init__(self, count=2):
+        super().__init__()
+        self.layers = [_MoEBlock() for _ in range(count)]
+
+
+def _moe_scan_kinds(model):
+    return [kind for _, kind in ane_patch._iter_mlp_candidates(model)]
+
+
+def test_scan_classifies_the_shared_expert_and_ignores_routed_experts():
+    model = _MoEModel(2)
+
+    kinds = _moe_scan_kinds(model)
+
+    # Two layers, each with exactly one shared expert. The routed experts are
+    # never surfaced: their projections are not affine quantized linears, and
+    # the classifier refuses them by path regardless.
+    assert kinds == [ane_patch._MOE_SHARED_EXPERT] * 2
+
+
+def test_scan_classifies_dense_mlps_as_dense():
+    model = _Model(3)
+    assert _moe_scan_kinds(model) == [ane_patch._DENSE_MLP] * 3
+
+
+def test_scan_never_routes_non_shared_mlps_inside_an_moe_block():
+    """A stray dense-shaped MLP elsewhere inside the MoE block must not reach
+    the ANE: the router's selection has to stay bit-exact."""
+    block = _MoEBlock(with_gdn=False)
+    block.other = _FP16MLP()
+    model = nn.Module()
+    model.layers = [block]
+
+    kinds = _moe_scan_kinds(model)
+
+    assert kinds.count(ane_patch._MOE_SHARED_EXPERT) == 1
+    assert kinds.count(ane_patch._MOE_OTHER) == 1
+    assert ane_patch._DENSE_MLP not in kinds
+
+
+def test_shared_expert_is_picked_up_only_with_the_toggle(monkeypatch, caplog):
+    """Before this toggle the shared expert was collected accidentally because
+    it is the same dense MLP class. Governing it means an unsupported model
+    family must not change behaviour when the toggle is off."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear",
+        lambda weight, sequence_length, *args: object(),
+    )
+    monkeypatch.setattr(fast, "qwen35_ane_linear_bank_builder", _no_bank_builder)
+
+    with caplog.at_level(logging.WARNING):
+        off = ane_patch.enable_qwen35_ane_prefill(
+            _MoEModel(2), sequence_length=2048, fraction=0.5, dual_ane=False
+        )
+    assert off == 0
+    assert "MoE shared expert" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        on = ane_patch.enable_qwen35_ane_prefill(
+            _MoEModel(2),
+            sequence_length=2048,
+            fraction=0.5,
+            dual_ane=False,
+            moe_shared_expert=True,
+        )
+    assert on == 2
+
+
+def test_gdn_stays_eligible_inside_moe_layers(monkeypatch):
+    """The MoE gate governs dense MLP shapes only; GDN z projections are a
+    separate scan and keep working in MoE checkpoints."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear",
+        lambda weight, sequence_length, *args: object(),
+    )
+    monkeypatch.setattr(fast, "qwen35_ane_linear_bank_builder", _no_bank_builder)
+    model = _MoEModel(2)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model, sequence_length=2048, fraction=0.5, dual_ane=False, gdn=True
+    )
+
+    # No dense MLP (shared expert gated off), but the GDN scan still runs.
+    assert count == 0
+    assert int(getattr(model, "_omlx_ane_gdn_prefill_count", 0)) == 2
+
+
+def test_moe_weighted_sum_still_reaches_the_shared_expert_wrap():
+    """Ordering check: the weighted-sum patch calls
+    ``shared_expert(x, target_verify)``, which must land on the ANE wrapper's
+    dispatch rather than bypassing it."""
+    from omlx.patches import qwen35_moe_weighted_sum as moe_patch
+
+    calls: list[tuple[tuple, dict]] = []
+
+    class _Shared:
+        def __call__(self, x, *args, **kwargs):
+            calls.append((args, kwargs))
+            return x
+
+    block = SimpleNamespace(
+        shared_expert=_Shared(), shared_expert_gate=SimpleNamespace()
+    )
+    x = mx.zeros((1, 4, 8))
+
+    moe_patch._call_shared_expert(block, x, True)
+
+    # The wrapper signature is what the ANE class-wrap intercepts.
+    assert calls == [((True,), {})]
+
+
+def test_moe_weighted_sum_falls_back_when_the_expert_rejects_target_verify():
+    """A shared expert whose __call__ takes no target_verify must still work."""
+    from omlx.patches import qwen35_moe_weighted_sum as moe_patch
+
+    seen: list[int] = []
+
+    class _Plain:
+        def __call__(self, x):
+            seen.append(x.shape[-2])
+            return x
+
+    x = mx.zeros((1, 4, 8))
+    out = moe_patch._call_shared_expert(
+        SimpleNamespace(shared_expert=_Plain()), x, True
+    )
+
+    assert seen == [4]
+    assert out.shape == x.shape

@@ -1155,10 +1155,17 @@ class TestFilterUploadedSettings:
             "mtp_enabled": True,
             "vlm_mtp_enabled": False,
             "qwen35_ane_prefill_enabled": False,
+            "qwen35_ane_prefill_swiglu_in_ane": False,
+            "qwen35_ane_prefill_moe_shared_expert": False,
+            "qwen35_ane_prefill_oproj": False,
         }
         # Everything else is gone.
         assert "temperature" not in out
         assert "max_context_window" not in out
+        # Only toggles survive the fallback; the numeric o_proj knobs are
+        # settings, not flags.
+        assert "qwen35_ane_prefill_oproj_fraction" not in out
+        assert "qwen35_ane_prefill_oproj_max_layers" not in out
 
 
 # =============================================================================
@@ -2210,6 +2217,36 @@ class TestAneBenchmarkTrace:
         gdn_line = next(m for m in messages if "category=gdn" in m)
         assert "compiled_layers=0" in gdn_line
         assert "expected_operations=0" in gdn_line
+
+    def test_oproj_category_and_moe_shared_count_are_accounted(self, caplog):
+        with caplog.at_level(logging.INFO):
+            summary = _log_ane_benchmark_trace(
+                pp_len=4096,
+                prefill_duration_s=1.0,
+                config={
+                    "sequence_length": 2048,
+                    "mlp_layers": 64,
+                    "compiled_mlp_layers": 64,
+                    "compiled_moe_shared_expert_layers": 2,
+                    "moe_shared_expert": True,
+                    "oproj_layers": 16,
+                    "compiled_oproj_layers": 4,
+                    "active": True,
+                },
+                profile={
+                    "mlp": {"operations": 4},
+                    "gdn": {},
+                    "oproj": {"operations": 8},
+                },
+            )
+
+        assert summary["categories"]["mlp"]["expected_operations"] == 2
+        assert summary["categories"]["oproj"]["expected_operations"] == 4
+        messages = [record.getMessage() for record in caplog.records]
+        oproj_line = next(m for m in messages if "category=oproj" in m)
+        assert "configured_layers=16" in oproj_line
+        assert "compiled_layers=4" in oproj_line
+        assert "expected_operations=4" in oproj_line
 
     def test_settings_layers_remain_the_fallback_when_unknown(self, caplog):
         with caplog.at_level(logging.INFO):

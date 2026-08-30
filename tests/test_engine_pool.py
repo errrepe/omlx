@@ -532,6 +532,60 @@ class TestQwenCpuShareMemoryEstimate:
             )
         )
 
+    @staticmethod
+    def _write_moe_config(path):
+        path.mkdir()
+        (path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5_moe",
+                    "text_config": {
+                        "model_type": "qwen3_5_moe_text",
+                        "hidden_size": 256,
+                        "intermediate_size": 512,
+                        "shared_expert_intermediate_size": 512,
+                        "moe_intermediate_size": 256,
+                        "num_experts": 128,
+                        "num_experts_per_tok": 8,
+                        "num_hidden_layers": 4,
+                    },
+                }
+            )
+        )
+
+    def test_estimate_refuses_moe_instead_of_under_budgeting(self, tmp_path):
+        """CPU gate/up sharing is unsupported on MoE this iteration.
+
+        Returning 0 here would be read downstream as "no extra memory", which
+        is exactly the dangerous answer for a checkpoint whose eager FP16 row
+        slices are sized from the shared expert. ``None`` forces callers onto
+        their conservative fallback.
+        """
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen-moe"
+        self._write_moe_config(model)
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_cpu_enabled=True,
+            qwen35_ane_prefill_cpu_fraction=0.25,
+        )
+
+        assert _qwen35_cpu_share_estimated_bytes(str(model), settings) is None
+
+    def test_estimate_still_zero_when_moe_does_not_ask_for_cpu_sharing(
+        self, tmp_path
+    ):
+        """The refusal is about CPU sharing only; a MoE checkpoint with CPU
+        sharing off adds nothing and must not trip the fallback."""
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen-moe"
+        self._write_moe_config(model)
+        settings = ModelSettings(qwen35_ane_prefill_enabled=True)
+
+        assert _qwen35_cpu_share_estimated_bytes(str(model), settings) == 0
+
     def test_estimate_covers_gate_down_suffix_and_gdn_materialization(self, tmp_path):
         from omlx.model_settings import ModelSettings
 

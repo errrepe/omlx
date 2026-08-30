@@ -14,7 +14,7 @@ import os
 import threading
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -31,6 +31,17 @@ _PATCHED_CLASSES: set[type] = set()
 _VLM_HOOK_INSTALLED = False
 _VLM_GDN_HOOK_INSTALLED = False
 _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+# o_proj dispatch. Keyed by ``id(linear)`` so the single class-level hook can
+# decide without touching instance state in the hot path. The boolean is a
+# cheap first gate: while the feature is off every quantized projection pays
+# one global load instead of a dictionary lookup.
+_OPROJ_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+_OPROJ_DISPATCH_ACTIVE = False
+# Native profiler bucket for attention output projections. The runtime
+# accumulates per-category timings, so o_proj needs its own slot to keep the
+# MLP and GDN duty-cycle readings clean. 0 is the MLP/SwiGLU bucket, 1 is the
+# tokenwise (GDN/down) bucket.
+_OPROJ_PROFILE_CATEGORY = 2
 # Legacy extensions compile one program per slice, and the private runtime on
 # the reference M3 Ultra accepts 120 resident programs. Current extensions pack
 # all slices into one multi-procedure program per ANE instance and bypass this
@@ -95,6 +106,10 @@ class _AnePrefillConfig:
     ane_down_fraction: float = 0.0
     fused_down: bool = False
     tail_padding_min_tokens: int = 0
+    # SwiGLU-in-ANE: the ANE procedure computes silu(gate)*up itself and
+    # returns activation rows instead of doubled gate/up rows. The merge then
+    # only activates the GPU suffix. Opt-in and off by default.
+    swiglu_in_ane: bool = False
 
 
 @dataclass(frozen=True)
@@ -151,6 +166,9 @@ class _CombinedMLPState:
     cpu_outputs: int = 0
     down_cpu: _CpuLinearState | None = None
     down_ane: _AneDownState | None = None
+    # True when the ANE models return fused activation rows (SwiGLU-in-ANE),
+    # so dispatch must use the *_act_t merge instead of the SwiGLU merge.
+    ane_act: bool = False
 
 
 @dataclass(frozen=True)
@@ -165,6 +183,36 @@ class _FusedDownMLPState:
     down_biases: mx.array
     cpu_gate_up_weight: mx.array | None = None
     cpu_down_weight: mx.array | None = None
+
+
+@dataclass(frozen=True)
+class _AneOProjConfig:
+    sequence_length: int
+    fraction: float
+    variant: int
+    dual_ane: bool = False
+    tail_padding_min_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class _CombinedOProjState:
+    """Attention output projection split across ANE instances and the GPU.
+
+    Output rows are split the way the GDN split works: every backend owns
+    complete output rows, so the pieces concatenate without summing
+    independently approximated partial dot products. There is no activation,
+    so the plain affine qmm merge is used.
+    """
+
+    model: Any
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
+    ane_outputs: int
+    gpu_outputs: int
+    bits: int
+    group_size: int
+    model1: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +296,17 @@ def _fused_swiglu_symbol(bits: int, *, dual: bool) -> str:
             else "qwen35_ane_affine_swiglu_t"
         )
     raise ValueError(f"Unsupported ANE SwiGLU bit width: {bits}")
+
+
+def _act_symbol(bits: int, *, dual: bool) -> str:
+    """Merge symbol for the SwiGLU-in-ANE layout (ANE rows already activated)."""
+    if bits == 4:
+        return "qwen35_ane_dual_q4_act_t" if dual else "qwen35_ane_q4_act_t"
+    if bits in (5, 6, 8):
+        return (
+            "qwen35_ane_dual_affine_act_t" if dual else "qwen35_ane_affine_act_t"
+        )
+    raise ValueError(f"Unsupported ANE activation bit width: {bits}")
 
 
 def _eligible_input(x: mx.array, config: _AnePrefillConfig) -> bool:
@@ -803,6 +862,179 @@ def _prepare_pair_for_bank(
     )
 
 
+_DENSE_MLP = "dense"
+_MOE_SHARED_EXPERT = "moe_shared_expert"
+_MOE_OTHER = "moe_other"
+
+
+def _has_mlp_shape(module: Any) -> bool:
+    return all(
+        hasattr(module, name)
+        for name in ("gate_proj", "up_proj", "down_proj")
+    )
+
+
+def _classify_mlp_path(path: str, by_path: dict[str, Any]) -> str:
+    """Classify one dense-MLP-shaped module by its position in the tree.
+
+    A MoE block keeps its always-on dense expert at ``shared_expert`` and its
+    routed experts inside ``switch_mlp``. Both are token-local once the router
+    has selected, but they are very different bets:
+
+    * the shared expert runs on every token, so an ANE split behaves exactly
+      like a dense MLP and is worth governing with a toggle;
+    * the routed experts' projections are ``SwitchLinear`` (gathered by
+      expert index), so they are structurally ineligible and never reach the
+      eligibility check. Classifying them explicitly keeps that guarantee
+      from depending on the accident.
+
+    Anything else inside an MoE block is refused: the repo requires bit-exact
+    router parity, so no ANE approximation may influence expert selection.
+    """
+    parts = path.split(".")
+    module = by_path.get(path)
+    for depth in range(len(parts) - 1, 0, -1):
+        ancestor = by_path.get(".".join(parts[:depth]))
+        if ancestor is None:
+            continue
+        if getattr(ancestor, "shared_expert", None) is module:
+            return _MOE_SHARED_EXPERT
+        if hasattr(ancestor, "switch_mlp"):
+            return _MOE_OTHER
+    return _DENSE_MLP
+
+
+def _iter_mlp_candidates(model: Any) -> Iterator[tuple[Any, str]]:
+    """Yield ``(module, kind)`` for every dense-MLP-shaped module.
+
+    Falls back to the flat scan when ``named_modules()`` is unavailable, in
+    which case every module is treated as dense and the MoE toggle cannot be
+    enforced (the pre-feature behaviour).
+    """
+    named = getattr(model, "named_modules", None)
+    if not callable(named):
+        for module in model.modules() if hasattr(model, "modules") else ():
+            if _has_mlp_shape(module):
+                yield module, _DENSE_MLP
+        return
+    by_path: dict[str, Any] = {}
+    for path, module in named():
+        by_path[path] = module
+    for path, module in by_path.items():
+        if not _has_mlp_shape(module):
+            continue
+        yield module, _classify_mlp_path(path, by_path)
+
+
+def _set_mlp_accounting(
+    model: Any,
+    compiled_modules: list[Any] | tuple[Any, ...],
+    kind_by_id: dict[int, str],
+) -> None:
+    """Persist the MLP breakdown used by status and benchmark telemetry.
+
+    ``_omlx_ane_mlp_prefill_count`` remains the total for backwards
+    compatibility. The extra counters make a MoE run unambiguous: a shared
+    expert is one dense MLP procedure, while routed experts and the router are
+    intentionally not counted as ANE work.
+    """
+    modules = list(compiled_modules)
+    shared = sum(
+        kind_by_id.get(id(module)) == _MOE_SHARED_EXPERT for module in modules
+    )
+    dense = sum(
+        kind_by_id.get(id(module), _DENSE_MLP) == _DENSE_MLP for module in modules
+    )
+    model._omlx_ane_mlp_prefill_count = len(modules)
+    model._omlx_ane_moe_shared_expert_count = shared
+    model._omlx_ane_dense_mlp_prefill_count = dense
+    # This is deliberately zero: routed expert projections and the router are
+    # never eligible, even when the shared expert toggle is enabled.
+    model._omlx_ane_moe_routed_expert_count = 0
+
+
+def _prepare_swiglu_pair_for_bank(
+    mlp: Any, config: _AnePrefillConfig
+) -> tuple[
+    _CombinedMLPState,
+    tuple[mx.array, mx.array],
+    tuple[mx.array, mx.array],
+] | None:
+    """Stage a gate/up pair per ANE instance for a SwiGLU-in-ANE procedure.
+
+    The program folds silu(gate)*up, so gate and up are handed to the bank
+    builder as two separate projections and one procedure returns activation
+    rows. For the same hidden-channel coverage that is half the row count of
+    the plain gate+up concatenation, which is why the merge consumes
+    ``ane_outputs / 2`` rows per instance instead of ``ane_outputs``.
+
+    Requires dual ANE: the single-instance path has no SwiGLU bank builder
+    and stays on the established gate+up merge.
+    """
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    gate = getattr(mlp, "gate_proj", None)
+    up = getattr(mlp, "up_proj", None)
+    if not _eligible_pair(mlp):
+        return None
+    if not config.dual_ane:
+        return None
+    bits = int(gate.bits)
+    if not fast.has_symbol(_act_symbol(bits, dual=True)):
+        return None
+    output_dim = int(gate.weight.shape[0])
+    group_size = int(gate.group_size)
+    alignment = 128
+    ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
+    gpu_outputs = output_dim - ane_outputs
+    if ane_outputs <= 0 or gpu_outputs <= 0 or gpu_outputs % 64:
+        return None
+    split = ane_outputs // 2
+
+    def dense_slice(linear: Any, start: int, end: int) -> mx.array:
+        return mx.contiguous(
+            mx.dequantize(
+                linear.weight[start:end],
+                linear.scales[start:end],
+                linear.biases[start:end],
+                group_size=group_size,
+                bits=bits,
+            ).astype(mx.float32)
+        )
+
+    gate0 = dense_slice(gate, 0, split)
+    up0 = dense_slice(up, 0, split)
+    gate1 = dense_slice(gate, split, ane_outputs)
+    up1 = dense_slice(up, split, ane_outputs)
+    weight = mx.contiguous(
+        mx.concatenate((gate.weight[ane_outputs:], up.weight[ane_outputs:]), axis=0)
+    )
+    scales = mx.contiguous(
+        mx.concatenate((gate.scales[ane_outputs:], up.scales[ane_outputs:]), axis=0)
+    )
+    biases = mx.contiguous(
+        mx.concatenate((gate.biases[ane_outputs:], up.biases[ane_outputs:]), axis=0)
+    )
+    mx.eval(gate0, up0, gate1, up1, weight, scales, biases)
+    state = _CombinedMLPState(
+        model=None,
+        weight=weight,
+        scales=scales,
+        biases=biases,
+        ane_outputs=ane_outputs,
+        gpu_outputs=gpu_outputs,
+        bits=bits,
+        model1=None,
+        group_size=group_size,
+        cpu_weight=None,
+        cpu_outputs=0,
+        down_cpu=None,
+        down_ane=_prepare_down_for_bank(mlp.down_proj, config),
+        ane_act=True,
+    )
+    return state, (gate0, up0), (gate1, up1)
+
+
 def _prepare_pair_runtime_state(
     mlp: Any,
     config: _AnePrefillConfig,
@@ -1326,6 +1558,343 @@ def _warn_gdn_below_floor(
     )
 
 
+# --- Feature B: attention output projection (o_proj) split ---
+
+
+def _eligible_oproj(linear: Any, *, dual_ane: bool) -> bool:
+    """Gate an attention output projection for the ANE/GPU channel split.
+
+    ``o_proj`` is token-local: it sits after attention and its rows are
+    complete output channels, so the split behaves like the MLP and GDN
+    splits already in production.
+
+    QKV (and the split k/v projections) are deliberately never collected --
+    they feed the KV cache, so an INT8 approximation would be re-read at every
+    subsequent token and could accumulate error across a long prompt. That is
+    the same recurrent-safe policy that keeps GDN qkv off the ANE.
+    """
+    if not isinstance(linear, nn.QuantizedLinear):
+        return False
+    dtype = getattr(getattr(linear, "scales", None), "dtype", None)
+    spec = _affine_spec(linear, dtype)
+    if spec is None:
+        return False
+    bits, group_size = spec
+    output_dim = int(linear.weight.shape[0])
+    input_dim = int(linear.weight.shape[1]) * 32 // bits
+    alignment = 128 if dual_ane else 64
+    return bool(
+        input_dim > 0
+        and output_dim > 0
+        and input_dim % group_size == 0
+        and output_dim % alignment == 0
+    )
+
+
+def _iter_oproj_candidates(model: Any) -> Iterator[Any]:
+    """Yield the ``o_proj`` linear of every full-attention layer.
+
+    Only full-attention layers have an ``o_proj``; the linear-attention (GDN)
+    layers do not, so they are skipped structurally. Nothing else from an
+    attention block is ever yielded.
+    """
+    named = getattr(model, "named_modules", None)
+    if not callable(named):
+        return
+    for _path, module in named():
+        o_proj = getattr(module, "o_proj", None)
+        if o_proj is None:
+            continue
+        # A bare projection is not an attention block; require a sibling
+        # query projection so an unrelated module attribute cannot be picked
+        # up by accident.
+        if not any(
+            hasattr(module, name) for name in ("q_proj", "qkv_proj", "in_proj_qkv")
+        ):
+            continue
+        yield o_proj
+
+
+def _oproj_split_plan(linear: Any, config: _AneOProjConfig) -> tuple[int, int] | None:
+    """Return ``(ane_outputs, gpu_outputs)`` for one output-row split."""
+    output_dim = int(linear.weight.shape[0])
+    alignment = 128 if config.dual_ane else 64
+    ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
+    gpu_outputs = output_dim - ane_outputs
+    if ane_outputs <= 0 or gpu_outputs <= 0 or gpu_outputs % 64:
+        return None
+    return ane_outputs, gpu_outputs
+
+
+def _prepare_oproj_for_bank(
+    linear: Any, config: _AneOProjConfig
+) -> tuple[_CombinedOProjState, mx.array, mx.array | None] | None:
+    if not _eligible_oproj(linear, dual_ane=config.dual_ane):
+        return None
+    plan = _oproj_split_plan(linear, config)
+    if plan is None:
+        return None
+    ane_outputs, gpu_outputs = plan
+    bits = int(linear.bits)
+    group_size = int(linear.group_size)
+
+    def dense_rows(start: int, end: int) -> mx.array:
+        return mx.contiguous(
+            mx.dequantize(
+                linear.weight[start:end],
+                linear.scales[start:end],
+                linear.biases[start:end],
+                group_size=group_size,
+                bits=bits,
+            ).astype(mx.float32)
+        )
+
+    if config.dual_ane:
+        split = ane_outputs // 2
+        dense0 = dense_rows(0, split)
+        dense1 = dense_rows(split, ane_outputs)
+    else:
+        dense0 = dense_rows(0, ane_outputs)
+        dense1 = None
+    weight = mx.contiguous(linear.weight[ane_outputs:])
+    scales = mx.contiguous(linear.scales[ane_outputs:])
+    biases = mx.contiguous(linear.biases[ane_outputs:])
+    values = [dense0, weight, scales, biases]
+    if dense1 is not None:
+        values.append(dense1)
+    mx.eval(*values)
+    return (
+        _CombinedOProjState(
+            model=None,
+            weight=weight,
+            scales=scales,
+            biases=biases,
+            ane_outputs=ane_outputs,
+            gpu_outputs=gpu_outputs,
+            bits=bits,
+            group_size=group_size,
+            model1=None,
+        ),
+        dense0,
+        dense1,
+    )
+
+
+def _compile_oproj(
+    linear: Any, config: _AneOProjConfig
+) -> _CombinedOProjState | None:
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    if not fast.has_symbol("qwen35_ane_affine_qmm_t"):
+        return None
+    dual_ane = bool(
+        config.dual_ane and fast.has_symbol("qwen35_ane_dual_affine_qmm_t")
+    )
+    effective_config = replace(config, dual_ane=dual_ane)
+    if not _eligible_oproj(linear, dual_ane=dual_ane):
+        return None
+    plan = _oproj_split_plan(linear, effective_config)
+    if plan is None:
+        return None
+    ane_outputs, gpu_outputs = plan
+    bits = int(linear.bits)
+    group_size = int(linear.group_size)
+    cache = getattr(linear, "_omlx_ane_oproj_cache", None)
+    if cache is None:
+        cache = {}
+        linear._omlx_ane_oproj_cache = cache
+    key = (
+        effective_config.sequence_length,
+        ane_outputs,
+        bits,
+        group_size,
+        "dual" if dual_ane else "linear",
+    )
+    if key in cache:
+        return cache[key]
+    with _COMPILE_LOCK:
+        if key in cache:
+            return cache[key]
+        prepared = _prepare_oproj_for_bank(linear, effective_config)
+        if prepared is None:
+            return None
+        state, dense0, dense1 = prepared
+        model = (
+            fast.qwen35_ane_compile_linear(
+                dense0, effective_config.sequence_length, 1
+            )
+            if dual_ane
+            else fast.qwen35_ane_compile_linear(
+                dense0, effective_config.sequence_length
+            )
+        )
+        model1 = (
+            fast.qwen35_ane_compile_linear(
+                dense1, effective_config.sequence_length, 2
+            )
+            if dense1 is not None
+            else None
+        )
+        compiled = replace(state, model=model, model1=model1)
+        cache[key] = compiled
+        return compiled
+
+
+def _oproj_backend_exact(linear: Any, x: mx.array) -> mx.array | None:
+    config = getattr(linear, "_omlx_ane_oproj_config", None)
+    if config is None or not _eligible_input(x, config):
+        return None
+    if getattr(linear, "_omlx_ane_oproj_failed", False):
+        return None
+    state = getattr(linear, "_omlx_ane_oproj_state", None)
+    if state is None:
+        try:
+            state = _compile_oproj(linear, config)
+            linear._omlx_ane_oproj_state = state
+        except Exception:
+            linear._omlx_ane_oproj_failed = True
+            logger.warning(
+                "Disabling ANE o_proj prefill after a runtime failure",
+                exc_info=True,
+            )
+            return None
+    if state is None or state.scales.dtype != x.dtype:
+        return None
+    if int(state.weight.shape[1]) * 32 != int(x.shape[-1]) * state.bits:
+        return None
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        _raise_if_latched(state.model, state.model1)
+        if state.model1 is not None:
+            return fast.qwen35_ane_dual_affine_qmm_t(
+                x,
+                state.weight,
+                state.scales,
+                state.biases,
+                state.model,
+                state.model1,
+                state.bits,
+                config.variant,
+                state.group_size,
+                _OPROJ_PROFILE_CATEGORY,
+            )
+        if not fast.has_symbol("qwen35_ane_affine_qmm_t"):
+            return None
+        return fast.qwen35_ane_affine_qmm_t(
+            x,
+            state.weight,
+            state.scales,
+            state.biases,
+            state.model,
+            state.bits,
+            config.variant,
+            state.group_size,
+            _OPROJ_PROFILE_CATEGORY,
+        )
+    except Exception:
+        linear._omlx_ane_oproj_failed = True
+        logger.warning(
+            "Disabling ANE o_proj prefill after a runtime failure", exc_info=True
+        )
+        return None
+
+
+def _oproj_backend(
+    linear: Any, x: mx.array, target_verify: bool = False
+) -> mx.array | None:
+    """Route exact or internally tiled attention output projections.
+
+    Output rows are split, not sequence positions, so concatenating the
+    independently projected row blocks is algebraically identical to one wide
+    projection. Inputs without a complete fixed-shape tile fall through to the
+    original GPU operation.
+    """
+    config = getattr(linear, "_omlx_ane_oproj_config", None)
+    if config is None or target_verify:
+        return None
+    input_dim = int(x.shape[-1]) if x.ndim else 0
+    rows = int(x.size // input_dim) if input_dim else 0
+    if rows == config.sequence_length:
+        return _oproj_backend_exact(linear, x)
+    if rows < config.sequence_length:
+        if _tail_padding_profitable(rows, config):
+            padded = _oproj_backend_exact(
+                linear, _pad_fixed_shape_tail(x, config.sequence_length)
+            )
+            if padded is not None:
+                return padded[..., :rows, :]
+        # Decode and unprofitable short chunks exit before the tiling planner;
+        # this wrapper runs on every attention call of every decode step.
+        return None
+
+    plan = _tiled_input_plan(x, config.sequence_length)
+    if plan is None:
+        return None
+    full_blocks, tail_rows = plan
+    outputs: list[mx.array] = []
+    for block in range(full_blocks):
+        start = block * config.sequence_length
+        stop = start + config.sequence_length
+        block_x = mx.contiguous(x[:, start:stop, :])
+        output = _oproj_backend_exact(linear, block_x)
+        if output is None:
+            return None
+        outputs.append(output)
+    if tail_rows:
+        tail_x = x[:, full_blocks * config.sequence_length :, :]
+        padded = None
+        if _tail_padding_profitable(tail_rows, config):
+            padded = _oproj_backend_exact(
+                linear, _pad_fixed_shape_tail(tail_x, config.sequence_length)
+            )
+        if padded is not None:
+            outputs.append(padded[..., :tail_rows, :])
+        else:
+            outputs.append(_tail_qmm_or_linear(linear, tail_x, config.variant))
+    return mx.concatenate(outputs, axis=-2)
+
+
+def _install_oproj_dispatch() -> bool:
+    """Give the ANE first refusal on registered ``o_proj`` projections.
+
+    One hook on ``nn.QuantizedLinear`` serves both mlx-lm and mlx-vlm: the
+    attention block calls ``self.o_proj(...)`` (or mlx-vlm's
+    ``_target_verify_linear`` wrapper, which forwards the same positional flag)
+    in either case, so a per-instance wrapper would have to duplicate that
+    plumbing twice.
+    """
+    global _OPROJ_DISPATCH_ACTIVE
+    cls = nn.QuantizedLinear
+    if getattr(cls, "_omlx_ane_oproj_patched", False):
+        return True
+    original = cls.__call__
+
+    def patched(self, x, *args, **kwargs):
+        if _OPROJ_DISPATCH_ACTIVE and id(self) in _OPROJ_MODULES:
+            output = _oproj_backend(self, x, _target_verify(args, kwargs))
+            if output is not None:
+                return output
+        return original(self, x, *args, **kwargs)
+
+    cls.__call__ = patched
+    cls._omlx_ane_oproj_patched = True
+    cls._omlx_ane_oproj_original_call = original
+    return True
+
+
+def _register_oproj_module(linear: Any) -> None:
+    global _OPROJ_DISPATCH_ACTIVE
+    _OPROJ_MODULES[id(linear)] = linear
+    _OPROJ_DISPATCH_ACTIVE = True
+
+
+def _release_oproj_module(linear: Any) -> None:
+    global _OPROJ_DISPATCH_ACTIVE
+    _OPROJ_MODULES.pop(id(linear), None)
+    _OPROJ_DISPATCH_ACTIVE = bool(_OPROJ_MODULES)
+
+
 def _prepare_gdn_for_bank(
     gdn: Any, config: _AneGDNConfig
 ) -> tuple[_CombinedGDNState, mx.array, mx.array | None] | None:
@@ -1806,6 +2375,67 @@ def _backend_exact(
         from omlx.custom_kernels.qwen35_prefill import fast
 
         _raise_if_latched(state.model, state.model1, state.down_ane)
+        if state.ane_act:
+            # SwiGLU-in-ANE: the ANE programs already returned silu(gate)*up
+            # activation rows, so the merge only activates the GPU suffix.
+            # The profile category defaults to the MLP bucket in the native
+            # constructor, matching the standard SwiGLU merge.
+            symbol = _act_symbol(state.bits, dual=state.model1 is not None)
+            if not fast.has_symbol(symbol):
+                return None
+            if state.model1 is not None:
+                if state.bits == 4:
+                    activation = fast.qwen35_ane_dual_q4_act_t(
+                        x,
+                        state.weight,
+                        state.scales,
+                        state.biases,
+                        state.model,
+                        state.model1,
+                        config.variant,
+                        state.group_size,
+                    )
+                else:
+                    activation = fast.qwen35_ane_dual_affine_act_t(
+                        x,
+                        state.weight,
+                        state.scales,
+                        state.biases,
+                        state.model,
+                        state.model1,
+                        state.bits,
+                        config.variant,
+                        state.group_size,
+                    )
+            elif state.bits == 4:
+                activation = fast.qwen35_ane_q4_act_t(
+                    x,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    config.variant,
+                    state.group_size,
+                )
+            else:
+                activation = fast.qwen35_ane_affine_act_t(
+                    x,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    state.bits,
+                    config.variant,
+                    state.group_size,
+                )
+            return _post_ane_down(
+                mlp.down_proj,
+                activation,
+                state.down_ane,
+                config,
+                state.down_cpu,
+            )
+
         if state.cpu_weight is not None:
             if state.model1 is not None and state.bits == 4:
                 activation = fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
@@ -2096,6 +2726,22 @@ def _install_dispatch() -> bool:
             if cls is not None:
                 _wrap_class(cls)
                 installed = True
+        # The MoE variant currently re-exports the dense MLP class, so the
+        # wrap above already covers its shared expert. Wrap the MoE module's
+        # own class too: that alias is an implementation detail of mlx-vlm
+        # and relying on it would silently lose the shared expert if the
+        # classes ever diverge.
+        try:
+            vlm_moe = importlib.import_module("mlx_vlm.models.qwen3_5_moe.language")
+            moe_cls = getattr(vlm_moe, "Qwen3_5MoeMLP", None)
+            if moe_cls is not None:
+                _wrap_class(moe_cls)
+                installed = True
+        except Exception:
+            logger.debug(
+                "mlx-vlm Qwen3.5 MoE MLP unavailable for ANE dispatch",
+                exc_info=True,
+            )
         if callable(register_gdn) and not _VLM_GDN_HOOK_INSTALLED:
             register_gdn(_gdn_backend)
             _VLM_GDN_HOOK_INSTALLED = True
@@ -2468,7 +3114,14 @@ def _enable_dual_procedure_banks(
     gdn_fraction: float,
     gdn_max_layers: int,
     cpu_gdn_fraction: float = 0.0,
-) -> tuple[int, int, int, int] | None:
+    oproj_candidates: list[Any] | None = None,
+    oproj_config: _AneOProjConfig | None = None,
+) -> tuple[int, int, int, int, int] | None:
+    """Compile every procedure into the dual banks.
+
+    Returns ``(mlp_count, dual_count, gdn_count, oproj_count,
+    resident_programs)``.
+    """
     from omlx.custom_kernels.qwen35_prefill import fast
 
     if not (
@@ -2481,9 +3134,27 @@ def _enable_dual_procedure_banks(
         int(getattr(getattr(module, "gate_proj", None), "bits", 0))
         for module in mlp_candidates
     }
-    if 4 in candidate_bits and not fast.has_symbol("qwen35_ane_dual_q4_swiglu_t"):
+    if config.swiglu_in_ane:
+        # SwiGLU-in-ANE needs dual ANE (only the dual bank stages gate/up
+        # pairs) and the dedicated merge symbols for every bit width present.
+        # It replaces the SwiGLU merge entirely, so the fused-swiglu symbols
+        # below are deliberately not required on this path.
+        if not config.dual_ane or not mlp_candidates:
+            return None
+        if any(
+            not fast.has_symbol(_act_symbol(bits, dual=True))
+            for bits in candidate_bits
+        ):
+            logger.warning(
+                "SwiGLU-in-ANE requested but the native activation merge is "
+                "unavailable; falling back to the standard ANE SwiGLU merge"
+            )
+            return None
+    elif 4 in candidate_bits and not fast.has_symbol(
+        "qwen35_ane_dual_q4_swiglu_t"
+    ):
         return None
-    if any(
+    elif any(
         bits != 4
         and not fast.has_symbol(_fused_swiglu_symbol(bits, dual=True))
         for bits in candidate_bits
@@ -2492,6 +3163,7 @@ def _enable_dual_procedure_banks(
 
     prepared_mlps: list[tuple[Any, _CombinedMLPState]] = []
     prepared_gdns: list[tuple[Any, _CombinedGDNState]] = []
+    prepared_oprojs: list[tuple[Any, _CombinedOProjState]] = []
     gdn_config = _AneGDNConfig(
         config.sequence_length,
         gdn_fraction,
@@ -2524,26 +3196,71 @@ def _enable_dual_procedure_banks(
                     "ANE bank builder unavailable; staging all slices at once"
                 )
                 builder0 = builder1 = None
+        if config.swiglu_in_ane and builder0 is None:
+            # The legacy bank compiler only accepts one projection per
+            # procedure. Returning None lets enable_qwen35_ane_prefill use its
+            # established per-layer SwiGLU merge instead of silently
+            # reporting a zero-layer ANE configuration.
+            logger.warning(
+                "SwiGLU-in-ANE requires the incremental ANE bank builder; "
+                "falling back to the standard ANE SwiGLU merge"
+            )
+            return None
         weights0: list[mx.array] = []
         weights1: list[mx.array] = []
         source_bytes: list[int] = []
 
-        def _stage(dense0: mx.array, dense1: mx.array) -> None:
-            source_bytes.append(int(dense0.nbytes))
+        def _stage(
+            dense0: mx.array,
+            dense1: mx.array,
+            up0: mx.array | None = None,
+            up1: mx.array | None = None,
+        ) -> None:
+            """Hand one procedure per instance to the bank builder.
+
+            ``up0``/``up1`` stage a SwiGLU-in-ANE procedure: the pair becomes
+            a single procedure whose output is the fused activation, so it
+            counts as one procedure against the 256-procedure budget while
+            contributing both projections' bytes to the split ladder.
+            """
+            # A SwiGLU procedure needs the builder: the legacy hold-everything
+            # path compiles through the plain single-conv bank generator.
+            if up0 is not None and builder0 is None:
+                raise RuntimeError(
+                    "SwiGLU-in-ANE requires the incremental ANE bank builder"
+                )
+            source_bytes.append(
+                int(dense0.nbytes)
+                + (int(up0.nbytes) if up0 is not None else 0)
+            )
             if builder0 is not None:
                 # The builder reads the raw fp32 buffers from C++, outside
                 # MLX's own accessors, so make the GPU writes fully visible
                 # before handing the pointers over.
-                mx.eval(dense0, dense1)
+                values = [dense0, dense1]
+                if up0 is not None:
+                    values.extend([up0, up1])
+                mx.eval(*values)
                 mx.synchronize()
-                builder0.add(dense0)
-                builder1.add(dense1)
+                if up0 is not None:
+                    builder0.add_swiglu(dense0, up0)
+                    builder1.add_swiglu(dense1, up1)
+                else:
+                    builder0.add(dense0)
+                    builder1.add(dense1)
             else:
                 weights0.append(dense0)
                 weights1.append(dense1)
 
         for module in mlp_candidates:
             try:
+                if config.swiglu_in_ane:
+                    prepared = _prepare_swiglu_pair_for_bank(module, config)
+                    if prepared is not None:
+                        state, (gate0, up0), (gate1, up1) = prepared
+                        _stage(gate0, gate1, up0, up1)
+                        prepared_mlps.append((module, state))
+                    continue
                 prepared = _prepare_pair_for_bank(module, config)
             except Exception:
                 logger.warning(
@@ -2575,6 +3292,22 @@ def _enable_dual_procedure_banks(
                     _stage(dense0, dense1)
                     prepared_gdns.append((module, state))
 
+        if oproj_candidates and oproj_config is not None:
+            for linear in oproj_candidates:
+                try:
+                    prepared = _prepare_oproj_for_bank(linear, oproj_config)
+                except Exception:
+                    logger.warning(
+                        "Skipping one Qwen o_proj while preparing its ANE "
+                        "procedure",
+                        exc_info=True,
+                    )
+                    continue
+                if prepared is not None:
+                    state, dense0, dense1 = prepared
+                    _stage(dense0, dense1)
+                    prepared_oprojs.append((linear, state))
+
         try:
             down_layer_stride = max(
                 1,
@@ -2597,6 +3330,7 @@ def _enable_dual_procedure_banks(
         procedure_entries: list[tuple[str, int]] = [
             *(("mlp", index) for index in range(len(prepared_mlps))),
             *(("gdn", index) for index in range(len(prepared_gdns))),
+            *(("oproj", index) for index in range(len(prepared_oprojs))),
         ]
         if combine_down:
             for index, down_state in down_entries:
@@ -2611,7 +3345,7 @@ def _enable_dual_procedure_banks(
         ]
         procedure_count = len(procedure_entries) + len(separate_down_entries)
         if not procedure_count:
-            return (0, 0, 0, 0)
+            return (0, 0, 0, 0, 0)
         if procedure_count > 256:
             logger.warning(
                 "ANE procedure bank exceeds the private 256-procedure limit; "
@@ -2671,6 +3405,7 @@ def _enable_dual_procedure_banks(
             for index, (_, state) in enumerate(prepared_mlps)
         ]
         assigned_gdn_states = [entry[1] for entry in prepared_gdns]
+        assigned_oprojs = [entry[1] for entry in prepared_oprojs]
         if config.ane_down_fraction > 0 and not down_entries:
             assigned_mlp_states = [
                 replace(state, down_ane=None) for state in assigned_mlp_states
@@ -2697,9 +3432,15 @@ def _enable_dual_procedure_banks(
                         compile_weight1=None,
                     ),
                 )
-            else:
+            elif kind == "gdn":
                 assigned_gdn_states[index] = replace(
                     assigned_gdn_states[index],
+                    model=models0[procedure],
+                    model1=models1[procedure],
+                )
+            else:
+                assigned_oprojs[index] = replace(
+                    assigned_oprojs[index],
                     model=models0[procedure],
                     model1=models1[procedure],
                 )
@@ -2729,6 +3470,14 @@ def _enable_dual_procedure_banks(
             module._omlx_ane_gdn_config = gdn_config
             module._omlx_ane_gdn_state = state
             _register_gdn_module(module)
+        for (linear, _), state in zip(
+            prepared_oprojs, assigned_oprojs, strict=True
+        ):
+            if oproj_config is None:
+                raise RuntimeError("Missing o_proj ANE configuration")
+            linear._omlx_ane_oproj_config = oproj_config
+            linear._omlx_ane_oproj_state = state
+            _register_oproj_module(linear)
 
         # Pay every procedure's first-evaluation cost now, while the model is
         # still loading, so the first user request measures inference rather
@@ -2749,6 +3498,8 @@ def _enable_dual_procedure_banks(
             module = (
                 prepared_gdns[index][0]
                 if kind == "gdn"
+                else prepared_oprojs[index][0]
+                if kind == "oproj"
                 else prepared_mlps[index][0]
             )
             try:
@@ -2761,6 +3512,8 @@ def _enable_dual_procedure_banks(
             except Exception:
                 if kind == "gdn":
                     module._omlx_ane_gdn_failed = True
+                elif kind == "oproj":
+                    module._omlx_ane_oproj_failed = True
                 else:
                     module._omlx_ane_prefill_failed = True
                 disabled += 1
@@ -2768,7 +3521,10 @@ def _enable_dual_procedure_banks(
                     "ANE warmup failed for procedure %d; disabling ANE for "
                     "its %s module and continuing",
                     procedure,
-                    "GDN" if kind == "gdn" else "MLP",
+                    {
+                        "gdn": "GDN",
+                        "oproj": "o_proj",
+                    }.get(kind, "MLP"),
                     exc_info=True,
                 )
         for procedure, (index, _) in enumerate(separate_down_entries):
@@ -2840,6 +3596,7 @@ def _enable_dual_procedure_banks(
         len(prepared_mlps),
         len(prepared_mlps),
         len(prepared_gdns),
+        len(prepared_oprojs),
         resident_program_count,
     )
 
@@ -3127,6 +3884,11 @@ def enable_qwen35_ane_prefill(
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
     tail_padding_min_tokens: int = 0,
+    swiglu_in_ane: bool = False,
+    moe_shared_expert: bool = False,
+    oproj: bool = False,
+    oproj_fraction: float = 0.50,
+    oproj_max_layers: int = 16,
 ) -> int:
     """Enable the private ANE backend on eligible MLPs in ``model``.
 
@@ -3164,6 +3926,10 @@ def enable_qwen35_ane_prefill(
         raise ValueError(
             "ANE tail padding threshold must be zero or less than sequence_length"
         )
+    if not 0.05 <= oproj_fraction <= 0.90:
+        raise ValueError("ANE o_proj fraction must be between 0.05 and 0.90")
+    if oproj_max_layers < 0:
+        raise ValueError("ANE o_proj max_layers must be non-negative")
 
     env = os.environ.get("OMLX_QWEN35_ANE_PREFILL", "").strip().lower()
     if env in ("0", "false", "off"):
@@ -3186,6 +3952,12 @@ def enable_qwen35_ane_prefill(
         )
         return 0
 
+    if swiglu_in_ane and not dual_ane:
+        logger.warning(
+            "SwiGLU-in-ANE requires dual ANE; falling back to the standard "
+            "ANE SwiGLU merge"
+        )
+        swiglu_in_ane = False
     config = _AnePrefillConfig(
         sequence_length=sequence_length,
         fraction=fraction,
@@ -3198,6 +3970,7 @@ def enable_qwen35_ane_prefill(
         ane_down_fraction=ane_down_fraction if dual_ane else 0.0,
         fused_down=fused_down and dual_ane,
         tail_padding_min_tokens=tail_padding_min_tokens,
+        swiglu_in_ane=swiglu_in_ane,
     )
     model._omlx_ane_tail_padding_min_tokens = tail_padding_min_tokens
     if ane_down_fraction > 0 and not dual_ane:
@@ -3205,28 +3978,104 @@ def enable_qwen35_ane_prefill(
             "Experimental ANE down projection currently requires dual ANE; "
             "continuing without ANE down offload"
         )
+    if config.swiglu_in_ane and (cpu_fraction > 0 or cpu_down_fraction > 0):
+        # The ANE returns pre-activated rows while the CPU branch would return
+        # raw gate/up. Merging those three sources needs a dedicated kernel
+        # that this iteration does not ship, so CPU sharing is forced off.
+        logger.warning(
+            "SwiGLU-in-ANE merges ANE activation rows with a raw GPU gate/up "
+            "suffix; CPU gate/up and down sharing are disabled"
+        )
+        config = replace(config, cpu_fraction=0.0, cpu_down_fraction=0.0)
     candidates = []
+    candidate_kind_by_id: dict[int, str] = {}
     scanned_mlp = 0
-    modules = model.modules() if hasattr(model, "modules") else ()
-    for module in modules:
-        if not all(
-            hasattr(module, name) for name in ("gate_proj", "up_proj", "down_proj")
-        ):
-            continue
+    skipped_moe_shared = 0
+    moe_detected = False
+    for module, kind in _iter_mlp_candidates(model):
         scanned_mlp += 1
+        if kind in (_MOE_SHARED_EXPERT, _MOE_OTHER):
+            moe_detected = True
+        if kind == _MOE_OTHER:
+            # Routed experts and anything else inside an MoE block: the router
+            # must stay bit-exact, so no ANE approximation participates.
+            continue
+        if kind == _MOE_SHARED_EXPERT and not moe_shared_expert:
+            # The shared expert is the same dense class as a plain MLP, so
+            # before this toggle it was picked up accidentally. Governing it
+            # here is the whole point of the toggle: an unsupported model
+            # family must not silently change behaviour.
+            skipped_moe_shared += 1
+            continue
         if not _eligible_pair(module):
             continue
-        candidates.append(module)
         if len(candidates) >= max_layers:
-            break
+            # Keep scanning after the layer cap so a later MoE block still
+            # disables unsupported CPU sharing for the checkpoint as a whole.
+            continue
+        candidates.append(module)
+        candidate_kind_by_id[id(module)] = kind
 
+    if moe_detected and (
+        cpu_fraction > 0 or cpu_down_fraction > 0 or cpu_gdn_fraction > 0
+    ):
+        logger.warning(
+            "CPU sharing is not supported for Qwen MoE ANE prefill; "
+            "disabling all CPU shares for this load"
+        )
+        config = replace(config, cpu_fraction=0.0, cpu_down_fraction=0.0)
+        cpu_gdn_fraction = 0.0
+
+    # Clear load-time accounting before any early/fallback branch. A fresh
+    # enable supersedes counters from a previous model configuration.
+    _set_mlp_accounting(model, [], candidate_kind_by_id)
     if not candidates:
         logger.warning(
             "Qwen ANE prefill requested but no eligible MLP layers found "
             "(%d dense MLP module(s) scanned; ANE requires affine int4/5/6/8 "
-            "quantization with group_size 64 or 128)",
+            "quantization with group_size 64 or 128)%s",
             scanned_mlp,
+            (
+                f"; {skipped_moe_shared} MoE shared expert(s) skipped because "
+                "MoE shared expert ANE offload is disabled"
+                if skipped_moe_shared
+                else ""
+            ),
         )
+    elif skipped_moe_shared:
+        logger.info(
+            "Skipped %d MoE shared expert(s); enable MoE shared expert ANE "
+            "offload to include them",
+            skipped_moe_shared,
+        )
+
+    oproj_candidates: list[Any] = []
+    oproj_config: _AneOProjConfig | None = None
+    if oproj and oproj_max_layers:
+        oproj_config = _AneOProjConfig(
+            sequence_length=sequence_length,
+            fraction=oproj_fraction,
+            variant=variant,
+            dual_ane=dual_ane,
+            tail_padding_min_tokens=tail_padding_min_tokens,
+        )
+        for linear in _iter_oproj_candidates(model):
+            if not _eligible_oproj(linear, dual_ane=dual_ane):
+                continue
+            oproj_candidates.append(linear)
+            if len(oproj_candidates) >= oproj_max_layers:
+                break
+        if oproj_candidates and not _install_oproj_dispatch():
+            logger.warning(
+                "Qwen ANE o_proj dispatch hook could not be installed; "
+                "attention output projections stay on GPU"
+            )
+            oproj_candidates = []
+        elif oproj and not oproj_candidates:
+            logger.info(
+                "Qwen ANE o_proj requested but no eligible full-attention "
+                "output projections were found"
+            )
 
     if (
         cpu_fraction > 0 or cpu_down_fraction > 0 or cpu_gdn_fraction > 0
@@ -3254,6 +4103,19 @@ def enable_qwen35_ane_prefill(
                     "falling back to ordinary Accelerate scheduling"
                 )
                 config = replace(config, cpu_shared_resource=False)
+
+    if config.fused_down and config.swiglu_in_ane:
+        logger.warning(
+            "SwiGLU-in-ANE is incompatible with the fused MLP/down bank; "
+            "using the separate activation and down procedures"
+        )
+        config = replace(config, fused_down=False, ane_down_fraction=0.0)
+    if config.fused_down and oproj_candidates:
+        logger.warning(
+            "o_proj split is incompatible with the fused MLP/down bank; "
+            "using the standard procedure bank for this load"
+        )
+        config = replace(config, fused_down=False, ane_down_fraction=0.0)
 
     if config.fused_down:
         if config.cpu_down_fraction > 0:
@@ -3283,7 +4145,12 @@ def enable_qwen35_ane_prefill(
                 else:
                     gdn_count, gdn_programs = fused_gdn
                     resident_programs += gdn_programs
-            model._omlx_ane_mlp_prefill_count = count
+            fused_modules = [
+                module
+                for module in candidates
+                if getattr(module, "_omlx_ane_fused_down_state", None) is not None
+            ]
+            _set_mlp_accounting(model, fused_modules, candidate_kind_by_id)
             model._omlx_ane_gdn_prefill_count = gdn_count
             model._omlx_ane_dual_prefill_count = count
             model._omlx_ane_resident_program_count = resident_programs
@@ -3349,25 +4216,40 @@ def enable_qwen35_ane_prefill(
         gdn_fraction=gdn_fraction,
         gdn_max_layers=gdn_max_layers,
         cpu_gdn_fraction=cpu_gdn_fraction,
+        oproj_candidates=oproj_candidates,
+        oproj_config=oproj_config,
     )
     if banked is not None:
-        count, dual_count, gdn_count, resident_programs = banked
-        model._omlx_ane_mlp_prefill_count = count
+        if len(banked) == 4:
+            count, dual_count, gdn_count, resident_programs = banked
+            oproj_count = 0
+        else:
+            count, dual_count, gdn_count, oproj_count, resident_programs = banked
+        compiled_mlp_modules = [
+            module
+            for module in candidates
+            if getattr(module, "_omlx_ane_prefill_state", None) is not None
+        ]
+        _set_mlp_accounting(model, compiled_mlp_modules, candidate_kind_by_id)
         model._omlx_ane_gdn_prefill_count = gdn_count
+        model._omlx_ane_oproj_prefill_count = oproj_count
         model._omlx_ane_dual_prefill_count = dual_count
         model._omlx_ane_resident_program_count = resident_programs
         down_count = int(getattr(model, "_omlx_ane_down_prefill_count", 0))
-        model._omlx_ane_procedure_count = count + gdn_count + down_count
+        model._omlx_ane_procedure_count = (
+            count + gdn_count + oproj_count + down_count
+        )
         _warn_gdn_below_floor(
             model, bool(gdn and gdn_max_layers), gdn_count, gdn_fraction, dual_ane
         )
         _log_gdn_recurrent_safe_cap(model, gdn_fraction, gdn_count, dual_ane)
-        if count or gdn_count:
+        if count or gdn_count or oproj_count:
             logger.info(
-                "Eagerly compiled %d MLP and %d GDN procedures into %d "
-                "instance-pinned ANE programs (sequence_length=%d)",
+                "Eagerly compiled %d MLP, %d GDN, and %d o_proj procedures "
+                "into %d instance-pinned ANE programs (sequence_length=%d)",
                 count,
                 gdn_count,
+                oproj_count,
                 resident_programs,
                 sequence_length,
             )
@@ -3443,12 +4325,45 @@ def enable_qwen35_ane_prefill(
             _register_gdn_module(module)
             resident_programs += 2 if getattr(state, "model1", None) is not None else 1
             gdn_count += 1
-    model._omlx_ane_mlp_prefill_count = count
+
+    oproj_count = 0
+    oproj_budget_exhausted = False
+    if oproj_candidates and oproj_config is not None:
+        for linear in oproj_candidates:
+            requested_programs = 2 if oproj_config.dual_ane else 1
+            if resident_programs + requested_programs > _ANE_RESIDENT_PROGRAM_LIMIT:
+                oproj_budget_exhausted = True
+                break
+            try:
+                state = _compile_oproj(linear, oproj_config)
+            except Exception:
+                linear._omlx_ane_oproj_failed = True
+                logger.warning(
+                    "Skipping one Qwen o_proj after eager ANE compilation failed",
+                    exc_info=True,
+                )
+                continue
+            if state is None:
+                continue
+            linear._omlx_ane_oproj_config = oproj_config
+            linear._omlx_ane_oproj_state = state
+            _register_oproj_module(linear)
+            actual_programs = 2 if getattr(state, "model1", None) is not None else 1
+            resident_programs += actual_programs
+            oproj_count += 1
+
+    compiled_mlp_modules = [
+        module
+        for module in candidates
+        if getattr(module, "_omlx_ane_prefill_state", None) is not None
+    ]
+    _set_mlp_accounting(model, compiled_mlp_modules, candidate_kind_by_id)
     model._omlx_ane_gdn_prefill_count = gdn_count
+    model._omlx_ane_oproj_prefill_count = oproj_count
     model._omlx_ane_dual_prefill_count = dual_count
     model._omlx_ane_down_prefill_count = 0
     model._omlx_ane_resident_program_count = resident_programs
-    model._omlx_ane_procedure_count = count + gdn_count
+    model._omlx_ane_procedure_count = count + gdn_count + oproj_count
     _warn_gdn_below_floor(
         model, bool(gdn and gdn_max_layers), gdn_count, gdn_fraction, dual_ane
     )
@@ -3463,12 +4378,14 @@ def enable_qwen35_ane_prefill(
             fraction,
             dual_ane,
         )
-    if mlp_budget_exhausted or gdn_budget_exhausted:
+    if mlp_budget_exhausted or gdn_budget_exhausted or oproj_budget_exhausted:
         logger.info(
             "Stopped eager ANE preparation at the %d-program private-runtime "
-            "budget (%d MLPs, %d dual)",
+            "budget (%d MLPs, %d GDN, %d o_proj, %d dual MLP)",
             _ANE_RESIDENT_PROGRAM_LIMIT,
             count,
+            gdn_count,
+            oproj_count,
             dual_count,
         )
     if gdn and gdn_max_layers and gdn_budget_exhausted:
@@ -3486,7 +4403,15 @@ def enable_qwen35_ane_prefill(
             gdn_fraction,
             dual_ane,
         )
-    if not count and not gdn_count:
+    if oproj_count:
+        logger.info(
+            "Eagerly compiled and enabled ANE/GPU Qwen o_proj output "
+            "projections on %d layers (fraction=%.3f, dual_ane=%s)",
+            oproj_count,
+            oproj_fraction,
+            dual_ane,
+        )
+    if not count and not gdn_count and not oproj_count:
         logger.warning(
             "Qwen ANE prefill enabled but 0 procedures were compiled; "
             "the whole model runs prefill on GPU"
@@ -3510,6 +4435,7 @@ def ane_prefill_transient_bytes(model: Any) -> int:
             "_omlx_ane_prefill_state",
             "_omlx_ane_gdn_state",
             "_omlx_ane_fused_down_state",
+            "_omlx_ane_oproj_state",
         ):
             state = getattr(module, state_attr, None)
             if state is None:
@@ -3535,12 +4461,27 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
     attempted = hasattr(model, "_omlx_ane_mlp_prefill_count")
     mlp = int(getattr(model, "_omlx_ane_mlp_prefill_count", 0) or 0)
     gdn = int(getattr(model, "_omlx_ane_gdn_prefill_count", 0) or 0)
+    oproj = int(getattr(model, "_omlx_ane_oproj_prefill_count", 0) or 0)
     return {
         "attempted": attempted,
-        "configured": bool(mlp or gdn),
+        "configured": bool(mlp or gdn or oproj),
         "shed": bool(getattr(model, "_omlx_ane_prefill_shed", False)),
+        # The following breakdown fields were added with MoE/o_proj telemetry;
+        # keep the legacy status shape for callers that do not expose those
+        # features yet by only including them when the model has the counters.
+
         "mlp_layers": mlp,
+        "dense_mlp_layers": int(
+            getattr(model, "_omlx_ane_dense_mlp_prefill_count", 0) or 0
+        ),
+        "moe_shared_expert_layers": int(
+            getattr(model, "_omlx_ane_moe_shared_expert_count", 0) or 0
+        ),
+        "moe_routed_expert_layers": int(
+            getattr(model, "_omlx_ane_moe_routed_expert_count", 0) or 0
+        ),
         "gdn_layers": gdn,
+        "oproj_layers": oproj,
         "dual_ane_layers": int(
             getattr(model, "_omlx_ane_dual_prefill_count", 0) or 0
         ),
@@ -3578,9 +4519,12 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             ("_omlx_ane_prefill_state", "_omlx_ane_prefill_failed"),
             ("_omlx_ane_fused_down_state", "_omlx_ane_prefill_failed"),
             ("_omlx_ane_gdn_state", "_omlx_ane_gdn_failed"),
+            ("_omlx_ane_oproj_state", "_omlx_ane_oproj_failed"),
         ):
             if getattr(module, state_attr, None) is None:
                 continue
+            if state_attr == "_omlx_ane_oproj_state":
+                _release_oproj_module(module)
             # Latch BEFORE dropping the state: the fetch sites lazily
             # recompile a missing state, and the failure flag is the one
             # switch they all check first.
@@ -3595,7 +4539,11 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
         model._omlx_ane_prefill_shed = True
         for counter in (
             "_omlx_ane_mlp_prefill_count",
+            "_omlx_ane_dense_mlp_prefill_count",
+            "_omlx_ane_moe_shared_expert_count",
+            "_omlx_ane_moe_routed_expert_count",
             "_omlx_ane_gdn_prefill_count",
+            "_omlx_ane_oproj_prefill_count",
             "_omlx_ane_dual_prefill_count",
             "_omlx_ane_resident_program_count",
         ):

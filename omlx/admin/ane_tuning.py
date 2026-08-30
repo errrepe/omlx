@@ -38,6 +38,7 @@ _DOWN_SLOT = 2
 _GDN_SLOT = 3
 _VERIFY_SLOT = 4
 _REFINE_SLOT = 5
+_OPROJ_SLOT = 6
 
 
 class ANETuningRequest(BaseModel):
@@ -50,6 +51,7 @@ class ANETuningRequest(BaseModel):
     allow_ane_gdn: bool = True
     allow_cpu_gdn: bool = True
     allow_cpu_shared_resource: bool = True
+    allow_ane_oproj: bool = True
 
     @field_validator("sequence_length")
     @classmethod
@@ -80,6 +82,8 @@ class _Candidate:
     fused_down: bool = False
     cpu_threads: int | None = None
     stage: str = "verification"
+    oproj_enabled: bool = False
+    oproj_fraction: float | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,8 @@ class _CalibrationChoice:
     alternate_gdn_fraction: float | None = None
     alternate_cpu_gdn_fraction: float | None = None
     alternate_reason: str | None = None
+    oproj_enabled: bool = False
+    oproj_fraction: float | None = None
 
 
 @dataclass
@@ -171,6 +177,11 @@ def _gdn_fraction_grid() -> list[float]:
     return [0.35, 0.40, 0.45, 0.50, 0.53, 0.56, 0.60]
 
 
+def _oproj_fraction_grid() -> list[float]:
+    """Conservative channel shares for token-local attention output rows."""
+    return [0.25, 0.40, 0.50, 0.60, 0.75]
+
+
 def _planned_rows() -> list[_Candidate]:
     return [
         _Candidate("GPU only", False),
@@ -179,6 +190,7 @@ def _planned_rows() -> list[_Candidate]:
         _Candidate("GDN calibration", True, stage="calibration"),
         _Candidate("Predicted optimum", True),
         _Candidate("Full-model uncertainty runner-up", True),
+        _Candidate("o_proj calibration", True, stage="calibration"),
     ]
 
 
@@ -211,7 +223,19 @@ def create_run(request: ANETuningRequest) -> ANETuningRun:
             else 1
         )
         gdn_points = len(fractions) * cpu_gdn_points
-    run.total = 3 + len(fractions) * cpu_gate_points + cpu_down_points + gdn_points
+    oproj_points = (
+        len(_oproj_fraction_grid()) if request.allow_ane_oproj else 1
+    )
+    # Baseline + gate/down/GDN phases + the independent o_proj calibration
+    # row. The o_proj phase is skipped cleanly for models without a full
+    # attention output projection or when the caller disables the dimension.
+    run.total = (
+        4
+        + len(fractions) * cpu_gate_points
+        + cpu_down_points
+        + gdn_points
+        + oproj_points
+    )
     _runs[run.tuning_id] = run
     return run
 
@@ -269,6 +293,8 @@ def _empty_result(candidate: _Candidate) -> dict[str, Any]:
         "cpu_gdn_fraction": candidate.cpu_gdn_fraction,
         "fused_down": candidate.fused_down,
         "cpu_threads": candidate.cpu_threads,
+        "oproj_enabled": candidate.oproj_enabled,
+        "oproj_fraction": candidate.oproj_fraction,
         "state": "pending",
         "processing_tps": None,
         "latency_ms": None,
@@ -361,6 +387,8 @@ def _complete_phase(
     cpu_gdn_fraction: float | None = None,
     fused_down: bool = False,
     cpu_threads: int | None = None,
+    oproj_enabled: bool = False,
+    oproj_fraction: float | None = None,
 ) -> None:
     result = run.results[slot]
     result.update(
@@ -377,6 +405,8 @@ def _complete_phase(
             "cpu_gdn_fraction": cpu_gdn_fraction,
             "fused_down": fused_down,
             "cpu_threads": cpu_threads,
+            "oproj_enabled": oproj_enabled,
+            "oproj_fraction": oproj_fraction,
         }
     )
 
@@ -472,6 +502,23 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     settings.qwen35_ane_prefill_dual_ane = bool(
         getattr(base, "qwen35_ane_prefill_dual_ane", True)
     )
+    settings.qwen35_ane_prefill_oproj = bool(
+        candidate.oproj_enabled
+        and request.allow_ane_oproj
+        and settings.qwen35_ane_prefill_dual_ane
+    )
+    if candidate.oproj_fraction is not None and request.allow_ane_oproj:
+        settings.qwen35_ane_prefill_oproj_fraction = candidate.oproj_fraction
+    # SwiGLU-in-ANE is a separate opt-in and is not guessed by the tuner. It
+    # disables CPU gate/up sharing, so preserve the user's setting only when
+    # the candidate did not request a CPU branch.
+    settings.qwen35_ane_prefill_swiglu_in_ane = bool(
+        getattr(base, "qwen35_ane_prefill_swiglu_in_ane", False)
+    )
+    if settings.qwen35_ane_prefill_swiglu_in_ane:
+        settings.qwen35_ane_prefill_cpu_enabled = False
+        settings.qwen35_ane_prefill_cpu_fraction = 0.0
+        settings.qwen35_ane_prefill_cpu_down_fraction = 0.0
     # The tuner reaches into the engine for the raw model and compares prompt
     # throughput across slots, so it must stage the plain LM engine: a DFlash
     # engine exposes no _model and would skew every measurement (issue #2914).
@@ -508,6 +555,7 @@ def _ane_execution_observed(
     *,
     require_mlp: bool = False,
     require_gdn: bool = False,
+    require_oproj: bool = False,
 ) -> bool | None:
     """Whether the ANE ran ops, or None when that cannot be determined.
 
@@ -522,6 +570,10 @@ def _ane_execution_observed(
         return False
     if require_gdn and int((categories.get("gdn") or {}).get("operations", 0) or 0) <= 0:
         return False
+    if require_oproj and int(
+        (categories.get("oproj") or {}).get("operations", 0) or 0
+    ) <= 0:
+        return False
     return any(
         int(values.get("operations", 0) or 0) > 0
         for values in categories.values()
@@ -535,6 +587,7 @@ def _ane_is_active(engine: Any) -> bool:
     return bool(
         getattr(model, "_omlx_ane_mlp_prefill_count", 0)
         or getattr(model, "_omlx_ane_gdn_prefill_count", 0)
+        or getattr(model, "_omlx_ane_oproj_prefill_count", 0)
     )
 
 
@@ -619,6 +672,11 @@ async def _measure_candidate(
                             if candidate.gdn_enabled
                             else 0
                         ),
+                        "oproj_layers": (
+                            int(settings.qwen35_ane_prefill_oproj_max_layers)
+                            if candidate.oproj_enabled
+                            else 0
+                        ),
                     }
                     if candidate.enabled
                     else None
@@ -640,8 +698,9 @@ async def _measure_candidate(
     observations = [
         _ane_execution_observed(
             trace,
-            require_mlp=candidate.enabled,
+            require_mlp=candidate.enabled and candidate.mlp_fraction is not None,
             require_gdn=candidate.gdn_enabled,
+            require_oproj=candidate.oproj_enabled,
         )
         for trace in traces
     ]
@@ -680,6 +739,8 @@ async def _measure_candidate(
         "cpu_gdn_fraction": candidate.cpu_gdn_fraction,
         "fused_down": candidate.fused_down,
         "cpu_threads": candidate.cpu_threads,
+        "oproj_enabled": candidate.oproj_enabled,
+        "oproj_fraction": candidate.oproj_fraction,
         "processing_tps": round(statistics.median(samples), 2),
         "samples": [round(value, 2) for value in samples],
         "_profile": profile,
@@ -805,6 +866,26 @@ def _profile_refinement(
             if cpu_gdn_fraction > 0:
                 cpu_gdn_fraction = balanced[1]
 
+    # The representative o_proj calibration chooses a starting width, while
+    # the full-model profile can account for contention with the MLP/GDN
+    # procedures. Keep this correction bounded to the same conservative grid.
+    oproj_fraction = candidate.oproj_fraction
+    oproj = profile.get("oproj") or {}
+    oproj_ops = float(oproj.get("operations", 0.0))
+    if candidate.oproj_enabled and oproj_fraction is not None and oproj_ops > 0:
+        ane_time = max(
+            float(oproj.get("ane0_eval_ns", 0.0)),
+            float(oproj.get("ane1_eval_ns", 0.0)),
+        ) / oproj_ops
+        gpu_time = float(oproj.get("gpu_completion_ns", 0.0)) / oproj_ops
+        if ane_time > 0 and gpu_time > 0:
+            ane_rate = float(oproj_fraction) / ane_time
+            gpu_rate = (1.0 - float(oproj_fraction)) / gpu_time
+            if ane_rate > 0 and gpu_rate > 0:
+                oproj_fraction = _nearest(
+                    ane_rate / (ane_rate + gpu_rate), _oproj_fraction_grid()
+                )
+
     return replace(
         candidate,
         label="Profile-refined optimum",
@@ -812,6 +893,7 @@ def _profile_refinement(
         cpu_fraction=cpu_fraction,
         gdn_fraction=gdn_fraction,
         cpu_gdn_fraction=cpu_gdn_fraction,
+        oproj_fraction=oproj_fraction,
     )
 
 
@@ -1601,6 +1683,171 @@ def _calibrate_fused_components_sync(
     )
 
 
+def _time_oproj_state(
+    fast: Any,
+    state: Any,
+    x: Any,
+    config: Any,
+    repeats: int,
+) -> float:
+    """Time one token-local o_proj split and attribute it to profiler bucket 2."""
+    if state.model1 is not None:
+        factory = lambda: fast.qwen35_ane_dual_affine_qmm_t(
+            x,
+            state.weight,
+            state.scales,
+            state.biases,
+            state.model,
+            state.model1,
+            state.bits,
+            config.variant,
+            state.group_size,
+            2,
+        )
+    else:
+        factory = lambda: fast.qwen35_ane_affine_qmm_t(
+            x,
+            state.weight,
+            state.scales,
+            state.biases,
+            state.model,
+            state.bits,
+            config.variant,
+            state.group_size,
+            2,
+        )
+    return _time_native(factory, repeats)
+
+
+def _calibrate_oproj_sync(
+    run: ANETuningRun,
+    model: Any,
+    base_settings: Any,
+    fast: Any,
+    patch: Any,
+    dual_ane: bool,
+) -> tuple[bool, float | None, float | None]:
+    """Calibrate a representative full-attention ``o_proj`` when present.
+
+    This deliberately uses a separate small procedure per candidate rather
+    than mixing attention and MLP widths into the MLP calibration bank. The
+    output projection is token-local and reuses the affine qmm primitive, but
+    its input/output geometry is different; keeping it separate makes a
+    missing full-attention layer a clean skipped phase.
+    """
+    if not run.request.allow_ane_oproj or not dual_ane:
+        _complete_phase(
+            run,
+            _OPROJ_SLOT,
+            detail=(
+                "Disabled by tuner override"
+                if not run.request.allow_ane_oproj
+                else "Requires dual ANE"
+            ),
+            latency_ms=None,
+            oproj_enabled=False,
+        )
+        run.current += 1
+        return False, None, None
+
+    linear = next(
+        (
+            candidate
+            for candidate in patch._iter_oproj_candidates(model)
+            if patch._eligible_oproj(candidate, dual_ane=dual_ane)
+        ),
+        None,
+    )
+    if linear is None:
+        _complete_phase(
+            run,
+            _OPROJ_SLOT,
+            detail="Not eligible in this checkpoint",
+            latency_ms=None,
+            oproj_enabled=False,
+        )
+        run.current += 1
+        return False, None, None
+
+    run.phase = "compiling_calibration"
+    run.message = "Compiling representative o_proj calibration procedures…"
+    results: list[tuple[float, float]] = []
+    input_dim = int(linear.weight.shape[1]) * 32 // int(linear.bits)
+    import mlx.core as mx
+
+    x = mx.zeros((1, run.request.sequence_length, input_dim), dtype=linear.scales.dtype)
+    mx.eval(x)
+    for fraction in _oproj_fraction_grid():
+        try:
+            config = patch._AneOProjConfig(
+                sequence_length=run.request.sequence_length,
+                fraction=fraction,
+                variant=8,
+                dual_ane=dual_ane,
+                tail_padding_min_tokens=0,
+            )
+            prepared = patch._prepare_oproj_for_bank(linear, config)
+            if prepared is None:
+                continue
+            state, dense0, dense1 = prepared
+            mx.eval(dense0, *(tuple() if dense1 is None else (dense1,)))
+            model0 = fast.qwen35_ane_compile_linear(
+                dense0, run.request.sequence_length, 1
+            )
+            model1 = (
+                fast.qwen35_ane_compile_linear(
+                    dense1, run.request.sequence_length, 2
+                )
+                if dense1 is not None
+                else None
+            )
+            state = replace(state, model=model0, model1=model1)
+            latency = _time_oproj_state(
+                fast, state, x, config, _COARSE_SAMPLES
+            )
+        except Exception:
+            logger.warning(
+                "Skipping representative o_proj calibration fraction %.3f",
+                fraction,
+                exc_info=True,
+            )
+            continue
+        else:
+            results.append((latency, fraction))
+            preview = min(results)
+            _preview_phase(
+                run,
+                _OPROJ_SLOT,
+                detail=f"Current best · ANE {preview[1]:.1%} · GPU {1.0 - preview[1]:.1%}",
+                latency_ms=preview[0],
+                oproj_enabled=True,
+                oproj_fraction=preview[1],
+            )
+        finally:
+            run.current += 1
+            run.message = f"o_proj: ANE {fraction:.1%}…"
+
+    if not results:
+        _complete_phase(
+            run,
+            _OPROJ_SLOT,
+            detail="No valid o_proj calibration width",
+            latency_ms=None,
+            oproj_enabled=False,
+        )
+        return False, None, None
+    latency, fraction = min(results)
+    _complete_phase(
+        run,
+        _OPROJ_SLOT,
+        detail=f"ANE {fraction:.1%} · GPU {1.0 - fraction:.1%}",
+        latency_ms=latency,
+        oproj_enabled=True,
+        oproj_fraction=fraction,
+    )
+    return True, fraction, latency
+
+
 async def _calibrate_components(
     run: ANETuningRun,
     engine: Any,
@@ -1661,13 +1908,21 @@ def _calibrate_components_sync(
         )
     )
     if fused_supported:
-        return _calibrate_fused_components_sync(
+        choice = _calibrate_fused_components_sync(
             run,
             base_settings,
             mlp,
             gdn,
             fast,
             patch,
+        )
+        oproj_enabled, oproj_fraction, _oproj_latency = _calibrate_oproj_sync(
+            run, model, base_settings, fast, patch, dual_ane
+        )
+        return replace(
+            choice,
+            oproj_enabled=oproj_enabled,
+            oproj_fraction=oproj_fraction,
         )
 
     bits = int(gate.bits)
@@ -1983,6 +2238,10 @@ def _calibrate_components_sync(
             gdn_enabled=False,
         )
 
+    oproj_enabled, oproj_fraction, _oproj_latency = _calibrate_oproj_sync(
+        run, model, base_settings, fast, patch, dual_ane
+    )
+
     return _CalibrationChoice(
         mlp_fraction=best_mlp,
         cpu_fraction=best_cpu,
@@ -1993,6 +2252,8 @@ def _calibrate_components_sync(
         cpu_enabled=best_cpu > 0 or best_down > 0 or best_gdn_cpu > 0,
         cpu_threads=cpu_threads,
         cpu_shared_resource=cpu_shared,
+        oproj_enabled=oproj_enabled,
+        oproj_fraction=oproj_fraction,
     )
 
 
@@ -2034,6 +2295,8 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             "gdn_enabled": False,
             "gdn_fraction": None,
             "fused_down": False,
+            "oproj_enabled": False,
+            "oproj_fraction": None,
             "processing_tps": None,
             "speedup_percent": None,
             "sequence_length": run.request.sequence_length,
@@ -2091,6 +2354,8 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             cpu_gdn_fraction=choice.cpu_gdn_fraction,
             fused_down=choice.fused_down,
             cpu_threads=choice.cpu_threads,
+            oproj_enabled=choice.oproj_enabled,
+            oproj_fraction=choice.oproj_fraction,
         )
         active_slot = _VERIFY_SLOT
         await _measure_result_slot(
@@ -2106,16 +2371,20 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             getattr(profiled, name) != getattr(candidate, name)
             for name in ("gdn_fraction", "cpu_gdn_fraction")
         )
-        if choice.fused_down and gdn_profile_changed:
-            # The representative GDN call cannot reproduce contention with all
-            # surrounding layers. Let the aggregate three-sample native profile
+        oproj_profile_changed = (
+            profiled.oproj_fraction != candidate.oproj_fraction
+        )
+        if choice.fused_down and (gdn_profile_changed or oproj_profile_changed):
+            # The representative GDN/o_proj calls cannot reproduce contention
+            # with all surrounding layers. Let the aggregate native profile
             # propose a stateless correction and spend the existing runner-up
             # load validating it end to end.
             refined = replace(
                 candidate,
-                label="Full-model profile-refined GDN",
+                label="Full-model profile-refined split",
                 gdn_fraction=profiled.gdn_fraction,
                 cpu_gdn_fraction=profiled.cpu_gdn_fraction,
+                oproj_fraction=profiled.oproj_fraction,
             )
             refinement_changed = True
             logger.info(
@@ -2147,6 +2416,7 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                     if choice.alternate_cpu_gdn_fraction is not None
                     else candidate.cpu_gdn_fraction
                 ),
+                oproj_fraction=profiled.oproj_fraction,
             )
             refinement_changed = True
         else:
@@ -2159,6 +2429,7 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                     "gdn_fraction",
                     "cpu_gdn_fraction",
                     "cpu_threads",
+                    "oproj_fraction",
                 )
             )
         if refinement_changed:
@@ -2181,6 +2452,8 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                 cpu_gdn_fraction=refined.cpu_gdn_fraction,
                 fused_down=refined.fused_down,
                 cpu_threads=refined.cpu_threads,
+                oproj_enabled=refined.oproj_enabled,
+                oproj_fraction=refined.oproj_fraction,
             )
             run.current += 1
 
@@ -2215,6 +2488,16 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             )
             gdn_enabled = False
             gdn_fraction = None
+        oproj_enabled = bool(best.get("oproj_enabled", choice.oproj_enabled))
+        oproj_fraction = best.get("oproj_fraction", choice.oproj_fraction)
+        oproj_ops = float((profile.get("oproj") or {}).get("operations", 0) or 0)
+        if oproj_enabled and profile and oproj_ops <= 0:
+            logger.warning(
+                "ANE tuner: recommended slot ran 0 o_proj operations; "
+                "persisting the recommendation with o_proj disabled"
+            )
+            oproj_enabled = False
+            oproj_fraction = None
         tail_padding_min_tokens = _tail_padding_min_tokens(
             run.request.sequence_length,
             baseline_result.get("processing_tps"),
@@ -2232,6 +2515,8 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             "fused_down": bool(best.get("fused_down", False)),
             "cpu_threads": best.get("cpu_threads") or choice.cpu_threads,
             "cpu_shared_resource": choice.cpu_shared_resource,
+            "oproj_enabled": oproj_enabled,
+            "oproj_fraction": oproj_fraction,
             "processing_tps": best["processing_tps"],
             "speedup_percent": best["speedup_percent"],
             "sequence_length": run.request.sequence_length,
@@ -2294,6 +2579,8 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                 "gdn_enabled": False,
                 "gdn_fraction": None,
                 "fused_down": False,
+                "oproj_enabled": False,
+                "oproj_fraction": None,
                 "processing_tps": baseline_result["processing_tps"],
                 "speedup_percent": baseline_result.get("speedup_percent"),
                 "sequence_length": run.request.sequence_length,

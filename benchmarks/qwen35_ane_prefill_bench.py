@@ -252,6 +252,27 @@ def main() -> None:
     parser.add_argument("--dual-mlp-fraction", type=float, default=0.53)
     parser.add_argument("--dual-gdn-fraction", type=float, default=0.50)
     parser.add_argument(
+        "--oproj-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Enable the token-local attention o_proj split at this ANE output "
+            "fraction; omitted keeps o_proj on GPU"
+        ),
+    )
+    parser.add_argument(
+        "--oproj-max-layers",
+        type=int,
+        default=16,
+        help="Maximum full-attention o_proj layers to prepare (default: 16)",
+    )
+    parser.add_argument(
+        "--moe-shared-expert",
+        action="store_true",
+        help="Allow the ANE prefill path to offload the always-on MoE "
+        "shared_expert MLP (Feature C); ignored for dense models",
+    )
+    parser.add_argument(
         "--cpu-fraction",
         type=float,
         default=0.0,
@@ -307,6 +328,12 @@ def main() -> None:
         value < 0 or value > 0.50 for value in args.cpu_down_fraction_grid
     ):
         parser.error("CPU down fractions must be between 0 and 0.50")
+    if args.oproj_fraction is not None and not 0.05 <= args.oproj_fraction <= 0.90:
+        parser.error("o_proj fractions must be between 0.05 and 0.90")
+    if args.oproj_max_layers < 0:
+        parser.error("o_proj max layers must be non-negative")
+    oproj_enabled = args.oproj_fraction is not None and args.oproj_max_layers > 0
+    oproj_fraction = args.oproj_fraction if args.oproj_fraction is not None else 0.50
 
     native_ext = inject_extension(args.extension) if args.extension else None
     from omlx.custom_kernels.qwen35_prefill import fast
@@ -362,6 +389,10 @@ def main() -> None:
                 cpu_gdn_fraction=args.cpu_gdn_fraction,
                 cpu_threads=args.cpu_threads,
                 cpu_shared_resource=not args.disable_cpu_shared_resource,
+                oproj=oproj_enabled,
+                oproj_fraction=oproj_fraction,
+                oproj_max_layers=args.oproj_max_layers,
+                moe_shared_expert=args.moe_shared_expert,
             )
             compile_seconds = time.perf_counter() - started
         elif mode == "dual":
@@ -380,6 +411,10 @@ def main() -> None:
                 cpu_gdn_fraction=args.cpu_gdn_fraction,
                 cpu_threads=args.cpu_threads,
                 cpu_shared_resource=not args.disable_cpu_shared_resource,
+                oproj=oproj_enabled,
+                oproj_fraction=oproj_fraction,
+                oproj_max_layers=args.oproj_max_layers,
+                moe_shared_expert=args.moe_shared_expert,
             )
             compile_seconds = time.perf_counter() - started
         else:
@@ -492,6 +527,13 @@ def main() -> None:
                     else 0,
                     "gdn_layers": int(
                         getattr(model, "_omlx_ane_gdn_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "oproj_enabled": oproj_enabled if mode != "gpu" else False,
+                    "oproj_fraction": oproj_fraction if oproj_enabled else None,
+                    "oproj_layers": int(
+                        getattr(model, "_omlx_ane_oproj_prefill_count", 0)
                     )
                     if mode != "gpu"
                     else 0,

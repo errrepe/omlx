@@ -1,0 +1,4 @@
+Loading /Volumes/SSD 4TB/AI Models/Jundot/Qwen3.8-27B-oQ4e-mtp
+Planned 101 tuning points; o_proj slot = 6
+o_proj calibration: {'label': 'o_proj calibration', 'detail': 'ANE 60.0% · GPU 40.0%', 'stage': 'calibration', 'enabled': True, 'mlp_fraction': None, 'gdn_enabled': False, 'gdn_fraction': None, 'cpu_enabled': False, 'cpu_fraction': None, 'cpu_down_fraction': None, 'cpu_gdn_fraction': None, 'fused_down': False, 'cpu_threads': None, 'oproj_enabled': True, 'oproj_fraction': 0.6, 'state': 'completed', 'processing_tps': None, 'latency_ms': 10.7, 'samples': [], 'speedup_percent': None, 'error': None}
+DRYRUN PASS (enabled=True, fraction=0.6, latency_ms=10.7)

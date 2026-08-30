@@ -196,6 +196,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
                 fusedDown: true,
                 cpuThreads: nil,
                 cpuSharedResource: nil,
+                oprojEnabled: nil,
+                oprojFraction: nil,
                 processingTps: 123.4,
                 speedupPercent: 12.3,
                 sequenceLength: 2112,
@@ -278,7 +280,12 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             "qwen35_ane_prefill_cpu_down_fraction": 0.2,
             "qwen35_ane_prefill_cpu_gdn_fraction": 0.05,
             "qwen35_ane_prefill_cpu_threads": 8,
-            "qwen35_ane_prefill_cpu_shared_resource": true
+            "qwen35_ane_prefill_cpu_shared_resource": true,
+            "qwen35_ane_prefill_swiglu_in_ane": true,
+            "qwen35_ane_prefill_moe_shared_expert": true,
+            "qwen35_ane_prefill_oproj": true,
+            "qwen35_ane_prefill_oproj_fraction": 0.5,
+            "qwen35_ane_prefill_oproj_max_layers": 16
         }
         """#
         let dto = try decoder.decode(ModelSettingsDTO.self, from: Data(json.utf8))
@@ -290,6 +297,11 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(dto.qwen35AnePrefillCpuGdnFraction, 0.05)
         XCTAssertEqual(dto.qwen35AnePrefillCpuThreads, 8)
         XCTAssertEqual(dto.qwen35AnePrefillCpuSharedResource, true)
+        XCTAssertEqual(dto.qwen35AnePrefillSwigluInAne, true)
+        XCTAssertEqual(dto.qwen35AnePrefillMoeSharedExpert, true)
+        XCTAssertEqual(dto.qwen35AnePrefillOproj, true)
+        XCTAssertEqual(dto.qwen35AnePrefillOprojFraction, 0.5)
+        XCTAssertEqual(dto.qwen35AnePrefillOprojMaxLayers, 16)
 
         var patch = ModelSettingsPatch()
         patch.qwen35AnePrefillEnabled = true
@@ -300,6 +312,11 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         patch.qwen35AnePrefillCpuGdnFraction = 0.05
         patch.qwen35AnePrefillCpuThreads = 8
         patch.qwen35AnePrefillCpuSharedResource = true
+        patch.qwen35AnePrefillSwigluInAne = true
+        patch.qwen35AnePrefillMoeSharedExpert = true
+        patch.qwen35AnePrefillOproj = true
+        patch.qwen35AnePrefillOprojFraction = 0.5
+        patch.qwen35AnePrefillOprojMaxLayers = 16
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let object = try JSONSerialization.jsonObject(with: encoder.encode(patch)) as? [String: Any]
@@ -311,6 +328,11 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_gdn_fraction"] as? Double, 0.05)
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_threads"] as? Int, 8)
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_shared_resource"] as? Bool, true)
+        XCTAssertEqual(object?["qwen35_ane_prefill_swiglu_in_ane"] as? Bool, true)
+        XCTAssertEqual(object?["qwen35_ane_prefill_moe_shared_expert"] as? Bool, true)
+        XCTAssertEqual(object?["qwen35_ane_prefill_oproj"] as? Bool, true)
+        XCTAssertEqual(object?["qwen35_ane_prefill_oproj_fraction"] as? Double, 0.5)
+        XCTAssertEqual(object?["qwen35_ane_prefill_oproj_max_layers"] as? Int, 16)
     }
 
     func testANETunerOverridesEncodeForStartRequest() throws {
@@ -323,7 +345,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             allowCpuDown: true,
             allowAneGdn: false,
             allowCpuGdn: false,
-            allowCpuSharedResource: false
+            allowCpuSharedResource: false,
+            allowAneOproj: true
         )
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -337,6 +360,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["allow_ane_gdn"] as? Bool, false)
         XCTAssertEqual(object?["allow_cpu_gdn"] as? Bool, false)
         XCTAssertEqual(object?["allow_cpu_shared_resource"] as? Bool, false)
+        XCTAssertEqual(object?["allow_ane_oproj"] as? Bool, true)
     }
 
     private func makeModel(id: String, configModelType: String?) -> ModelDTO {

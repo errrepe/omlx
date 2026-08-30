@@ -84,6 +84,8 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_affine_qmm_t",
     "qwen35_ane_q4_swiglu_t",
     "qwen35_ane_affine_swiglu_t",
+    "qwen35_ane_q4_act_t",
+    "qwen35_ane_affine_act_t",
     "qwen35_ane_cpu_fp16_affine_qmm_t",
     "qwen35_ane_cpu_fp16_swiglu_t",
     "qwen35_ane_cpu_fp16_q4_swiglu_t",
@@ -95,6 +97,8 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_dual_cpu_fp16_swiglu_t",
     "qwen35_ane_dual_q4_swiglu_t",
     "qwen35_ane_dual_affine_swiglu_t",
+    "qwen35_ane_dual_q4_act_t",
+    "qwen35_ane_dual_affine_act_t",
     "qwen35_ane_dual_cpu_fp16_q4_swiglu_t",
     "qwen35_ane_q4_swiglu_down_t",
     "qwen35_ane_dual_q4_swiglu_down_t",
@@ -357,6 +361,8 @@ def qwen35_ane_hybrid_nax_enabled() -> bool:
     )
 
 
+_ANE_PROFILE_CATEGORIES = ("mlp", "gdn", "oproj")
+
 _ANE_PROFILE_KEYS = (
     "operations",
     "pack_ns",
@@ -393,11 +399,11 @@ def qwen35_ane_profile_snapshot() -> dict[str, dict[str, float]]:
         return {}
     values = list(_ext.qwen35_ane_profile_snapshot())
     width = len(_ANE_PROFILE_KEYS)
-    if len(values) != 2 * width:
+    if len(values) != len(_ANE_PROFILE_CATEGORIES) * width:
         return {}
     return {
         name: dict(zip(_ANE_PROFILE_KEYS, values[index * width : (index + 1) * width]))
-        for index, name in enumerate(("mlp", "gdn"))
+        for index, name in enumerate(_ANE_PROFILE_CATEGORIES)
     }
 
 
@@ -471,6 +477,8 @@ def qwen35_ane_affine_qmm_t(
     group_size: int = 128,
     profile_category: int = 1,
 ) -> mx.array:
+    if profile_category < 0 or profile_category >= len(_ANE_PROFILE_CATEGORIES):
+        raise ValueError("ANE profile category is out of range")
     if _ext is None or not hasattr(_ext, "qwen35_ane_affine_qmm_t"):
         raise RuntimeError("ANE hybrid affine qmm native kernel is unavailable")
     return _ext.qwen35_ane_affine_qmm_t(
@@ -614,6 +622,8 @@ def qwen35_ane_dual_affine_qmm_t(
     group_size: int = 128,
     profile_category: int = 1,
 ) -> mx.array:
+    if profile_category < 0 or profile_category >= len(_ANE_PROFILE_CATEGORIES):
+        raise ValueError("ANE profile category is out of range")
     if _ext is None or not hasattr(_ext, "qwen35_ane_dual_affine_qmm_t"):
         raise RuntimeError("Dual ANE hybrid affine qmm native kernel is unavailable")
     return _ext.qwen35_ane_dual_affine_qmm_t(
@@ -679,6 +689,120 @@ def qwen35_ane_dual_affine_swiglu_t(
         bits,
         variant,
         group_size,
+    )
+
+
+def qwen35_ane_q4_act_t(
+    x: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model,
+    variant: int = 8,
+    group_size: int = 128,
+    profile_category: int = 0,
+) -> mx.array:
+    """SwiGLU-in-ANE q4 merge: ANE rows are already the fused activation."""
+    if _ext is None or not hasattr(_ext, "qwen35_ane_q4_act_t"):
+        raise RuntimeError("ANE q4 SwiGLU-in-ANE native kernel is unavailable")
+    return _ext.qwen35_ane_q4_act_t(
+        x,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model,
+        variant,
+        group_size,
+        profile_category,
+    )
+
+
+def qwen35_ane_affine_act_t(
+    x: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    profile_category: int = 0,
+) -> mx.array:
+    """SwiGLU-in-ANE affine merge: ANE rows are already the fused activation."""
+    if _ext is None or not hasattr(_ext, "qwen35_ane_affine_act_t"):
+        raise RuntimeError(
+            "ANE hybrid affine SwiGLU-in-ANE native kernel is unavailable"
+        )
+    return _ext.qwen35_ane_affine_act_t(
+        x,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model,
+        bits,
+        variant,
+        group_size,
+        profile_category,
+    )
+
+
+def qwen35_ane_dual_q4_act_t(
+    x: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    variant: int = 8,
+    group_size: int = 128,
+    profile_category: int = 0,
+) -> mx.array:
+    """Dual-ANE SwiGLU-in-ANE q4 merge."""
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_q4_act_t"):
+        raise RuntimeError(
+            "Dual ANE hybrid q4 SwiGLU-in-ANE native kernel is unavailable"
+        )
+    return _ext.qwen35_ane_dual_q4_act_t(
+        x,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        variant,
+        group_size,
+        profile_category,
+    )
+
+
+def qwen35_ane_dual_affine_act_t(
+    x: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    profile_category: int = 0,
+) -> mx.array:
+    """Dual-ANE SwiGLU-in-ANE affine merge."""
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_affine_act_t"):
+        raise RuntimeError(
+            "Dual ANE hybrid affine SwiGLU-in-ANE native kernel is unavailable"
+        )
+    return _ext.qwen35_ane_dual_affine_act_t(
+        x,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        bits,
+        variant,
+        group_size,
+        profile_category,
     )
 
 

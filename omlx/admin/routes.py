@@ -163,6 +163,11 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
+    qwen35_ane_prefill_swiglu_in_ane: bool | None = None
+    qwen35_ane_prefill_moe_shared_expert: bool | None = None
+    qwen35_ane_prefill_oproj: bool | None = None
+    qwen35_ane_prefill_oproj_fraction: float | None = None
+    qwen35_ane_prefill_oproj_max_layers: int | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -2530,6 +2535,34 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
+    if "qwen35_ane_prefill_swiglu_in_ane" in sent:
+        current_settings.qwen35_ane_prefill_swiglu_in_ane = bool(
+            request.qwen35_ane_prefill_swiglu_in_ane
+        )
+    if "qwen35_ane_prefill_moe_shared_expert" in sent:
+        current_settings.qwen35_ane_prefill_moe_shared_expert = bool(
+            request.qwen35_ane_prefill_moe_shared_expert
+        )
+    if "qwen35_ane_prefill_oproj" in sent:
+        current_settings.qwen35_ane_prefill_oproj = bool(
+            request.qwen35_ane_prefill_oproj
+        )
+    if "qwen35_ane_prefill_oproj_fraction" in sent:
+        value = request.qwen35_ane_prefill_oproj_fraction
+        if value is None or not 0.05 <= value <= 0.90:
+            raise HTTPException(
+                status_code=400,
+                detail="o_proj ANE fraction must be between 0.05 and 0.90.",
+            )
+        current_settings.qwen35_ane_prefill_oproj_fraction = float(value)
+    if "qwen35_ane_prefill_oproj_max_layers" in sent:
+        value = request.qwen35_ane_prefill_oproj_max_layers
+        if value is None or value < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE o_proj layer limit must be positive.",
+            )
+        current_settings.qwen35_ane_prefill_oproj_max_layers = int(value)
     if (
         current_settings.qwen35_ane_prefill_fused_down
         and current_settings.qwen35_ane_prefill_fraction > 0.50
@@ -2569,6 +2602,17 @@ async def update_model_settings(
         raise HTTPException(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
+    if (
+        current_settings.qwen35_ane_prefill_swiglu_in_ane
+        and not current_settings.qwen35_ane_prefill_dual_ane
+    ):
+        # The gate/up pair is only staged by the dual ANE procedure bank.
+        # Without this check the save succeeds and the next load silently
+        # falls back to the standard SwiGLU merge.
+        raise HTTPException(
+            status_code=400,
+            detail="SwiGLU-in-ANE requires dual ANE.",
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:

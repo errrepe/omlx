@@ -1,0 +1,32 @@
+Loading /Volumes/SSD 4TB/AI Models/Jundot/Qwen3.8-27B-oQ4e-mtp
+ANE procedure bank compilation failed (1 banks per instance, 128 procedures, 14.53 GiB per instance)
+Traceback (most recent call last):
+  File "/Volumes/SSD 4TB/DEV/omlx/omlx/patches/qwen35_ane_prefill.py", line 2865, in _bank_split_ladder
+    span0, span1 = compile_span(start, stop)
+                   ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/Volumes/SSD 4TB/DEV/omlx/omlx/patches/qwen35_ane_prefill.py", line 3359, in <lambda>
+    builder0.compile(1, start, stop),
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+RuntimeError: ANE procedure bank compilation failed: Error Domain=com.apple.appleneuralengine.compiler Code=1 "_ANECompiler : ANECCompile() FAILED" UserInfo={NSLocalizedDescription=_ANECompiler : ANECCompile() FAILED, NSUnderlyingError=0x7cb44e8750 {Error Domain=com.apple.appleneuralengine.compiler Code=1 "ANECCompile(/var/folders/cx/4dqsb72n4j3f75j1vx4qqntr0000gn/T/FFC28004D281D2EE65D0D6F7162624A9C19854DFE0DB021DEE99238B7D473E42_05C4192E0D69B2A3B026846071CE7B35956F38B593FFD618D0CEB514EC8C538E_E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855/) FAILED: err=(
+)" UserInfo={NSLocalizedDescription=ANECCompile(/var/folders/cx/4dqsb72n4j3f75j1vx4qqntr0000gn/T/FFC28004D281D2EE65D0D6F7162624A9C19854DFE0DB021DEE99238B7D473E42_05C4192E0D69B2A3B026846071CE7B35956F38B593FFD618D0CEB514EC8C538E_E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855/) FAILED: err=(
+)}}}
+Traceback (most recent call last):
+  File "/Volumes/SSD 4TB/DEV/omlx/benchmarks/qwen35_ane_prefill_bench.py", line 564, in <module>
+    main()
+    ~~~~^^
+  File "/Volumes/SSD 4TB/DEV/omlx/benchmarks/qwen35_ane_prefill_bench.py", line 400, in main
+    mlp_layers = enable_qwen35_ane_prefill(
+        model,
+    ...<15 lines>...
+        moe_shared_expert=args.moe_shared_expert,
+    )
+  File "/Volumes/SSD 4TB/DEV/omlx/omlx/patches/qwen35_ane_prefill.py", line 4211, in enable_qwen35_ane_prefill
+    banked = _enable_dual_procedure_banks(
+        model,
+    ...<7 lines>...
+        oproj_config=oproj_config,
+    )
+  File "/Volumes/SSD 4TB/DEV/omlx/omlx/patches/qwen35_ane_prefill.py", line 3478, in _enable_dual_procedure_banks
+    linear._omlx_ane_oproj_config = oproj_config
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'tuple' object has no attribute '_omlx_ane_oproj_config' and no __dict__ for setting new attributes

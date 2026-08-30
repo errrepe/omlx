@@ -142,6 +142,17 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
+        qwen35_ane_prefill_swiglu_in_ane: Fold the SwiGLU activation into the
+            ANE gate/up program instead of applying it in the Metal merge.
+            Requires dual ANE and disables CPU gate/up and down sharing.
+        qwen35_ane_prefill_moe_shared_expert: Route the dense always-on shared
+            expert of MoE checkpoints through the ANE prefill path.
+        qwen35_ane_prefill_oproj: Split attention output projections across
+            ANE and GPU. Never applies to qkv/k/v projections.
+        qwen35_ane_prefill_oproj_fraction: Fraction of eligible o_proj output
+            rows assigned across the ANE instances.
+        qwen35_ane_prefill_oproj_max_layers: Maximum eligible attention layers
+            whose o_proj is accelerated.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -257,6 +268,11 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
+    qwen35_ane_prefill_swiglu_in_ane: bool = False
+    qwen35_ane_prefill_moe_shared_expert: bool = False
+    qwen35_ane_prefill_oproj: bool = False
+    qwen35_ane_prefill_oproj_fraction: float = 0.50
+    qwen35_ane_prefill_oproj_max_layers: int = 16
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

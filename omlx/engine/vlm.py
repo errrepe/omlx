@@ -2092,14 +2092,41 @@ class VLMBatchedEngine(BaseEngine):
                             "qwen35_ane_prefill_cpu_shared_resource",
                             True,
                         ),
+                        swiglu_in_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_swiglu_in_ane",
+                            False,
+                        ),
+                        moe_shared_expert=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_moe_shared_expert",
+                            False,
+                        ),
+                        oproj=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_oproj",
+                            False,
+                        ),
+                        oproj_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_oproj_fraction",
+                            0.50,
+                        ),
+                        oproj_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_oproj_max_layers",
+                            16,
+                        ),
                     )
 
                 ane_count = await loop.run_in_executor(
                     get_mlx_executor(),
                     _enable_ane_prefill,
                 )
-                if ane_count or getattr(
-                    self._vlm_model, "_omlx_ane_gdn_prefill_count", 0
+                if (
+                    ane_count
+                    or getattr(self._vlm_model, "_omlx_ane_gdn_prefill_count", 0)
+                    or getattr(self._vlm_model, "_omlx_ane_oproj_prefill_count", 0)
                 ):
                     configure_qwen35_ane_prefill_scheduler(
                         scheduler,

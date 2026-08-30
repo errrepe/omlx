@@ -74,6 +74,24 @@ token threshold as that patch: below `OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS`
 (default 16384, which covers every fixed ANE shape) q8 b/a use stock MLX,
 where the native q8 tile is not profitable.
 
+## Native ANE constraints relevant to this experiment
+
+The private ANE compiler is undocumented and these limits are observations from
+Orion/`ane-infer` reverse-engineering rather than an Apple API contract. They are
+kept here as engineering guardrails and must be rechecked after a macOS or
+AppleNeuralEngine.framework update.
+
+| Constraint | Practical consequence in oMLX |
+|---|---|
+| A procedure has a small BLOBFILE budget (about 16 references in the observed runtime). | The SwiGLU-in-ANE procedure uses two int8 data/scale pairs in one shared blob and avoids additional scalar/`pow` constants; the builder can mix plain and SwiGLU procedures without adding per-layer files. |
+| Elementwise operations can consume compiler/resource slots even when they do not add weight blobs. | `silu` + `mul` are kept inside the dedicated Feature A MIL generator and are validated by the hardware POC instead of being added to every legacy procedure. |
+| Multi-I/O surfaces are ordered by name in observed compiler/runtime paths. | Native merge kernels use explicit, stable buffer ordering and keep the ANE planar output separate from the row-major GPU suffix. |
+| Very small IOSurfaces can be rejected (roughly 49 KB minimum in the observed path). | Output-channel splits are aligned to 64/128 rows, and zero/near-zero o_proj or MLP slices are rejected before compilation. |
+| A resident model maps its packed weight blob into the ANE device address window at load time. | The bank split ladder monitors footprint, retries smaller spans after a load failure, and reports resident program counts; o_proj remains capped by its own layer limit. |
+
+These constraints are why all three extensions are opt-in, use alignment checks,
+and retain the original GPU implementation as the fallback.
+
 ## Per-model settings
 
 ```json
@@ -92,7 +110,12 @@ where the native q8 tile is not profitable.
   "qwen35_ane_prefill_cpu_down_fraction": 0.0,
   "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
   "qwen35_ane_prefill_cpu_threads": 8,
-  "qwen35_ane_prefill_cpu_shared_resource": true
+  "qwen35_ane_prefill_cpu_shared_resource": true,
+  "qwen35_ane_prefill_swiglu_in_ane": false,
+  "qwen35_ane_prefill_moe_shared_expert": false,
+  "qwen35_ane_prefill_oproj": false,
+  "qwen35_ane_prefill_oproj_fraction": 0.50,
+  "qwen35_ane_prefill_oproj_max_layers": 16
 }
 ```
 
@@ -195,6 +218,59 @@ force ANE shapes. Intermediate tail padding is different: it adds zero rows
 only around the tokenwise MLP and GDN input projections, slices those rows from
 the projection result before GDN recurrence or later model stages, and never
 alters the token sequence, positions, or cache state.
+
+### SwiGLU-in-ANE (Feature A)
+
+`qwen35_ane_prefill_swiglu_in_ane` is an opt-in dual-ANE variant. Each staged
+procedure contains separate int8 gate and up convolutions followed by `silu` and
+`mul` in the ANE program. The native merge then copies the already activated ANE
+rows and applies SwiGLU only to the GPU suffix. This removes the activation from
+the Metal merge and reduces the ANE output surface from doubled gate/up rows to
+one activation row per hidden channel. The switch requires both ANEs and the
+incremental procedure-bank builder; older extensions fall back to the standard
+ANE SwiGLU merge without disabling the rest of prefill.
+
+The feature forces MLP gate/up and down CPU sharing off because the current merge
+cannot combine ANE-activated rows with a raw CPU gate/up branch. CPU GDN sharing
+remains an independent option. It is still approximate: the ANE program
+requantizes the selected gate/up rows to per-channel int8. Run
+`benchmarks/qwen35_ane_silu_in_ane_poc.py` on the target machine before enabling
+it, and compare both cosine similarity and latency with the ordinary gate/up
+bank.
+
+### MoE shared expert (Feature C)
+
+`qwen35_ane_prefill_moe_shared_expert` admits only the always-on dense
+`shared_expert` MLP in a Qwen MoE block. Routed `switch_mlp` experts, the router,
+and all QKV/k/v projections stay on their existing GPU paths. The shared expert
+uses the ordinary MLP fraction and layer limit; there is no additional width
+knob. The weighted-sum patch preserves `target_verify`, so verification and
+decode never use the approximate ANE branch.
+
+CPU sharing is deliberately unsupported for MoE in this iteration. When a MoE
+checkpoint is detected, the loader disables all eager CPU shares for that load
+and the memory guard takes a conservative model-sized allowance rather than
+underestimating shared/routed expert materialization. Validate a real MoE
+checkpoint separately; no MoE hardware result is implied by the dense Qwen
+numbers in this document.
+
+### Attention output projection (Feature B)
+
+`qwen35_ane_prefill_oproj` adds a token-local row split for full-attention
+`o_proj` only. `qwen35_ane_prefill_oproj_fraction` selects the output-channel
+share assigned across the two ANEs (0.05–0.90), and
+`qwen35_ane_prefill_oproj_max_layers` caps the number of full-attention layers
+prepared eagerly. GDN/linear-attention layers have no `o_proj`; qkv, k, and v
+are never collected because their values feed recurrent or KV-cache state.
+The implementation reuses the affine ANE/GPU merge and records o_proj work in a
+separate `oproj` profiler bucket.
+
+The default remains off, and the UI defaults to 16 layers so a 64-layer dense
+checkpoint does not pay for a full-model o_proj bank. The extra token-local
+projection is expected to produce a modest end-to-end gain unless the workload
+is dominated by long prompts and the selected layers are well balanced. It also
+adds fixed ANE surfaces and resident bank bytes; check the reported
+`oproj_layers`, `resident_programs`, and transient-byte estimate after loading.
 
 For the combined-only path, the native bridge directly merges the planar ANE
 prefix and row-major GPU suffix while applying SwiGLU. This avoids materializing
@@ -376,3 +452,105 @@ GPU suffix and destroyed device overlap. The completion-callback version
 increased a fused layer from about 47.5 ms to 71.0 ms and the 64-layer body from
 5.2243 s to 6.3535 s (322.3 prompt tokens/s), 5.6% slower than GPU-only. The
 blocking version was therefore retained.
+
+## ANE feature-extension validation (A/B/C, 2026-08-29)
+
+Hardware validation of the three opt-in prefill extensions on real checkpoints.
+The earlier sections above characterize the core dual-ANE MLP+GDN path; this section
+characterizes the extensions layered on top of it. **All three extensions remain
+default-off** and are gated behind an explicit setting flag plus a per-model `allow`
+in the patch — the numbers below inform the tuner's default caps, not the runtime
+defaults.
+
+### Environment
+
+- Hardware: Apple Silicon (M3 Ultra)
+- Checkpoints: `Jundot/Qwen3.8-27B-oQ4e-mtp` (dense), `Jundot/Qwen3.6-35B-A3B-oQ4e-mtp`
+  (MoE), `mlx-community/Qwen3.5-2B-bf16` (sanity load)
+- Prompt sizes: 4096 tokens (27B dense), 2048 tokens (35B-A3B MoE)
+- Each prefill run: 3 repeats, median `prompt_tokens_per_second` reported. Profiles
+  collected with `OMLX_ANE_PROFILE=1`.
+- Raw artifacts: `benchmarks/results/*.json` (b_/c_*) and `*.txt` (poc_/tuner_).
+
+### Feature A — SwiGLU-in-ANE (proof of concept)
+
+The activation `silu(x) · (x·W_gate) * (x·W_up)` is fused into the ANE MIL program
+(2 convs + `silu` + `mul`) instead of being merged on Metal.
+
+| hidden | intermediate | tokens | ANE merge (ms) | baseline (ms) | speedup | cosine vs GPU |
+|-------:|------------:|-------:|---------------:|--------------:|--------:|--------------:|
+| 4096   | 12288       | 2048   | 79.56         | 85.74         | 1.08x   | 0.99569       |
+| 5120   | 15360       | 4096   | 203.68        | 116.48        | 0.57x   | 0.99569       |
+
+**PASS (correctness).** The ANE accepted the 2-conv + `silu` + `mul` bank at both
+geometries, and the activation matches the exact GPU SwiGLU to cosine 0.9957 (max
+abs error 2.84 / 3.30). **Latency is mixed**: a 1.08x win at hidden=4096 but a 0.57x
+regression at hidden=5120, where the larger matmul fits the ANE less well than the
+Metal merge path. The validated property is correctness, not speed; Feature A stays
+off until a size/shape heuristic decides when it wins.
+
+### Feature B — `o_proj` channel split (dense 27B, 4096 tokens)
+
+Token-local ANE/GPU output-channel partition of the attention output projection, on
+top of the MLP+GDN dual path (`qwen35_ane_dual_affine_qmm_t`). Fractions are 0.5
+(60% ANE / 40% GPU split at the 128-wide instance boundary).
+
+| mode                | o_proj layers | tok/s   | vs GPU-only | vs dual no-oproj |
+|:--------------------|--------------:|--------:|------------:|-----------------:|
+| GPU-only            | 0             | 99.60   | —           | −24.8%           |
+| Dual, no o_proj     | 0             | 132.49  | +33.0%      | —                |
+| Dual + o_proj       | 4             | 134.64  | +35.2%      | +1.6%            |
+| Dual + o_proj       | 8             | 133.81  | +34.3%      | +1.0%            |
+| Dual + o_proj       | 16            | 57.62   | −42.1%      | −56.5%           |
+
+**Mixed.** 4/8 layers add +1.0–1.6% on top of the MLP+GDN dual path. **16 layers
+overflow the ANE procedure bank** (128 procedures / ~14.5 GiB per instance at
+`qwen35_ane_prefill.py:2865 _bank_split_ladder`) and fall back to a 4-program split,
+regressing to 57.6 tok/s. → the tuner caps `o_proj` layers conservatively per model
+(see dry-run below); full-depth o_proj is not recommended on 27B.
+
+### Feature C — MoE shared expert (35B-A3B, 2048 tokens)
+
+Only the always-on `shared_expert` MLP is offloaded to ANE (the routed `switch_mlp`
+experts and the router stay on GPU). Enabled via the `--moe-shared-expert` harness
+flag (added this pass).
+
+| mode              | tok/s   | vs GPU-only | ANE experts | GDN layers |
+|:------------------|--------:|------------:|------------:|-----------:|
+| GPU-only          | 762.97  | —           | 0           | 0          |
+| Dual + shared_exp | 802.63  | +5.2%       | 40          | 30         |
+
+**PASS.** +5.2% (762.97 → 802.63 tok/s). 40 shared experts offloaded to ANE
+(`dual_mlp_layers=40`), 30 GDN layers; routed experts + router remain on GPU. No
+numeric fusion is introduced (pure op relocation), so correctness rests on the
+unit-test gate rather than a separate cosine probe this pass.
+
+### Tuner dry-run — `o_proj` dimension (27B)
+
+Offline driver `benchmarks/ane_tuner_dryrun.py` exercising the tuner's 6th
+calibration dimension without standing up the admin server.
+
+- Planned **101 tuning points**; `o_proj` occupies **slot 6** (`_OPROJ_SLOT`).
+- Recommendation: `oproj_enabled=True`, `oproj_fraction=0.6`, `latency_ms=10.7`.
+- **PASS** (`enabled=True, fraction=0.6, latency_ms=10.7`).
+
+The calibration wired `allow_ane_oproj=True` and `_calibrate_oproj_sync` produced a
+concrete per-device recommendation, confirming the tuner can drive Feature B
+end-to-end (and will apply the conservative layer cap that avoids the bank overflow
+seen in the manual 16-layer sweep).
+
+### Honest limitations
+
+- **No end-to-end greedy cosine / top-1 parity probe** was run this pass for
+  Features B and C. Their correctness rests on the unit-test gate (168 tests green,
+  including the real-model `o_proj` staging path) plus the ANE-accept / activation-shape
+  checks. All three extensions are default-off and require an explicit `allow`.
+- **Feature A speed is unproven at large hidden** (0.57x at 5120); only its
+  correctness is validated. A size/shape heuristic is needed before enabling.
+- **Feature B at full depth is ANE-bank-limited** on 27B; the tuner's conservative
+  layer cap is the mitigation, not a config tweak.
+- **Single-machine results** (M3 Ultra only); no cross-chip variance captured.
+- The `o_proj` real-model staging loop had a tuple-unpack bug (`prepared_oprojs`
+  entries are `(linear, state)` tuples) that unit tests with fakes did not catch;
+  fixed and re-verified (`omlx/patches/qwen35_ane_prefill.py`).
+

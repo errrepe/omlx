@@ -45,6 +45,9 @@ final class ModelSettingsScreenVM {
         case qwen35AnePrefillCpuDownFraction
         case qwen35AnePrefillCpuGdnFraction
         case qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuSharedResource
+        case qwen35AnePrefillSwigluInAne, qwen35AnePrefillMoeSharedExpert
+        case qwen35AnePrefillOproj, qwen35AnePrefillOprojFraction
+        case qwen35AnePrefillOprojMaxLayers
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
         case dflashEnabled, dflashDraftModel, dflashMaxCtx
@@ -286,6 +289,11 @@ final class ModelSettingsScreenVM {
     var qwen35AnePrefillCpuThreads: String = "8"
     var qwen35AnePrefillCpuSharedResource: Bool = true
     var qwen35AnePrefillFusedDown: Bool = false
+    var qwen35AnePrefillSwigluInAne: Bool = false
+    var qwen35AnePrefillMoeSharedExpert: Bool = false
+    var qwen35AnePrefillOproj: Bool = false
+    var qwen35AnePrefillOprojFraction: String = "0.5"
+    var qwen35AnePrefillOprojMaxLayers: String = "16"
     var aneTuningID: String?
     var aneTuningIsRunning: Bool = false
     var aneTuningStatus: ANETuningStatusResponse?
@@ -295,6 +303,7 @@ final class ModelSettingsScreenVM {
     var aneTuningAllowANEGDN: Bool = true
     var aneTuningAllowCPUGDN: Bool = true
     var aneTuningAllowCPUSharedResource: Bool = true
+    var aneTuningAllowANEOProj: Bool = true
 
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
@@ -404,6 +413,12 @@ final class ModelSettingsScreenVM {
              .qwen35AnePrefillCpuDownFraction, .qwen35AnePrefillCpuGdnFraction:
             return true
         case .qwen35AnePrefillCpuThreads, .qwen35AnePrefillCpuSharedResource:
+            return true
+        case .qwen35AnePrefillSwigluInAne, .qwen35AnePrefillMoeSharedExpert:
+            return true
+        case .qwen35AnePrefillOproj, .qwen35AnePrefillOprojFraction:
+            return true
+        case .qwen35AnePrefillOprojMaxLayers:
             return true
         case .indexCacheEnabled, .indexCacheFreq:
             return true
@@ -553,6 +568,11 @@ final class ModelSettingsScreenVM {
                 self.qwen35AnePrefillCpuThreads = s?.qwen35AnePrefillCpuThreads.map(String.init) ?? "8"
                 self.qwen35AnePrefillCpuSharedResource = s?.qwen35AnePrefillCpuSharedResource ?? true
                 self.qwen35AnePrefillFusedDown = s?.qwen35AnePrefillFusedDown ?? false
+                self.qwen35AnePrefillSwigluInAne = s?.qwen35AnePrefillSwigluInAne ?? false
+                self.qwen35AnePrefillMoeSharedExpert = s?.qwen35AnePrefillMoeSharedExpert ?? false
+                self.qwen35AnePrefillOproj = s?.qwen35AnePrefillOproj ?? false
+                self.qwen35AnePrefillOprojFraction = s?.qwen35AnePrefillOprojFraction.map { Self.formatPct($0) } ?? "0.5"
+                self.qwen35AnePrefillOprojMaxLayers = s?.qwen35AnePrefillOprojMaxLayers.map(String.init) ?? "16"
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
                 self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
                 self.specprefillEnabled = s?.specprefillEnabled ?? false
@@ -762,6 +782,27 @@ final class ModelSettingsScreenVM {
             }
         case .qwen35AnePrefillCpuSharedResource:
             patch.qwen35AnePrefillCpuSharedResource = qwen35AnePrefillCpuSharedResource
+        case .qwen35AnePrefillSwigluInAne:
+            // The gate/up pair is only staged by the dual-ANE procedure bank.
+            guard qwen35AnePrefillDualAne else {
+                lastError = "SwiGLU-in-ANE requires dual ANE."
+                return
+            }
+            patch.qwen35AnePrefillSwigluInAne = qwen35AnePrefillSwigluInAne
+        case .qwen35AnePrefillMoeSharedExpert:
+            patch.qwen35AnePrefillMoeSharedExpert = qwen35AnePrefillMoeSharedExpert
+        case .qwen35AnePrefillOproj:
+            patch.qwen35AnePrefillOproj = qwen35AnePrefillOproj
+        case .qwen35AnePrefillOprojFraction:
+            switch QwenAneSettingsValidator.oprojFraction(qwen35AnePrefillOprojFraction) {
+            case .success(let value): patch.qwen35AnePrefillOprojFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
+        case .qwen35AnePrefillOprojMaxLayers:
+            switch QwenAneSettingsValidator.oprojLayers(qwen35AnePrefillOprojMaxLayers) {
+            case .success(let value): patch.qwen35AnePrefillOprojMaxLayers = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .indexCacheEnabled:
             patch.indexCacheFreq = indexCacheEnabled ? (Int(indexCacheFreq) ?? 4) : 0
         case .indexCacheFreq:
@@ -842,7 +883,8 @@ final class ModelSettingsScreenVM {
                         && aneTuningAllowANEGDN
                         && aneTuningAllowCPUGDN,
                     allowCpuSharedResource: aneTuningAllowCPU
-                        && aneTuningAllowCPUSharedResource
+                        && aneTuningAllowCPUSharedResource,
+                    allowAneOproj: aneTuningAllowANEOProj
                 )
             )
             aneTuningID = started.tuningId
@@ -911,6 +953,10 @@ final class ModelSettingsScreenVM {
         }
         if let sharedResource = recommendation.cpuSharedResource {
             qwen35AnePrefillCpuSharedResource = sharedResource
+        }
+        qwen35AnePrefillOproj = recommendation.oprojEnabled ?? false
+        if let fraction = recommendation.oprojFraction {
+            qwen35AnePrefillOprojFraction = Self.formatPct(fraction)
         }
         profileDirty = true
         lastError = nil
@@ -1176,6 +1222,13 @@ final class ModelSettingsScreenVM {
                     putDouble(ProfileSettingsKey.qwen35AnePrefillCpuGdnFraction, qwen35AnePrefillCpuGdnFraction)
                     putInt(ProfileSettingsKey.qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuThreads)
                     putBool(ProfileSettingsKey.qwen35AnePrefillCpuSharedResource, qwen35AnePrefillCpuSharedResource)
+                }
+                putBool(ProfileSettingsKey.qwen35AnePrefillSwigluInAne, qwen35AnePrefillSwigluInAne)
+                putBool(ProfileSettingsKey.qwen35AnePrefillMoeSharedExpert, qwen35AnePrefillMoeSharedExpert)
+                putBool(ProfileSettingsKey.qwen35AnePrefillOproj, qwen35AnePrefillOproj)
+                if qwen35AnePrefillOproj {
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillOprojFraction, qwen35AnePrefillOprojFraction)
+                    putInt(ProfileSettingsKey.qwen35AnePrefillOprojMaxLayers, qwen35AnePrefillOprojMaxLayers)
                 }
             }
             if indexCacheEnabled, let n = Int(indexCacheFreq), n >= 2 {
@@ -1688,6 +1741,16 @@ enum QwenAneSettingsValidator {
     static func gdnLayers(_ raw: String) -> Result<Int, SamplingValidationError> {
         integer(raw, label: "ANE GDN layer limit") { $0 >= 0
             ? nil : "ANE GDN layer limit must be zero or greater."
+        }
+    }
+
+    static func oprojFraction(_ raw: String) -> Result<Double, SamplingValidationError> {
+        fraction(raw, label: "o_proj ANE fraction", range: 0.05...0.90)
+    }
+
+    static func oprojLayers(_ raw: String) -> Result<Int, SamplingValidationError> {
+        integer(raw, label: "ANE o_proj layer limit") { $0 >= 1
+            ? nil : "ANE o_proj layer limit must be positive."
         }
     }
 

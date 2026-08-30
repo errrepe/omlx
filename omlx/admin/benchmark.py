@@ -256,6 +256,24 @@ _FEATURE_FLAG_SPECS = (
         "qwen35_ane_prefill",
         "Qwen ANE Prefill",
     ),
+    _FeatureFlagSpec(
+        "qwen35_ane_prefill_swiglu_in_ane",
+        "qwen35_ane_swiglu_in_ane",
+        "qwen35_ane_swiglu_in_ane",
+        "ANE SwiGLU-in-ANE",
+    ),
+    _FeatureFlagSpec(
+        "qwen35_ane_prefill_moe_shared_expert",
+        "qwen35_ane_moe_shared_expert",
+        "qwen35_ane_moe_shared_expert",
+        "ANE MoE Shared Expert",
+    ),
+    _FeatureFlagSpec(
+        "qwen35_ane_prefill_oproj",
+        "qwen35_ane_oproj",
+        "qwen35_ane_oproj",
+        "ANE o_proj Split",
+    ),
 )
 
 
@@ -383,6 +401,11 @@ _UPLOADED_SETTING_FIELDS = (
     "qwen35_ane_prefill_cpu_gdn_fraction",
     "qwen35_ane_prefill_cpu_threads",
     "qwen35_ane_prefill_cpu_shared_resource",
+    "qwen35_ane_prefill_swiglu_in_ane",
+    "qwen35_ane_prefill_moe_shared_expert",
+    "qwen35_ane_prefill_oproj",
+    "qwen35_ane_prefill_oproj_fraction",
+    "qwen35_ane_prefill_oproj_max_layers",
 )
 
 _PATH_VALUED_SETTING_FIELDS = frozenset(
@@ -962,6 +985,7 @@ def _log_ane_benchmark_trace(
     for category, layer_key, compiled_key in (
         ("mlp", "mlp_layers", "compiled_mlp_layers"),
         ("gdn", "gdn_layers", "compiled_gdn_layers"),
+        ("oproj", "oproj_layers", "compiled_oproj_layers"),
     ):
         values = profile.get(category, {})
         operations = int(values.get("operations", 0) or 0)
@@ -975,6 +999,13 @@ def _log_ane_benchmark_trace(
         layers = (
             compiled_layers if compiled_layers is not None else configured_layers
         )
+        if category == "mlp" and config.get("moe_shared_expert"):
+            # MoE routing is intentionally not profiled on ANE. The only MoE
+            # MLP work represented here is the always-on shared expert, whose
+            # compiled count is the authoritative layer count when available.
+            shared_compiled = config.get("compiled_moe_shared_expert_layers")
+            if shared_compiled is not None:
+                layers = int(shared_compiled)
         observed_shapes = operations / layers if layers > 0 else 0.0
         expected_operations = full_shapes * layers
         per_op = max(operations, 1)
@@ -1852,7 +1883,13 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             compiled_gdn = getattr(
                 loaded_model, "_omlx_ane_gdn_prefill_count", None
             )
-            ane_active = bool(compiled_mlp or compiled_gdn)
+            compiled_oproj = getattr(
+                loaded_model, "_omlx_ane_oproj_prefill_count", None
+            )
+            compiled_moe_shared = getattr(
+                loaded_model, "_omlx_ane_moe_shared_expert_count", None
+            )
+            ane_active = bool(compiled_mlp or compiled_gdn or compiled_oproj)
             ane_trace_config = {
                 "sequence_length": int(
                     getattr(
@@ -1875,11 +1912,39 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                     if gdn_enabled
                     else 0
                 ),
+                "oproj_layers": (
+                    int(
+                        getattr(
+                            model_settings,
+                            "qwen35_ane_prefill_oproj_max_layers",
+                            0,
+                        )
+                    )
+                    if bool(
+                        getattr(model_settings, "qwen35_ane_prefill_oproj", False)
+                    )
+                    else 0
+                ),
+                "moe_shared_expert": bool(
+                    getattr(
+                        model_settings,
+                        "qwen35_ane_prefill_moe_shared_expert",
+                        False,
+                    )
+                ),
                 "compiled_mlp_layers": (
                     None if compiled_mlp is None else int(compiled_mlp)
                 ),
                 "compiled_gdn_layers": (
                     None if compiled_gdn is None else int(compiled_gdn)
+                ),
+                "compiled_oproj_layers": (
+                    None if compiled_oproj is None else int(compiled_oproj)
+                ),
+                "compiled_moe_shared_expert_layers": (
+                    None
+                    if compiled_moe_shared is None
+                    else int(compiled_moe_shared)
                 ),
                 "active": ane_active,
             }

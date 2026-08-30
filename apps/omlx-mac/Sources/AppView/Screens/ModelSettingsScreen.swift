@@ -1187,6 +1187,7 @@ private struct ExperimentalSection: View {
                                     isOn: $vm.aneTuningAllowCPUSharedResource
                                 )
                                 .disabled(!vm.aneTuningAllowCPU)
+                                Toggle("Allow o_proj on ANE", isOn: $vm.aneTuningAllowANEOProj)
                             }
                             .menuStyle(.borderlessButton)
                             .fixedSize()
@@ -1429,6 +1430,63 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.qwen35AnePrefillGdnMaxLayers),
                                       placeholder: "48", mono: true,
                                       isNumeric: true, range: 0...256,
+                                      step: 1, width: 190)
+                        }
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.swiglu_in_ane.label",
+                                      defaultValue: "SwiGLU on ANE",
+                                      comment: "Row label for folding the SwiGLU activation into the ANE program"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.swiglu_in_ane.sub",
+                                         defaultValue: "Applies silu(gate)*up inside the ANE gate/up program so the merge only activates the GPU suffix. Requires both ANEs and disables CPU sharing.",
+                                         comment: "Sublabel explaining SwiGLU-in-ANE")) {
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillSwigluInAne))
+                            .labelsHidden().toggleStyle(.switch)
+                            .disabled(!vm.qwen35AnePrefillDualAne)
+                            .help(!vm.qwen35AnePrefillDualAne
+                                  ? String(localized: "settings.experimental.qwen_ane.swiglu_in_ane.needs_dual",
+                                           defaultValue: "SwiGLU-in-ANE requires dual ANE.",
+                                           comment: "Explanation shown when SwiGLU-in-ANE is disabled because dual ANE is off")
+                                  : "")
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.moe_shared_expert.label",
+                                      defaultValue: "MoE Shared Expert on ANE",
+                                      comment: "Row label for MoE shared expert ANE acceleration"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.moe_shared_expert.sub",
+                                         defaultValue: "Also split the always-on dense shared expert of MoE checkpoints. Routed experts stay on GPU; the router is never approximated.",
+                                         comment: "Sublabel describing MoE shared expert ANE acceleration")) {
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillMoeSharedExpert))
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.oproj.label",
+                                      defaultValue: "o_proj on ANE",
+                                      comment: "Row label for splitting attention output projections across ANE and GPU"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.oproj.sub",
+                                         defaultValue: "Splits attention output projections by output channel. Token-local and safe for INT8, unlike qkv/k/v which feed the KV cache.",
+                                         comment: "Sublabel describing the ANE o_proj split")) {
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillOproj))
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                    if vm.qwen35AnePrefillOproj {
+                        Row(label: String(localized: "settings.experimental.qwen_ane.oproj_fraction.label",
+                                          defaultValue: "o_proj on ANE",
+                                          comment: "Row label for the Qwen o_proj ANE workload fraction"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.oproj_fraction.sub",
+                                             defaultValue: "Output channels assigned to both ANEs; the GPU handles the remainder.",
+                                             comment: "Sublabel explaining the Qwen o_proj ANE workload fraction")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillOprojFraction),
+                                      placeholder: "0.5", mono: true,
+                                      isNumeric: true, range: 0.05...0.90,
+                                      step: 0.005, width: 190)
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.oproj_layers.label",
+                                          defaultValue: "o_proj Layer Limit",
+                                          comment: "Row label for the maximum number of Qwen attention layers whose o_proj is placed on ANE"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.oproj_layers.sub",
+                                             defaultValue: "Maximum eligible attention layers prepared eagerly. Only full-attention layers have an o_proj.",
+                                             comment: "Sublabel explaining the maximum number of Qwen o_proj ANE layers")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillOprojMaxLayers),
+                                      placeholder: "16", mono: true,
+                                      isNumeric: true, range: 1...256,
                                       step: 1, width: 190)
                         }
                     }
@@ -1803,6 +1861,10 @@ private struct ExperimentalSection: View {
             parts.append("GDN ANE \(gdn)%")
         } else {
             parts.append("GDN off")
+        }
+        if recommendation.oprojEnabled == true {
+            let oproj = Int(((recommendation.oprojFraction ?? 0) * 100).rounded())
+            parts.append("o_proj ANE \(oproj)%")
         }
         if recommendation.cpuEnabled == true {
             let gate = Int(((recommendation.cpuFraction ?? 0) * 100).rounded())

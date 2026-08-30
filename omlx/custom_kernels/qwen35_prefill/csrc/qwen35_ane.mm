@@ -62,7 +62,9 @@ enum ProfileMetric : size_t {
 
 using ProfileCategory =
     std::array<std::atomic<uint64_t>, kProfileMetricCount>;
-ProfileCategory g_ane_profile[2]{};
+// Category 0: MLP/SwiGLU, 1: GDN/down, 2: attention o_proj.
+constexpr size_t kProfileCategoryCount = 3;
+ProfileCategory g_ane_profile[kProfileCategoryCount]{};
 std::atomic<uint64_t> g_previous_ane_done_ns{0};
 std::atomic<int> g_ane_profile_override{-1};
 
@@ -1510,7 +1512,7 @@ void qwen35_ane_profile_reset() {
 
 std::vector<double> qwen35_ane_profile_snapshot() {
   std::vector<double> result;
-  result.reserve(2 * kProfileMetricCount);
+  result.reserve(kProfileCategoryCount * kProfileMetricCount);
   for (const auto &category : g_ane_profile) {
     for (const auto &metric : category) {
       result.push_back(static_cast<double>(
@@ -3049,14 +3051,15 @@ public:
            fuse_swiglu_ == rhs.fuse_swiglu_ &&
            profile_category_ == rhs.profile_category_ &&
            cpu_fp16_ == rhs.cpu_fp16_ && cpu_threads_ == rhs.cpu_threads_ &&
-           cpu_shared_resource_ == rhs.cpu_shared_resource_;
+           cpu_shared_resource_ == rhs.cpu_shared_resource_ &&
+           ane_act_ == rhs.ane_act_;
   }
   auto state() const {
     return std::make_tuple(reinterpret_cast<uintptr_t>(model0_.get()),
                            reinterpret_cast<uintptr_t>(model1_.get()), bits_,
                            variant_, group_size_, fuse_swiglu_,
                            profile_category_, cpu_fp16_, cpu_threads_,
-                           cpu_shared_resource_);
+                           cpu_shared_resource_, ane_act_);
   }
 
 private:
@@ -3070,6 +3073,7 @@ private:
   bool cpu_fp16_;
   int cpu_threads_;
   bool cpu_shared_resource_;
+  bool ane_act_;
 };
 
 class AneHybridQ4SwiGLUDownPrimitive : public Primitive {
@@ -3847,6 +3851,113 @@ array qwen35_ane_dual_q4_swiglu_t(
   return qwen35_ane_dual_affine_swiglu_t(
       x, gpu_weight, gpu_scales, gpu_biases, ane_model0, ane_model1, 4,
       variant, group_size, s);
+}
+
+// SwiGLU-in-ANE entrances. The ANE programs return fused activation rows
+// (silu(gate)*up computed on the Neural Engine), so the GPU only has to
+// produce and activate the split suffix. ``ane0_n``/``ane1_n`` are therefore
+// activation rows (no even/2 requirement), while ``gpu_n`` remains the
+// doubled gate+up row count of the quantized suffix.
+array qwen35_ane_affine_act_t(
+    const array &x, const array &gpu_weight, const array &gpu_scales,
+    const array &gpu_biases, const std::shared_ptr<AneLinearModel> &ane_model,
+    int bits, int variant, int group_size, int profile_category,
+    StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (!ane_model || stream.device == Device::cpu ||
+      (x.dtype() != float16 && x.dtype() != bfloat16) || x.ndim() < 2 ||
+      !row_contiguous(x) || gpu_weight.dtype() != mlx::core::uint32 ||
+      gpu_scales.dtype() != x.dtype() || gpu_biases.dtype() != x.dtype() ||
+      gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
+      gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
+      !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
+      (bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
+      (group_size != 64 && group_size != 128) || variant != 8) {
+    throw std::invalid_argument("Unsupported ANE SwiGLU-in-ANE configuration.");
+  }
+  const int K = static_cast<int>(x.shape(-1));
+  const int M = static_cast<int>(x.size() / K);
+  const int gpu_n = static_cast<int>(gpu_weight.shape(0));
+  const int ane_n = ane_model->output_dim();
+  if (K != ane_model->input_dim() || M != ane_model->sequence_length() ||
+      ane_n <= 0 || gpu_n <= 0 || gpu_n % 128 != 0 || K % group_size != 0 ||
+      gpu_weight.shape(1) * 32 != K * bits || gpu_scales.shape(0) != gpu_n ||
+      gpu_scales.shape(1) != K / group_size) {
+    throw std::invalid_argument("ANE SwiGLU-in-ANE shape mismatch.");
+  }
+  Shape shape = x.shape();
+  shape.back() = ane_n + gpu_n / 2;
+  return array(std::move(shape), x.dtype(),
+               std::make_shared<AneHybridQ4Primitive>(
+                   stream, ane_model, bits, variant, group_size,
+                   /* fuse_swiglu */ false, profile_category,
+                   /* cpu_fp16 */ false, /* cpu_threads */ 0,
+                   /* cpu_shared_resource */ false, /* ane_act */ true),
+               std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
+}
+
+array qwen35_ane_q4_act_t(const array &x, const array &gpu_weight,
+                          const array &gpu_scales, const array &gpu_biases,
+                          const std::shared_ptr<AneLinearModel> &ane_model,
+                          int variant, int group_size, int profile_category,
+                          StreamOrDevice s) {
+  return qwen35_ane_affine_act_t(x, gpu_weight, gpu_scales, gpu_biases,
+                                 ane_model, 4, variant, group_size,
+                                 profile_category, s);
+}
+
+array qwen35_ane_dual_affine_act_t(
+    const array &x, const array &gpu_weight, const array &gpu_scales,
+    const array &gpu_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int bits, int variant,
+    int group_size, int profile_category, StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (!ane_model0 || !ane_model1 || stream.device == Device::cpu ||
+      (x.dtype() != float16 && x.dtype() != bfloat16) || x.ndim() < 2 ||
+      !row_contiguous(x) || gpu_weight.dtype() != mlx::core::uint32 ||
+      gpu_scales.dtype() != x.dtype() || gpu_biases.dtype() != x.dtype() ||
+      gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
+      gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
+      !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
+      (bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
+      (group_size != 64 && group_size != 128) || variant != 8) {
+    throw std::invalid_argument(
+        "Unsupported dual ANE SwiGLU-in-ANE configuration.");
+  }
+  const int K = static_cast<int>(x.shape(-1));
+  const int M = static_cast<int>(x.size() / K);
+  const int gpu_n = static_cast<int>(gpu_weight.shape(0));
+  const int ane0_n = ane_model0->output_dim();
+  const int ane1_n = ane_model1->output_dim();
+  if (K != ane_model0->input_dim() || K != ane_model1->input_dim() ||
+      M != ane_model0->sequence_length() ||
+      M != ane_model1->sequence_length() || ane0_n <= 0 || ane1_n <= 0 ||
+      gpu_n <= 0 || gpu_n % 128 != 0 || K % group_size != 0 ||
+      gpu_weight.shape(1) * 32 != K * bits || gpu_scales.shape(0) != gpu_n ||
+      gpu_scales.shape(1) != K / group_size) {
+    throw std::invalid_argument("Dual ANE SwiGLU-in-ANE shape mismatch.");
+  }
+  Shape shape = x.shape();
+  shape.back() = ane0_n + ane1_n + gpu_n / 2;
+  return array(std::move(shape), x.dtype(),
+               std::make_shared<DualAneHybridPrimitive>(
+                   stream, ane_model0, ane_model1, bits, variant, group_size,
+                   /* fuse_swiglu */ false, profile_category,
+                   /* cpu_fp16 */ false, /* cpu_threads */ 0,
+                   /* cpu_shared_resource */ false, /* ane_act */ true),
+               std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
+}
+
+array qwen35_ane_dual_q4_act_t(
+    const array &x, const array &gpu_weight, const array &gpu_scales,
+    const array &gpu_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int variant,
+    int group_size, int profile_category, StreamOrDevice s) {
+  return qwen35_ane_dual_affine_act_t(x, gpu_weight, gpu_scales, gpu_biases,
+                                      ane_model0, ane_model1, 4, variant,
+                                      group_size, profile_category, s);
 }
 
 array qwen35_ane_dual_cpu_fp16_q4_swiglu_t(

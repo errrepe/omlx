@@ -74,6 +74,12 @@ NB_MODULE(_ext, m) {
           &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::add,
           "weight"_a,
           nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "add_swiglu",
+          &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::add_swiglu,
+          "gate"_a,
+          "up"_a,
+          nb::call_guard<nb::gil_scoped_release>())
       .def_prop_ro(
           "size",
           &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::size)
@@ -299,6 +305,58 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
+      "stream"_a = nb::none());
+  // SwiGLU-in-ANE: the ANE programs return fused activation rows.
+  m.def(
+      "qwen35_ane_q4_act_t", &omlx::qwen35_prefill_kernels::qwen35_ane_q4_act_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "profile_category"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_affine_act_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_affine_act_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "profile_category"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_q4_act_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_q4_act_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "profile_category"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_affine_act_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_affine_act_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "profile_category"_a = 0,
       "stream"_a = nb::none());
   m.def(
       "qwen35_ane_dual_cpu_fp16_q4_swiglu_t",

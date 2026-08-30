@@ -233,6 +233,7 @@ struct ANETuningStartRequest: Encodable, Sendable {
     let allowAneGdn: Bool
     let allowCpuGdn: Bool
     let allowCpuSharedResource: Bool
+    let allowAneOproj: Bool
 }
 
 struct ANETuningStartResponse: Codable, Sendable {
@@ -254,6 +255,8 @@ struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
     let cpuDownFraction: Double?
     let cpuGdnFraction: Double?
     let fusedDown: Bool?
+    let oprojEnabled: Bool?
+    let oprojFraction: Double?
     let state: String?
     let processingTps: Double?
     let latencyMs: Double?
@@ -276,6 +279,8 @@ struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
     let fusedDown: Bool?
     let cpuThreads: Int?
     let cpuSharedResource: Bool?
+    let oprojEnabled: Bool?
+    let oprojFraction: Double?
     // Null when the tuner returned a verdict without measuring, e.g. the
     // GPU-only preflight on machines without the ANE compiler (#3067).
     let processingTps: Double?

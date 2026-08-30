@@ -125,6 +125,11 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen35AnePrefillCpuGdnFraction: Double?
     let qwen35AnePrefillCpuThreads: Int?
     let qwen35AnePrefillCpuSharedResource: Bool?
+    let qwen35AnePrefillSwigluInAne: Bool?
+    let qwen35AnePrefillMoeSharedExpert: Bool?
+    let qwen35AnePrefillOproj: Bool?
+    let qwen35AnePrefillOprojFraction: Double?
+    let qwen35AnePrefillOprojMaxLayers: Int?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -208,6 +213,11 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen35AnePrefillCpuGdnFraction: Double? = nil
     var qwen35AnePrefillCpuThreads: Int? = nil
     var qwen35AnePrefillCpuSharedResource: Bool? = nil
+    var qwen35AnePrefillSwigluInAne: Bool? = nil
+    var qwen35AnePrefillMoeSharedExpert: Bool? = nil
+    var qwen35AnePrefillOproj: Bool? = nil
+    var qwen35AnePrefillOprojFraction: Double? = nil
+    var qwen35AnePrefillOprojMaxLayers: Int? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill

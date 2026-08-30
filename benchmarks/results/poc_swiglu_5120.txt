@@ -1,0 +1,17 @@
+geometry: hidden=5120 intermediate=15360 tokens=4096 bits=4 group_size=64 ane=7680 (3840/instance) gpu=7680
+compiling the SwiGLU-in-ANE procedure bank ...
+  compiled in 0.41s
+  ANE output rows: instance0=3840 instance1=3840 (expect 3840 each = half of the 7680 rows of a plain gate+up program)
+  activation shape: (1, 4096, 15360) (expect (1, 4096, 15360))
+
+SwiGLU-in-ANE merge: 203.68 ms median over 20 runs
+  best 116.02 ms / worst 228.97 ms
+  cosine vs exact GPU SwiGLU : 0.995690
+  max abs error              : 3.29842
+
+baseline (gate+up program + Metal SwiGLU merge): 116.48 ms median
+  cosine vs exact GPU SwiGLU : 0.995696
+  cosine vs SwiGLU-in-ANE    : 0.999995
+  speedup of SwiGLU-in-ANE   : 0.57x
+
+PASS: the ANE accepted the program and the activation matches.

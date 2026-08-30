@@ -191,9 +191,55 @@ def test_tuner_overrides_reduce_planned_search_matrix():
             allow_ane_gdn=False,
         )
     )
+    no_oproj = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(
+            model_id="no-oproj",
+            allow_cpu=False,
+            allow_ane_gdn=False,
+            allow_ane_oproj=False,
+        )
+    )
 
-    assert constrained.total == 9
+    # The independent o_proj calibration adds five width probes even when
+    # CPU/GDN dimensions are disabled by the request.
+    assert constrained.total == 15
+    assert no_oproj.total == 11
     assert constrained.total < full.total
+
+
+def test_tuner_settings_and_profile_observation_include_oproj(monkeypatch):
+    base = ModelSettings(qwen35_ane_prefill_dual_ane=True)
+    request = ane_tuning.ANETuningRequest(model_id="qwen")
+    candidate = ane_tuning._Candidate(
+        "oproj", True, mlp_fraction=0.5, oproj_enabled=True, oproj_fraction=0.4
+    )
+
+    tuned = ane_tuning._settings_for_candidate(base, request, candidate)
+    assert tuned.qwen35_ane_prefill_oproj is True
+    assert tuned.qwen35_ane_prefill_oproj_fraction == 0.4
+    assert ane_tuning._ane_execution_observed(
+        {"profiling_available": True, "categories": {"oproj": {"operations": 1}}},
+        require_oproj=True,
+    ) is True
+    assert ane_tuning._ane_execution_observed(
+        {"profiling_available": True, "categories": {"oproj": {"operations": 0}}},
+        require_oproj=True,
+    ) is False
+
+    refined = ane_tuning._profile_refinement(
+        candidate,
+        {
+            "_profile": {
+                "oproj": {
+                    "operations": 10,
+                    "ane0_eval_ns": 4.0e6,
+                    "ane1_eval_ns": 4.0e6,
+                    "gpu_completion_ns": 8.0e6,
+                }
+            }
+        },
+    )
+    assert refined.oproj_fraction == 0.6
 
 
 def test_full_model_profile_rebalances_representative_prediction(monkeypatch):
@@ -333,6 +379,8 @@ async def test_tuner_recommends_best_combined_split(monkeypatch):
         "fused_down": False,
         "cpu_threads": 8,
         "cpu_shared_resource": True,
+        "oproj_enabled": False,
+        "oproj_fraction": None,
         "processing_tps": 125.0,
         "speedup_percent": 25.0,
         "sequence_length": 2048,
@@ -805,7 +853,7 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
 
     assert run.status == "error"
     assert run.current == 1
-    assert len(snapshot["results"]) == 6
+    assert len(snapshot["results"]) == 7
     assert [result["state"] for result in snapshot["results"]] == [
         "completed",
         "failed",
@@ -813,9 +861,11 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
         "pending",
         "pending",
         "pending",
+        "pending",
     ]
     assert [result["processing_tps"] for result in snapshot["results"]] == [
         100.0,
+        None,
         None,
         None,
         None,
@@ -835,6 +885,8 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
         "gdn_enabled": False,
         "gdn_fraction": None,
         "fused_down": False,
+        "oproj_enabled": False,
+        "oproj_fraction": None,
         "processing_tps": 100.0,
         "speedup_percent": 0.0,
         "sequence_length": run.request.sequence_length,

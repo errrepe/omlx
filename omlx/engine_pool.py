@@ -75,6 +75,21 @@ def _aligned_share_rows(outputs: int, fraction: float) -> int:
     return min(outputs, (int(outputs * fraction) // 64) * 64)
 
 
+def _config_is_moe(text: dict) -> bool:
+    """True when a text config describes a Mixture-of-Experts checkpoint.
+
+    MoE layers carry a router (``num_experts``) plus the always-on dense
+    ``shared_expert``; matching on either the expert count or the dedicated
+    widths survives the different key spellings across Qwen revisions.
+    """
+    if _positive_int(text.get("num_experts")):
+        return True
+    return bool(
+        _positive_int(text.get("shared_expert_intermediate_size"))
+        or _positive_int(text.get("moe_intermediate_size"))
+    )
+
+
 def _qwen35_cpu_share_estimated_bytes(
     model_path: str,
     settings: object | None,
@@ -109,6 +124,18 @@ def _qwen35_cpu_share_estimated_bytes(
     model_type = str(text.get("model_type") or config.get("model_type") or "")
     if not any(token in model_type for token in ("qwen3_5", "qwen3_6", "qwen3_8")):
         return 0
+
+    # MoE checkpoints size every eager FP16 row slice from the shared expert's
+    # intermediate width and add a second copy for the routed path. CPU gate/up
+    # sharing is not supported on MoE this iteration, so refuse the estimate
+    # instead of silently under-budgeting the load (0 would be read as "safe").
+    if _config_is_moe(text):
+        logger.warning(
+            "Qwen CPU sharing is not supported for MoE checkpoints at this time; "
+            "using conservative memory admission for %s",
+            model_path,
+        )
+        return None
 
     hidden = _positive_int(text.get("hidden_size"))
     intermediate = _positive_int(text.get("intermediate_size"))
@@ -651,6 +678,27 @@ class EnginePool:
                 add(
                     "qwen35_ane_prefill_cpu_shared_resource",
                     data.get("qwen35_ane_prefill_cpu_shared_resource", True),
+                )
+            add(
+                "qwen35_ane_prefill_swiglu_in_ane",
+                data.get("qwen35_ane_prefill_swiglu_in_ane", False),
+            )
+            add(
+                "qwen35_ane_prefill_moe_shared_expert",
+                data.get("qwen35_ane_prefill_moe_shared_expert", False),
+            )
+            add(
+                "qwen35_ane_prefill_oproj",
+                data.get("qwen35_ane_prefill_oproj", False),
+            )
+            if data.get("qwen35_ane_prefill_oproj", False):
+                add(
+                    "qwen35_ane_prefill_oproj_fraction",
+                    data.get("qwen35_ane_prefill_oproj_fraction", 0.50),
+                )
+                add(
+                    "qwen35_ane_prefill_oproj_max_layers",
+                    data.get("qwen35_ane_prefill_oproj_max_layers", 16),
                 )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
