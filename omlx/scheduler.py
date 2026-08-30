@@ -2321,7 +2321,9 @@ class Scheduler:
         clear, ``_mx_buffer_access_lock``), so the #978/#1040 panic-class
         gating semantics are preserved.
         """
-        info = self._resolve_streaming_guard_info()
+        info = self._streaming_guard_info
+        if info is None:
+            info = self._resolve_streaming_guard_info()
         pool = mx.get_cache_memory()
         if not info:
             # Diagnostic: the streaming hooks are inert without the backing's
@@ -12170,6 +12172,7 @@ class Scheduler:
                     layer.self_attn.cache = None
 
         # Release model and tokenizer references for GC
+        self._streaming_guard_info = None
         self.model = None
         self.tokenizer = None
 

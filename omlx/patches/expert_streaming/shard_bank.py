@@ -7,6 +7,7 @@ but slices a stacked bank (E, O, I) per expert id.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import fcntl
 import json
@@ -16,7 +17,7 @@ import os
 import struct
 import sys
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import NamedTuple
 
 import mlx.core as mx
 import numpy as np
@@ -123,18 +124,38 @@ def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
     return mx.array(np_view)
 
 
+class _ReadParams(NamedTuple):
+    """Immutable, precomputed per-key read parameters.
+
+    The safetensors header is fixed after __init__, so once derived a key's
+    params never need re-validation on the hot path (no per-call shape/dtype
+    re-derivation, no repeated size-mismatch arithmetic).
+    """
+
+    shape: tuple[int, ...]
+    dtype_str: str
+    np_dtype: np.dtype
+    item: int
+    num_experts: int
+    expert_bytes: int
+    tensor_abs_off: int
+
+    @property
+    def per_shape(self) -> tuple[int, ...]:
+        return self.shape[1:] if len(self.shape) > 1 else self.shape
+
+
 class _ShardReader:
     def __init__(self, path: Path):
         self.path = path
         self._file = path.open("rb")
+        self._rp: dict[str, _ReadParams] = {}
         hsize = struct.unpack("<Q", self._file.read(8))[0]
         self.header: dict = json.loads(self._file.read(hsize))
         self.data_start = 8 + hsize
         self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-        try:
+        with contextlib.suppress(Exception):
             self._mmap.madvise(mmap.MADV_RANDOM)  # type: ignore[attr-defined]
-        except Exception:
-            pass
 
     def close(self) -> None:
         try:
@@ -150,46 +171,88 @@ class _ShardReader:
         self._mmap = None  # type: ignore[assignment]
         self._file = None  # type: ignore[assignment]
 
-    def expert_slice(self, key: str, expert_id: int) -> np.ndarray:
+    def _rp_for(self, key: str) -> _ReadParams:
+        """Precompute (and cache) the immutable per-key read parameters.
+
+        The safetensors header is fixed after __init__, so once derived a key's
+        params never need re-validation on the hot path (no per-call shape/dtype
+        re-derivation, no repeated size-mismatch arithmetic). Raises ValueError
+        on a header size mismatch — computed once, then cached so it stays stable.
+        """
+        rp = self._rp.get(key)
+        if rp is not None:
+            return rp
         entry = self.header[key]
         shape = tuple(entry["shape"])
         dtype_str = str(entry["dtype"])
-        start, end = entry["data_offsets"]
         np_dtype, item = _DTYPE_MAP.get(dtype_str, (None, None))  # type: ignore[assignment]
         if np_dtype is None:
             raise TypeError(f"Unsupported dtype {dtype_str} for {key}")
-        # Build view over the whole stacked tensor, then index expert_id on axis 0
-        # For ranks >2, the view is (E, ...) — slicing axis 0 is contiguous for that expert
-        # because safetensors is row-major: expert slice offset = expert_id * stride
+        start, end = entry["data_offsets"]
         n_elements = 1
         for d in shape:
             n_elements *= int(d)
         expected_bytes = n_elements * int(item)
         if (end - start) != expected_bytes:
             raise ValueError(f"Header size mismatch for {key}: {end-start} vs {expected_bytes}")
-        # One large os.pread instead of mmap page faults. With MADV_RANDOM the
-        # cold-fault path tops out around 0.2-0.4 GB/s (16K faults, no
-        # readahead), while a single pread of the contiguous slice sustains
-        # several GB/s on the same NVMe — a ~10-30x difference per bundle.
-        # expert_id indexes axis 0 of a row-major tensor, so the slice is one
-        # contiguous byte range: expert_bytes = (end-start) / E.
         num_experts = shape[0] if shape else 1
         expert_bytes = (end - start) // num_experts
-        fd = self._file.fileno()
-        buf = bytearray(os.pread(fd, expert_bytes, self.data_start + int(start) + expert_id * expert_bytes))
-        if len(buf) != expert_bytes:
-            raise OSError(f"Short read for {key}[{expert_id}]: {len(buf)} of {expert_bytes}")
-        return np.frombuffer(buf, dtype=np_dtype).reshape(shape[1:] if len(shape) > 1 else shape)
+        if expert_bytes % item != 0:
+            # Slices would misalign against the dtype; surface it rather than
+            # produce a silently-corrupt view.
+            raise ValueError(
+                f"Unaligned expert slice for {key}: expert_bytes={expert_bytes} "
+                f"not divisible by itemsize {item}"
+            )
+        rp = _ReadParams(
+            shape=shape,
+            dtype_str=dtype_str,
+            np_dtype=np_dtype,
+            item=item,
+            num_experts=num_experts,
+            expert_bytes=expert_bytes,
+            tensor_abs_off=self.data_start + int(start),
+        )
+        self._rp[key] = rp
+        return rp
 
-    def expert_byte_range(self, key: str, expert_id: int) -> Tuple[int, int]:
+    def _read_into(self, abs_off: int, out: np.ndarray) -> None:
+        """Zero-copy read of `out.nbytes` bytes at `abs_off` into the writable
+        uint8 buffer `out`.
+
+        os.preadv writes straight into the buffer — no intermediate heap copy
+        (the old path did pread -> bytes -> bytearray -> view, a double copy).
+        Raises OSError on a short read or IO error. Falls back to os.pread + copy
+        when preadv is unavailable; short reads still surface as OSError so the
+        caller can fail-high.
+        """
+        n = out.nbytes
+        fd = self._file.fileno()
+        try:
+            got = os.preadv(fd, [memoryview(out)], abs_off)
+        except (AttributeError, OSError):
+            data = os.pread(fd, n, abs_off)
+            if len(data) != n:
+                raise OSError(f"Short read at {abs_off}: {len(data)} of {n}") from None
+            out[:] = np.frombuffer(data, dtype=np.uint8)
+            return
+        if got != n:
+            raise OSError(f"Short read (preadv) at {abs_off}: {got} of {n}") from None
+
+    def expert_slice(self, key: str, expert_id: int) -> np.ndarray:
+        rp = self._rp_for(key)
+        off = rp.tensor_abs_off + expert_id * rp.expert_bytes
+        # Single zero-copy preadv into a writable buffer; the typed view is a
+        # zero-copy reinterpret (no bytearray double-copy as the old path had).
+        out = np.empty(rp.expert_bytes, dtype=np.uint8)
+        self._read_into(off, out)
+        return np.frombuffer(out, dtype=rp.np_dtype).reshape(rp.per_shape)
+
+    def expert_byte_range(self, key: str, expert_id: int) -> tuple[int, int]:
         """Absolute file offsets (start, end) of one expert's slice."""
-        entry = self.header[key]
-        start, end = entry["data_offsets"]
-        shape = entry["shape"]
-        num_experts = shape[0] if shape else 1
-        expert_bytes = (end - start) // num_experts
-        off = self.data_start + int(start) + expert_id * expert_bytes
-        return off, off + expert_bytes
+        rp = self._rp_for(key)
+        off = rp.tensor_abs_off + expert_id * rp.expert_bytes
+        return off, off + rp.expert_bytes
 
     def advise_range(self, offset: int, length: int) -> bool:
         """Kernel readahead hint (F_RDADVISE) for one file range.
@@ -214,34 +277,23 @@ class _ShardReader:
             return False
 
     def expert_run(self, key: str, first_id: int, count: int) -> list:
-        """One pread covering experts [first_id, first_id+count), sliced per expert.
+        """One preadv covering experts [first_id, first_id+count), sliced per expert.
 
         Row-major stacked banks give consecutive ids contiguous offsets, so a
         run reads back as one sequential transfer — fewer syscalls and larger
         requests than per-expert preads (matters most when the demand set is
-        dense, i.e. long-prompt prefill).
+        dense, i.e. long-prompt prefill). The single buffer stays alive via the
+        returned per-expert views (zero-copy, no bytearray double-copy).
         """
-        entry = self.header[key]
-        shape = tuple(entry["shape"])
-        dtype_str = str(entry["dtype"])
-        start, end = entry["data_offsets"]
-        np_dtype, item = _DTYPE_MAP.get(dtype_str, (None, None))  # type: ignore[assignment]
-        if np_dtype is None:
-            raise TypeError(f"Unsupported dtype {dtype_str} for {key}")
-        num_experts = shape[0] if shape else 1
-        count = max(1, min(int(count), num_experts - first_id))
-        expert_bytes = (end - start) // num_experts
-        off = self.data_start + int(start) + first_id * expert_bytes
-        buf = os.pread(self._file.fileno(), expert_bytes * count, off)
-        if len(buf) != expert_bytes * count:
-            raise OSError(f"Short run read for {key}[{first_id}+{count}]: {len(buf)}")
-        per_shape = shape[1:] if len(shape) > 1 else shape
-        n_elements = 1
-        for d in shape:
-            n_elements *= int(d)
-        n_elements //= num_experts
+        rp = self._rp_for(key)
+        count = max(1, min(int(count), rp.num_experts - first_id))
+        off = rp.tensor_abs_off + first_id * rp.expert_bytes
+        buf = np.empty(rp.expert_bytes * count, dtype=np.uint8)
+        self._read_into(off, buf)
+        per = rp.per_shape
+        per_elements = rp.expert_bytes // rp.item
         return [
-            np.frombuffer(buf, dtype=np_dtype, count=n_elements, offset=i * expert_bytes).reshape(per_shape)
+            np.frombuffer(buf, dtype=rp.np_dtype, count=per_elements, offset=i * rp.expert_bytes).reshape(per)
             for i in range(count)
         ]
 
@@ -332,18 +384,16 @@ class ExpertBackingStore:
         # runtime (slices, runs, pins, readahead, dtypes) reads the cold
         # packing uniformly. Same filenames/key names, lower bit width.
         self.cold_root = Path(cold_root).expanduser().resolve() if cold_root else None
-        self._cold_readers: Dict[str, _ShardReader] = {}
-        self._cold_key_to_reader: Dict[str, _ShardReader] = {}
-        self._readers: Dict[str, _ShardReader] = {}
-        self._key_to_reader: Dict[str, _ShardReader] = {}
-        self._key_to_shape_dtype: Dict[str, Tuple[Tuple[int, ...], str]] = {}
+        self._cold_readers: dict[str, _ShardReader] = {}
+        self._cold_key_to_reader: dict[str, _ShardReader] = {}
+        self._readers: dict[str, _ShardReader] = {}
+        self._key_to_reader: dict[str, _ShardReader] = {}
+        self._key_to_shape_dtype: dict[str, tuple[tuple[int, ...], str]] = {}
         weight_map = self._load_weight_map()
-        # Pre-open readers for files that contain expert banks
-        needed_files = set(weight_map.values())
-        # We will lazily open per key, but also keep weight_map for lookup
+        # We lazily open per key, but also keep weight_map for lookup.
         self._weight_map = weight_map
         # Build header cache lazily
-        self._header_cache: Dict[str, dict] = {}
+        self._header_cache: dict[str, dict] = {}
         # mlock pin tracking (expert_streaming pin mode)
         self._pinned: set = set()
         self.pinned_bytes = 0
@@ -360,7 +410,7 @@ class ExpertBackingStore:
                 return p
         return None
 
-    def _load_weight_map(self) -> Dict[str, str]:
+    def _load_weight_map(self) -> dict[str, str]:
         idx = self.model_path / "model.safetensors.index.json"
         if idx.is_file():
             try:
@@ -368,10 +418,10 @@ class ExpertBackingStore:
             except Exception:
                 return {}
         # fallback: single shard case — enumerate headers
-        wm: Dict[str, str] = {}
+        wm: dict[str, str] = {}
         for shard in self.model_path.glob("*.safetensors"):
             hdr = self._header_for_file(shard)
-            for k in hdr.keys():
+            for k in hdr:
                 if k == "__metadata__":
                     continue
                 wm[k] = shard.name
@@ -444,7 +494,7 @@ class ExpertBackingStore:
         self._key_to_reader[key] = reader
         return reader
 
-    def cold_quant_params(self, key: str) -> Tuple[int, int] | None:
+    def cold_quant_params(self, key: str) -> tuple[int, int] | None:
         """(bits, group_size) of the cold packing for *key*, from the cold
         shard's __metadata__ — None when the cold tier is not active for it."""
         cold = self._cold_reader_for_key(key)
@@ -485,8 +535,9 @@ class ExpertBackingStore:
             return 0
 
     def load_expert(self, key: str, expert_id: int) -> mx.array:
-        np_view = self.load_expert_slice(key, expert_id)
-        return _np_to_mx(key, np_view, self._reader_for_key(key).header[key]["dtype"])
+        reader = self._reader_for_key(key)
+        np_view = reader.expert_slice(key, expert_id)
+        return _np_to_mx(key, np_view, reader.header[key]["dtype"])
 
     def load_expert_slice(self, key: str, expert_id: int) -> np.ndarray:
         """Return a fresh np.ndarray copy of one expert's slice (mmap-backed).
@@ -510,6 +561,67 @@ class ExpertBackingStore:
         reader = self._reader_for_key(key)
         return reader.expert_run(key, first_id, count)
 
+    def read_expert_into(
+        self,
+        components: list[tuple[str, list[int]]],
+        outs: list[np.ndarray],
+    ) -> bool:
+        """Coalesced zero-copy read of several (key, expert-ids) components.
+
+        For each ``(key, eids)`` in *components* this resolves the backing
+        reader once and issues a single ``preadv`` covering every requested
+        expert id (row-major banks make consecutive ids one contiguous range),
+        writing the raw bytes into ``outs[i]`` — a caller-owned writable
+        ``uint8`` buffer of shape ``(len(eids), per_expert_bytes)``. This
+        replaces the per-expert ``load_expert_slice`` loop used by the
+        demand-assembly miss path: one reader resolution and one syscall per
+        *component* instead of one resolution + one read per *expert*, which
+        is the win for dense demand sets (long-prompt prefill).
+
+        Returns ``True`` on success, ``False`` if any component could not be
+        served (caller must fall back to :meth:`load_expert_slice`). Bytes are
+        written in expert-id order so ``outs[i][j]`` is expert ``eids[j]``.
+        """
+        if len(components) != len(outs):
+            return False
+        for (key, eids), out in zip(components, outs):
+            if out.dtype != np.uint8 or out.ndim != 2:
+                return False
+            try:
+                reader = self._reader_for_key(key)
+                rp = reader._rp_for(key)
+            except Exception:
+                return False
+            n = len(eids)
+            if out.shape[0] != n or out.shape[1] != rp.expert_bytes:
+                return False
+            if n == 0:
+                continue
+            if any(eid < 0 or eid >= rp.num_experts for eid in eids):
+                return False
+            # Read contiguous runs separately. This keeps sparse demand from
+            # over-reading the gap between the first and last expert.
+            order = sorted(range(n), key=lambda j: eids[j])
+            start = 0
+            while start < n:
+                first = eids[order[start]]
+                end = start + 1
+                while end < n and eids[order[end]] == eids[order[end - 1]] + 1:
+                    end += 1
+                count = end - start
+                off = rp.tensor_abs_off + first * rp.expert_bytes
+                buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                try:
+                    reader._read_into(off, buf)
+                except Exception:
+                    return False
+                for pos in range(count):
+                    j = order[start + pos]
+                    base = pos * rp.expert_bytes
+                    out[j, :] = buf[base : base + rp.expert_bytes]
+                start = end
+        return True
+
     def advise_expert_run(self, key: str, first_id: int, count: int) -> bool:
         """Kernel readahead of experts [first_id, first_id+count) of one bank.
 
@@ -520,8 +632,10 @@ class ExpertBackingStore:
         """
         try:
             reader = self._reader_for_key(key)
-            start, _ = reader.expert_byte_range(key, first_id)
-            _, end = reader.expert_byte_range(key, max(0, first_id + count - 1))
+            rp = reader._rp_for(key)
+            count = max(1, min(int(count), rp.num_experts - first_id))
+            start = rp.tensor_abs_off + first_id * rp.expert_bytes
+            end = start + count * rp.expert_bytes
             if end <= start:
                 return False
             return reader.advise_range(start, end - start)
@@ -533,10 +647,10 @@ class ExpertBackingStore:
 
         Returns locked bytes (0 on failure). Duplicate pins of the same
         (key, expert) are tracked and skipped."""
-        pkey = (str(self._reader_for_key(key).path), key, expert_id)
+        reader = self._reader_for_key(key)
+        pkey = (str(reader.path), key, expert_id)
         if pkey in self._pinned:
             return 0
-        reader = self._reader_for_key(key)
         locked = reader.pin_expert(key, expert_id)
         if locked > 0:
             self._pinned.add(pkey)
@@ -548,10 +662,10 @@ class ExpertBackingStore:
         return len(self._pinned)
 
     def close(self) -> None:
-        for r in list(self._readers.values()):
-            try:
-                r.close()
-            except Exception:
-                pass
-        self._readers.clear()
+        for readers in (self._readers, self._cold_readers):
+            for r in list(readers.values()):
+                with contextlib.suppress(Exception):
+                    r.close()
+            readers.clear()
         self._key_to_reader.clear()
+        self._cold_key_to_reader.clear()

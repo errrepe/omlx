@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -30,6 +31,17 @@ from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
+_STREAM_CACHE_THRESH_ENV = "OMLX_EXPERT_STREAMING_CACHE_THRESH"
+
+
+def _stream_cache_threshold_bytes() -> int:
+    raw = os.environ.get(_STREAM_CACHE_THRESH_ENV)
+    if raw:
+        try:
+            return max(0, int(float(raw) * 1024**3))
+        except ValueError:
+            logger.warning("Invalid %s=%r; using 2 GiB", _STREAM_CACHE_THRESH_ENV, raw)
+    return 2 * 1024**3
 
 
 def glm5_next_cast_predicate(key: str) -> bool:
@@ -862,7 +874,11 @@ class Glm5NextDecoderLayer(nn.Module):
         # GB across layers.
         if getattr(self, "_stream_eval", False):
             mx.eval(out)
-            mx.clear_cache()
+            # Keep eval load-bearing, but avoid flushing MLX's allocator cache
+            # on every layer when the free pool is small.
+            get_cache_memory = getattr(mx, "get_cache_memory", None)
+            if get_cache_memory is None or get_cache_memory() >= _stream_cache_threshold_bytes():
+                mx.clear_cache()
         return out
 
     def _ffn_block(self, x: mx.array) -> mx.array:

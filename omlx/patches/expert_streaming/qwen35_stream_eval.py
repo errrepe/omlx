@@ -40,6 +40,16 @@ _per_layer_eval_enabled = _PER_LAYER_EVAL_DEFAULT
 _APPLIED_FLAG = "_omlx_stream_eval_wrapped"
 
 
+def _cache_threshold_bytes() -> int:
+    raw = os.environ.get("OMLX_EXPERT_STREAMING_CACHE_THRESH")
+    if raw:
+        try:
+            return max(0, int(float(raw) * 1024**3))
+        except ValueError:
+            logger.warning("Invalid OMLX_EXPERT_STREAMING_CACHE_THRESH=%r", raw)
+    return 2 * 1024**3
+
+
 def configure_from_settings(value: Any) -> bool:
     """Resolve the knob (``None`` = env / built-in default) and store the
     effective flag the wrapper reads per call. Returns the effective value."""
@@ -61,7 +71,9 @@ def _wrap_call(orig_call: Any) -> Any:
             and x.shape[1] > 1
         ):
             mx.eval(out)
-            mx.clear_cache()
+            get_cache_memory = getattr(mx, "get_cache_memory", None)
+            if get_cache_memory is None or get_cache_memory() >= _cache_threshold_bytes():
+                mx.clear_cache()
         return out
 
     return call

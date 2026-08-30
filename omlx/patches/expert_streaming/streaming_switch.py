@@ -18,7 +18,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 
 _PROFILE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
 _COALESCE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_COALESCE", "") != "0"
+_BANK_MAX_BYTES = max(
+    1,
+    int(os.environ.get("OMLX_EXPERT_STREAMING_BANK_MAX_BYTES", str(256 * 1024**2))),
+)
+_RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
 # Prefill attribution diag: sync the GPU at every prefill-sized MoE GLU call
 # and record the drain as a per-layer gpu bucket. Serializes CPU/GPU overlap
 # (wall inflates), so use it for attribution only — never for latency claims.
@@ -73,7 +78,7 @@ _EXPERT_IO_POOL = ThreadPoolExecutor(
 # depth (autotune). One shared executor per distinct depth value — repeated
 # conversions of models tuned to the same depth must not multiply idle
 # worker threads. depth None → the env-default module pool above.
-_IO_POOLS: Dict[int, ThreadPoolExecutor] = {}
+_IO_POOLS: dict[int, ThreadPoolExecutor] = {}
 _IO_POOLS_LOCK = threading.Lock()
 
 
@@ -132,10 +137,10 @@ class ProfileAccumulator:
 
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
-        self.layers: Dict[int, LayerProfile] = {}
-        self.wall_s: Dict[int, float] = {}
-        self.predicted: Dict[int, set] = {}
-        self.observed: Dict[int, set] = {}
+        self.layers: dict[int, LayerProfile] = {}
+        self.wall_s: dict[int, float] = {}
+        self.predicted: dict[int, set] = {}
+        self.observed: dict[int, set] = {}
 
     def record_predicted(self, idx: int, ids: Any) -> None:
         if not self.enabled:
@@ -196,7 +201,7 @@ class ProfileAccumulator:
             lp.sync_s += dt
 
     def report(self) -> dict:
-        per: Dict[str, dict] = {}
+        per: dict[str, dict] = {}
         totals = LayerProfile()
         for idx in sorted(self.layers):
             lp = self.layers[idx]
@@ -320,18 +325,19 @@ class ExpertLRUCache:
             per_layer = max(1, self.capacity // self.num_layers)
             # distribute remainder
             self._per_layer_cap = per_layer
-            self._global_cap = self.capacity
         else:
             self._per_layer_cap = self.capacity
-            self._global_cap = self.capacity
         self._store: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
+        self._layer_store: dict[int, OrderedDict[tuple[int, int, str], None]] = {}
+        self._lock = threading.RLock()
         # per-layer tracking for eviction
-        self._layer_counts: Dict[int, int] = {}
+        self._layer_counts: dict[int, int] = {}
         self.stats = CacheStats()
         self.profile = ProfileAccumulator(enabled=_PROFILE_ENV)
 
     def __contains__(self, key: tuple[int, int, str]) -> bool:
-        return key in self._store
+        with self._lock:
+            return key in self._store
 
     def _layer_of(self, key: tuple[int, int, str]) -> int:
         try:
@@ -339,48 +345,70 @@ class ExpertLRUCache:
         except Exception:
             return -1
 
+    def _remove_locked(self, key: tuple[int, int, str]) -> bool:
+        if key not in self._store:
+            return False
+        del self._store[key]
+        layer = self._layer_of(key)
+        queue = self._layer_store.get(layer)
+        if queue is not None:
+            queue.pop(key, None)
+            if not queue:
+                self._layer_store.pop(layer, None)
+        count = self._layer_counts.get(layer, 0) - 1
+        if count > 0:
+            self._layer_counts[layer] = count
+        else:
+            self._layer_counts.pop(layer, None)
+        return True
+
     def get(self, key: tuple[int, int, str]) -> Any | None:
-        if key in self._store:
-            self._store.move_to_end(key)
-            self.stats.hits += 1
-            return self._store[key]
-        self.stats.misses += 1
-        return None
+        with self._lock:
+            if key in self._store:
+                self._store.move_to_end(key)
+                layer_queue = self._layer_store.get(self._layer_of(key))
+                if layer_queue is not None and key in layer_queue:
+                    layer_queue.move_to_end(key)
+                self.stats.hits += 1
+                return self._store[key]
+            self.stats.misses += 1
+            return None
 
     def put(self, key: tuple[int, int, str], value: Any) -> None:
         if self.capacity <= 0:
             return
-        if key in self._store:
-            self._store.move_to_end(key)
+        with self._lock:
+            if key in self._store:
+                self._store.move_to_end(key)
+                self._store[key] = value
+                queue = self._layer_store.setdefault(self._layer_of(key), OrderedDict())
+                queue.move_to_end(key)
+                return
+            layer = self._layer_of(key)
+            queue = self._layer_store.setdefault(layer, OrderedDict())
+            if self.num_layers > 0 and self._per_layer_cap and len(queue) >= self._per_layer_cap:
+                old_key, _ = queue.popitem(last=False)
+                self._remove_locked(old_key)
+                self.stats.evictions += 1
+            while len(self._store) >= self.capacity:
+                old_key = next(iter(self._store))
+                self._remove_locked(old_key)
+                self.stats.evictions += 1
             self._store[key] = value
-            return
-        # per-layer cap enforcement
-        layer = self._layer_of(key)
-        if self.num_layers > 0 and self._per_layer_cap:
-            cnt = self._layer_counts.get(layer, 0)
-            # evict oldest entry of same layer if per-layer full
-            if cnt >= self._per_layer_cap:
-                # find oldest entry of this layer
-                for k in list(self._store.keys()):
-                    if self._layer_of(k) == layer:
-                        self._store.pop(k)
-                        self.stats.evictions += 1
-                        self._layer_counts[layer] = max(0, self._layer_counts.get(layer, 1) - 1)
-                        break
-                # if still over capacity due to rounding, fall through to global
-        # global cap
-        while len(self._store) >= self.capacity:
-            old_k, _ = self._store.popitem(last=False)
-            self.stats.evictions += 1
-            old_layer = self._layer_of(old_k)
-            self._layer_counts[old_layer] = max(0, self._layer_counts.get(old_layer, 1) - 1)
-        self._store[key] = value
-        self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
+            self._layer_store.setdefault(layer, OrderedDict())[key] = None
+            self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
+
+    def discard(self, key: tuple[int, int, str]) -> bool:
+        """Remove a cache entry while keeping per-layer accounting correct."""
+        with self._lock:
+            return self._remove_locked(key)
 
     def clear(self) -> None:
-        self._store.clear()
-        self._layer_counts.clear()
-        self.stats = CacheStats()
+        with self._lock:
+            self._store.clear()
+            self._layer_store.clear()
+            self._layer_counts.clear()
+            self.stats = CacheStats()
 
     def retain_hot(self, hot_pairs: set) -> int:
         """Keep only entries whose (layer_idx, expert_id) is in hot_pairs.
@@ -390,21 +418,17 @@ class ExpertLRUCache:
         prompt-wide hot set. Rebuilds per-layer counts; returns the number
         of evicted entries.
         """
-        if self.capacity <= 0 or not self._store:
-            return 0
-        evicted = 0
-        for key in list(self._store.keys()):
-            if (key[0], key[1]) not in hot_pairs:
-                del self._store[key]
-                evicted += 1
-        if evicted:
-            counts: Dict[int, int] = {}
-            for key in self._store:
-                layer = self._layer_of(key)
-                counts[layer] = counts.get(layer, 0) + 1
-            self._layer_counts = counts
-            self.stats.evictions += evicted
-        return evicted
+        with self._lock:
+            if self.capacity <= 0 or not self._store:
+                return 0
+            evicted = 0
+            for key in list(self._store.keys()):
+                if (key[0], key[1]) not in hot_pairs:
+                    if self._remove_locked(key):
+                        evicted += 1
+            if evicted:
+                self.stats.evictions += evicted
+            return evicted
 
     @property
     def size(self) -> int:
@@ -424,11 +448,11 @@ def _inverse_permutation(order, inverse_scatter=False):
 
 
 def _gather_sort(x, indices, inverse_scatter=False):
-    *_, M = indices.shape
+    *_, m_cols = indices.shape
     indices = indices.flatten()
     order = mx.argsort(indices)
     inv_order = _inverse_permutation(order, inverse_scatter)
-    lhs_indices = order // M
+    lhs_indices = order // m_cols
     x = x.flatten(0, -3)
     return x[lhs_indices], indices[order], inv_order
 
@@ -453,7 +477,7 @@ class _RemapPlan:
     it — one sync per MoE layer instead of three.
     """
 
-    indices_shape: Tuple[int, ...] = ()
+    indices_shape: tuple[int, ...] = ()
     flat_np: Any = None
     uniq_list: list = field(default_factory=list)
     remapped: Any = None  # mx.array of compact ids, original indices shape
@@ -540,7 +564,7 @@ class StreamingSwitchLinear(nn.Module):
     def output_dims(self) -> int:
         return self._output_dims
 
-    def _load_expert_weight(self, expert_id: int) -> mx.array:
+    def _load_expert_weight(self, expert_id: int, *, cache_result: bool = True) -> mx.array:
         key = (self.layer_idx, expert_id, self.stacked_key)
         cached = self.cache.get(key)
         if cached is not None:
@@ -555,7 +579,8 @@ class StreamingSwitchLinear(nn.Module):
             # ensure mx.array
             if not isinstance(w, mx.array):
                 w = mx.array(w)
-        self.cache.put(key, w)
+        if cache_result:
+            self.cache.put(key, w)
         return w
 
     def set_bias(self, bias: mx.array | None) -> None:
@@ -569,7 +594,11 @@ class StreamingSwitchLinear(nn.Module):
         if built:
             _build_plan_into(plan, indices)
         t2 = time.perf_counter()
-        # Load each unique expert weight
+        # Load each unique expert weight. C4 avoids retaining a large prefill
+        # demand set while the hotness seeder is active.
+        cache_result = not (
+            getattr(self.cache, "prefill_bypass", False) and plan.positions > 64
+        )
         mini_weights = []
         t_load = 0.0
         hits = 0
@@ -577,7 +606,7 @@ class StreamingSwitchLinear(nn.Module):
         for eid in plan.uniq_list:
             was_hit = (self.layer_idx, eid, self.stacked_key) in self.cache
             t_l = time.perf_counter()
-            w = self._load_expert_weight(int(eid))
+            w = self._load_expert_weight(int(eid), cache_result=cache_result)
             t_load += time.perf_counter() - t_l
             if was_hit:
                 hits += 1
@@ -666,9 +695,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
     def _slice_dtypes_lazy(self):
         if not hasattr(self, "_slice_dtypes"):
             td = getattr(self.backing, "tensor_dtype", None)
-            self._slice_dtypes = (
-                td(self.stacked_scales_key) if td else None,
-                td(self.stacked_biases_key) if td and self.stacked_biases_key else None,
+            object.__setattr__(
+                self,
+                "_slice_dtypes",
+                (
+                    td(self.stacked_scales_key) if td else None,
+                    td(self.stacked_biases_key) if td and self.stacked_biases_key else None,
+                ),
             )
         return self._slice_dtypes
 
@@ -684,6 +717,23 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # Metal FTZ and cost ~9x more on 4 MB slices).
             return mx.array(v).view(mx.bfloat16)
         return mx.array(v)  # np.ndarray -> mx.array copy on this thread
+
+    def _slice_bytes(self, key: str) -> int:
+        """Per-expert byte size of *key* (truthful: read from the backing reader)."""
+        try:
+            reader = self.backing._reader_for_key(key)
+            return int(reader._rp_for(key).expert_bytes)
+        except Exception:
+            return 0
+
+    def _slice_view(self, key: str, buf: np.ndarray) -> np.ndarray:
+        """Reshape a raw uint8 expert buffer exactly as ``expert_slice`` would.
+
+        Mirrors ``_ShardReader.expert_slice`` so the promoted mx.array is
+        bit-identical to the legacy per-slice path (C2 correctness)."""
+        reader = self.backing._reader_for_key(key)
+        rp = reader._rp_for(key)
+        return np.frombuffer(buf, dtype=rp.np_dtype).reshape(rp.per_shape)
 
     def bundle_key(self, expert_id: int):
         return (self.layer_idx, expert_id, self.stacked_weight_key)
@@ -735,9 +785,52 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         except Exception:
             return None
 
+    def _load_expert_bank_np(self, expert_ids: list[int]) -> list[tuple] | None:
+        """Read a demand set into one raw NumPy bank per projection.
+
+        The backing performs coalesced contiguous reads into caller-owned banks;
+        rows are then exposed as views for the existing LRU representation.
+        Returning ``None`` preserves the legacy per-expert fallback for dict
+        backings and unsupported/cold layouts.
+        """
+        if not hasattr(self.backing, "read_expert_into") or not expert_ids:
+            return None
+        keys = [self.stacked_weight_key, self.stacked_scales_key]
+        if self.stacked_biases_key:
+            keys.append(self.stacked_biases_key)
+        try:
+            per_bytes = [self._slice_bytes(key) for key in keys]
+            if any(size <= 0 for size in per_bytes):
+                return None
+            total = len(expert_ids) * sum(per_bytes)
+            if total > _BANK_MAX_BYTES:
+                return None
+            banks = [
+                np.empty((len(expert_ids), size), dtype=np.uint8) for size in per_bytes
+            ]
+            components = [(key, expert_ids) for key in keys]
+            if not self.backing.read_expert_into(components, banks):
+                return None
+            rows = []
+            for row in range(len(expert_ids)):
+                w = self._slice_view(self.stacked_weight_key, banks[0][row])
+                s = self._slice_view(self.stacked_scales_key, banks[1][row])
+                b = (
+                    self._slice_view(self.stacked_biases_key, banks[2][row])
+                    if self.stacked_biases_key
+                    else None
+                )
+                rows.append((w, s, b))
+            return rows
+        except Exception:
+            return None
+
     @staticmethod
-    def _group_runs(sorted_ids: list[int], max_run: int = 16) -> list[tuple[int, int]]:
-        """Split ascending expert ids into (first, count) contiguous runs."""
+    def _group_runs(
+        sorted_ids: list[int], max_run: int | None = None
+    ) -> list[tuple[int, int]]:
+        """Split ascending expert ids into bounded contiguous runs."""
+        max_run = _RUN_MAX if max_run is None else max(1, int(max_run))
         runs: list[tuple[int, int]] = []
         i = 0
         n = len(sorted_ids)
@@ -775,12 +868,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 if s is not None:
                     bundle = (cached, s, b)
                     # Collapse 3 slots into 1 bundle slot (evict companions)
-                    try:
-                        self.cache._store.pop(s_key, None)  # type: ignore[attr-defined]
-                        if b_key:
-                            self.cache._store.pop(b_key, None)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+                    self.cache.discard(s_key)
+                    if b_key:
+                        self.cache.discard(b_key)
                     self.cache.put(key, bundle)  # type: ignore[arg-type]
                     return bundle  # type: ignore[return-value]
         # prefetch staging: worker already read the np slices — promote here
@@ -812,7 +902,45 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             return resolved  # type: ignore[return-value]
         # 3) synchronous load from backing
         t_sy = time.perf_counter()
-        if hasattr(self.backing, "load_expert_slice"):
+        if hasattr(self.backing, "read_expert_into"):
+            # Coalesced zero-copy read of all three components into caller-owned
+            # uint8 buffers (one preadv per component across every missing
+            # expert — avoids the per-expert reader resolution + slice
+            # allocation the legacy path below does). Falls back to per-slice
+            # reads if the backing cannot serve any component.
+            try:
+                per_w = self._slice_bytes(self.stacked_weight_key)
+                per_s = self._slice_bytes(self.stacked_scales_key)
+                w_buf = np.empty((1, per_w), dtype=np.uint8)
+                s_buf = np.empty((1, per_s), dtype=np.uint8)
+                comps = [(self.stacked_weight_key, [expert_id]), (self.stacked_scales_key, [expert_id])]
+                outs = [w_buf, s_buf]
+                if self.stacked_biases_key:
+                    per_b = self._slice_bytes(self.stacked_biases_key)
+                    b_buf = np.empty((1, per_b), dtype=np.uint8)
+                    comps.append((self.stacked_biases_key, [expert_id]))
+                    outs.append(b_buf)
+                if per_w and per_s and (not self.stacked_biases_key or per_b):
+                    if self.backing.read_expert_into(comps, outs):
+                        w = self._promote_np(self._slice_view(self.stacked_weight_key, w_buf[0]))
+                        s = self._promote_np(self._slice_view(self.stacked_scales_key, s_buf[0]))
+                        b = None
+                        if self.stacked_biases_key:
+                            b = self._promote_np(self._slice_view(self.stacked_biases_key, b_buf[0]))
+                    else:
+                        raise ValueError("read_expert_into returned False")
+                else:
+                    raise ValueError("slice bytes unavailable")
+            except Exception:
+                w = self.backing.load_expert_slice(self.stacked_weight_key, expert_id)
+                s = self.backing.load_expert_slice(self.stacked_scales_key, expert_id)
+                b = None
+                if self.stacked_biases_key:
+                    try:
+                        b = self.backing.load_expert_slice(self.stacked_biases_key, expert_id)
+                    except Exception:
+                        b = None
+        elif hasattr(self.backing, "load_expert_slice"):
             # Async-friendly: store plain np.ndarray slices in the cache and
             # promote them to mx.array on the inference thread at use time
             # (avoids cross-thread stream errors from MLX op allocation —
@@ -860,12 +988,15 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         built = plan.flat_np is None
         if built:
             _build_plan_into(plan, indices)
+        cache_result = not (
+            getattr(self.cache, "prefill_bypass", False) and plan.positions > 64
+        )
         t2 = time.perf_counter()
         # Load bundles: cache/staging resolution on this thread, then one
         # parallel os.pread fetch per missing bundle (QD1 -> QD8). Pool
         # workers return raw np slices only; promotion to mx.array happens
         # in the loop below on the inference thread.
-        bundles: Dict[int, tuple] = {}
+        bundles: dict[int, tuple] = {}
         mini_w, mini_s, mini_b = [], [], []
         has_b = False
         hits = 0
@@ -887,35 +1018,41 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             missing.sort()
             if hasattr(self.backing, "load_expert_slice"):
                 io_pool = self._io_pool_override or _EXPERT_IO_POOL
-                coalesce_on = (
-                    _COALESCE_ENV
-                    if self._coalesce_override is None
-                    else bool(self._coalesce_override)
-                )
-                raws: list = [None] * len(missing)
-                # Coalesce consecutive ids into single-pread runs (dense in
-                # long-prompt prefill; rare in decode, where runs are size 1
-                # and the path degenerates to the per-expert fetch).
-                runs = self._group_runs(missing)
-                if coalesce_on and len(runs) < len(missing):
-                    results_by_run = list(
-                        io_pool.map(lambda r: (r, self._load_expert_run_np(r[0], r[1])), runs)
+                # C2 bank-first path: read all missing experts into one raw
+                # bank per projection, then expose rows as views. This avoids
+                # one task/result allocation per expert on dense demand sets.
+                raws = self._load_expert_bank_np(missing)
+                if raws is None:
+                    coalesce_on = (
+                        _COALESCE_ENV
+                        if self._coalesce_override is None
+                        else bool(self._coalesce_override)
                     )
-                    idx_of = {eid: i for i, eid in enumerate(missing)}
-                    leftover: list[int] = []
-                    for (first, count), out in results_by_run:
-                        if out is not None:
-                            for j in range(count):
-                                raws[idx_of[first + j]] = out[j]
-                        else:
-                            leftover.extend(range(first, first + count))
-                    if leftover:
-                        for eid, raw in zip(
-                            leftover, io_pool.map(self._load_expert_np, leftover)
-                        ):
-                            raws[idx_of[eid]] = raw
-                else:
-                    raws = list(io_pool.map(self._load_expert_np, missing))
+                    raws = [None] * len(missing)
+                    # Legacy fallback: coalesce consecutive ids into runs.
+                    runs = self._group_runs(missing)
+                    if coalesce_on and len(runs) < len(missing):
+                        results_by_run = list(
+                            io_pool.map(
+                                lambda r: (r, self._load_expert_run_np(r[0], r[1])),
+                                runs,
+                            )
+                        )
+                        idx_of = {eid: i for i, eid in enumerate(missing)}
+                        leftover: list[int] = []
+                        for (first, count), out in results_by_run:
+                            if out is not None:
+                                for j in range(count):
+                                    raws[idx_of[first + j]] = out[j]
+                            else:
+                                leftover.extend(range(first, first + count))
+                        if leftover:
+                            for eid, raw in zip(
+                                leftover, io_pool.map(self._load_expert_np, leftover)
+                            ):
+                                raws[idx_of[eid]] = raw
+                    else:
+                        raws = list(io_pool.map(self._load_expert_np, missing))
                 dt_per = time.perf_counter() - t_res_start
                 for eid, raw in zip(missing, raws):
                     if raw is None:
@@ -928,7 +1065,10 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     # Metal active on a 6GiB budget and the guard killed the
                     # second prefill outright (F2 post-mortem).
                     bundles[eid] = raw
-                    self.cache.put((self.layer_idx, eid, self.stacked_weight_key), raw)  # type: ignore[arg-type]
+                    if cache_result:
+                        self.cache.put(
+                            (self.layer_idx, eid, self.stacked_weight_key), raw
+                        )  # type: ignore[arg-type]
                     if p is not None:
                         p.add_load_source(self.layer_idx, staged=False, dt=dt_per / len(missing))
             else:
@@ -1103,7 +1243,7 @@ class StreamingSwitchGLU(nn.Module):
         # weighted sum fast path — keep compatible but may not use fast kernel when streaming
         if weighted_sum and scores is not None and do_sort:
             try:
-                from .kernels import fast as glm_fast  # type: ignore
+                from omlx.patches.glm_moe_dsa.kernels import fast as glm_fast  # type: ignore
 
                 if hasattr(glm_fast, "glm_moe_weighted_sum"):
                     return glm_fast.glm_moe_weighted_sum(x_out, inv_order, scores)

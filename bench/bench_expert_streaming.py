@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -51,7 +52,19 @@ def build_prompt(model_key: str, prompt_len: str) -> list[dict]:
 
 
 class FakeEnforcer:
-    memory_guard_tier = "balanced"
+    # Bench-only memory-guard tier. Override via OMLX_BENCH_TIER (safe|balanced|
+    # aggressive|custom) to probe admission behaviour on constrained hardware.
+    # The server normally derives this from ProcessMemoryEnforcer; the bench has
+    # no enforcer, so it defaults to "balanced".
+    memory_guard_tier = os.environ.get("OMLX_BENCH_TIER", "balanced") or "balanced"
+    if memory_guard_tier not in ("safe", "balanced", "aggressive", "custom"):
+        import sys
+        print(
+            f"[bench] OMLX_BENCH_TIER={memory_guard_tier!r} invalid; "
+            "falling back to 'balanced'",
+            file=sys.stderr,
+        )
+        memory_guard_tier = "balanced"
 
     def __init__(self, ceiling_gib=32.0):
         self._ceiling = int(ceiling_gib * 1024**3)
@@ -293,14 +306,34 @@ async def run(
         sampler.samples(),
         open(out_dir_p / f"{model_key}_{budget}g_samples.json", "w"),
     )
-    # Generated output for bit-exactness comparison across runs
+    # Generated output for bit-exactness comparison across runs.
+    # The VLM/batched engine's `chat` populates `text` and `completion_tokens`
+    # but leaves `GenerationOutput.tokens` as [] (the underlying mlx-lm result's
+    # token ids are dropped at the omlx GenerationOutput boundary). So `text`
+    # is the real, populated field and — for greedy (temperature=0) decoding —
+    # is a faithful deterministic proxy for token-id equality, which is what the
+    # success criterion needs. Fail-high: a run with no comparable output must
+    # abort, never be accepted (the old gate recorded token_ids:null silently).
     _text = getattr(out2, "text", None)
-    _ids = getattr(out2, "completion_tokens", None) or getattr(out2, "token_ids", None)
+    _tokens = getattr(out2, "tokens", None)
+    if isinstance(_tokens, list) and _tokens:
+        _bit_exact = _tokens
+        _bit_exact_kind = "tokens"
+    elif isinstance(_text, str) and _text:
+        _bit_exact = _text
+        _bit_exact_kind = "text"
+    else:
+        raise SystemExit(
+            f"bit-exactness gate FAILED: out2 has neither tokens nor text "
+            f"(tokens={type(_tokens).__name__}, text={type(_text).__name__}); "
+            f"cannot compare runs across commits. Aborting."
+        )
     _json.dump(
         {
+            "bit_exact_kind": _bit_exact_kind,
             "text": _text if isinstance(_text, str) else None,
             "completion_tokens": n,
-            "token_ids": _ids if isinstance(_ids, list) else None,
+            "tokens": _tokens if isinstance(_tokens, list) else None,
         },
         open(out_dir_p / f"{model_key}_{budget}g_output.json", "w"),
     )
@@ -390,6 +423,14 @@ def main():
     ap.add_argument("--out-dir", default="bench/results", metavar="DIR",
                     help="directory for the _samples/_output side-effect files (default bench/results)")
     args = ap.parse_args()
+    repo_root = Path(__file__).resolve().parents[1]
+    import omlx
+
+    omlx_path = Path(omlx.__file__).resolve()
+    if repo_root not in omlx_path.parents:
+        raise SystemExit(
+            f"wrong omlx checkout imported: {omlx_path}; expected under {repo_root}"
+        )
     try:
         import psutil
 

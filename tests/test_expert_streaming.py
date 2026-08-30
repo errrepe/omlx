@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 from omlx.admin import routes as admin_routes
@@ -669,11 +670,169 @@ def test_backing_store_multi_root_resolution():
         assert slc.shape == (16, 32)
 
         # Without the extra root the expert key cannot resolve.
-        from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore as BS
+        from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
 
-        primary_only = BS(primary)
+        primary_only = ExpertBackingStore(primary)
         with pytest.raises((KeyError, FileNotFoundError)):
             primary_only.load_expert_slice("model.layers.0.mlp.switch_mlp.gate_proj.weight", 0)
+
+
+# --- Fase J, C1: preadv zero-copy + per-key read params -----------------------
+def test_shard_reader_preadv_slice_shape_and_run_matches_slices():
+    """C1: preadv zero-copy slice/run yield correct shapes and the run equals
+    the independently-sliced per-expert views (no content regression)."""
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        _write_shard(tmp / "model.safetensors", {key: ((4, 16, 32), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        assert backing.load_expert_slice(key, 0).shape == (16, 32)
+        assert backing.load_expert_slice(key, 3).shape == (16, 32)
+        run = backing.load_expert_run(key, 0, 4)
+        assert len(run) == 4
+        for i, s in enumerate(run):
+            assert s.shape == (16, 32)
+            assert np.array_equal(s, backing.load_expert_slice(key, i))
+
+
+def test_shard_reader_rp_for_cached_and_zero_copy_buffer():
+    """C1: _rp_for caches per-key params and the slice is a view into the
+    writable preadv buffer (no bytearray double-copy)."""
+    from omlx.patches.expert_streaming.shard_bank import _ShardReader
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "m.weight"
+        _write_shard(tmp / "model.safetensors", {key: ((4, 16, 32), "BF16")})
+        reader = _ShardReader(tmp / "model.safetensors")
+        rp1 = reader._rp_for(key)
+        rp2 = reader._rp_for(key)
+        assert rp1 is rp2  # cached, no per-call recompute
+        assert rp1.expert_bytes == (4 * 16 * 32 * 2) // 4
+        assert rp1.per_shape == (16, 32)
+        slc = reader.expert_slice(key, 2)
+        assert slc.shape == (16, 32)
+        assert slc.base is not None  # view into the preadv-filled buffer
+
+
+def test_shard_reader_size_mismatch_raises_value_error():
+    """C1: a header whose data_offsets disagree with n_elements*item raises
+    ValueError (computed once, then cached)."""
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "m.switch_mlp.gate_proj.weight"
+        shape = (4, 16, 32)
+        item = 2  # BF16
+        nbytes = int(np.prod(shape)) * item  # 4096
+        # header claims MORE bytes than the tensor actually holds
+        header = {key: {"dtype": "BF16", "shape": list(shape), "data_offsets": [0, nbytes + 904]}}
+        hb = json.dumps(header).encode()
+        with (tmp / "model.safetensors").open("wb") as f:
+            f.write(struct.pack("<Q", len(hb)))
+            f.write(hb)
+            f.write(b"\x00" * (nbytes + 904))
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        with pytest.raises(ValueError):
+            backing.load_expert_slice(key, 0)
+
+
+def test_shard_reader_short_read_raises_os_error():
+    """C1: reading an expert whose byte range runs past EOF surfaces OSError
+    (the zero-copy preadv short read is not silently swallowed)."""
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "m.switch_mlp.gate_proj.weight"
+        shape = (2, 16, 32)
+        item = 2
+        nbytes = int(np.prod(shape)) * item  # 2048
+        # header claims the full 2048, but the file data is truncated by 100 bytes
+        header = {key: {"dtype": "BF16", "shape": list(shape), "data_offsets": [0, nbytes]}}
+        hb = json.dumps(header).encode()
+        with (tmp / "model.safetensors").open("wb") as f:
+            f.write(struct.pack("<Q", len(hb)))
+            f.write(hb)
+            f.write(b"\x00" * (nbytes - 100))
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        # expert 1's range extends 100 bytes past EOF -> short read -> OSError
+        with pytest.raises(OSError):
+            backing.load_expert_slice(key, 1)
+
+
+def test_backing_read_expert_into_matches_load_expert_slice():
+    """C2: the coalesced read_expert_into must be byte-identical to the
+    per-expert load_expert_slice path (correctness contract for the miss
+    path consolidation in _load_expert_bundle)."""
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        # 4 experts, BF16 -> 16*32*2 bytes per expert
+        per = 16 * 32 * 2
+        _write_shard(tmp / "model.safetensors", {key: ((4, 16, 32), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        # single-expert coalesced read
+        out1 = np.empty((1, per), dtype=np.uint8)
+        assert backing.read_expert_into([(key, [0])], [out1])
+        assert np.array_equal(out1[0], backing.load_expert_slice(key, 0).view(np.uint8).reshape(-1))
+        # multi-expert (out of order) coalesced read, in id order in the buffer
+        eids = [3, 0, 2]
+        out3 = np.empty((3, per), dtype=np.uint8)
+        assert backing.read_expert_into([(key, eids)], [out3])
+        for slot, eid in enumerate(eids):
+            assert np.array_equal(
+                out3[slot], backing.load_expert_slice(key, eid).view(np.uint8).reshape(-1)
+            )
+        # wrong buffer shape -> False (safe fallback signal)
+        bad = np.empty((2, per + 1), dtype=np.uint8)
+        assert not backing.read_expert_into([(key, [0, 1])], [bad])
+        empty = np.empty((0, per), dtype=np.uint8)
+        assert backing.read_expert_into([(key, [])], [empty])
+        assert not backing.read_expert_into([(key, [])], [np.empty((0, per + 1), dtype=np.uint8)])
+
+
+def test_expert_lru_per_layer_cap_evicts_oldest_same_layer():
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    cache = ExpertLRUCache(4 * 1024, 1024, num_layers=2)
+    cache.put((0, 0, "w"), "e0")
+    cache.put((0, 1, "w"), "e1")
+    cache.put((0, 2, "w"), "e2")
+    assert (0, 0, "w") not in cache
+    assert (0, 1, "w") in cache
+    assert (0, 2, "w") in cache
+    assert cache._layer_counts == {0: 2}
+
+
+def test_expert_lru_discard_keeps_layer_counts_consistent():
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    cache = ExpertLRUCache(8 * 1024, 1024, num_layers=2)
+    keys = [(0, 0, "w"), (0, 1, "w"), (1, 0, "w")]
+    for key in keys:
+        cache.put(key, key)
+    assert cache.discard(keys[1])
+    assert not cache.discard(keys[1])
+    assert cache._layer_counts == {0: 1, 1: 1}
+    assert cache.size == 2
 
 
 def test_backing_store_extra_root_wins_for_mirrored_shards():
@@ -715,7 +874,6 @@ def test_streaming_glu_matches_reference():
     bit-exact against mlx-lm's reference SwitchGLU."""
     import mlx.core as mx
     import numpy as np
-
     from mlx_lm.models.switch_layers import SwitchGLU
 
     from omlx.patches.expert_streaming.streaming_switch import (
@@ -774,7 +932,6 @@ def test_streaming_quantized_glu_matches_reference():
     path) must be bit-exact against the reference composition."""
     import mlx.core as mx
     import numpy as np
-
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 
     from omlx.patches.expert_streaming.streaming_switch import (
@@ -822,25 +979,7 @@ def test_streaming_quantized_glu_matches_reference():
     backing[(0, "down_proj", "weight")] = ref_down.weight
     backing[(0, "down_proj", "scales")] = ref_down.scales
     backing[(0, "down_proj", "biases")] = ref_down.biases
-    setattr(
-        glu,
-        "down_proj",
-        StreamingQuantizedSwitchLinear(
-            layer_idx=0,
-            proj_name="down_proj",
-            stacked_weight_key="k.down_proj.weight",
-            stacked_scales_key="k.down_proj.scales",
-            stacked_biases_key="k.down_proj.biases",
-            num_experts=E,
-            input_dims=ref_down.input_dims,
-            output_dims=ref_down.output_dims,
-            backing=backing,
-            cache=cache,
-            group_size=32,
-            bits=4,
-            mode="affine",
-        ),
-    )
+    glu.down_proj = StreamingQuantizedSwitchLinear(layer_idx=0, proj_name="down_proj", stacked_weight_key="k.down_proj.weight", stacked_scales_key="k.down_proj.scales", stacked_biases_key="k.down_proj.biases", num_experts=E, input_dims=ref_down.input_dims, output_dims=ref_down.output_dims, backing=backing, cache=cache, group_size=32, bits=4, mode="affine")
 
     rng = np.random.default_rng(7)
     for trial in range(3):
@@ -967,11 +1106,13 @@ def test_adaptive_topk_truncate_math():
 def test_adaptive_topk_qwen_block_patch():
     """The patched Qwen3_5MoeSparseMoeBlock must bypass at exact threshold
     and produce finite, same-shape output when truncation engages."""
-    import mlx.core as mx
     from types import SimpleNamespace
+
+    import mlx.core as mx
 
     pytest.importorskip("mlx_vlm")
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
     from omlx.patches.expert_streaming import adaptive_topk
 
     cfg = SimpleNamespace(
@@ -1185,7 +1326,6 @@ def test_backing_advise_expert_run_real_range():
     degrades to False instead of raising."""
     import sys
 
-    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
 
     tmp, warmer, backing, linears = _ra_warmer_setup()
     try:
@@ -1279,8 +1419,9 @@ def test_prefill_hotness_recorder_budget0_page_cache_seed():
 
         with patch.object(
             ExpertBackingStore,
-            "load_expert_slice",
-            side_effect=lambda key, eid: reads.append((key, eid)) or b"\0" * 8,
+            "load_expert_run",
+            side_effect=lambda key, first, count: reads.append((key, first, count))
+            or [b"\0" * 8] * count,
         ):
             rec.maybe_seed(0, 8)
             deadline = time.time() + 5
@@ -1425,17 +1566,16 @@ def test_predicted_chunk_transient_includes_bank_term():
 def test_admission_floor_scales_down_for_streaming_chunks():
     """A big chunk's measured transient must not floor-limit smaller chunks
     when streaming banks dominate (they scale ~linearly with tokens)."""
-    from types import SimpleNamespace
 
-    from omlx.scheduler import Scheduler
     from omlx.prefill_transient_tracker import PrefillTransientTracker
+    from omlx.scheduler import Scheduler
 
     back = _GuardBackingStub(48, 512, 2_500_000)
     model = MagicMock()
     model._expert_streaming_backing = back
     sched = _guard_scheduler(model)
     tracker = PrefillTransientTracker()
-    tracker.update(1897, int(17_385_500))  # measured 17.4MB/token at 1.9k chunk
+    tracker.update(1897, 17_385_500)  # measured 17.4MB/token at 1.9k chunk
     tracker._observed_max_bytes = float(1897 * 17_385_500)  # ~32GB
     tracker._last_n_tokens = 1897
     sched._prefill_transient_tracker = tracker
@@ -1455,13 +1595,13 @@ def test_admission_floor_scales_down_for_streaming_chunks():
 
 def test_admission_floor_kept_without_streaming():
     """Non-streaming keeps the conservative size-invariant observed_max floor."""
-    from omlx.scheduler import Scheduler
     from omlx.prefill_transient_tracker import PrefillTransientTracker
+    from omlx.scheduler import Scheduler
 
     sched = _guard_scheduler(MagicMock())
     del sched.model._expert_streaming_backing
     tracker = PrefillTransientTracker()
-    tracker.update(1897, int(17_385_500))
+    tracker.update(1897, 17_385_500)
     tracker._observed_max_bytes = 32.0 * 1024**3
     tracker._last_n_tokens = 1897
     sched._prefill_transient_tracker = tracker

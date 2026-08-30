@@ -447,9 +447,9 @@ graphs are small.
   when idle — the two arms differ only in the env:
   ```
   OMLX_EXPERT_STREAMING_PER_LAYER_EVAL=0 .venv/bin/python bench/bench_expert_streaming.py \
-      --model qwen --prompt-tokens 2048 --decode 48 --min-free-gib 22 --mem-ceiling-gib <available-6>
+      --model qwen --prompt-len 2k --decode 48 --min-free-gb 22 --mem-ceiling-gib <available-6>
   OMLX_EXPERT_STREAMING_PER_LAYER_EVAL=1 .venv/bin/python bench/bench_expert_streaming.py \
-      --model qwen --prompt-tokens 2048 --decode 48 --min-free-gib 22 --mem-ceiling-gib <available-6>
+      --model qwen --prompt-len 2k --decode 48 --min-free-gb 22 --mem-ceiling-gib <available-6>
   ```
 
 ### I2 — learned pin store server integration (E3 follow-up)
@@ -512,6 +512,65 @@ that caps GLM decode.
 - **Quality gate before any default**: run I4 on the oQ4e checkpoint and the
   cold variant; publish the delta before enabling the tier anywhere.
 - Pending measurement: tok/s / TTFT A/B (idle window) + the I4 ppl delta.
+
+## Fase J — auditoria e execução (2026-08-30)
+
+A Fase J foi executada incrementalmente com o protocolo `PYTHONPATH=$PWD`,
+subprocesso novo por braço, `--out-dir` isolado e verificação de saída greedy.
+
+### Estado dos commits
+
+| Item | Estado | Observação |
+|---|---|---|
+| C0 | Adaptado | O VLM expõe `text`/`completion_tokens`, mas `GenerationOutput.tokens` permanece vazio; o gate aceita `text` não vazio e aborta sem saída comparável. |
+| M0 | Qwen concluído; GLM bloqueado | Qwen A0/B3a/B3b/A0b medidos. GLM falha no prefill por pico previsto de 46,38 GiB em máquina de 48 GiB, inclusive no tier agressive. |
+| C1 | Implementado e testado | `_ReadParams`, `preadv`, fallback `pread`, runs contíguos e validações de short-read. |
+| C2 | Implementado localmente | Leitura bank-first dos experts ausentes com limite `OMLX_EXPERT_STREAMING_BANK_MAX_BYTES`; fallback legado preservado. |
+| C3 | Implementado localmente | Eviction por camada O(1), `discard()` e lock reentrante; contadores protegidos contra drift. |
+| C4 | Implementado localmente | `prefill_bypass` evita fills durante prefill quando o seed de hotness está ativo. |
+| C5 | Parcial | O seed positivo ainda requer integração assíncrona completa; o caminho page-cache é assíncrono. |
+| C7 | Implementado localmente | Chaves de projeção pré-computadas por camada/linear. |
+| C8 | Implementado localmente | Page-cache seed agrupa IDs contíguos e usa `load_expert_run`. |
+| C9 | Implementado localmente | `mx.eval` permanece load-bearing; `mx.clear_cache` é condicionado por `get_cache_memory()` e `OMLX_EXPERT_STREAMING_CACHE_THRESH`. GLM não foi mensurável nesta máquina. |
+| C10 | Parcial | `_slice_dtypes` não polui a árvore MLX e `OMLX_EXPERT_STREAMING_RUN_MAX` existe; `uniq_mx`/bias gather ainda requerem medição e cobertura adicional. |
+| C11 | Parcial | Sentinel scheduler invalidado no `deep_reset`; PLE usa `np.asarray`; MTP não foi alterado sem medição específica. |
+| C12 | Implementado localmente | Import do weighted-sum streaming corrigido para `omlx.patches.glm_moe_dsa.kernels`. |
+| C6 | Pendente | Batch compartilhado entre gate/up/down ainda requer implementação invasiva e validação de bit-exactness/RSS. |
+| C13 | Este registro | Limitações e números locais registrados aqui. |
+
+### Medições locais
+
+| Braço | TTFT | tok/s | hit rate |
+|---|---:|---:|---:|
+| M0 Qwen A0 | 198,83 ms | 0,3004 | 0 |
+| M0 Qwen B3a | 106,42 ms | 0,3451 | 0,0877 |
+| M0 Qwen B3b | 86,47 ms | 0,3939 | 0,0877 |
+| M0 Qwen A0b | 50,96 ms | 0,6835 | 0 |
+| C1 Qwen B3 | 114,98 ms | 0,3685 | 0,0877 |
+
+O gate local registrou `bit_exact_kind=text`, 48 completion tokens e texto de
+253 caracteres em todos os braços. Como os IDs não atravessam a fronteira VLM,
+esses números comprovam determinismo textual greedy, não igualdade de token IDs.
+O C1 foi neutro dentro do ruído da máquina (swap já em uso); sua justificativa
+principal é corretude, robustez de leitura e eliminação da cópia intermediária.
+
+### Itens rejeitados ou não mensuráveis
+
+- **GLM 2k/512:** rejeitado pelo prefill guard; o transient estimado é constante
+  (36,71 GiB), portanto reduzir o prompt não resolve. Não há `glm_b4.json`.
+- **C6:** não foi medido porque o batch compartilhado ainda não foi implementado.
+- **C9 GLM:** sem métrica nesta máquina porque GLM não chega ao decode.
+- **Gate token-ID:** indisponível na API `GenerationOutput` atual; exige expor os
+  IDs no engine antes de restaurar o critério original do plano.
+
+### Verificação
+
+No estado documentado, as suítes Fase J passaram: `75 passed` em
+`tests/test_expert_streaming.py tests/test_cold_tier.py`; as regressões de
+scheduler passaram com `224 passed`; compatibilidade Qwen/GLM/DSA passou com
+`70 passed, 8 skipped`; e MTP passou com `197 passed`. A medição de benchmark
+C1 ocorreu antes das mudanças posteriores C2–C12 e não deve ser reutilizada como
+medição desses commits.
 
 ## References
 
