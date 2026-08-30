@@ -317,6 +317,14 @@
                                                        class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
                                                 <span class="block text-sm font-medium text-neutral-700" x-text="t('bench.config.ane_sweep_oproj')"></span>
                                             </label>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1" x-text="t('bench.config.ane_sweep_runs')"></label>
+                                                <input type="number" x-model.number="benchSweepRuns"
+                                                       :disabled="benchRunning || benchSweepRunning"
+                                                       min="1" max="5" step="1" placeholder="3"
+                                                       class="w-20 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                                <span class="block text-xs text-neutral-400 mt-1" x-text="t('bench.config.ane_sweep_runs_hint')"></span>
+                                            </div>
                                             <button type="button"
                                                     @click="runSweep()"
                                                     :disabled="benchSweepRunning || benchRunning || benchExternalEnabled || (!benchSweepSwiglu &amp;&amp; !benchSweepMoeShared &amp;&amp; !benchSweepOproj)"
@@ -344,8 +352,14 @@
                                                                     <span x-text="r.name"></span>
                                                                     <span x-show="r.best" class="ml-2 inline-block text-xs text-green-700" x-text="t('bench.config.ane_sweep_best')"></span>
                                                                 </td>
-                                                                <td class="px-3 py-2 text-right text-neutral-700" x-text="r.ppTps ? r.ppTps.toFixed(1) : '—'"></td>
-                                                                <td class="px-3 py-2 text-right text-neutral-700" x-text="r.genTps ? r.genTps.toFixed(1) : '—'"></td>
+                                                                <td class="px-3 py-2 text-right text-neutral-700">
+                                                                    <span x-text="r.ppTps != null ? r.ppTps.toFixed(1) : '—'"></span>
+                                                                    <span x-show="r.runs > 1 &amp;&amp; r.ppMin != null &amp;&amp; r.ppMax != null" class="block text-xs text-neutral-400" x-text="'(' + r.ppMin.toFixed(1) + '–' + r.ppMax.toFixed(1) + ')'"></span>
+                                                                </td>
+                                                                <td class="px-3 py-2 text-right text-neutral-700">
+                                                                    <span x-text="r.genTps != null ? r.genTps.toFixed(1) : '—'"></span>
+                                                                    <span x-show="r.runs > 1 &amp;&amp; r.genMin != null &amp;&amp; r.genMax != null" class="block text-xs text-neutral-400" x-text="'(' + r.genMin.toFixed(1) + '–' + r.genMax.toFixed(1) + ')'"></span>
+                                                                </td>
                                                                 <td class="px-3 py-2 text-right" :class="r.speedup > 1 ? 'text-green-700' : 'text-neutral-700'" x-text="r.speedup ? ((r.speedup >= 1 ? '+' : '') + ((r.speedup - 1) * 100).toFixed(0) + '%') : '—'"></td>
                                                             </tr>
                                                         </template>

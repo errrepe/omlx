@@ -746,7 +746,8 @@
             benchSweepOproj: false,
             benchSweepRunning: false,
             benchSweepProgress: null,  // { current, total, name } during a sweep
-            benchSweepResults: [],     // [{ name, ppTps, genTps, speedup, best }]
+            benchSweepResults: [],     // [{ name, ppTps, genTps, speedup, best, ppMin, ppMax, genMin, genMax, runs }]
+            benchSweepRuns: 3,         // benches per combination; table shows mean + min-max range
             // Shared external endpoint settings (persisted in localStorage,
             // used by both the throughput and accuracy bench tabs)
             externalBaseUrl: localStorage.getItem('omlx_bench_external_base_url') || '',
@@ -9678,37 +9679,72 @@
                     });
                 }
 
+                // Benches per combination — average several runs so the comparison
+                // is not dominated by a single run landing in the margin of error
+                // (thermal, OS scheduling, ANE compile-cache warmup, etc.).
+                const runs = Math.max(1, Math.min(5, parseInt(this.benchSweepRuns, 10) || 3));
+                const totalRuns = combos.length * runs;
+
                 this.benchSweepRunning = true;
                 this.benchSweepResults = [];
-                this.benchSweepProgress = { current: 0, total: combos.length, name: '' };
+                this.benchSweepProgress = { current: 0, total: totalRuns, name: '' };
                 this.benchError = '';
+
+                const meanOf = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
 
                 let failed = null;
                 try {
                     for (let i = 0; i < combos.length; i++) {
                         const c = combos[i];
-                        this.benchSweepProgress = { current: i + 1, total: combos.length, name: c.name };
-                        // Apply this combination's settings.
+                        // Apply this combination's settings once for the whole combo.
                         this.benchAneCustomize = true;
                         this.benchAnePrefillEnabled = c.master;
                         this.benchSwigluInAne = c.swiglu;
                         this.benchMoeSharedExpert = c.moe_shared;
                         this.benchOproj = c.oproj;
-                        // Run; startBenchmark sets benchRunning=true and
-                        // connectBenchSSE clears it when the run finishes.
-                        await this.startBenchmark();
-                        // Wait for the SSE 'done' to clear benchRunning.
-                        await this._waitForBenchComplete();
-                        if (this.benchError) {
-                            failed = this.benchError;
-                            break;
+
+                        const comboRuns = [];
+                        for (let r = 1; r <= runs; r++) {
+                            this.benchSweepProgress = {
+                                current: i * runs + r,
+                                total: totalRuns,
+                                name: `${c.name} · run ${r}/${runs}`,
+                            };
+                            // startBenchmark sets benchRunning=true and
+                            // connectBenchSSE clears it when the run finishes.
+                            await this.startBenchmark();
+                            // Wait for the SSE 'done' to clear benchRunning.
+                            await this._waitForBenchComplete();
+                            if (this.benchError) {
+                                failed = this.benchError;
+                                break;
+                            }
+                            // Collect metrics from this run.
+                            const m = this._extractSweepMetrics();
+                            if (m.ppTps != null || m.genTps != null) comboRuns.push(m);
                         }
-                        // Collect metrics from this run.
-                        const metrics = this._extractSweepMetrics();
+                        if (failed) break;
+
+                        if (comboRuns.length === 0) {
+                            this.benchSweepResults.push({
+                                name: c.name, ppTps: null, genTps: null,
+                                ppMin: null, ppMax: null, genMin: null, genMax: null,
+                                runs: 0, speedup: null, best: false,
+                            });
+                            continue;
+                        }
+
+                        const ppVals = comboRuns.map(m => m.ppTps).filter(v => typeof v === 'number');
+                        const genVals = comboRuns.map(m => m.genTps).filter(v => typeof v === 'number');
                         this.benchSweepResults.push({
                             name: c.name,
-                            ppTps: metrics.ppTps,
-                            genTps: metrics.genTps,
+                            ppTps: meanOf(ppVals),
+                            genTps: meanOf(genVals),
+                            ppMin: ppVals.length ? Math.min(...ppVals) : null,
+                            ppMax: ppVals.length ? Math.max(...ppVals) : null,
+                            genMin: genVals.length ? Math.min(...genVals) : null,
+                            genMax: genVals.length ? Math.max(...genVals) : null,
+                            runs: comboRuns.length,
                             speedup: null,
                             best: false,
                         });
@@ -9725,17 +9761,17 @@
                     return;
                 }
 
-                // Compute speedup vs baseline (first result).
+                // Compute speedup vs baseline (first result, averaged).
                 const baseline = this.benchSweepResults[0];
-                if (baseline && baseline.ppTps) {
+                if (baseline && baseline.ppTps != null) {
                     for (const r of this.benchSweepResults) {
-                        r.speedup = r.ppTps ? (r.ppTps / baseline.ppTps) : null;
+                        r.speedup = r.ppTps != null ? (r.ppTps / baseline.ppTps) : null;
                     }
                 }
-                // Highlight the best (highest pp TPS).
+                // Highlight the best (highest averaged pp TPS).
                 let best = null;
                 for (const r of this.benchSweepResults) {
-                    if (r.ppTps && (!best || r.ppTps > best.ppTps)) best = r;
+                    if (r.ppTps != null && (!best || r.ppTps > best.ppTps)) best = r;
                 }
                 if (best) best.best = true;
             },
