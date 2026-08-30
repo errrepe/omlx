@@ -542,14 +542,14 @@ subprocesso novo por braço, `--out-dir` isolado e verificação de saída greed
 
 | Braço | TTFT | tok/s | hit rate |
 |---|---:|---:|---:|
-| M0 Qwen A0 | 198,83 ms | 0,3004 | 0 |
-| M0 Qwen B3a | 106,42 ms | 0,3451 | 0,0877 |
-| M0 Qwen B3b | 86,47 ms | 0,3939 | 0,0877 |
-| M0 Qwen A0b | 50,96 ms | 0,6835 | 0 |
-| C1 Qwen B3 | 114,98 ms | 0,3685 | 0,0877 |
-| Current C2–C12 Qwen A0 | 84,27 ms | 0,4514 | 0 |
-| Current C2–C12 Qwen B3 | 85,20 ms | 0,4141 | 0,0323 |
-| Single-request Qwen A0 | 81,01 ms | 2,6241 | 0 |
+| M0 Qwen A0 | 198,83 s | 0,3004 | 0 |
+| M0 Qwen B3a | 106,42 s | 0,3451 | 0,0877 |
+| M0 Qwen B3b | 86,47 s | 0,3939 | 0,0877 |
+| M0 Qwen A0b | 50,96 s | 0,6835 | 0 |
+| C1 Qwen B3 | 114,98 s | 0,3685 | 0,0877 |
+| Current C2–C12 Qwen A0 | 84,27 s | 0,4514 | 0 |
+| Current C2–C12 Qwen B3 | 85,20 s | 0,4141 | 0,0323 |
+| Single-request Qwen A0 | 81,01 s | 2,6241 | 0 |
 
 O gate histórico registrou `bit_exact_kind=text`, 48 completion tokens e texto
 de 253 caracteres porque os IDs não atravessavam a fronteira VLM. A fronteira
