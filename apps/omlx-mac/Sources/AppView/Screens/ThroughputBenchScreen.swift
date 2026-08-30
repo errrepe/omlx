@@ -68,9 +68,21 @@ struct ThroughputBenchScreen: View {
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
+                isQwenAneModel: vm.models.first(where: { $0.id == vm.selectedModelId })
+                    .map { isQwen35AnePrefillModel($0) || ($0.settings?.qwen35AnePrefillEnabled ?? false) } ?? false,
+                aneCustomize: $vm.aneCustomize,
+                anePrefillEnabled: $vm.anePrefillEnabled,
+                aneDualAne: $vm.aneDualAne,
+                swigluInAne: $vm.swigluInAne,
+                moeSharedExpert: $vm.moeSharedExpert,
+                oproj: $vm.oproj,
+                oprojFraction: $vm.oprojFraction,
+                oprojMaxLayers: $vm.oprojMaxLayers,
                 running: vm.running,
                 canRun: vm.canRun,
                 pendingFlags: vm.pendingFeatureFlags,
+                onSelectModel: { vm.seedAneFromSaved() },
+                onToggleAneCustomize: { vm.seedAneFromSaved() },
                 onRun: { vm.runBenchmark(client: services.client) },
                 onCancel: { vm.cancelBenchmark(client: services.client) }
             )
@@ -111,6 +123,16 @@ struct ThroughputBenchScreen: View {
         // doesn't lose progress.
         .task { await vm.start(client: services.client) }
     }
+}
+
+// Whether a model uses the Qwen3.5/3.6/3.8 private ANE/GPU prefill. Mirrors
+// the web admin panel's `isQwen35AnePrefillModel` (config_model_type prefix
+// check against qwen3_5 / qwen3_6 / qwen3_8).
+private func isQwen35AnePrefillModel(_ model: ModelDTO) -> Bool {
+    let modelType = (model.configModelType ?? "")
+        .lowercased()
+        .replacingOccurrences(of: "-", with: "_")
+    return ["qwen3_5", "qwen3_6", "qwen3_8"].contains(where: { modelType.hasPrefix($0) })
 }
 
 // MARK: - Device chip
@@ -166,9 +188,20 @@ private struct ConfigurationSection: View {
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
+    let isQwenAneModel: Bool
+    @Binding var aneCustomize: Bool
+    @Binding var anePrefillEnabled: Bool
+    @Binding var aneDualAne: Bool
+    @Binding var swigluInAne: Bool
+    @Binding var moeSharedExpert: Bool
+    @Binding var oproj: Bool
+    @Binding var oprojFraction: Double
+    @Binding var oprojMaxLayers: Int
     let running: Bool
     let canRun: Bool
     let pendingFlags: [String]
+    let onSelectModel: () -> Void
+    let onToggleAneCustomize: () -> Void
     let onRun: () -> Void
     let onCancel: () -> Void
 
@@ -200,6 +233,7 @@ private struct ConfigurationSection: View {
                     width: 320,
                     options: modelOptions
                 )
+                .onChange(of: selectedModelId) { _, _ in onSelectModel() }
             }
 
             Row(label: String(localized: "bench.throughput.row.context.label",
@@ -288,6 +322,106 @@ private struct ConfigurationSection: View {
                     selection: $batchSizes,
                     format: { "\($0)" }
                 )
+            }
+
+            // Qwen ANE Prefill (this run): per-run override of the three
+            // opt-in ANE options. Only shown for Qwen3.5/3.6/3.8 models. When
+            // aneCustomize is off, no override is sent and the run honors the
+            // model's saved settings (zero-code path).
+            if isQwenAneModel {
+                Row(label: String(localized: "bench.throughput.row.ane_group.label",
+                                  defaultValue: "Qwen ANE Prefill (this run)",
+                                  comment: "Row label for the per-run ANE prefill override group on the Throughput Bench"),
+                    sublabel: String(localized: "bench.throughput.row.ane_group.sub",
+                                     defaultValue: "Override the model's saved ANE prefill settings for this run only. Your saved Model Settings are restored when the benchmark finishes.",
+                                     comment: "Sublabel under the per-run ANE prefill override group")) {
+                    Toggle("", isOn: $aneCustomize)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .disabled(running)
+                        .onChange(of: aneCustomize) { _, _ in onToggleAneCustomize() }
+                }
+
+                if aneCustomize {
+                    Row(label: String(localized: "bench.throughput.row.ane_enabled.label",
+                                      defaultValue: "Qwen ANE Prefill",
+                                      comment: "Label for the per-run ANE prefill master toggle"),
+                        sublabel: String(localized: "bench.throughput.row.ane_enabled.sub",
+                                         defaultValue: "Master switch for the dual-ANE/GPU hybrid prefill. The three options below only take effect when this is on.",
+                                         comment: "Sublabel for the per-run ANE prefill master toggle")) {
+                        Toggle("", isOn: $anePrefillEnabled)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .disabled(running)
+                    }
+
+                    Row(label: String(localized: "bench.throughput.row.ane_swiglu.label",
+                                      defaultValue: "SwiGLU on ANE",
+                                      comment: "Label for the per-run SwiGLU-in-ANE toggle"),
+                        sublabel: String(localized: "bench.throughput.row.ane_swiglu.sub",
+                                         defaultValue: "Folds the SwiGLU activation into the ANE gate/up program so only the GPU suffix is activated. Requires both ANEs and disables CPU sharing.",
+                                         comment: "Sublabel for the per-run SwiGLU-in-ANE toggle")) {
+                        Toggle("", isOn: $swigluInAne)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .disabled(running || !anePrefillEnabled || !aneDualAne)
+                    }
+
+                    Row(label: String(localized: "bench.throughput.row.ane_moe_shared.label",
+                                      defaultValue: "MoE Shared Expert on ANE",
+                                      comment: "Label for the per-run MoE Shared Expert on ANE toggle"),
+                        sublabel: String(localized: "bench.throughput.row.ane_moe_shared.sub",
+                                         defaultValue: "Also split the always-on dense shared expert of MoE checkpoints. Routed experts stay on GPU; the router is never approximated.",
+                                         comment: "Sublabel for the per-run MoE Shared Expert on ANE toggle")) {
+                        Toggle("", isOn: $moeSharedExpert)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .disabled(running || !anePrefillEnabled)
+                    }
+
+                    Row(label: String(localized: "bench.throughput.row.ane_oproj.label",
+                                      defaultValue: "o_proj on ANE",
+                                      comment: "Label for the per-run o_proj on ANE toggle"),
+                        sublabel: String(localized: "bench.throughput.row.ane_oproj.sub",
+                                         defaultValue: "Splits attention output projections by output channel. Token-local and safe for INT8, unlike qkv/k/v which feed the KV cache.",
+                                         comment: "Sublabel for the per-run o_proj on ANE toggle")) {
+                        Toggle("", isOn: $oproj)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .disabled(running || !anePrefillEnabled)
+                    }
+
+                    if oproj {
+                        FreeRow {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(String(localized: "bench.throughput.row.ane_oproj_fraction.label",
+                                                   defaultValue: "o_proj Fraction",
+                                                   comment: "Label for the per-run o_proj fraction input"))
+                                            .font(.omlxText(12, weight: .medium))
+                                            .foregroundStyle(theme.textSecondary)
+                                        TextField(value: $oprojFraction, format: .number) {}
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(width: 120)
+                                            .disabled(running)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(String(localized: "bench.throughput.row.ane_oproj_layers.label",
+                                                   defaultValue: "o_proj Layer Limit",
+                                                   comment: "Label for the per-run o_proj layer limit input"))
+                                            .font(.omlxText(12, weight: .medium))
+                                            .foregroundStyle(theme.textSecondary)
+                                        TextField(value: $oprojMaxLayers, format: .number) {}
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(width: 120)
+                                            .disabled(running)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             Row(isLast: true) {

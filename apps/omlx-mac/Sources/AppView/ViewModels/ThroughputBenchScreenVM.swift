@@ -40,6 +40,19 @@ final class ThroughputBenchScreenVM {
     var batchSizes: Set<Int> = [2, 4]
     var exportOpen: Bool = false
 
+    // Per-run Qwen3.5/3.6/3.8 ANE prefill override. `aneCustomize` gates
+    // whether any override is sent; when false the run honors the model's
+    // saved settings (zero-code path). The other fields are seeded from the
+    // selected model's saved settings when customize is turned on.
+    var aneCustomize: Bool = false
+    var anePrefillEnabled: Bool = false
+    var aneDualAne: Bool = false
+    var swigluInAne: Bool = false
+    var moeSharedExpert: Bool = false
+    var oproj: Bool = false
+    var oprojFraction: Double = 0.5
+    var oprojMaxLayers: Int = 16
+
     // Server state
     private(set) var models: [ModelDTO] = []
     private(set) var device: DeviceInfoDTO?
@@ -102,7 +115,34 @@ final class ThroughputBenchScreenVM {
         }
         if s.mtpEnabled == true { flags.append("Lightning MTP") }
         if s.vlmMtpEnabled == true { flags.append("VLM MTP") }
+        // Qwen3.5/3.6/3.8 ANE prefill: reflect the *effective* config so the
+        // note matches what the run will actually be tagged with (the bench
+        // override wins when aneCustomize is on).
+        let aneEnabled = aneCustomize ? anePrefillEnabled : (s.qwen35AnePrefillEnabled ?? false)
+        let swiglu = aneCustomize ? swigluInAne : (s.qwen35AnePrefillSwigluInAne ?? false)
+        let moe = aneCustomize ? moeSharedExpert : (s.qwen35AnePrefillMoeSharedExpert ?? false)
+        let oprojOn = aneCustomize ? oproj : (s.qwen35AnePrefillOproj ?? false)
+        if aneEnabled {
+            flags.append("Qwen ANE Prefill")
+            if swiglu { flags.append("ANE SwiGLU-in-ANE") }
+            if moe { flags.append("ANE MoE Shared Expert") }
+            if oprojOn { flags.append("ANE o_proj Split") }
+        }
         return flags
+    }
+
+    /// Seed the per-run ANE prefill override controls from the selected model's
+    /// saved settings so "customize" starts from the current config and only
+    /// the fields the user flips actually change the run.
+    func seedAneFromSaved() {
+        guard let s = models.first(where: { $0.id == selectedModelId })?.settings else { return }
+        anePrefillEnabled = s.qwen35AnePrefillEnabled ?? false
+        aneDualAne = s.qwen35AnePrefillDualAne ?? false
+        swigluInAne = s.qwen35AnePrefillSwigluInAne ?? false
+        moeSharedExpert = s.qwen35AnePrefillMoeSharedExpert ?? false
+        oproj = s.qwen35AnePrefillOproj ?? false
+        oprojFraction = s.qwen35AnePrefillOprojFraction ?? 0.5
+        oprojMaxLayers = s.qwen35AnePrefillOprojMaxLayers ?? 16
     }
 
     /// Synthetic 1× baseline for the Batch Results table: the first single
@@ -229,7 +269,13 @@ final class ThroughputBenchScreenVM {
             alignPromptToAne: alignPromptToAne,
             promptLengths: promptLengths.sorted(),
             generationLength: Int(genLength) ?? 128,
-            batchSizes: batchSizes.sorted()
+            batchSizes: batchSizes.sorted(),
+            qwen35AnePrefillEnabled: aneCustomize ? anePrefillEnabled : nil,
+            qwen35AnePrefillSwigluInAne: aneCustomize ? swigluInAne : nil,
+            qwen35AnePrefillMoeSharedExpert: aneCustomize ? moeSharedExpert : nil,
+            qwen35AnePrefillOproj: aneCustomize ? oproj : nil,
+            qwen35AnePrefillOprojFraction: aneCustomize ? oprojFraction : nil,
+            qwen35AnePrefillOprojMaxLayers: aneCustomize ? oprojMaxLayers : nil
         )
         // Wipe the previous run's tables so a new run doesn't accumulate
         // across unrelated configurations.

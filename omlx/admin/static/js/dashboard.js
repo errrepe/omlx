@@ -725,6 +725,18 @@
             benchForceLmEngine: false,
             benchAdvancedOptionsOpen: false,
             benchExternalEnabled: false,
+            // Per-run Qwen ANE prefill override (Throughput Bench → Advanced options).
+            // benchAneCustomize gates whether any override is sent; when false the run
+            // honors the model's saved settings (zero-code path). The other fields are
+            // seeded from the selected model's saved settings when customize is turned on.
+            benchAneCustomize: false,
+            benchAnePrefillEnabled: false,
+            benchAneDualAne: false,
+            benchSwigluInAne: false,
+            benchMoeSharedExpert: false,
+            benchOproj: false,
+            benchOprojFraction: 0.5,
+            benchOprojMaxLayers: 16,
             // Shared external endpoint settings (persisted in localStorage,
             // used by both the throughput and accuracy bench tabs)
             externalBaseUrl: localStorage.getItem('omlx_bench_external_base_url') || '',
@@ -7224,6 +7236,18 @@
                 return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
             },
 
+            benchAneEligible(modelId) {
+                // Show the per-run ANE prefill controls for Qwen3.5/3.6/3.8
+                // models, and also for any model whose saved settings already
+                // enable ANE prefill (covers fine-tunes whose config type
+                // prefix doesn't match the known prefixes).
+                const m = this.models.find(x => x.id === modelId);
+                if (!m) return false;
+                if (this.isQwen35AnePrefillModel(m)) return true;
+                const s = m.settings || {};
+                return !!s.qwen35_ane_prefill_enabled;
+            },
+
             isDiffusionUnsupportedProfileField(field) {
                 return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
             },
@@ -9370,6 +9394,23 @@
             },
 
             // Benchmark functions
+            seedBenchAneFromSaved() {
+                // Seed the per-run ANE prefill override controls from the selected
+                // model's saved settings so "customize" starts from the current config
+                // and only the fields the user flips actually change the run.
+                const model = this.models.find(m => m.id === this.benchModelId);
+                const s = (model && model.settings) || {};
+                this.benchAnePrefillEnabled = !!s.qwen35_ane_prefill_enabled;
+                this.benchAneDualAne = !!s.qwen35_ane_prefill_dual_ane;
+                this.benchSwigluInAne = !!s.qwen35_ane_prefill_swiglu_in_ane;
+                this.benchMoeSharedExpert = !!s.qwen35_ane_prefill_moe_shared_expert;
+                this.benchOproj = !!s.qwen35_ane_prefill_oproj;
+                this.benchOprojFraction = (typeof s.qwen35_ane_prefill_oproj_fraction === 'number')
+                    ? s.qwen35_ane_prefill_oproj_fraction : 0.5;
+                this.benchOprojMaxLayers = (typeof s.qwen35_ane_prefill_oproj_max_layers === 'number')
+                    ? s.qwen35_ane_prefill_oproj_max_layers : 16;
+            },
+
             async startBenchmark() {
                 if (this.benchExternalEnabled) {
                     if (!this.externalConfigValid()) {
@@ -9429,6 +9470,15 @@
                             batch_sizes: batchSizes,
                             force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
                             external: this.benchExternalEnabled ? this.externalRequestBody() : null,
+                            // Per-run ANE prefill override (only when the user opted in).
+                            ...(this.benchAneCustomize && !this.benchExternalEnabled ? {
+                                qwen35_ane_prefill_enabled: this.benchAnePrefillEnabled,
+                                qwen35_ane_prefill_swiglu_in_ane: this.benchSwigluInAne,
+                                qwen35_ane_prefill_moe_shared_expert: this.benchMoeSharedExpert,
+                                qwen35_ane_prefill_oproj: this.benchOproj,
+                                qwen35_ane_prefill_oproj_fraction: this.benchOprojFraction,
+                                qwen35_ane_prefill_oproj_max_layers: this.benchOprojMaxLayers,
+                            } : {}),
                         }),
                     });
 

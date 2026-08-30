@@ -117,6 +117,17 @@ class BenchmarkRequest(BaseModel):
     # endpoint instead of a local engine and model_id is the remote
     # model name (not validated against the local catalog).
     external: Optional[ExternalEndpointConfig] = None
+    # Per-run Qwen3.5/3.6/3.8 ANE/GPU prefill overrides from the bench UI.
+    # When provided, they transiently override the model's saved settings for
+    # the duration of the run and are restored afterward (see run_benchmark).
+    # None means "inherit the saved value" — so a run that leaves them unset
+    # behaves exactly like the zero-code path that honors Model Settings.
+    qwen35_ane_prefill_enabled: Optional[bool] = None
+    qwen35_ane_prefill_swiglu_in_ane: Optional[bool] = None
+    qwen35_ane_prefill_moe_shared_expert: Optional[bool] = None
+    qwen35_ane_prefill_oproj: Optional[bool] = None
+    qwen35_ane_prefill_oproj_fraction: Optional[float] = None
+    qwen35_ane_prefill_oproj_max_layers: Optional[int] = None
 
     @field_validator("prompt_lengths")
     @classmethod
@@ -328,6 +339,51 @@ def _derive_feature_flags(model_settings: Any) -> list[dict]:
                 label += spec.detail_label_fmt.format(bits)
         flags.append({"key": key, "label": label})
     return flags
+
+
+# Bench UI override keys for the Qwen3.5/3.6/3.8 ANE/GPU prefill. The user
+# can toggle these on the Throughput Bench tab to try a combination without
+# mutating their saved Model Settings; the originals are restored when the run
+# ends.
+_BENCH_ANE_OVERRIDE_FIELDS = (
+    "qwen35_ane_prefill_enabled",
+    "qwen35_ane_prefill_swiglu_in_ane",
+    "qwen35_ane_prefill_moe_shared_expert",
+    "qwen35_ane_prefill_oproj",
+    "qwen35_ane_prefill_oproj_fraction",
+    "qwen35_ane_prefill_oproj_max_layers",
+)
+
+
+def _bench_ane_overrides(request: "BenchmarkRequest") -> dict:
+    """Collect the non-None ANE prefill override fields from a bench request."""
+    overrides: dict = {}
+    for field in _BENCH_ANE_OVERRIDE_FIELDS:
+        value = getattr(request, field, None)
+        if value is not None:
+            overrides[field] = value
+    return overrides
+
+
+def _apply_bench_ane_override(sm: Any, request: "BenchmarkRequest") -> Optional[Any]:
+    """Transiently apply ANE prefill overrides to the model's saved settings.
+
+    The load-time ANE patch compiles from the model's saved settings at load
+    time, so overriding them here (before engine_pool.get_engine loads the
+    model) makes a bench run reflect the chosen combination. The caller is
+    responsible for restoring the returned original ModelSettings afterward.
+
+    Returns the original ModelSettings (an independent copy) so it can be
+    restored, or None if no override was requested.
+    """
+    overrides = _bench_ane_overrides(request)
+    if not overrides:
+        return None
+    original = sm.get_settings(request.model_id)  # copy — safe to hand back
+    merged = original.to_dict()
+    merged.update(overrides)
+    sm.set_settings(request.model_id, type(original).from_dict(merged))
+    return original
 
 
 # Performance-relevant settings only, as an allowlist rather than a denylist:
@@ -1717,6 +1773,13 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     # throttle shrinking chunks; pin speed priority for the run.
     previous_speed_priority = _pin_speed_priority(engine_pool)
 
+    # Per-run ANE prefill overrides from the bench UI. The load-time ANE patch
+    # compiles from the model's saved settings at load time, so overriding them
+    # here (before engine_pool.get_engine reloads the model in Phase 2) makes a
+    # run reflect the chosen combination. The original is restored in the
+    # finally block so the user's saved Model Settings are never mutated.
+    sm = getattr(engine_pool, "_settings_manager", None)
+    ane_override_original = None
     try:
         run.model_settings_snapshot = _with_benchmark_context(
             request.context_profile,
@@ -1726,8 +1789,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # and the produced numbers are tied to whatever was active when
         # generation actually ran.
         model_settings = None
-        sm = getattr(engine_pool, "_settings_manager", None)
         if sm is not None:
+            try:
+                ane_override_original = _apply_bench_ane_override(sm, request)
+            except Exception as e:
+                logger.warning(
+                    f"Benchmark: failed to apply ANE override for "
+                    f"{request.model_id}: {e}"
+                )
             try:
                 model_settings = sm.get_settings(request.model_id)
                 run.experimental_features.extend(
@@ -2196,6 +2265,19 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 run.sampler.stop()
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Benchmark: sampler stop failed: {e}")
+        # Restore the saved ANE prefill settings if this run overrode them, so
+        # the bench never permanently changes the user's Model Settings.
+        if ane_override_original is not None and sm is not None:
+            try:
+                sm.set_settings(request.model_id, ane_override_original)
+                logger.info(
+                    f"Benchmark: restored ANE settings for {request.model_id}"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Benchmark: failed to restore ANE settings for "
+                    f"{request.model_id}: {e}"
+                )
         _restore_speed_priority(engine_pool, previous_speed_priority)
 
 

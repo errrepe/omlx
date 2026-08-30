@@ -61,6 +61,16 @@ struct BenchStartRequest: Encodable, Sendable {
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]
+    // Per-run Qwen3.5/3.6/3.8 ANE prefill override. `nil` (the default) means
+    // "inherit the model's saved settings" — the backend only overrides when a
+    // value is present, set together when the bench's "customize" toggle is on.
+    // Encoded as qwen35_ane_prefill_* via the client's snake_case encoder.
+    var qwen35AnePrefillEnabled: Bool? = nil
+    var qwen35AnePrefillSwigluInAne: Bool? = nil
+    var qwen35AnePrefillMoeSharedExpert: Bool? = nil
+    var qwen35AnePrefillOproj: Bool? = nil
+    var qwen35AnePrefillOprojFraction: Double? = nil
+    var qwen35AnePrefillOprojMaxLayers: Int? = nil
 }
 
 struct BenchStartResponse: Codable, Sendable {

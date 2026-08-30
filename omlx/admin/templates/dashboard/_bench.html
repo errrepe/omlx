@@ -101,6 +101,7 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.config.model') }}</label>
                                 <select x-model="benchModelId"
+                                        @change="benchAneCustomize && seedBenchAneFromSaved()"
                                         :disabled="benchRunning || benchExternalEnabled"
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('bench.config.model_placeholder') }}</option>
@@ -193,6 +194,89 @@
                                             <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.force_lm_engine_hint') }}</span>
                                         </span>
                                     </label>
+                                    <!-- Qwen ANE Prefill (this run): per-run override of the
+                                         three opt-in ANE options. Only shown for Qwen3.5/3.6/3.8
+                                         models. When the master checkbox is off, no override is
+                                         sent and the run honors the model's saved settings. -->
+                                    <div x-show="benchAneEligible(benchModelId)" x-cloak class="pt-3 border-t border-neutral-100">
+                                        <label class="inline-flex items-start gap-2 cursor-pointer">
+                                            <input type="checkbox"
+                                                   x-model="benchAneCustomize"
+                                                   @change="benchAneCustomize && seedBenchAneFromSaved()"
+                                                   :disabled="benchRunning || benchExternalEnabled"
+                                                   class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                            <span>
+                                                <span class="block text-sm font-medium text-neutral-700" x-text="t('bench.config.ane_prefill_group')"></span>
+                                                <span class="block text-xs text-neutral-400 mt-1" x-text="t('bench.config.ane_prefill_group_hint')"></span>
+                                            </span>
+                                        </label>
+                                        <div x-show="benchAneCustomize" x-cloak class="mt-3 space-y-3 pl-6">
+                                            <!-- Master enable -->
+                                            <label class="inline-flex items-start gap-2 cursor-pointer">
+                                                <input type="checkbox"
+                                                       x-model="benchAnePrefillEnabled"
+                                                       :disabled="benchRunning"
+                                                       class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                                <span>
+                                                    <span class="block text-sm font-medium text-neutral-700" x-text="t('bench.config.ane_prefill_enabled')"></span>
+                                                    <span class="block text-xs text-neutral-400 mt-1" x-text="t('bench.config.ane_prefill_enabled_hint')"></span>
+                                                </span>
+                                            </label>
+                                            <!-- SwiGLU-in-ANE -->
+                                            <label class="inline-flex items-start gap-2 cursor-pointer">
+                                                <input type="checkbox"
+                                                       x-model="benchSwigluInAne"
+                                                       :disabled="benchRunning || !benchAnePrefillEnabled || !benchAneDualAne"
+                                                       :title="(benchAnePrefillEnabled && !benchAneDualAne) ? t('bench.config.ane_swiglu_needs_dual') : ''"
+                                                       class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                                <span>
+                                                    <span class="block text-sm font-medium text-neutral-700" x-text="t('bench.config.ane_swiglu')"></span>
+                                                    <span class="block text-xs text-neutral-400 mt-1" x-text="t('bench.config.ane_swiglu_hint')"></span>
+                                                </span>
+                                            </label>
+                                            <!-- MoE Shared Expert on ANE -->
+                                            <label class="inline-flex items-start gap-2 cursor-pointer">
+                                                <input type="checkbox"
+                                                       x-model="benchMoeSharedExpert"
+                                                       :disabled="benchRunning || !benchAnePrefillEnabled"
+                                                       class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                                <span>
+                                                    <span class="block text-sm font-medium text-neutral-700" x-text="t('bench.config.ane_moe_shared')"></span>
+                                                    <span class="block text-xs text-neutral-400 mt-1" x-text="t('bench.config.ane_moe_shared_hint')"></span>
+                                                </span>
+                                            </label>
+                                            <!-- o_proj on ANE -->
+                                            <div>
+                                                <label class="inline-flex items-start gap-2 cursor-pointer">
+                                                    <input type="checkbox"
+                                                           x-model="benchOproj"
+                                                           :disabled="benchRunning || !benchAnePrefillEnabled"
+                                                           class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                                    <span>
+                                                        <span class="block text-sm font-medium text-neutral-700" x-text="t('bench.config.ane_oproj')"></span>
+                                                        <span class="block text-xs text-neutral-400 mt-1" x-text="t('bench.config.ane_oproj_hint')"></span>
+                                                    </span>
+                                                </label>
+                                                <div x-show="benchOproj" x-cloak class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 pl-6">
+                                                    <div>
+                                                        <label class="block text-xs font-medium text-neutral-600 mb-1" x-text="t('bench.config.ane_oproj_fraction')"></label>
+                                                        <input type="number" x-model.number="benchOprojFraction"
+                                                               :disabled="benchRunning"
+                                                               min="0.05" max="0.90" step="0.005" placeholder="0.5"
+                                                               class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-xs font-medium text-neutral-600 mb-1" x-text="t('bench.config.ane_oproj_layers')"></label>
+                                                        <input type="number" x-model.number="benchOprojMaxLayers"
+                                                               :disabled="benchRunning"
+                                                               min="1" max="256" step="1" placeholder="16"
+                                                               class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
                                     <!-- External OpenAI-compatible endpoint -->
                                     <div>
                                         <label class="inline-flex items-start gap-2 cursor-pointer">
