@@ -532,7 +532,7 @@ subprocesso novo por braço, `--out-dir` isolado e verificação de saída greed
 | C7 | Implementado localmente | Chaves de projeção pré-computadas por camada/linear. |
 | C8 | Implementado localmente | Page-cache seed agrupa IDs contíguos e usa `load_expert_run`. |
 | C9 | Implementado localmente | `mx.eval` permanece load-bearing; `mx.clear_cache` é condicionado por `get_cache_memory()` e `OMLX_EXPERT_STREAMING_CACHE_THRESH`. GLM não foi mensurável nesta máquina. |
-| C10 | Parcial | `_slice_dtypes` não polui a árvore MLX e `OMLX_EXPERT_STREAMING_RUN_MAX` existe; `uniq_mx`/bias gather ainda requerem medição e cobertura adicional. |
+| C10 | Implementado localmente; benchmark pendente | `_slice_dtypes` fora da árvore MLX, `OMLX_EXPERT_STREAMING_RUN_MAX`, `uniq_mx` e bias gather via `mx.take`; benchmark isolado ainda pendente. |
 | C11 | Parcial | Sentinel scheduler invalidado no `deep_reset`; PLE usa `np.asarray`; MTP não foi alterado sem medição específica. |
 | C12 | Implementado localmente | Import do weighted-sum streaming corrigido para `omlx.patches.glm_moe_dsa.kernels`. |
 | C6 | Implementado localmente; benchmark pendente | `_LayerLoadContext` coordena uma submissão de I/O entre as projeções quantizadas da camada; fallback legado permanece quando o bank não é suportado. |

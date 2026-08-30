@@ -524,6 +524,7 @@ class _RemapPlan:
     indices_shape: tuple[int, ...] = ()
     flat_np: Any = None
     uniq_list: list = field(default_factory=list)
+    uniq_mx: Any = None  # MLX unique expert IDs reused by bias gather
     remapped: Any = None  # mx.array of compact ids, original indices shape
     positions: int = 0
     gate_s: float = 0.0
@@ -558,6 +559,7 @@ def _build_plan_into(plan: _RemapPlan, indices) -> None:
     plan.indices_shape = tuple(indices.shape)
     plan.flat_np = flat_np
     plan.uniq_list = uniq_list
+    plan.uniq_mx = mx.array(uniq_np)
     plan.remapped = mx.array(remapped_np.reshape(indices.shape))
     plan.positions = int(flat_np.size)
     plan.gate_s = t1 - t0
@@ -667,7 +669,7 @@ class StreamingSwitchLinear(nn.Module):
         # Call gather_mm with mini-bank
         out = mx.gather_mm(x, mini_bank.swapaxes(-1, -2), rhs_indices=remapped, sorted_indices=sorted_indices)
         if self._bias is not None and self._has_bias:
-            b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)  # (U,O)
+            b_mini = mx.take(self._bias, plan.uniq_mx, axis=0)  # (U,O)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
         p.record_observed(self.layer_idx, plan.uniq_list)
@@ -1168,7 +1170,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             sorted_indices=sorted_indices,
         )
         if self._bias is not None and self._has_bias:
-            b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)
+            b_mini = mx.take(self._bias, plan.uniq_mx, axis=0)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
         p.record_observed(self.layer_idx, plan.uniq_list)

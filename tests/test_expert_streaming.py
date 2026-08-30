@@ -1939,6 +1939,14 @@ def test_pin_controller_profile_round_trip(tmp_path):
     ).profile_path == profile or warmer_mod.PIN_PROFILE_PATH == ""
 
 
+def test_streaming_glm_weighted_sum_kernel_module_imports():
+    """C12: the streaming path resolves the shared GLM kernel module rather
+    than swallowing a missing relative expert_streaming.kernels import."""
+    from omlx.patches.glm_moe_dsa.kernels import fast
+
+    assert fast is not None
+
+
 def test_expert_streaming_pins_io_overrides():
     from omlx.model_settings import ModelSettings
     from omlx.patches.expert_streaming import _io_overrides
