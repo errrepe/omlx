@@ -528,14 +528,14 @@ subprocesso novo por braço, `--out-dir` isolado e verificação de saída greed
 | C2 | Implementado localmente | Leitura bank-first dos experts ausentes com limite `OMLX_EXPERT_STREAMING_BANK_MAX_BYTES`; fallback legado preservado. |
 | C3 | Implementado localmente | Eviction por camada O(1), `discard()` e lock reentrante; contadores protegidos contra drift. |
 | C4 | Implementado localmente | `prefill_bypass` evita fills durante prefill quando o seed de hotness está ativo. |
-| C5 | Parcial | O seed positivo ainda requer integração assíncrona completa; o caminho page-cache é assíncrono. |
+| C5 | Implementado localmente | Retain síncrono do hot set; leituras de bundles NumPy e puts no LRU são assíncronos no warm pool, protegidos pelo lock da C3. |
 | C7 | Implementado localmente | Chaves de projeção pré-computadas por camada/linear. |
 | C8 | Implementado localmente | Page-cache seed agrupa IDs contíguos e usa `load_expert_run`. |
 | C9 | Implementado localmente | `mx.eval` permanece load-bearing; `mx.clear_cache` é condicionado por `get_cache_memory()` e `OMLX_EXPERT_STREAMING_CACHE_THRESH`. GLM não foi mensurável nesta máquina. |
 | C10 | Parcial | `_slice_dtypes` não polui a árvore MLX e `OMLX_EXPERT_STREAMING_RUN_MAX` existe; `uniq_mx`/bias gather ainda requerem medição e cobertura adicional. |
 | C11 | Parcial | Sentinel scheduler invalidado no `deep_reset`; PLE usa `np.asarray`; MTP não foi alterado sem medição específica. |
 | C12 | Implementado localmente | Import do weighted-sum streaming corrigido para `omlx.patches.glm_moe_dsa.kernels`. |
-| C6 | Pendente | Batch compartilhado entre gate/up/down ainda requer implementação invasiva e validação de bit-exactness/RSS. |
+| C6 | Implementado localmente; benchmark pendente | `_LayerLoadContext` coordena uma submissão de I/O entre as projeções quantizadas da camada; fallback legado permanece quando o bank não é suportado. |
 | C13 | Este registro | Limitações e números locais registrados aqui. |
 
 ### Medições locais
@@ -558,19 +558,19 @@ principal é corretude, robustez de leitura e eliminação da cópia intermediá
 
 - **GLM 2k/512:** rejeitado pelo prefill guard; o transient estimado é constante
   (36,71 GiB), portanto reduzir o prompt não resolve. Não há `glm_b4.json`.
-- **C6:** não foi medido porque o batch compartilhado ainda não foi implementado.
+- **C2/C5/C6:** implementados localmente, mas sem benchmark isolado nesta máquina por falta de uma janela de memória suficiente; o último C2 tentou rodar com 22,9 GiB disponíveis e foi rejeitado pelo prefill guard.
 - **C9 GLM:** sem métrica nesta máquina porque GLM não chega ao decode.
 - **Gate token-ID:** indisponível na API `GenerationOutput` atual; exige expor os
   IDs no engine antes de restaurar o critério original do plano.
 
 ### Verificação
 
-No estado documentado, as suítes Fase J passaram: `75 passed` em
-`tests/test_expert_streaming.py tests/test_cold_tier.py`; as regressões de
-scheduler passaram com `224 passed`; compatibilidade Qwen/GLM/DSA passou com
-`70 passed, 8 skipped`; e MTP passou com `197 passed`. A medição de benchmark
-C1 ocorreu antes das mudanças posteriores C2–C12 e não deve ser reutilizada como
-medição desses commits.
+No estado documentado, a seleção completa de regressão passou com `566 passed,
+8 skipped` em 574 testes: streaming/cold tier, scheduler, compatibilidade
+Qwen/GLM/DSA e MTP. `compileall` e `git diff --check` também passaram. Os
+benchmarks isolados de C2–C6 ainda dependem de uma janela de memória suficiente;
+a medição C1 ocorreu antes das mudanças posteriores e não deve ser reutilizada
+como medição desses commits.
 
 ## References
 

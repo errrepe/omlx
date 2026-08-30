@@ -469,6 +469,50 @@ def _scatter_unsort(x, inv_order, shape=None):
 # ---------------------------------------------------------------------------
 
 @dataclass
+class _LayerLoadContext:
+    """Shared quantized demand load for one MoE layer's projections."""
+
+    def __init__(self, linears: list[Any], cache: ExpertLRUCache):
+        self.linears = linears
+        self.cache = cache
+        self.bundles: dict[int, dict[int, tuple]] = {}
+        self.hits: dict[int, int] = {}
+        self.misses: dict[int, int] = {}
+        self.failed = False
+        self._loaded = False
+
+    def ensure(self, expert_ids: list[int]) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        jobs: list[tuple[Any, list[int]]] = []
+        for linear in self.linears:
+            cached: dict[int, tuple] = {}
+            missing: list[int] = []
+            for eid in expert_ids:
+                key = (linear.layer_idx, eid, linear.stacked_weight_key)
+                value = self.cache.get(key)
+                if value is None:
+                    missing.append(eid)
+                else:
+                    cached[eid] = value
+            self.bundles[id(linear)] = cached
+            self.hits[id(linear)] = len(cached)
+            self.misses[id(linear)] = len(missing)
+            if missing:
+                jobs.append((linear, missing))
+        if not jobs:
+            return
+        pool = getattr(jobs[0][0], "_io_pool_override", None) or _EXPERT_IO_POOL
+        results = list(pool.map(lambda job: job[0]._load_expert_bank_np(job[1]), jobs))
+        for (linear, expert_ids), rows in zip(jobs, results):
+            if rows is None or len(rows) != len(expert_ids):
+                self.failed = True
+                return
+            self.bundles[id(linear)].update(zip(expert_ids, rows))
+
+
+@dataclass
 class _RemapPlan:
     """Routing plan shared by every streaming linear of one MoE layer call.
 
@@ -484,6 +528,7 @@ class _RemapPlan:
     positions: int = 0
     gate_s: float = 0.0
     unique_s: float = 0.0
+    ctx: _LayerLoadContext | None = None
 
 
 def _build_plan_into(plan: _RemapPlan, indices) -> None:
@@ -1003,15 +1048,27 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         misses = 0
         missing: list[int] = []
         t_res_start = time.perf_counter()
-        for eid in plan.uniq_list:
-            eid = int(eid)
-            b = self._bundle_cached_or_staged(eid)
-            if b is not None:
-                bundles[eid] = b
-                hits += 1
-            else:
-                misses += 1
-                missing.append(eid)
+        context_bundles = None
+        if plan.ctx is not None:
+            plan.ctx.ensure(plan.uniq_list)
+            if not plan.ctx.failed:
+                context_bundles = plan.ctx.bundles.get(id(self))
+                hits = plan.ctx.hits.get(id(self), 0)
+                misses = plan.ctx.misses.get(id(self), 0)
+                if context_bundles is not None and len(context_bundles) == len(plan.uniq_list):
+                    bundles.update(context_bundles)
+                else:
+                    context_bundles = None
+        if context_bundles is None:
+            for eid in plan.uniq_list:
+                eid = int(eid)
+                b = self._bundle_cached_or_staged(eid)
+                if b is not None:
+                    bundles[eid] = b
+                    hits += 1
+                else:
+                    misses += 1
+                    missing.append(eid)
         if missing:
             # ascending expert id = ascending file offset within the stacked
             # bank (row-major) — sorted reads keep the NVMe's locality
@@ -1208,6 +1265,14 @@ class StreamingSwitchGLU(nn.Module):
         # One shared routing plan for the whole layer: the first linear
         # invoked builds it (single mx.eval + unique + remap), the rest reuse.
         plan = _RemapPlan()
+        if self.quantized:
+            projections = (
+                [self.gate_up_proj, self.down_proj]
+                if has_fused
+                else [self.up_proj, self.gate_proj, self.down_proj]
+            )
+            if all(hasattr(proj, "_load_expert_bank_np") for proj in projections):
+                plan.ctx = _LayerLoadContext(projections, self._cache)
 
         if has_fused:
             x_gate_up = self.gate_up_proj(x_exp, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]

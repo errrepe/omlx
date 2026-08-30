@@ -1383,6 +1383,7 @@ def test_prefill_hotness_recorder_seeds_lru():
         rec.maybe_seed(0, 8)
         assert rec.seeded is True
         assert rec.seeded_experts > 0
+        assert rec.seed_done.wait(5)
 
         # Non-hot entries evicted (layer 0 expert 0 was seen but 1,2 rank higher
         # only if counts differ — with equal counts most_common is stable, so
