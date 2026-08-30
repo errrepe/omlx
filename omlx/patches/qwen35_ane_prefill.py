@@ -4550,3 +4550,34 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             if hasattr(model, counter):
                 setattr(model, counter, 0)
     return modules_released, programs_before
+
+
+def set_qwen35_ane_prefill_skip(model: Any, skip: bool) -> int:
+    """Soft-gate the ANE prefill backends on ``model`` for the current request.
+
+    Unlike :func:`release_qwen35_ane_prefill`, this does NOT drop the compiled
+    procedure banks or free the resident memory. It only flips the per-module
+    failure latches that every ANE dispatch site checks *before* attempting a
+    compile, so the next prefill chunk silently falls back to stock GPU compute.
+    Clearing the latch (``skip=False``) restores ANE dispatch instantly because
+    the compiled state is still attached -- no recompile, no memory churn.
+
+    This is what makes a per-request prompt-length gate cheap: the fixed-shape
+    ANE programs stay resident (they are wanted for long prompts) while short
+    prompts are served by plain GPU prefill. Returns the number of modules
+    toggled.
+    """
+    skip = bool(skip)
+    toggled = 0
+    for module in model.modules() if hasattr(model, "modules") else ():
+        for state_attr, failed_attr in (
+            ("_omlx_ane_prefill_state", "_omlx_ane_prefill_failed"),
+            ("_omlx_ane_fused_down_state", "_omlx_ane_prefill_failed"),
+            ("_omlx_ane_gdn_state", "_omlx_ane_gdn_failed"),
+            ("_omlx_ane_oproj_state", "_omlx_ane_oproj_failed"),
+        ):
+            if getattr(module, state_attr, None) is None:
+                continue
+            setattr(module, failed_attr, skip)
+            toggled += 1
+    return toggled

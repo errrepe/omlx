@@ -153,6 +153,12 @@ class ModelSettings:
             rows assigned across the ANE instances.
         qwen35_ane_prefill_oproj_max_layers: Maximum eligible attention layers
             whose o_proj is accelerated.
+        qwen35_ane_prefill_min_pp_tokens: Only engage the opt-in ANE prefill
+            modes (SwiGLU / MoE shared expert / o_proj) when the incoming
+            prompt has at least this many tokens. The new ANE modes only
+            pay off once the prefill is long enough to amortize their fixed
+            per-call overhead, so short prompts are served by plain GPU prefill.
+            0 disables the gate (always engage when enabled).
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -273,6 +279,7 @@ class ModelSettings:
     qwen35_ane_prefill_oproj: bool = False
     qwen35_ane_prefill_oproj_fraction: float = 0.50
     qwen35_ane_prefill_oproj_max_layers: int = 16
+    qwen35_ane_prefill_min_pp_tokens: int = 0
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

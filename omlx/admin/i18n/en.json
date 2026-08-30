@@ -675,6 +675,8 @@
   "modal.model_settings.qwen_ane_oproj_hint": "Splits attention output projections by output channel. Token-local and safe for INT8, unlike qkv/k/v which feed the KV cache.",
   "modal.model_settings.qwen_ane_oproj_fraction": "o_proj on ANE",
   "modal.model_settings.qwen_ane_oproj_layers": "o_proj Layer Limit",
+  "modal.model_settings.qwen_ane_min_pp": "Min PP tokens",
+  "modal.model_settings.qwen_ane_min_pp_hint": "Only engage the ANE prefill modes (SwiGLU / MoE shared expert / o_proj) when the prompt has at least this many tokens. 0 = always engage. The new ANE modes only pay off once the prefill is long enough to amortize their fixed overhead, so short prompts are served by plain GPU prefill.",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",
   "modal.model_settings.mtp_conflict": "Disable DFlash and TurboQuant KV first — they patch the same path MTP relies on.",

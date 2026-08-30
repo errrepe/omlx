@@ -66,6 +66,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_oproj",
     "qwen35_ane_prefill_oproj_fraction",
     "qwen35_ane_prefill_oproj_max_layers",
+    "qwen35_ane_prefill_min_pp_tokens",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",

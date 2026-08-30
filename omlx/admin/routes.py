@@ -168,6 +168,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_oproj: bool | None = None
     qwen35_ane_prefill_oproj_fraction: float | None = None
     qwen35_ane_prefill_oproj_max_layers: int | None = None
+    qwen35_ane_prefill_min_pp_tokens: int | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -2563,6 +2564,14 @@ async def update_model_settings(
                 detail="ANE o_proj layer limit must be positive.",
             )
         current_settings.qwen35_ane_prefill_oproj_max_layers = int(value)
+    if "qwen35_ane_prefill_min_pp_tokens" in sent:
+        value = request.qwen35_ane_prefill_min_pp_tokens
+        if value is None or int(value) < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE min PP tokens must be non-negative.",
+            )
+        current_settings.qwen35_ane_prefill_min_pp_tokens = int(value)
     if (
         current_settings.qwen35_ane_prefill_fused_down
         and current_settings.qwen35_ane_prefill_fraction > 0.50

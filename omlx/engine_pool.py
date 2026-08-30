@@ -700,6 +700,10 @@ class EnginePool:
                     "qwen35_ane_prefill_oproj_max_layers",
                     data.get("qwen35_ane_prefill_oproj_max_layers", 16),
                 )
+            add(
+                "qwen35_ane_prefill_min_pp_tokens",
+                data.get("qwen35_ane_prefill_min_pp_tokens", 0),
+            )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"

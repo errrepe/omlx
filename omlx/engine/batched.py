@@ -548,6 +548,10 @@ class BatchedEngine(BaseEngine):
                     ane_prefill_sequence_length = requested_ane_sequence_length
             except Exception:
                 logger.warning("Qwen ANE prefill not enabled", exc_info=True)
+            # Tracks the current per-request ANE soft-gate latch (True = ANE
+            # skipped for short prompts). Starts False because ANE is engaged
+            # at load when enabled; the min-PP gate only flips it per request.
+            self._ane_min_pp_skip = False
 
         # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
         # SwitchGLU. Strictly gated; decode and unsupported MoE variants fall
@@ -863,6 +867,59 @@ class BatchedEngine(BaseEngine):
             except Exception as e:
                 logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
+    async def _apply_ane_prefill_min_pp_gate(
+        self, prompt: str | list[int]
+    ) -> None:
+        """Soft-gate the opt-in ANE prefill backends by prompt length.
+
+        Mirrors the in-benchmark transient ANE override: the *saved* settings
+        are never mutated. When ``qwen35_ane_prefill_min_pp_tokens`` > 0 and the
+        incoming prompt is shorter than that threshold, the ANE modes are
+        skipped for this request (plain GPU prefill); a longer prompt
+        re-engages them. The toggle is a cheap per-module latch flip (see
+        ``set_qwen35_ane_prefill_skip``) -- no recompile, no memory drop. The
+        latch is process-global on the shared model object and is scoped to the
+        request that last set it; for a single-model local server this matches
+        the "ANE only for long prompts" intent. Runs on the MLX executor thread.
+        """
+        if not getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+            return
+        threshold = int(
+            getattr(self._model_settings, "qwen35_ane_prefill_min_pp_tokens", 0) or 0
+        )
+        if threshold <= 0:
+            return
+        from omlx.ane_prefill_gate import ane_prefill_should_engage
+
+        try:
+            if isinstance(prompt, str):
+                num_tokens = len(self._tokenizer.encode(prompt))
+            else:
+                num_tokens = len(prompt)
+        except Exception:
+            logger.debug(
+                "ANE min-PP gate: prompt tokenization failed; leaving ANE as-is"
+            )
+            return
+        want_ane = ane_prefill_should_engage(num_tokens, threshold)
+        desired_skip = not want_ane
+        if getattr(self, "_ane_min_pp_skip", None) == desired_skip:
+            return
+        from ..engine_core import get_mlx_executor
+        from ..patches.qwen35_ane_prefill import set_qwen35_ane_prefill_skip
+
+        loop = asyncio.get_running_loop()
+        executor = get_mlx_executor()
+
+        def _set() -> int:
+            return set_qwen35_ane_prefill_skip(self._model, desired_skip)
+
+        try:
+            await loop.run_in_executor(executor, _set)
+            self._ane_min_pp_skip = desired_skip
+        except Exception:
+            logger.warning("ANE min-PP gate toggle failed", exc_info=True)
+
     async def generate(
         self,
         prompt: str | list[int],
@@ -921,6 +978,10 @@ class BatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+
+        # Per-request ANE min-PP gate: skip the opt-in ANE modes for short
+        # prompts so prefill runs on plain GPU (they only pay off when long).
+        await self._apply_ane_prefill_min_pp_gate(prompt)
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -998,6 +1059,10 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides to engine
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+
+        # Per-request ANE min-PP gate: skip the opt-in ANE modes for short
+        # prompts so prefill runs on plain GPU (they only pay off when long).
+        await self._apply_ane_prefill_min_pp_gate(prompt)
 
         engine = self._engine
         request_id = await engine.add_request(

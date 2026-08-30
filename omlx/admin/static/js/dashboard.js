@@ -249,6 +249,7 @@
                 qwen35_ane_prefill_oproj: false,
                 qwen35_ane_prefill_oproj_fraction: 0.5,
                 qwen35_ane_prefill_oproj_max_layers: 16,
+                qwen35_ane_prefill_min_pp_tokens: 0,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -7459,6 +7460,15 @@
                     qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0,
                     qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8,
                     qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
+                    // Opt-in ANE prefill extensions (Feature A/B/C) and the
+                    // production min-PP gate. Seeded here so reopening the
+                    // modal reflects the saved values instead of resetting.
+                    qwen35_ane_prefill_swiglu_in_ane: s.qwen35_ane_prefill_swiglu_in_ane || false,
+                    qwen35_ane_prefill_moe_shared_expert: s.qwen35_ane_prefill_moe_shared_expert || false,
+                    qwen35_ane_prefill_oproj: s.qwen35_ane_prefill_oproj || false,
+                    qwen35_ane_prefill_oproj_fraction: s.qwen35_ane_prefill_oproj_fraction ?? 0.5,
+                    qwen35_ane_prefill_oproj_max_layers: s.qwen35_ane_prefill_oproj_max_layers ?? 16,
+                    qwen35_ane_prefill_min_pp_tokens: s.qwen35_ane_prefill_min_pp_tokens ?? 0,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
@@ -8400,6 +8410,19 @@
                                     ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
                                     : 8,
                                 qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
+                                // Opt-in ANE prefill extensions (Feature A/B/C) and the
+                                // production min-PP gate. Sent so the modal save actually
+                                // persists them (previously omitted, so toggles never stuck).
+                                qwen35_ane_prefill_swiglu_in_ane: !!this.modelSettings.qwen35_ane_prefill_swiglu_in_ane,
+                                qwen35_ane_prefill_moe_shared_expert: !!this.modelSettings.qwen35_ane_prefill_moe_shared_expert,
+                                qwen35_ane_prefill_oproj: !!this.modelSettings.qwen35_ane_prefill_oproj,
+                                qwen35_ane_prefill_oproj_fraction: Number(this.modelSettings.qwen35_ane_prefill_oproj_fraction) || 0.5,
+                                qwen35_ane_prefill_oproj_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_oproj_max_layers))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_oproj_max_layers)
+                                    : 16,
+                                qwen35_ane_prefill_min_pp_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_min_pp_tokens))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_min_pp_tokens)
+                                    : 0,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
