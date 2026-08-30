@@ -33,6 +33,7 @@ _BANK_MAX_BYTES = max(
     int(os.environ.get("OMLX_EXPERT_STREAMING_BANK_MAX_BYTES", str(256 * 1024**2))),
 )
 _RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
+_LAYER_BARRIER_ENV = os.environ.get("OMLX_EXPERT_STREAMING_LAYER_BARRIER", "1") != "0"
 # Prefill attribution diag: sync the GPU at every prefill-sized MoE GLU call
 # and record the drain as a per-layer gpu bucket. Serializes CPU/GPU overlap
 # (wall inflates), so use it for attribution only — never for latency claims.
@@ -468,7 +469,6 @@ def _scatter_unsort(x, inv_order, shape=None):
 # Shared per-layer routing plan (one host sync per MoE layer)
 # ---------------------------------------------------------------------------
 
-@dataclass
 class _LayerLoadContext:
     """Shared quantized demand load for one MoE layer's projections."""
 
@@ -1267,7 +1267,7 @@ class StreamingSwitchGLU(nn.Module):
         # One shared routing plan for the whole layer: the first linear
         # invoked builds it (single mx.eval + unique + remap), the rest reuse.
         plan = _RemapPlan()
-        if self.quantized:
+        if self.quantized and _LAYER_BARRIER_ENV:
             projections = (
                 [self.gate_up_proj, self.down_proj]
                 if has_fused
