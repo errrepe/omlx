@@ -26,6 +26,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Opt-in per-layer / per-projection Metal memory trace (Fase J prefill-memory
+# work). Null-tracer by default: call sites cost one attribute lookup.
+from .memtrace import memtrace  # noqa: E402
+
 _PROFILE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
 _COALESCE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_COALESCE", "") != "0"
 _BANK_MAX_BYTES = max(
@@ -34,6 +38,24 @@ _BANK_MAX_BYTES = max(
 )
 _RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
 _LAYER_BARRIER_ENV = os.environ.get("OMLX_EXPERT_STREAMING_LAYER_BARRIER", "1") != "0"
+# Etapa B: rolling per-projection bank load instead of the union load.
+# 0 restores the legacy behaviour (every projection's NumPy bank resident at
+# once) for A/B against the new pipelined path.
+_CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "0"
+# How many *following* projections to read in the background while the
+# current one is promoted/computed. 0 disables prefetch entirely.
+_CTX_PREFETCH_AHEAD = max(
+    0, int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_AHEAD", "1"))
+)
+# Banks larger than this are never held speculatively; they are read on demand.
+_CTX_PREFETCH_MAX_BYTES = max(
+    0,
+    int(
+        os.environ.get(
+            "OMLX_EXPERT_STREAMING_CTX_AHEAD_BYTES", str(512 * 1024**2)
+        )
+    ),
+)
 # Prefill attribution diag: sync the GPU at every prefill-sized MoE GLU call
 # and record the drain as a per-layer gpu bucket. Serializes CPU/GPU overlap
 # (wall inflates), so use it for attribution only — never for latency claims.
@@ -470,7 +492,24 @@ def _scatter_unsort(x, inv_order, shape=None):
 # ---------------------------------------------------------------------------
 
 class _LayerLoadContext:
-    """Shared quantized demand load for one MoE layer's projections."""
+    """Shared quantized demand load for one MoE layer's projections.
+
+    Two modes, selected by ``OMLX_EXPERT_STREAMING_CTX_ROLLING``:
+
+    rolling (default — Etapa B)
+        Each projection resolves its own bank on demand. At most
+        ``_CTX_PREFETCH_AHEAD`` following projections are read on pool workers
+        in the background, so the next bank is in flight while the current one
+        is promoted and consumed on the GPU. Peak NumPy residency drops from
+        the *union* of every projection (~3 banks) to ~1-2 banks.
+
+    union (legacy — set the env var to 0)
+        One ``pool.map`` across every projection; all banks are resident until
+        the last projection is consumed. Maximum I/O parallelism, highest RSS.
+
+    Both modes preserve the C6 contract: one shared routing plan, and reads
+    performed on IO-pool workers that never allocate MLX arrays.
+    """
 
     def __init__(self, linears: list[Any], cache: ExpertLRUCache):
         self.linears = linears
@@ -479,37 +518,185 @@ class _LayerLoadContext:
         self.hits: dict[int, int] = {}
         self.misses: dict[int, int] = {}
         self.failed = False
+        # rolling state
+        self._order: dict[int, int] = {id(lin): i for i, lin in enumerate(linears)}
+        self._futures: dict[int, Any] = {}
+        self._inflight: dict[int, int] = {}
+        self._resolved: set[int] = set()
+        self._expert_ids: list[int] = []
+        # legacy union latch
         self._loaded = False
 
-    def ensure(self, expert_ids: list[int]) -> None:
+    # -- helpers ------------------------------------------------------------
+
+    def _split(self, linear: Any, expert_ids: list[int]) -> tuple[dict, list[int]]:
+        """Partition ``expert_ids`` into cached bundles and missing ids."""
+        cached: dict[int, tuple] = {}
+        missing: list[int] = []
+        for eid in expert_ids:
+            key = (linear.layer_idx, eid, linear.stacked_weight_key)
+            value = self.cache.get(key)
+            if value is None:
+                missing.append(eid)
+            else:
+                cached[eid] = value
+        return cached, missing
+
+    @staticmethod
+    def _pool_for(linear: Any):
+        return getattr(linear, "_io_pool_override", None) or _EXPERT_IO_POOL
+
+    @property
+    def _inflight_bytes(self) -> int:
+        return sum(self._inflight.values())
+
+    # -- rolling path -------------------------------------------------------
+
+    def _prefetch(self, linear: Any) -> None:
+        """Start background reads for the following projections, bounded.
+
+        Bounded two ways: at most ``_CTX_PREFETCH_AHEAD`` submissions per
+        call, and no single bank larger than ``_CTX_PREFETCH_MAX_BYTES`` is
+        held speculatively (it is read on demand instead).
+        """
+        if _CTX_PREFETCH_AHEAD <= 0:
+            return
+        start = self._order.get(id(linear), -1)
+        if start < 0:
+            return
+        submitted = 0
+        for nxt in self.linears[start + 1 :]:
+            if submitted >= _CTX_PREFETCH_AHEAD:
+                break
+            nid = id(nxt)
+            if nid in self._resolved or nid in self._futures:
+                continue
+            cached, missing = self._split(nxt, self._expert_ids)
+            self.bundles[nid] = cached
+            self.hits[nid] = len(cached)
+            self.misses[nid] = len(missing)
+            if not missing:
+                # Fully cached: nothing to read, mark resolved so the linear
+                # short-circuits when it asks.
+                self._resolved.add(nid)
+                continue
+            bank_bytes = int(nxt._bank_bytes_for(len(missing)))
+            if bank_bytes > _CTX_PREFETCH_MAX_BYTES:
+                continue
+            self._futures[nid] = self._pool_for(nxt).submit(
+                nxt._load_expert_bank_np, missing
+            )
+            self._inflight[nid] = bank_bytes
+            submitted += 1
+
+    def _ensure_rolling(self, linear: Any, expert_ids: list[int]) -> None:
+        lid = id(linear)
+        if lid in self._resolved:
+            return
+        self._resolved.add(lid)
+        if not self._expert_ids:
+            self._expert_ids = list(expert_ids)
+        ids = self._expert_ids
+
+        # A prefetch may already be in flight; the split is recomputed because
+        # the cache can change between submit and await.
+        fut = self._futures.pop(lid, None)
+        self._inflight.pop(lid, None)
+        cached, missing = self._split(linear, ids)
+        self.bundles[lid] = cached
+        self.hits[lid] = len(cached)
+        self.misses[lid] = len(missing)
+
+        if missing:
+            if fut is not None:
+                try:
+                    rows = fut.result()
+                except Exception:
+                    rows = None
+            else:
+                rows = linear._load_expert_bank_np(missing)
+            if rows is None or len(rows) != len(missing):
+                self.failed = True
+                if memtrace.enabled:
+                    memtrace.record(
+                        "ctx.ensure.fail",
+                        layer=linear.layer_idx,
+                        proj=getattr(linear, "proj_name", "?"),
+                        uniq=len(ids),
+                        miss=len(missing),
+                    )
+                return
+            self.bundles[lid].update(zip(missing, rows))
+
+        self._prefetch(linear)
+        if memtrace.enabled:
+            memtrace.record(
+                "ctx.ensure.exit",
+                layer=linear.layer_idx,
+                proj=getattr(linear, "proj_name", "?"),
+                uniq=len(ids),
+                miss=len(missing),
+                bank_bytes=int(linear._bank_bytes_for(len(missing))),
+                inflight=len(self._futures),
+                inflight_bytes=self._inflight_bytes,
+            )
+
+    # -- legacy union path --------------------------------------------------
+
+    def _ensure_union(self, linear: Any, expert_ids: list[int]) -> None:
         if self._loaded:
             return
         self._loaded = True
+        tracing = memtrace.enabled
+        layer = self.linears[0].layer_idx if self.linears else -1
+        if tracing:
+            memtrace.record(
+                "ctx.ensure.enter",
+                layer=layer,
+                n_proj=len(self.linears),
+                uniq=len(expert_ids),
+            )
         jobs: list[tuple[Any, list[int]]] = []
-        for linear in self.linears:
-            cached: dict[int, tuple] = {}
-            missing: list[int] = []
-            for eid in expert_ids:
-                key = (linear.layer_idx, eid, linear.stacked_weight_key)
-                value = self.cache.get(key)
-                if value is None:
-                    missing.append(eid)
-                else:
-                    cached[eid] = value
-            self.bundles[id(linear)] = cached
-            self.hits[id(linear)] = len(cached)
-            self.misses[id(linear)] = len(missing)
+        for proj in self.linears:
+            cached, missing = self._split(proj, expert_ids)
+            self.bundles[id(proj)] = cached
+            self.hits[id(proj)] = len(cached)
+            self.misses[id(proj)] = len(missing)
             if missing:
-                jobs.append((linear, missing))
+                jobs.append((proj, missing))
         if not jobs:
             return
-        pool = getattr(jobs[0][0], "_io_pool_override", None) or _EXPERT_IO_POOL
+        pool = self._pool_for(jobs[0][0])
         results = list(pool.map(lambda job: job[0]._load_expert_bank_np(job[1]), jobs))
-        for (linear, expert_ids), rows in zip(jobs, results):
-            if rows is None or len(rows) != len(expert_ids):
+        for (proj, ids), rows in zip(jobs, results):
+            if rows is None or len(rows) != len(ids):
                 self.failed = True
                 return
-            self.bundles[id(linear)].update(zip(expert_ids, rows))
+            self.bundles[id(proj)].update(zip(ids, rows))
+        if tracing:
+            # Union retention: every projection's bank is resident at once
+            # here, so the layer holds sum(miss_i * per_expert_bytes_i) bytes
+            # of NumPy until the last projection is promoted. This is exactly
+            # the term the rolling path eliminates.
+            live = sum(proj._bank_bytes_for(len(ids)) for proj, ids in jobs)
+            memtrace.record(
+                "ctx.ensure.exit",
+                layer=layer,
+                n_proj=len(self.linears),
+                uniq=len(expert_ids),
+                n_loaded=len(jobs),
+                miss_per_proj=[len(ids) for _, ids in jobs],
+                bank_bytes=live,
+            )
+
+    # -- public API ---------------------------------------------------------
+
+    def ensure(self, linear: Any, expert_ids: list[int]) -> None:
+        """Resolve ``linear``'s demand set for this layer call."""
+        if _CTX_ROLLING_ENV:
+            self._ensure_rolling(linear, expert_ids)
+        else:
+            self._ensure_union(linear, expert_ids)
 
 
 @dataclass
@@ -772,6 +959,23 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             return int(reader._rp_for(key).expert_bytes)
         except Exception:
             return 0
+
+    def _per_expert_bytes(self) -> int:
+        """Summed per-expert bytes across this projection's stacked tensors."""
+        keys = [self.stacked_weight_key, self.stacked_scales_key]
+        if self.stacked_biases_key:
+            keys.append(self.stacked_biases_key)
+        return sum(self._slice_bytes(k) for k in keys)
+
+    def _bank_bytes_for(self, n_experts: int) -> int:
+        """Bytes of raw NumPy bank needed to hold ``n_experts`` of this projection.
+
+        Used by the memory trace to quantify per-projection retention and by
+        the demand-set tiler (Etapa A) to size tiles under the bank cap.
+        """
+        if n_experts <= 0:
+            return 0
+        return n_experts * self._per_expert_bytes()
 
     def _slice_view(self, key: str, buf: np.ndarray) -> np.ndarray:
         """Reshape a raw uint8 expert buffer exactly as ``expert_slice`` would.
@@ -1052,7 +1256,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         t_res_start = time.perf_counter()
         context_bundles = None
         if plan.ctx is not None:
-            plan.ctx.ensure(plan.uniq_list)
+            # Etapa B: resolve *this* projection; the context prefetches the
+            # next one in the background so banks are not all resident at once.
+            plan.ctx.ensure(self, plan.uniq_list)
             if not plan.ctx.failed:
                 context_bundles = plan.ctx.bundles.get(id(self))
                 hits = plan.ctx.hits.get(id(self), 0)
@@ -1136,6 +1342,18 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     bundles[eid] = self._load_expert_bundle(eid)
         t_load = time.perf_counter() - t_res_start
 
+        if memtrace.enabled:
+            memtrace.record(
+                "linear.resolve",
+                layer=self.layer_idx,
+                proj=self.proj_name,
+                uniq=len(plan.uniq_list),
+                hits=hits,
+                misses=misses,
+                bank_bytes=self._bank_bytes_for(len(missing)),
+                from_ctx=context_bundles is not None,
+            )
+
         dt = self._slice_dtypes_lazy()
         for eid in plan.uniq_list:
             w, s, b = bundles[int(eid)]
@@ -1156,6 +1374,17 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             w_bank = mx.stack(mini_w, axis=0)
             s_bank = mx.stack(mini_s, axis=0)
             b_bank = mx.stack(mini_b, axis=0) if has_b and mini_b else None
+        if memtrace.enabled:
+            # Sampled *before* the QMM runs: at this instant the U promoted
+            # per-expert mx copies and the freshly stacked bank coexist, which
+            # is the transient double-buffer that demand-set tiling removes.
+            memtrace.record(
+                "linear.stack",
+                layer=self.layer_idx,
+                proj=self.proj_name,
+                uniq=len(plan.uniq_list),
+                bank_bytes=self._bank_bytes_for(len(plan.uniq_list)),
+            )
         remapped = plan.remapped
         out = mx.gather_qmm(
             x,
@@ -1257,6 +1486,10 @@ class StreamingSwitchGLU(nn.Module):
         hook = getattr(self, "_warm_pins", None)
         if hook is not None:
             hook.on_layer_start(self.layer_idx, int(indices.size))
+        if memtrace.enabled:
+            memtrace.record(
+                "glu.enter", layer=self.layer_idx, positions=int(indices.size)
+            )
         x_exp = mx.expand_dims(x, (-2, -3))
         do_sort = indices.size >= 64
         idx = indices
@@ -1322,4 +1555,11 @@ class StreamingSwitchGLU(nn.Module):
         out = x_out.squeeze(-2)
         if t_wall0 is not None and p is not None:
             p.add_wall(self.layer_idx, time.perf_counter() - t_wall0)
+        if memtrace.enabled:
+            memtrace.record(
+                "glu.exit",
+                layer=self.layer_idx,
+                uniq=len(plan.uniq_list),
+                positions=plan.positions,
+            )
         return out

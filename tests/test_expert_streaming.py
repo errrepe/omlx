@@ -2015,3 +2015,407 @@ def test_save_expert_pin_profile_hook():
     # Nothing attached anywhere: silent no-op (and the model-side holder path).
     bare = MagicMock(spec=object)
     save_expert_pin_profile(bare)
+
+
+# ---------------------------------------------------------------------------
+# Fase J — per-layer / per-projection memory trace (memtrace)
+# ---------------------------------------------------------------------------
+
+
+def test_memtrace_disabled_by_default_is_noop():
+    """With the env var unset the singleton is a null tracer: recording is a
+    no-op and ``enabled`` is False, so the hot path stays free."""
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    assert ss.memtrace.enabled is False
+    assert ss.memtrace.record("linear.resolve", layer=0) is None
+    with ss.memtrace.scope("glu", layer=0):
+        pass
+    assert ss.memtrace.summary() == {"enabled": False}
+    assert ss.memtrace.rows() if hasattr(ss.memtrace, "rows") else True
+
+
+def test_memtracer_records_rows_and_tracks_peaks():
+    """An armed tracer records one row per call with the memory counters and
+    keeps a running per-metric peak."""
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tracer = MemTracer(path=None)
+    tracer.record("linear.stack", layer=3, proj="up_proj", bank_bytes=1234)
+    # Force a *lower* second sample so the peak must come from the first.
+    tracer.record("linear.stack", layer=3, proj="down_proj", bank_bytes=7)
+
+    rows = tracer.rows()
+    assert len(rows) == 2
+    first = rows[0]
+    for key in ("seq", "t", "event", "layer", "proj", "active", "cache", "peak",
+                "footprint", "rss", "bank_bytes"):
+        assert key in first, f"missing field {key}"
+    assert first["event"] == "linear.stack"
+    assert first["layer"] == 3
+    assert first["proj"] == "up_proj"
+    assert rows[1]["seq"] == 2
+
+    peaks = tracer.peaks()
+    # Peaks are monotone maxima: the larger bank_bytes must win.
+    assert peaks["bank_bytes"] == 1234
+    # MLX counters must be whatever mlx reports (non-negative ints).
+    assert peaks["active"] >= 0 and isinstance(peaks["active"], int)
+    assert int(mx.get_active_memory()) >= 0
+
+
+def test_memtracer_writes_jsonl():
+    """A path-armed tracer appends valid JSONL rows flush-on-write."""
+    import json
+
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "trace.jsonl"
+        tracer = MemTracer(path=str(path))
+        tracer.record("glu.enter", layer=1, uniq=8)
+        tracer.record("glu.exit", layer=1, uniq=8)
+        tracer.flush()
+        lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 2
+        rows = [json.loads(ln) for ln in lines]
+        assert [r["event"] for r in rows] == ["glu.enter", "glu.exit"]
+        # Writing to a path must not retain rows in memory (unbounded growth).
+        assert tracer.rows() == []
+
+
+def test_memtracer_scope_emits_enter_exit():
+    """``scope`` brackets a block with .enter/.exit rows, even on exception."""
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tracer = MemTracer(path=None)
+    with tracer.scope("ctx.ensure", layer=2):
+        pass
+    assert [r["event"] for r in tracer.rows()] == ["ctx.ensure.enter", "ctx.ensure.exit"]
+
+    tracer.reset()
+    try:
+        with tracer.scope("ctx.ensure", layer=2):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    # The exit row must still be emitted so the trace never looks truncated.
+    assert [r["event"] for r in tracer.rows()] == ["ctx.ensure.enter", "ctx.ensure.exit"]
+
+
+def test_memtracer_sample_every_decimates():
+    """sample_every=N keeps 1 row in N without breaking peak tracking of the
+    rows it did see."""
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tracer = MemTracer(path=None, sample_every=4)
+    for i in range(12):
+        tracer.record("linear.resolve", uniq=i, bank_bytes=i * 10)
+    rows = tracer.rows()
+    # seq 4, 8, 12 survive.
+    assert [r["seq"] for r in rows] == [4, 8, 12]
+    assert tracer.summary()["samples"] == 12
+
+
+def test_memtracer_summary_reports_gib_peaks():
+    """summary() exposes both raw bytes and GiB-normalized peaks, which is the
+    form the bench reports as the acceptance criterion."""
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tracer = MemTracer(path=None)
+    tracer.record("linear.stack", bank_bytes=2 << 30)
+    s = tracer.summary()
+    assert s["enabled"] is True
+    assert s["peaks_bytes"]["bank_bytes"] == 2 << 30
+    assert s["peak_bank_bytes_gib"] == 2.0
+
+
+def _ctx_modes_setup():
+    """Build (tmp, linears, cache) for the _LayerLoadContext mode tests."""
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    tmp, _warmer, _backing, linears = _ra_warmer_setup()
+    # budget 0 -> every expert misses, so all three projections must load.
+    return tmp, linears, ExpertLRUCache(0, 1 << 12, num_layers=2)
+
+
+def test_ctx_union_mode_traces_union_bank_bytes():
+    """Legacy union mode (_CTX_ROLLING_ENV=0) holds every projection's NumPy
+    bank at once; the trace must report that union, not one projection.
+
+    This is the quantity the rolling path removes, so getting the accounting
+    right is a precondition for claiming a win.
+    """
+    import shutil
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tmp, linears, cache = _ctx_modes_setup()
+    tracer = MemTracer(path=None)
+    original_trace, original_mode = ss.memtrace, ss._CTX_ROLLING_ENV
+    ss.memtrace = tracer
+    ss._CTX_ROLLING_ENV = False
+    try:
+        ctx = ss._LayerLoadContext(linears[0], cache)
+        # One call resolves every projection (union semantics).
+        ctx.ensure(linears[0][0], [0, 1, 2, 3])
+
+        events = [r["event"] for r in tracer.rows()]
+        assert "ctx.ensure.enter" in events
+        assert "ctx.ensure.exit" in events
+
+        exit_row = next(r for r in tracer.rows() if r["event"] == "ctx.ensure.exit")
+        assert exit_row["n_proj"] == 3
+        assert exit_row["uniq"] == 4
+        assert exit_row["n_loaded"] == 3
+        assert exit_row["miss_per_proj"] == [4, 4, 4]
+        # Union across projections, not per-projection.
+        expected = sum(lin._bank_bytes_for(4) for lin in linears[0])
+        assert expected > 0
+        assert exit_row["bank_bytes"] == expected
+        # Sanity: the union is 3x one projection's bank (all same shape here).
+        assert exit_row["bank_bytes"] == 3 * linears[0][0]._bank_bytes_for(4)
+        assert ctx.failed is False
+        # Every projection is fully resolved by the single call.
+        for lin in linears[0]:
+            assert len(ctx.bundles[id(lin)]) == 4
+    finally:
+        ss.memtrace = original_trace
+        ss._CTX_ROLLING_ENV = original_mode
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ctx_rolling_mode_resolves_one_projection_at_a_time():
+    """Rolling mode (default): each call resolves only the asking projection and
+    keeps at most _CTX_PREFETCH_AHEAD banks in flight — never the union."""
+    import shutil
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tmp, linears, cache = _ctx_modes_setup()
+    tracer = MemTracer(path=None)
+    original_trace, original_mode = ss.memtrace, ss._CTX_ROLLING_ENV
+    ss.memtrace = tracer
+    ss._CTX_ROLLING_ENV = True
+    try:
+        ctx = ss._LayerLoadContext(linears[0], cache)
+
+        # First call resolves projection 0 only, and prefetches at most `ahead`.
+        ctx.ensure(linears[0][0], [0, 1, 2, 3])
+        assert len(ctx.bundles[id(linears[0][0])]) == 4
+        assert len(ctx.bundles[id(linears[0][1])]) == 0
+        # Nothing beyond the prefetch window is resident.
+        assert len(ctx._futures) <= max(1, ss._CTX_PREFETCH_AHEAD)
+        first_row = next(r for r in tracer.rows() if r["event"] == "ctx.ensure.exit")
+        assert first_row["proj"] == linears[0][0].proj_name
+        assert first_row["miss"] == 4
+        # The trace reports this projection's bank, NOT the 3x union.
+        assert first_row["bank_bytes"] == linears[0][0]._bank_bytes_for(4)
+        assert first_row["bank_bytes"] * 3 == sum(
+            lin._bank_bytes_for(4) for lin in linears[0]
+        )
+
+        # Remaining projections resolve on demand in call order.
+        ctx.ensure(linears[0][1], [0, 1, 2, 3])
+        ctx.ensure(linears[0][2], [0, 1, 2, 3])
+        for lin in linears[0]:
+            assert len(ctx.bundles[id(lin)]) == 4
+            assert ctx.hits[id(lin)] == 0
+            assert ctx.misses[id(lin)] == 4
+        assert ctx.failed is False
+        # All prefetches drained; nothing left in flight.
+        assert ctx._futures == {}
+        assert ctx._inflight_bytes == 0
+
+        exits = [r for r in tracer.rows() if r["event"] == "ctx.ensure.exit"]
+        assert [r["proj"] for r in exits] == [lin.proj_name for lin in linears[0]]
+        # Idempotent: re-asking does not re-read or re-trace.
+        before = len(tracer.rows())
+        ctx.ensure(linears[0][0], [0, 1, 2, 3])
+        assert len(tracer.rows()) == before
+    finally:
+        ss.memtrace = original_trace
+        ss._CTX_ROLLING_ENV = original_mode
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ctx_rolling_mode_prefetch_ahead_zero_reads_on_demand():
+    """With the prefetch window closed, each projection reads synchronously and
+    no future is ever held in flight (still correct, just no overlap)."""
+    import shutil
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    tmp, linears, cache = _ctx_modes_setup()
+    original_ahead, original_mode = ss._CTX_PREFETCH_AHEAD, ss._CTX_ROLLING_ENV
+    ss._CTX_ROLLING_ENV = True
+    ss._CTX_PREFETCH_AHEAD = 0
+    try:
+        ctx = ss._LayerLoadContext(linears[0], cache)
+        for lin in linears[0]:
+            ctx.ensure(lin, [0, 1, 2, 3])
+            assert ctx._futures == {}
+        assert ctx.failed is False
+        for lin in linears[0]:
+            assert len(ctx.bundles[id(lin)]) == 4
+    finally:
+        ss._CTX_PREFETCH_AHEAD = original_ahead
+        ss._CTX_ROLLING_ENV = original_mode
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ctx_rolling_mode_matches_union_mode_results():
+    """Both modes must produce identical bundles — the rolling path is a
+    scheduling change, not a data change. Bit-exactness of the loaded rows is
+    what protects the token-ID gate downstream."""
+    import shutil
+
+    import numpy as np
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    tmp, _warmer, backing, linears = _ra_warmer_setup()
+    original_mode = ss._CTX_ROLLING_ENV
+    try:
+        results = {}
+        for mode in (False, True):
+            cache = ExpertLRUCache(0, 1 << 12, num_layers=2)
+            ss._CTX_ROLLING_ENV = mode
+            ctx = ss._LayerLoadContext(linears[0], cache)
+            for lin in linears[0]:
+                ctx.ensure(lin, [3, 1, 0, 2])  # deliberately unsorted
+            per_proj = {}
+            for lin in linears[0]:
+                bundles = ctx.bundles[id(lin)]
+                per_proj[lin.proj_name] = {
+                    eid: tuple(
+                        np.asarray(part) if part is not None else None
+                        for part in bundle
+                    )
+                    for eid, bundle in sorted(bundles.items())
+                }
+            results[mode] = per_proj
+        assert set(results[False]) == set(results[True])
+        for proj in results[False]:
+            for eid in results[False][proj]:
+                a, b = results[False][proj][eid], results[True][proj][eid]
+                assert len(a) == len(b)
+                for pa, pb in zip(a, b):
+                    if pa is None or pb is None:
+                        assert pa is pb
+                    else:
+                        assert np.array_equal(pa, pb)
+    finally:
+        ss._CTX_ROLLING_ENV = original_mode
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_bank_bytes_for_scales_linearly_and_zeroes():
+    """_bank_bytes_for is the tile-sizing primitive for Etapa A; it must be
+    linear in the expert count and return 0 for a non-positive count."""
+    import shutil
+
+    from omlx.patches.expert_streaming.streaming_switch import (
+        StreamingQuantizedSwitchLinear,
+    )
+
+    tmp, _warmer, backing, linears = _ra_warmer_setup()
+    try:
+        lin = linears[0][0]
+        assert lin._bank_bytes_for(0) == 0
+        assert lin._bank_bytes_for(-5) == 0
+        one = lin._per_expert_bytes()
+        assert one > 0
+        assert lin._bank_bytes_for(1) == one
+        assert lin._bank_bytes_for(7) == 7 * one
+        # Per-expert bytes include weight + scales + biases for this projection.
+        assert one == (
+            lin._slice_bytes(lin.stacked_weight_key)
+            + lin._slice_bytes(lin.stacked_scales_key)
+            + lin._slice_bytes(lin.stacked_biases_key)
+        )
+        assert isinstance(lin, StreamingQuantizedSwitchLinear)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_glu_forward_emits_memtrace_events():
+    """End-to-end: a quantized GLU forward emits glu/layer events and the
+    per-projection linear events, with the real (null) tracer swapped out."""
+    import mlx.core as mx
+    import numpy as np
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+        StreamingSwitchGLU,
+    )
+
+    # mx.quantize only supports group sizes 32/64/128 and requires the last
+    # weight dim to be divisible by it -> D must be >= 32.
+    E, H, D, GS = 8, 64, 32, 32
+    cache = ExpertLRUCache(0, 1 << 18, num_layers=1)
+    backing: dict = {}
+    glu = StreamingSwitchGLU(
+        input_dims=D, hidden_dims=H, num_experts=E, layer_idx=0,
+        backing=backing, cache=cache, quantized=True, activation=None,
+    )
+    for name, in_dims, out_dims in (
+        ("gate_proj", D, H), ("up_proj", D, H), ("down_proj", H, D),
+    ):
+        ref_lin = QuantizedSwitchLinear(in_dims, out_dims, E, bias=True, group_size=GS, bits=4)
+        mx.eval(ref_lin.parameters())
+        backing[(0, name, "weight")] = ref_lin.weight
+        backing[(0, name, "scales")] = ref_lin.scales
+        backing[(0, name, "biases")] = ref_lin.biases
+        setattr(glu, name, StreamingQuantizedSwitchLinear(
+            layer_idx=0, proj_name=name,
+            stacked_weight_key=f"k.{name}.weight",
+            stacked_scales_key=f"k.{name}.scales",
+            stacked_biases_key=f"k.{name}.biases",
+            num_experts=E, input_dims=in_dims, output_dims=out_dims,
+            backing=backing, cache=cache, group_size=GS, bits=4, mode="affine",
+        ))
+
+    tracer = MemTracer(path=None)
+    original = ss.memtrace
+    ss.memtrace = tracer
+    try:
+        rng = np.random.default_rng(11)
+        x = mx.array(rng.standard_normal((1, 80, D)).astype(np.float32))
+        idx = mx.array(rng.integers(0, E, size=(1, 80, 1)).astype(np.int32))
+        out = glu(x, idx)
+        mx.eval(out)
+    finally:
+        ss.memtrace = original
+
+    events = [r["event"] for r in tracer.rows()]
+    assert "glu.enter" in events
+    assert "glu.exit" in events
+    # dict backing has no read_expert_into -> the bank load fails (traced as
+    # ctx.ensure.fail in rolling mode, ctx.ensure.enter in union mode) and the
+    # linears fall back to per-expert resolution, which must still be traced.
+    assert any(e.startswith("ctx.ensure.") for e in events)
+    assert "linear.resolve" in events
+    assert "linear.stack" in events
+
+    resolved = [r for r in tracer.rows() if r["event"] == "linear.resolve"]
+    # One per projection (gate, up, down).
+    assert {r["proj"] for r in resolved} == {"gate_proj", "up_proj", "down_proj"}
+    for row in resolved:
+        assert row["uniq"] > 0
+        assert row["misses"] > 0
+        assert row["from_ctx"] is False
+        assert row["bank_bytes"] >= 0
+    # Indices of shape (B, T, 1) keep the trailing singleton — stock SwitchGLU
+    # returns the same rank here, so this is parity, not an artifact.
+    assert out.shape == (1, 80, 1, D)
