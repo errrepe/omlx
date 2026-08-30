@@ -182,3 +182,106 @@ async def test_expert_streaming_cold_tier_api_validation():
         await _update_settings(
             pool, settings, admin_routes.ModelSettingsRequest(expert_streaming_cold_tier="4")
         )
+
+
+def test_hobbit_hot_set_loader_and_backing_routing(tmp_path):
+    """Fase I6: the hot-set loader turns pin-profile frequencies into a
+    top-fraction set, and the backing routes hot experts to the ORIGINAL
+    shards while the rest keep reading expert_cold/."""
+    from requant_cold_tier import requant_shard
+
+    from omlx.patches.expert_streaming.shard_bank import (
+        ExpertBackingStore,
+        load_hot_set_from_profile,
+    )
+
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    key_w = _write_quantized_checkpoint(ckpt, bits=4, gs=64)
+    quant_cfg = json.loads((ckpt / "config.json").read_text())["quantization"]
+    requant_shard(
+        ckpt / "model-00001-of-00001.safetensors",
+        ckpt / "expert_cold",
+        quant_cfg,
+        bits=3,
+    )
+
+    # Pin profile: layer 0 with descending counts — the top fraction must be
+    # the most frequent ids.
+    profile = {
+        "freq": {
+            "0": [[0, 90], [1, 80], [2, 70], [3, 10], [4, 5], [5, 1], [6, 1], [7, 1]]
+        }
+    }
+    (ckpt / ".omlx").mkdir()
+    (ckpt / ".omlx" / "expert_pin_profile.json").write_text(json.dumps(profile))
+
+    hot = load_hot_set_from_profile(ckpt / ".omlx" / "expert_pin_profile.json", 0.25)
+    # ceil(0.25 * 8) == 2 — the two most frequent ids.
+    assert hot == {"layer_0": {0, 1}}
+    assert load_hot_set_from_profile(ckpt / ".omlx" / "expert_pin_profile.json", 0.0) == {}
+    assert load_hot_set_from_profile(tmp_path / "missing.json", 0.5) == {}
+
+    # Backing routing: hot ids resolve the source shard, cold ids the tier.
+    cold = ExpertBackingStore(ckpt, cold_root=ckpt / "expert_cold")
+    cold.set_hot_experts(hot)
+    src_slice = cold.load_expert_slice(key_w, 0)   # hot -> 4-bit width
+    cold_slice = cold.load_expert_slice(key_w, 5)  # cold -> 3-bit width
+    plain = ExpertBackingStore(ckpt)
+    assert src_slice.shape == plain.load_expert_slice(key_w, 0).shape
+    assert cold_slice.shape[-1] < src_slice.shape[-1]
+    reader_hot = cold._reader_for_key(key_w, 0)
+    reader_cold = cold._reader_for_key(key_w, 5)
+    assert reader_hot.path.parent.name != "expert_cold"
+    assert reader_cold.path.parent.name == "expert_cold"
+    # Uniform lookups (no expert id) still resolve the cold tier for
+    # tensor_dtype/metadata probes.
+    assert cold.cold_quant_params(key_w) == (3, 64)
+
+
+def test_expert_streaming_hot_fraction_round_trip_and_profiles():
+    """Fase I6: hot fraction persists through ModelSettings, is excluded from
+    profiles, and enters the runtime signature (reload semantics)."""
+    from omlx.model_settings import ModelSettings
+
+    s = ModelSettings(expert_streaming_hot_fraction=0.3)
+    data = s.to_dict()
+    assert data["expert_streaming_hot_fraction"] == 0.3
+    restored = ModelSettings.from_dict(data)
+    assert restored.expert_streaming_hot_fraction == 0.3
+
+    from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+
+    assert "expert_streaming_hot_fraction" in EXCLUDED_FROM_PROFILES
+
+
+@pytest.mark.asyncio
+async def test_expert_streaming_hot_fraction_api_validation():
+    from omlx.admin import routes as admin_routes
+    from omlx.admin.routes import HTTPException
+    from omlx.model_settings import ModelSettings
+
+    from tests.test_expert_streaming import _failed_pool, _update_settings
+
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(expert_streaming_hot_fraction=0.25),
+    )
+    assert settings.expert_streaming_hot_fraction == 0.25
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(expert_streaming_hot_fraction=None),
+    )
+    assert settings.expert_streaming_hot_fraction is None
+
+    with pytest.raises(HTTPException, match="between 0 and 1"):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(expert_streaming_hot_fraction=1.5),
+        )

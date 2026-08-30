@@ -77,6 +77,7 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
         "expert_streaming_pilot": None,
         "expert_streaming_per_layer_eval": None,
         "expert_streaming_pins": None,
+        "expert_streaming_hot_fraction": None,
         "expert_streaming_pin_gib": None,
     }
     if model_settings is None:
@@ -263,12 +264,15 @@ def _convert_switch_mlp_module(
     hidden: int,
     moe_hidden: int,
     layer: Any | None = None,
+    hot_ids: set | None = None,
 ) -> bool:
     """Replace *moe*.switch_mlp with a StreamingSwitchGLU. Returns True on success.
 
     ``candidates_for(proj, suffix)`` yields the checkpoint key candidates for
     this module's stacked banks; ``needle`` disambiguates weight-map fallback
-    scans (e.g. ``layers.5.`` or ``mtp.2.``).
+    scans (e.g. ``layers.5.`` or ``mtp.2.``). ``hot_ids`` (Fase I6) keeps
+    those experts at the SOURCE packing with a dual-tier gather; absent/empty
+    keeps the uniform I5 tier (bits overridden to the cold packing).
     """
     import mlx.core as mx
 
@@ -315,6 +319,10 @@ def _convert_switch_mlp_module(
     # from expert_cold/, every projection of the layer computes at the
     # tier's packing — override the source bits/group size once, here, so
     # the fused and split branches both build with the tier parameters.
+    # HOBBIT split (I6): with a hot set for this layer the linear keeps the
+    # SOURCE packing (hot experts) and the cold packing is attached per
+    # linear below (dual gather_qmm).
+    hobbit_cold_params: tuple[int, int] | None = None
     if hasattr(backing, "cold_quant_params"):
         first_attr = next(
             (
@@ -334,7 +342,10 @@ def _convert_switch_mlp_module(
             )
             cold_params = backing.cold_quant_params(probe_key)
             if cold_params is not None:
-                bits, group_size = cold_params
+                if hot_ids:
+                    hobbit_cold_params = cold_params
+                else:
+                    bits, group_size = cold_params
 
     streaming_glu = StreamingSwitchGLU(
         input_dims=hidden,
@@ -532,6 +543,20 @@ def _convert_switch_mlp_module(
                     proj_stream.set_bias(src.bias)  # type: ignore[attr-defined]
             setattr(streaming_glu, proj_name, proj_stream)
 
+    # HOBBIT dual-tier gate (Fase I6): wire the split into every quantized
+    # streaming linear of this module — fused AND split projections. With a
+    # hot set, the linear keeps the SOURCE packing for hot experts and the
+    # cold tier's (hobbit_cold_params) for the rest; the backing already
+    # routes the reads (set_hot_experts). Skipping this leaves the linear
+    # uniform while the backing splits — mixed packings in one mini-bank.
+    if hot_ids and is_quantized and hobbit_cold_params is not None:
+        for lin_ in (
+            getattr(streaming_glu, a, None)
+            for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+        ):
+            if lin_ is not None and hasattr(lin_, "set_hobbit_split"):
+                lin_.set_hobbit_split(hot_ids, hobbit_cold_params[0], hobbit_cold_params[1])
+
     # Replace
     moe.switch_mlp = streaming_glu  # type: ignore[attr-defined]
     # Disable decoder FFN compilation (GLM-5.3 Glm5NextDecoderLayer
@@ -598,13 +623,24 @@ def convert_model_to_streaming(
     per_slot = max(1, per_expert // 3) if per_expert else 0
     cache = ExpertLRUCache(budget_bytes, per_slot, num_layers=estimate.num_moe_layers)
 
+    # IO overrides (settings/env resolution) are read before the backing
+    # block: the HOBBIT split (I6) consumes expert_streaming_hot_fraction
+    # while building the backing store, and the later wiring reuses the
+    # same resolved dict.
+    io_ov = _io_overrides(model_settings)
+
     # Backing store
     backing = None
     backing_kind = "ram"
+    # HOBBIT split state (Fase I6): populated only when a complete cold tier
+    # exists AND a learned pin profile provides frequencies; otherwise the
+    # convert keeps the uniform I5 tier semantics.
+    hot_ids_by_layer: dict[int, set] = {}
     if use_file_backing:
         try:
             import os
 
+            from . import shard_bank as _shard_mod
             from .shard_bank import ExpertBackingStore, cold_tier_status
 
             extra_roots = [
@@ -632,6 +668,53 @@ def convert_model_to_streaming(
                         why,
                     )
             backing = ExpertBackingStore(model_path, extra_roots=extra_roots, cold_root=cold_root)
+            # HOBBIT per-expert hot/cold split (Fase I6): with a cold tier
+            # active, the top fraction of experts per layer (by learned
+            # pin-profile frequency) keeps the ORIGINAL packing while the
+            # rest compute at the tier. No profile = uniform I5 tier.
+            if cold_root is not None:
+                # Contract (UI/bench): None/unset hot fraction = UNIFORM tier
+                # (I5) — the split is opt-in per model, like the tier itself.
+                # The env default (OMLX_EXPERT_STREAMING_HOT_FRACTION) stays
+                # the bench/developer override and wins only when the
+                # setting is unset.
+                hf_setting = io_ov.get("expert_streaming_hot_fraction")
+                if hf_setting is None:
+                    hf_setting = _shard_mod.HOT_FRACTION_ENV or None
+                hot_fraction = (
+                    None
+                    if hf_setting is None
+                    else max(0.0, min(1.0, float(hf_setting)))
+                )
+                hot_keys = (
+                    _shard_mod.load_hot_set_from_profile(
+                        Path(model_path) / ".omlx" / "expert_pin_profile.json",
+                        hot_fraction,
+                        num_experts=estimate.experts_per_layer,
+                    )
+                    if hot_fraction is not None and hot_fraction > 0.0
+                    else {}
+                )
+                if hot_keys:
+                    backing.set_hot_experts(hot_keys)
+                    hot_ids_by_layer = {
+                        int(k.removeprefix("layer_")): v for k, v in hot_keys.items()
+                    }
+                    logger.info(
+                        "Expert streaming: HOBBIT split on %d/%d layers (fraction %.2f)",
+                        len(hot_keys),
+                        estimate.num_moe_layers,
+                        hot_fraction,
+                    )
+                elif hot_fraction is not None:
+                    logger.info(
+                        "Expert streaming: no pin profile for HOBBIT split"
+                        " — uniform cold tier (I5)"
+                    )
+                else:
+                    logger.debug(
+                        "Expert streaming: hot fraction unset — uniform cold tier (I5)"
+                    )
             # Guard metadata for the scheduler's prefill chunk sizing: the
             # lazy chunk forward holds every MoE layer's assembled mini-bank
             # until the chunk-end eval, so the peak carries ~one bank per
@@ -716,6 +799,7 @@ def convert_model_to_streaming(
             hidden=hidden,
             moe_hidden=moe_hidden,
             layer=layer,
+            hot_ids=hot_ids_by_layer.get(layer_idx),
         ):
             converted += 1
 
@@ -749,6 +833,7 @@ def convert_model_to_streaming(
                 hidden=hidden,
                 moe_hidden=moe_hidden,
                 layer=stage,
+                hot_ids=None,
             ):
                 mtp_converted += 1
                 converted += 1
@@ -773,7 +858,8 @@ def convert_model_to_streaming(
         logger.info("Expert streaming: converted %d MoE layers (backing=%s, cache_capacity=%d experts)", converted, backing_kind, cache.capacity)
         # Per-model IO overrides (autotune): pool depth + run coalescing ride
         # the streaming linears; unset values keep the env-var defaults.
-        io_ov = _io_overrides(model_settings)
+        # (io_ov was resolved before the backing block — the HOBBIT split
+        # reads hot_fraction from it during backing construction.)
         io_wired = _wire_streaming_io_overrides(
             layers, mtp_stages, io_ov["expert_streaming_io_depth"], io_ov["expert_streaming_coalesce"]
         )
@@ -932,6 +1018,9 @@ def convert_model_to_streaming(
                         observe_calls=_warmer_mod.PIN_OBSERVE_CALLS,
                         per_expert_bytes=estimate.per_expert_bytes,
                         profile_path=pin_profile_path,
+                        # I6: expert width — sizes the per-token bincount
+                        # payloads from on_layer_plan and validates them.
+                        num_experts=estimate.experts_per_layer,
                     )
                     # Save-on-unload hook: engines call save_expert_pin_profile()
                     # in stop() while the backing is still reachable.

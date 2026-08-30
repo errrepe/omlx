@@ -724,6 +724,7 @@ class EnginePool:
                     "expert_streaming_pins",
                     "expert_streaming_pin_gib",
                     "expert_streaming_cold_tier",
+                    "expert_streaming_hot_fraction",
                 ):
                     add(_io_key, data.get(_io_key))
 

@@ -1145,5 +1145,7 @@
   "modal.model_settings.expert_streaming_pin_gib": "Budget d'épinglage (GiB)",
   "modal.model_settings.expert_streaming_pin_gib_hint": "Plafond mémoire pour les experts épinglés. Vide = 1,25 GiB par défaut.",
   "modal.model_settings.expert_streaming_cold_tier": "Niveau froid d'experts (bits)",
-  "modal.model_settings.expert_streaming_cold_tier_hint": "Nécessite tools/requant_cold_tier.py (expert_cold/ présent). Lit les experts streamés depuis le niveau basse précision — moins d'octets par token au plancher I/O. Approximatif : validez avec le harnais de perplexité. Vide = désactivé."
+  "modal.model_settings.expert_streaming_cold_tier_hint": "Nécessite tools/requant_cold_tier.py (expert_cold/ présent). Lit les experts streamés depuis le niveau basse précision — moins d'octets par token au plancher I/O. Approximatif : validez avec le harnais de perplexité. Vide = désactivé.",
+  "modal.model_settings.expert_streaming_hot_fraction": "Fraction d'experts chauds (split HOBBIT)",
+  "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1. Avec un tier froid et un profil de pins appris, cette fraction des experts les plus utilisés par couche garde le 4-bit d'origine ; les autres lisent le tier froid. Vide/0 = tier uniforme."
 }

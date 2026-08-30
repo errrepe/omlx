@@ -143,6 +143,7 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_pins: bool | None = None
     expert_streaming_pin_gib: float | None = None
     expert_streaming_cold_tier: str | None = None
+    expert_streaming_hot_fraction: float | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -2484,6 +2485,17 @@ async def update_model_settings(
             current_settings.expert_streaming_cold_tier = str(v)
         else:
             raise HTTPException(status_code=400, detail="expert_streaming_cold_tier must be '2' or '3'")
+    if "expert_streaming_hot_fraction" in sent:
+        v = request.expert_streaming_hot_fraction
+        if v is None:
+            current_settings.expert_streaming_hot_fraction = None
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= float(v) <= 1:
+            current_settings.expert_streaming_hot_fraction = float(v)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expert_streaming_hot_fraction must be a number between 0 and 1",
+            )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False

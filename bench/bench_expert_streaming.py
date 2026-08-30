@@ -119,6 +119,7 @@ async def run(
     topk: float | None = None,
     cold_tier: str | None = None,
     prompt_len: str = "short",
+    hot_fraction: float | None = None,
     mtp_block: int | None = None,
     ane: bool = False,
     warm_control: float = 0.0,
@@ -151,6 +152,10 @@ async def run(
         expert_streaming_budget_gib=budget,
         expert_streaming_topk_threshold=topk,
         expert_streaming_cold_tier=cold_tier,
+        # Fase I6 HOBBIT split: top fraction of experts per layer (by
+        # learned pin-profile frequency) keeps the ORIGINAL packing while
+        # the rest read the cold tier. Requires --cold-tier + a profile.
+        expert_streaming_hot_fraction=hot_fraction,
         qwen4_ple_ssd_offload=True,
         vlm_mtp_enabled=mtp,
         vlm_mtp_draft_block_size=mtp_block,
@@ -244,6 +249,7 @@ async def run(
         "budget_gib": budget,
         "topk_threshold": topk,
         "cold_tier": cold_tier,
+        "hot_fraction": hot_fraction,
         "mtp": mtp,
         "mtp_block": mtp_block,
         "ane": ane,
@@ -377,6 +383,10 @@ def main():
     ap.add_argument("--topk", type=float, default=None, help="adaptive top-k mass threshold (default exact)")
     ap.add_argument("--cold-tier", default=None, metavar="BITS",
                     help="route expert reads to the <model>/expert_cold/ 3/2-bit tier (I5)")
+    ap.add_argument("--hot-fraction", type=float, default=None, metavar="FRAC",
+                    help="HOBBIT split fraction (I6): with --cold-tier and a learned pin "
+                         "profile, this fraction of each layer's most-used experts keeps the "
+                         "original packing; the rest read the cold tier")
     ap.add_argument("--prompt-len", choices=["short", "512", "2k", "8k"], default="short")
     ap.add_argument("--mtp-block", type=int, default=None, help="vlm_mtp_draft_block_size (MTP tokens per round)")
     ap.add_argument("--ane", action="store_true", help="enable qwen35 ANE prefill")
@@ -418,6 +428,7 @@ def main():
             args.topk,
             args.cold_tier,
             prompt_len=args.prompt_len,
+            hot_fraction=args.hot_fraction,
             mtp_block=args.mtp_block,
             ane=args.ane,
             specprefill_draft=args.specprefill,

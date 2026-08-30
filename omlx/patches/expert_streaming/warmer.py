@@ -60,7 +60,11 @@ PIN_OBSERVE_CALLS = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_TOKENS"
 # to this JSON and reload them on the next load, skipping the observation
 # window so the hot set is wired from token 1.
 PIN_PROFILE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_PIN_PROFILE", "") or None
-_PIN_PROFILE_KEEP = 64
+# Fase I6: the profile feeds the HOBBIT top-fraction split, so it must cover
+# the model's full expert width (GLM: 288 experts/layer) — 64 truncated it
+# and made the fraction's denominator meaningless. Env-tunable, JSON format
+# unchanged (a list of [expert, count] pairs per layer).
+_PIN_PROFILE_KEEP = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_KEEP", "512")))
 
 _WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="omlx-expert-warm")
 
@@ -194,12 +198,18 @@ class PinController:
         observe_calls: int = PIN_OBSERVE_CALLS,
         per_expert_bytes: int = 0,
         profile_path: str | None = None,
+        num_experts: int = 0,
     ):
         self.linears_by_layer = linears_by_layer
         self.backing = backing
         self.budget_bytes = budget_bytes
         self.observe_calls = observe_calls
         self.per_expert_bytes = per_expert_bytes
+        # Fase I6: expert width of the routed layers — lets on_layer_plan
+        # size per-token bincounts (and validate counts payloads) without
+        # another call. 0 = unknown (tests / legacy wiring); the counts
+        # payload then defines its own width.
+        self.num_experts = int(num_experts)
         self.freq: Dict[int, Counter] = {}
         self.calls = 0
         self.pinned = False
@@ -258,10 +268,60 @@ class PinController:
         except Exception as e:
             logger.debug("Failed to save pin profile %s: %s", self.profile_path, e)
 
-    def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
-        if self.pinned or positions > _MAX_WARM_ROWS:
+    @staticmethod
+    def _counts_payload(counts, num_experts: int) -> Dict[int, int] | None:
+        # Coerce a per-token usage histogram into {expert: count}. counts
+        # is either the np.bincount(plan.flat_np, minlength=E) vector from
+        # the streaming switch (Fase I6's hotness signal: usage per token,
+        # not presence per plan) or a plain mapping expert -> usage. None
+        # when the payload is unusable so callers fall back to the
+        # presence-based uniq_list signal (old wiring / tests).
+        if counts is None:
+            return None
+        try:
+            if hasattr(counts, "tolist"):  # np.ndarray / mx.array-like
+                counts = counts.tolist()
+            if isinstance(counts, dict):
+                return {int(e): int(c) for e, c in counts.items()}
+            if isinstance(counts, (list, tuple)):
+                if num_experts > 0 and len(counts) > num_experts:
+                    counts = counts[:num_experts]
+                return {i: int(c) for i, c in enumerate(counts) if int(c) > 0}
+        except Exception:
+            return None
+        return None
+
+    def on_layer_plan(
+        self,
+        layer_idx: int,
+        uniq_list: list[int],
+        positions: int,
+        counts=None,
+    ) -> None:
+        if self.pinned:
             return
-        self.freq.setdefault(layer_idx, Counter()).update(int(e) for e in uniq_list)
+        usage = self._counts_payload(counts, self.num_experts)
+        if positions > _MAX_WARM_ROWS:
+            # Prefill-sized call: still counts toward the learned profile
+            # (Fase I6's HOBBIT split reads these frequencies) but never
+            # triggers the mlock pass: pinning stays decode-driven.
+            if usage is not None:
+                self.freq.setdefault(layer_idx, Counter()).update(usage)
+            else:
+                self.freq.setdefault(layer_idx, Counter()).update(
+                    int(e) for e in uniq_list
+                )
+            return
+        if usage is not None:
+            # Per-token usage (np.bincount over the routing plan): each
+            # expert accrues its true token mass, so the learned profile
+            # ranks by USE. The old presence signal counted every uniq
+            # expert once per plan, flattening all frequencies (I6
+            # discovery: 42 layers x 64 entries, every count == 4) and
+            # making the fraction's top-N an arbitrary id prefix.
+            self.freq.setdefault(layer_idx, Counter()).update(usage)
+        else:
+            self.freq.setdefault(layer_idx, Counter()).update(int(e) for e in uniq_list)
         # One decode token = one plan per layer; pin after the window.
         self.calls += 1
         if self.calls >= self.observe_calls * max(len(self.linears_by_layer), 1):
@@ -404,16 +464,28 @@ class PrefillHotnessRecorder:
         self.seeded_experts = 0
         self.seeded_s = 0.0
 
-    def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
+    def on_layer_plan(
+        self,
+        layer_idx: int,
+        uniq_list: list[int],
+        positions: int,
+        counts=None,
+    ) -> None:
         if self.seeded:
             return
         if positions > _MAX_WARM_ROWS:
             # Prefill-sized call: accumulate frequency (decode rows are
-            # top_k * batch and would bias toward the first token).
+            # top_k * batch and would bias toward the first token). With a
+            # per-token counts payload (I6) the accumulation is true usage;
+            # the uniq_list fallback is presence-per-plan (legacy wiring).
             self.saw_prefill = True
-            self.freq.setdefault(layer_idx, Counter()).update(
-                int(e) for e in uniq_list
-            )
+            usage = PinController._counts_payload(counts, 0)
+            if usage is not None:
+                self.freq.setdefault(layer_idx, Counter()).update(usage)
+            else:
+                self.freq.setdefault(layer_idx, Counter()).update(
+                    int(e) for e in uniq_list
+                )
 
     def maybe_seed(self, layer_idx: int, positions: int) -> None:
         """Fire once, at the first decode-sized call after a prefill."""
@@ -528,18 +600,35 @@ class WarmPinHook:
         self.pinner = pinner
         self.recorder = recorder
 
+    @property
+    def wants_usage_counts(self) -> bool:
+        # Fase I6: only the pin/recorder consumers use the per-token usage
+        # histogram, so the switch only pays the np.bincount when at least
+        # one of them is attached. The readahead warmer keeps the plain
+        # uniq_list contract (contiguous-run F_RDADVISE grouping).
+        return self.pinner is not None or self.recorder is not None
+
     def on_layer_start(self, layer_idx: int, positions: int) -> None:
         if self.recorder is not None:
             self.recorder.maybe_seed(layer_idx, positions)
         if self.warmer is not None:
             self.warmer.on_layer_start(layer_idx, positions)
 
-    def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
+    def on_layer_plan(
+        self,
+        layer_idx: int,
+        uniq_list: list[int],
+        positions: int,
+        counts=None,
+    ) -> None:
         if self.warmer is not None:
+            # Warmer (readahead/discarded reads) keeps the uniq-list signal:
+            # its predictions are set-based (contiguous-run grouping), and a
+            # histogram adds nothing there.
             self.warmer.on_layer_plan(layer_idx, uniq_list, positions)
         if self.pinner is not None:
-            self.pinner.on_layer_plan(layer_idx, uniq_list, positions)
+            self.pinner.on_layer_plan(layer_idx, uniq_list, positions, counts)
         if self.recorder is not None:
-            self.recorder.on_layer_plan(layer_idx, uniq_list, positions)
+            self.recorder.on_layer_plan(layer_idx, uniq_list, positions, counts)
 
 

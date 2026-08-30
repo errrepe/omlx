@@ -651,6 +651,31 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         # None → module env defaults (_EXPERT_IO_POOL / _COALESCE_ENV).
         self._io_pool_override: Any = None
         self._coalesce_override: bool | None = None
+        # HOBBIT hot/cold split (Fase I6): hot experts keep the ORIGINAL
+        # packing (source bits/gs below); the rest compute at the cold tier
+        # (self._cold_bits/_cold_gs from expert_cold/ metadata). Empty set or
+        # None bits = uniform tier (I5) — the single-bank path.
+        self._hot_experts: set | None = None
+        self._cold_bits: int | None = None
+        self._cold_gs: int | None = None
+
+    def set_hobbit_split(self, hot_experts, cold_bits: int, cold_gs: int) -> None:
+        """Enable the dual-tier path for this linear (convert-time only)."""
+        self._hot_experts = {int(e) for e in (hot_experts or [])}
+        self._cold_bits = int(cold_bits)
+        self._cold_gs = int(cold_gs)
+
+    def _is_split_active(self) -> bool:
+        return (
+            self._hot_experts is not None
+            and len(self._hot_experts) > 0
+            and self._cold_bits is not None
+            and self._cold_bits != self.bits
+        )
+
+    def _tier_of(self, expert_id: int) -> int:
+        """0 = hot (source packing), 1 = cold (tier packing)."""
+        return 0 if int(expert_id) in (self._hot_experts or ()) else 1
 
     @property
     def input_dims(self) -> int:
@@ -686,7 +711,12 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         return mx.array(v)  # np.ndarray -> mx.array copy on this thread
 
     def bundle_key(self, expert_id: int):
-        return (self.layer_idx, expert_id, self.stacked_weight_key)
+        # Tier-suffixed under the HOBBIT split so a hot (source-packing)
+        # bundle and a cold (tier-packing) bundle of the same expert can
+        # coexist in the LRU without aliasing.
+        tier = self._tier_of(expert_id) if self._is_split_active() else 0
+        base = self.stacked_weight_key if tier == 0 else self.stacked_weight_key + "#c"
+        return (self.layer_idx, expert_id, base)
 
     def _load_expert_np(self, expert_id: int) -> tuple | None:
         """Numpy-only load for the prefetch worker.
@@ -697,6 +727,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         """
         if not hasattr(self.backing, "load_expert_slice"):
             return None
+        # Tier contract: the backing's hot set (same ids as this linear's
+        # _hot_experts) routes hot ids to the source shards; everyone else
+        # reads expert_cold/. The LRU key (bundle_key) keeps the two apart.
         try:
             w = self.backing.load_expert_slice(self.stacked_weight_key, expert_id)
             s = self.backing.load_expert_slice(self.stacked_scales_key, expert_id)
@@ -735,19 +768,27 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         except Exception:
             return None
 
-    @staticmethod
-    def _group_runs(sorted_ids: list[int], max_run: int = 16) -> list[tuple[int, int]]:
-        """Split ascending expert ids into (first, count) contiguous runs."""
+    def _group_runs(self, sorted_ids: list[int], max_run: int = 16) -> list[tuple[int, int]]:
+        """Split ascending expert ids into (first, count) contiguous runs.
+
+        Under the HOBBIT split a run must NOT cross a tier boundary: the
+        coalesced pread reads from ONE backing reader (resolved by the
+        first id — source shard vs expert_cold/), so experts past the
+        boundary would come back in the wrong packing. Runs therefore end
+        at the first id whose tier differs from the run's first id."""
+        tier_of = self._tier_of if self._is_split_active() else None
         runs: list[tuple[int, int]] = []
         i = 0
         n = len(sorted_ids)
         while i < n:
             first = sorted_ids[i]
+            first_tier = tier_of(first) if tier_of else 0
             count = 1
             while (
                 count < max_run
                 and i + count < n
                 and sorted_ids[i + count] == first + count
+                and (tier_of is None or tier_of(sorted_ids[i + count]) == first_tier)
             ):
                 count += 1
             runs.append((first, count))
@@ -760,7 +801,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         Returns the cached bundle (mx or raw np tuple) or None when the expert
         must be fetched from the backing store.
         """
-        key = (self.layer_idx, expert_id, self.stacked_weight_key)
+        key = self.bundle_key(expert_id)
         cached = self.cache.get(key)
         if cached is not None:
             # New format: bundle tuple stored under weight key
@@ -805,7 +846,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         return None
 
     def _load_expert_bundle(self, expert_id: int) -> tuple[mx.array, mx.array, mx.array | None]:
-        key = (self.layer_idx, expert_id, self.stacked_weight_key)
+        key = self.bundle_key(expert_id)
         # Cache / staging resolution (shared with the parallel demand-set path)
         resolved = self._bundle_cached_or_staged(expert_id)
         if resolved is not None:
@@ -928,7 +969,12 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     # Metal active on a 6GiB budget and the guard killed the
                     # second prefill outright (F2 post-mortem).
                     bundles[eid] = raw
-                    self.cache.put((self.layer_idx, eid, self.stacked_weight_key), raw)  # type: ignore[arg-type]
+                    # Tier-suffixed key (bundle_key): under the HOBBIT split a
+                    # hot (source-packing) and cold (tier-packing) bundle of
+                    # the same expert must never alias in the LRU — the raw
+                    # pread path staged unsuffixed keys and served a cold-packing
+                    # bundle to a hot slot (mixed widths, mx.stack crash).
+                    self.cache.put(self.bundle_key(eid), raw)  # type: ignore[arg-type]
                     if p is not None:
                         p.add_load_source(self.layer_idx, staged=False, dt=dt_per / len(missing))
             else:
@@ -938,17 +984,133 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         t_load = time.perf_counter() - t_res_start
 
         dt = self._slice_dtypes_lazy()
-        for eid in plan.uniq_list:
-            w, s, b = bundles[int(eid)]
-            w = self._promote_np(w)
-            s = self._promote_np(s, dt[0])
-            if b is not None:
-                has_b = True
-                b = self._promote_np(b, dt[1])
-            mini_w.append(w)
-            mini_s.append(s)
-            if b is not None:
-                mini_b.append(b)
+        split = self._is_split_active()
+        # Per-tier bundle lists under the HOBBIT split: hot (source packing)
+        # and cold (tier packing) widths differ (e.g. 8 vs 6 u32 cols per
+        # row at gs 64), so a single stacked mini-bank is impossible — build
+        # one per tier and combine the two gather_qmm outputs.
+        tier_w = ([], [])  # hot, cold
+        tier_s = ([], [])
+        tier_b = ([], [])
+        uniq: list[int] = []
+        hot_idx: list[int] = []
+        cold_idx: list[int] = []
+        if split:
+            uniq = [int(e) for e in plan.uniq_list]
+            hot_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 0]
+            cold_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 1]
+            hot_rank = {i: r for r, i in enumerate(hot_idx)}
+            cold_rank = {i: r for r, i in enumerate(cold_idx)}
+            for i, eid in enumerate(uniq):
+                w, s, b = bundles[eid]
+                if i in hot_rank:
+                    t = 0
+                else:
+                    t = 1
+                tier_w[t].append(self._promote_np(w))
+                tier_s[t].append(self._promote_np(s, dt[0]))
+                if b is not None:
+                    has_b = True
+                    tier_b[t].append(self._promote_np(b, dt[1]))
+        else:
+            for eid in plan.uniq_list:
+                w, s, b = bundles[int(eid)]
+                w = self._promote_np(w)
+                s = self._promote_np(s, dt[0])
+                if b is not None:
+                    has_b = True
+                    b = self._promote_np(b, dt[1])
+                mini_w.append(w)
+                mini_s.append(s)
+                if b is not None:
+                    mini_b.append(b)
+
+        # HOBBIT dual-tier assembly (Fase I6): one mini-bank per tier and a
+        # masked add — positions are mutually exclusive (each position
+        # consumes exactly one expert), so the two gather_qmm outputs
+        # partition the positions and zeros fill the rest.
+        if split:
+            flat_np = np.asarray(plan.flat_np).reshape(-1)
+            out = None
+            for t, idxs, bits_, gs_ in (
+                (0, hot_idx, self.bits, self.group_size),
+                (1, cold_idx, self._cold_bits, self._cold_gs),
+            ):
+                if not idxs:
+                    continue
+                ws, ss, bs_ = tier_w[t], tier_s[t], tier_b[t]
+                if len(ws) == 1:
+                    w_b = mx.expand_dims(ws[0], 0)
+                    s_b = mx.expand_dims(ss[0], 0)
+                    b_b = mx.expand_dims(bs_[0], 0) if bs_ else None
+                else:
+                    w_b = mx.stack(ws, axis=0)
+                    s_b = mx.stack(ss, axis=0)
+                    b_b = mx.stack(bs_, axis=0) if bs_ else None
+                # expert-id -> rank within THIS tier's bank (flat ids here,
+                # not compact uniq ranks); -1 where the other tier owns it.
+                tier_map = np.full((self.num_experts,), -1, dtype=np.int32)
+                for rank, i in enumerate(idxs):
+                    tier_map[uniq[i]] = rank
+                tier_remapped_np = tier_map[flat_np].reshape(plan.indices_shape)
+                # gather_qmm takes UNSIGNED row indices — -1 wraps to a huge
+                # OOB index (garbage/nan) that the keep mask cannot undo
+                # (nan * 0 = nan). Clamp the gather indices to 0 (any valid
+                # rank: the row is zeroed by the keep mask below); the -1
+                # survives only in keep_np, which is what selects the tier.
+                gather_np = np.maximum(tier_remapped_np, 0)
+                tier_remapped = mx.array(gather_np)
+                tier_out = mx.gather_qmm(
+                    x,
+                    w_b,
+                    s_b,
+                    b_b,
+                    rhs_indices=tier_remapped,
+                    transpose=True,
+                    group_size=gs_,
+                    bits=bits_,
+                    mode=self.mode,
+                    sorted_indices=sorted_indices,
+                )
+                # Mask: keep only the positions this tier owns (-1 elsewhere).
+                # gather_qmm inserts the indices' shape at dims 2.. so the
+                # keep mask is the (index-shaped) validity, expanded over the
+                # trailing (x_exp singleton, output) dims: [.., topk, 1, 1].
+                keep_np = (tier_remapped_np >= 0).astype(np.float32)
+                keep_shape = tuple(plan.indices_shape) + (1,) * (tier_out.ndim - len(plan.indices_shape))
+                keep = mx.array(keep_np).reshape(keep_shape)
+                tier_out = tier_out * keep
+                out = tier_out if out is None else out + tier_out
+            if out is None:
+                # Degenerate: every unique expert hot (hot bank == full uniq
+                # order) — identical to the uniform path.
+                ws, ss, bs_ = tier_w[0], tier_s[0], tier_b[0]
+                w_b = mx.stack(ws, axis=0) if len(ws) > 1 else mx.expand_dims(ws[0], 0)
+                s_b = mx.stack(ss, axis=0) if len(ss) > 1 else mx.expand_dims(ss[0], 0)
+                b_b = (mx.stack(bs_, axis=0) if len(bs_) > 1 else mx.expand_dims(bs_[0], 0)) if (has_b and bs_) else None
+                out = mx.gather_qmm(
+                    x, w_b, s_b, b_b, rhs_indices=plan.remapped,
+                    transpose=True, group_size=self.group_size, bits=self.bits,
+                    mode=self.mode, sorted_indices=sorted_indices,
+                )
+            if self._bias is not None and self._has_bias:
+                b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)
+                out = out + mx.expand_dims(b_mini[plan.remapped], -2)
+            t4 = time.perf_counter()
+            p.record_observed(self.layer_idx, plan.uniq_list)
+            p.add(
+                self.layer_idx,
+                gate=plan.gate_s if built else 0.0,
+                unique=plan.unique_s if built else 0.0,
+                load=t_load,
+                stack=t4 - t2 - t_load,
+                hits=hits,
+                misses=misses,
+                experts=len(plan.uniq_list),
+                positions=plan.positions,
+            )
+            return out
+
         if len(mini_w) == 1:
             w_bank = mx.expand_dims(mini_w[0], 0)
             s_bank = mx.expand_dims(mini_s[0], 0)
@@ -1081,7 +1243,20 @@ class StreamingSwitchGLU(nn.Module):
             x_out = self.down_proj(x_act, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]
 
         if hook is not None:
-            hook.on_layer_plan(self.layer_idx, plan.uniq_list, plan.positions)
+            # Fase I6 hotness signal: per-TOKEN usage over the routing plan
+            # (bincount of the flat ids), computed only when a consumer
+            # wants it — the readahead warmer keeps the uniq-list contract
+            # and pays nothing. flat_np is already on the host (built by
+            # _build_plan_into), so the bincount is a cheap vectorized pass.
+            counts = (
+                np.bincount(
+                    np.asarray(plan.flat_np).reshape(-1),
+                    minlength=self._num_experts,
+                )
+                if getattr(hook, "wants_usage_counts", False)
+                else None
+            )
+            hook.on_layer_plan(self.layer_idx, plan.uniq_list, plan.positions, counts)
         if _TRACE_PATH is not None:
             _trace_row(self.layer_idx, plan.uniq_list, plan.positions)
 

@@ -587,6 +587,101 @@ that caps GLM decode.
   buy what the disk cannot serve. Closed — do not revisit without a
   different disk. Artifact `bench/results/glm_i5_cold3_pilot.json`.
 
+### I6 — HOBBIT per-expert hot/cold split
+
+I5 made the cold tier uniform: EVERY expert reads `expert_cold/`, quality
+be damned (+24% ppl on GLM at the time). HOBBIT's insight (from the paper's
+hybrid offloading) is that routing is extremely skewed — a small set of
+experts carries most of the token mass — so only the truly-cold experts need
+the low-precision tier while the hot ones keep the source 4-bit packing.
+
+**The hotness signal was wrong (discovery).** The learned pin profile ranked
+experts by PRESENCE PER PLAN: `PinController.on_layer_plan` counted each
+unique expert once per routing plan, so every recorded frequency was
+identical (GLM profile: 42 layers × 64 entries, every count == 4). Worse,
+`_PIN_PROFILE_KEEP=64` truncated the record list, so on a 288-expert model
+`ceil(0.25 × 64) == 16` selected ids 0..15 — an arbitrary id prefix, not a
+hot set. Both defects are fixed in I6:
+
+- **Per-token usage counts**: the streaming switch computes
+  `np.bincount(plan.flat_np, minlength=num_experts)` per layer call and
+  passes it through `WarmPinHook.on_layer_plan` (new `counts` argument;
+  `wants_usage_counts` gates the bincount so the readahead warmer never
+  pays it). `PinController`/`PrefillHotnessRecorder` accept `counts=None`
+  and fall back to the presence signal for old callers.
+- **Profile coverage**: `_PIN_PROFILE_KEEP` is env-tunable
+  (`OMLX_EXPERT_STREAMING_PIN_KEEP`, default **512** — the full 288-expert
+  width fits; JSON format unchanged).
+- **Real fraction denominator**: `load_hot_set_from_profile(path, fraction,
+  num_experts)` computes `ceil(fraction × num_experts)` from the model
+  estimate (288 for GLM), clamped to the available records; the old code
+  used the record count, which the keep cap truncated.
+- **Correct layer log**: the split log reports `42/42` layers
+  (`estimate.num_moe_layers`), not the profile's layer count.
+
+The regenerated GLM profile (24 × 1000-token windows, 23,976 tokens, pins
+enabled, same corpus) now has 288 entries per layer with genuinely skewed
+counts (layer 3: top expert 1,474 uses, median ~640, min 96 — 2,237 distinct
+count values, not one).
+
+**Runtime**: `expert_streaming_hot_fraction` (0–1, opt-in like the tier
+itself; None/unset = uniform I5 — the env `OMLX_EXPERT_STREAMING_HOT_FRACTION`
+is the bench override). With a cold tier active and a learned profile
+present, the converter builds a dual-tier path per layer: hot experts keep
+the SOURCE packing (4-bit oQ4e), everyone else reads `expert_cold/` (3-bit);
+the backing (`set_hot_experts`) routes reads and the linear builds one
+mini-bank per tier with a masked dual `gather_qmm` (positions are mutually
+exclusive per tier; negative gather indices clamp to 0 with the -1 kept for
+the keep mask — `gather_qmm` takes unsigned rows and nan × 0 stays nan).
+The LRU keys are tier-suffixed (`bundle_key` appends `#c` for cold) so the
+two packings of one expert never alias, and coalesced pread runs
+(`_group_runs`) break at tier boundaries because a run reads ONE backing
+reader resolved by its first id.
+
+Three real-bugs-found-by-the-gate notes: (1) `io_ov` was resolved after the
+backing block that needed it (RAM-dict fallback on every cold-tier load);
+(2) `set_hobbit_split` was wired only in the fused-projection branch — GLM
+uses split gate/up/down, so the linear stayed uniform while the backing
+split, mixing packings in one mini-bank; (3) the raw-pread staging path put
+unsuffixed LRU keys, serving cold bundles to hot slots. All three reproduced
+as `mx.stack` shape errors or silent RAM fallback and are fixed + tested.
+
+**Quality gate re-measured with the current harness** (the I5 numbers above
+came from the pre-affine-guard era; streaming compute is bit-exact, so the
+base/cold numbers were re-run for a fair comparison. GLM, 24 × 1000-token
+windows, 23,976 tokens, budget 2 GiB):
+
+| arm | ppl | Δ ppl vs base |
+|---|---|---|
+| base (oQ4e 4-bit) | **2.2225** | — |
+| cold-uniform (3-bit) | 2.5552 | **+14.96%** |
+| HOBBIT 0.25 | **2.2505** | **+1.26%** |
+
+The split recovers ~92% of the uniform tier's quality penalty while keeping
+most of its byte savings (75% of experts still read 3-bit). Artifacts
+`bench/results/ppl_runs/{glm_base_i6, glm_cold3_i6, glm_hobbit25,
+glm_profile_regen}.json`; profile backup
+`expert_pin_profile.json.pre-i6.bak` beside the regenerated one.
+
+**tok/s / TTFT A/B (idle window, short prompt, 48-token decode, pins off,
+`--min-free-gb 22 --mem-ceiling-gib 21`; `--hot-fraction` added to the
+bench)**:
+
+| arm | tok/s (rep 1 / rep 2) | TTFT |
+|---|---|---|
+| base | 0.582 / 0.575 | 18.7 / 19.0 s |
+| cold-uniform 3-bit | **0.708 / 0.748** | 15.9 / 16.7 s |
+| HOBBIT 0.25 | **0.647 / 0.625** | 17.5 / 17.5 s |
+
+Decode: cold-uniform **+22–30%** vs base; HOBBIT **+9–11%** vs base and
+~84–88% of the uniform tier's speed — the hot experts ride 4-bit bytes on
+the routed 25% of experts. Decision: the quality/speed Pareto point is
+model-dependent — HOBBIT 0.25 gives GLM users the near-lossless option
+(+1.3% ppl for +9–11% decode) while the uniform tier stays for maximum
+speed. Fração 0.5 remains the recorded follow-up if the ppl headroom shows
+up elsewhere (Qwen). Artifacts `bench/results/i6/glm_i6_{base,cold3,
+hobbit25}.json` (rep 2).
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.

@@ -272,6 +272,10 @@ class ModelSettings:
         # bytes per token on the NVMe I/O floor, at the tier's fidelity
         # (gate with the perplexity harness). None/"" = off.
     )
+    # Fase I6: HOBBIT per-expert hot/cold split — fraction of experts per
+    # layer (top by learned pin-profile frequency) that keep the ORIGINAL
+    # packing while the rest read the cold tier. 0/unset = uniform tier (I5).
+    expert_streaming_hot_fraction: Optional[float] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

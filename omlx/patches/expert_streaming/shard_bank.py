@@ -10,9 +10,11 @@ from __future__ import annotations
 import ctypes
 import fcntl
 import json
+import math
 import logging
 import mmap
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -270,6 +272,53 @@ _COLD_BANK_MARKERS = (
 )
 
 
+# Fase I6: the env override is the bench/developer opt-in — an EMPTY env
+# means "no opinion" (None) so the runtime contract stays "unset = uniform
+# tier"; the settings key (expert_streaming_hot_fraction) is the per-model UI.
+HOT_FRACTION_ENV: str | None = os.environ.get("OMLX_EXPERT_STREAMING_HOT_FRACTION", "") or None
+HOT_FRACTION_DEFAULT = float(HOT_FRACTION_ENV or 0.25)
+
+
+def load_hot_set_from_profile(
+    profile_path: str | Path,
+    hot_fraction: float,
+    num_experts: int | None = None,
+) -> dict[str, set]:
+    """HOBBIT hot set (Fase I6) from a learned pin profile.
+
+    The profile's `freq` maps layer -> [[expert, count], ...]; the top
+    ceil(fraction * experts) by count per layer keep the ORIGINAL packing
+    while the rest read the cold tier. Keys are the backing's bare layer
+    keys ("layer_<i>"); MTP stages are absent from profiles (uniform cold
+    there). Missing profile → empty dict (split stays off, uniform I5).
+
+    ``num_experts`` (I6 fix) is the REAL per-layer expert width from the
+    model estimate; the fraction's denominator must be it, not the number
+    of recorded profile entries — the profile keep cap (and old profiles)
+    truncate the record list, which made ceil(0.25 * 64) == 16 an
+    arbitrary id-prefix selection on a 288-expert model. The hot count is
+    still clamped to the available records (a sparse profile cannot elect
+    experts it never observed)."""
+    try:
+        data = json.loads(Path(profile_path).read_text())
+        freq = data.get("freq") or {}
+        if not freq or hot_fraction <= 0.0:
+            return {}
+        hot: dict[str, set] = {}
+        for layer_key, pairs in freq.items():
+            counts = [(int(e), int(c)) for e, c in pairs]
+            if not counts:
+                continue
+            width = num_experts if num_experts and num_experts > 0 else len(counts)
+            n_hot = max(1, math.ceil(hot_fraction * width))
+            n_hot = min(n_hot, len(counts))  # cannot elect unseen experts
+            top = sorted(counts, key=lambda kv: (-kv[1], kv[0]))[:n_hot]
+            hot[f"layer_{int(layer_key)}"] = {e for e, _ in top}
+        return hot
+    except Exception:
+        return {}
+
+
 def cold_tier_status(model_path: str | Path) -> tuple[bool, str]:
     """Is a complete cold tier present for *model_path*?
 
@@ -334,6 +383,13 @@ class ExpertBackingStore:
         self.cold_root = Path(cold_root).expanduser().resolve() if cold_root else None
         self._cold_readers: Dict[str, _ShardReader] = {}
         self._cold_key_to_reader: Dict[str, _ShardReader] = {}
+        # HOBBIT hot/cold split (Fase I6): {stacked_key_prefix -> set(expert_id)}
+        # of experts served from the ORIGINAL (higher-precision) shards while
+        # the rest read expert_cold/. Empty/absent = uniform tier (I5, every
+        # expert cold). Keyed by the bank prefix (…switch_mlp.<proj>) with a
+        # per-layer fallback key ("layer_<i>") for profile sources that only
+        # know the layer.
+        self._hot_experts: Dict[str, set] = {}
         self._readers: Dict[str, _ShardReader] = {}
         self._key_to_reader: Dict[str, _ShardReader] = {}
         self._key_to_shape_dtype: Dict[str, Tuple[Tuple[int, ...], str]] = {}
@@ -390,9 +446,45 @@ class ExpertBackingStore:
         except Exception:
             return {}
 
-    def _cold_reader_for_key(self, key: str) -> _ShardReader | None:
-        """Cold-tier reader for *key*, or None (not in the cold root)."""
+    def set_hot_experts(self, hot: Dict[str, set] | None) -> None:
+        """Declare the HOBBIT hot set: experts that keep the ORIGINAL packing
+        while the cold tier is active. Keys are stacked-bank prefixes (as in
+        the weight map, e.g. "…switch_mlp.gate_proj") and/or bare layer keys
+        ("layer_12"); values are expert-id sets. None/empty = uniform cold."""
+        self._hot_experts = {
+            str(k): {int(e) for e in v} for k, v in (hot or {}).items() if v
+        }
+
+    def _hot_key_for(self, key: str, expert_id: int | None) -> str | None:
+        """Hot-set key matching *key*/*expert_id*, or None when not hot."""
+        if not self._hot_experts or expert_id is None:
+            return None
+        # bank prefix: strip the trailing ".weight"/".scales"/".biases"
+        prefix = key
+        for suffix in (".biases", ".scales", ".weight"):
+            if prefix.endswith(suffix):
+                prefix = prefix[: -len(suffix)]
+                break
+        if prefix in self._hot_experts and int(expert_id) in self._hot_experts[prefix]:
+            return prefix
+        # layer_<i> fallback: any prefix containing ".layers.<i>."
+        m = re.search(r"\.layers\.(\d+)\.", key)
+        if m:
+            lk = f"layer_{m.group(1)}"
+            if lk in self._hot_experts and int(expert_id) in self._hot_experts[lk]:
+                return lk
+        return None
+
+    def _cold_reader_for_key(
+        self, key: str, expert_id: int | None = None
+    ) -> _ShardReader | None:
+        """Cold-tier reader for *key*, or None (not in the cold root).
+        HOBBIT hot experts (I6) never resolve cold — they stay on the
+        original packing, so the demand path must fetch them from the
+        source shards and compute at the source bits."""
         if self.cold_root is None:
+            return None
+        if self._hot_key_for(key, expert_id) is not None:
             return None
         if key in self._cold_key_to_reader:
             return self._cold_key_to_reader[key]
@@ -414,12 +506,34 @@ class ExpertBackingStore:
         self._cold_key_to_reader[key] = reader
         return reader
 
-    def _reader_for_key(self, key: str) -> _ShardReader:
+    def _reader_for_key(self, key: str, expert_id: int | None = None) -> _ShardReader:
+        # expert_id routes the HOBBIT split (I6): a hot expert resolves the
+        # ORIGINAL shard even when a cold copy exists; everyone else cold.
+        # The no-id lookup stays tier-blind (cold-first) for dtype/metadata
+        # probes — never fall into it from the id-aware path when the id is
+        # hot, or a hot expert would land on the cold packing.
+        if expert_id is not None:
+            k2 = (key, int(expert_id))
+            if k2 in self._key_to_reader:
+                return self._key_to_reader[k2]
+            cold = self._cold_reader_for_key(key, int(expert_id))
+            if cold is not None:
+                self._key_to_reader[k2] = cold
+                return cold
+            reader = self._reader_for_key_source(key)
+            self._key_to_reader[k2] = reader
+            return reader
         if key in self._key_to_reader:
             return self._key_to_reader[key]
         cold = self._cold_reader_for_key(key)
         if cold is not None:
             return cold
+        return self._reader_for_key_source(key)
+
+    def _reader_for_key_source(self, key: str) -> _ShardReader:
+        """Resolve the ORIGINAL shard for *key* — never the cold tier."""
+        if ("src", key) in self._key_to_reader:
+            return self._key_to_reader[("src", key)]
         fname = self._weight_map.get(key)
         if fname is None:
             # key may be a stacked name not in weight_map for sharded raw experts case;
@@ -441,7 +555,7 @@ class ExpertBackingStore:
         if reader is None:
             reader = _ShardReader(fpath)
             self._readers[str(fpath)] = reader
-        self._key_to_reader[key] = reader
+        self._key_to_reader[("src", key)] = reader
         return reader
 
     def cold_quant_params(self, key: str) -> Tuple[int, int] | None:
@@ -486,7 +600,7 @@ class ExpertBackingStore:
 
     def load_expert(self, key: str, expert_id: int) -> mx.array:
         np_view = self.load_expert_slice(key, expert_id)
-        return _np_to_mx(key, np_view, self._reader_for_key(key).header[key]["dtype"])
+        return _np_to_mx(key, np_view, self._reader_for_key(key, expert_id).header[key]["dtype"])
 
     def load_expert_slice(self, key: str, expert_id: int) -> np.ndarray:
         """Return a fresh np.ndarray copy of one expert's slice (mmap-backed).
@@ -496,7 +610,7 @@ class ExpertBackingStore:
         thread as plain numpy buffers and the inference thread promotes them
         to mx.array at use time, avoiding cross-thread stream errors.
         """
-        reader = self._reader_for_key(key)
+        reader = self._reader_for_key(key, expert_id)
         return reader.expert_slice(key, expert_id)
 
     def load_expert_run(self, key: str, first_id: int, count: int) -> list[np.ndarray]:
@@ -507,7 +621,7 @@ class ExpertBackingStore:
         read instead of *count* separate ones. Returns per-expert numpy
         views into the run buffer (views are safe: promotion copies).
         """
-        reader = self._reader_for_key(key)
+        reader = self._reader_for_key(key, first_id)
         return reader.expert_run(key, first_id, count)
 
     def advise_expert_run(self, key: str, first_id: int, count: int) -> bool:
@@ -519,7 +633,7 @@ class ExpertBackingStore:
         platform lacks F_RDADVISE or the key cannot be resolved.
         """
         try:
-            reader = self._reader_for_key(key)
+            reader = self._reader_for_key(key, first_id)
             start, _ = reader.expert_byte_range(key, first_id)
             _, end = reader.expert_byte_range(key, max(0, first_id + count - 1))
             if end <= start:
@@ -533,10 +647,10 @@ class ExpertBackingStore:
 
         Returns locked bytes (0 on failure). Duplicate pins of the same
         (key, expert) are tracked and skipped."""
-        pkey = (str(self._reader_for_key(key).path), key, expert_id)
+        reader = self._reader_for_key(key, expert_id)
+        pkey = (str(reader.path), key, expert_id)
         if pkey in self._pinned:
             return 0
-        reader = self._reader_for_key(key)
         locked = reader.pin_expert(key, expert_id)
         if locked > 0:
             self._pinned.add(pkey)

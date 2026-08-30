@@ -34,6 +34,7 @@ shard metadata.
 
 import argparse
 import json
+import logging
 import math
 import os
 import sys
@@ -112,6 +113,11 @@ def run_streaming(model_path: str, text: str, args) -> dict:
             expert_streaming_cold_tier=(
                 None if args.cold_tier == "none" else args.cold_tier
             ),
+            expert_streaming_hot_fraction=(
+                None if not args.hot_fraction else float(args.hot_fraction)
+            ),
+            expert_streaming_pins=True,
+            expert_streaming_pin_gib=1.25,
             qwen4_ple_ssd_offload=True,
         )
         t0 = time.perf_counter()
@@ -214,6 +220,12 @@ def run_streaming(model_path: str, text: str, args) -> dict:
                 flush=True,
             )
 
+        # Persist the learned pin profile (the server does this in stop();
+        # the harness tears down via release/unload, so save explicitly —
+        # Fase I6's HOBBIT split needs the frequencies on the next load).
+        from omlx.patches.expert_streaming import save_expert_pin_profile
+
+        save_expert_pin_profile(engine)
         await pool.release_engine(entry_name)
         await pool._unload_engine(entry_name)
 
@@ -228,6 +240,7 @@ def run_streaming(model_path: str, text: str, args) -> dict:
             "perplexity": math.exp(mean_nll),
             "mode": "streaming",
             "cold_tier": args.cold_tier,
+            "hot_fraction": args.hot_fraction,
             "budget_gib": args.budget,
             "load_s": round(t_load, 1),
         }
@@ -236,6 +249,10 @@ def run_streaming(model_path: str, text: str, args) -> dict:
 
 
 def main() -> None:
+    # INFO logs (streaming conversion, HOBBIT split, cold tier) are gate
+    # evidence — the "HOBBIT split on 42/42 layers (fraction 0.25)" line the
+    # I6 gate requires must be in the harness log.
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--model",
@@ -253,6 +270,14 @@ def main() -> None:
         action="store_true",
         help="load through the omlx expert-streaming engine (for checkpoints "
         "whose expert banks far exceed RAM; --cold-tier selects the arm)",
+    )
+    ap.add_argument(
+        "--hot-fraction",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="HOBBIT split fraction (expert_streaming_hot_fraction; needs a "
+        "learned pin profile from --cold-tier runs)",
     )
     ap.add_argument(
         "--cold-tier",

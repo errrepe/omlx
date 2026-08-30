@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingColdTier
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingColdTier, expertStreamingHotFraction
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -251,6 +251,7 @@ final class ModelSettingsScreenVM {
     var expertStreamingPinGib: String = ""
     var expertStreamingColdTier: String = ""
     var expertStreamingColdTierPresent: Bool = false
+    var expertStreamingHotFraction: String = ""
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -399,6 +400,7 @@ final class ModelSettingsScreenVM {
         case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib,
              .expertStreamingTopkThreshold, .expertStreamingPerLayerEval, .expertStreamingPins, .expertStreamingPinGib,
              .expertStreamingColdTier,
+             .expertStreamingHotFraction,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
@@ -545,6 +547,7 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingPinGib = s?.expertStreamingPinGib.map { String($0) } ?? ""
                 self.expertStreamingColdTier = s?.expertStreamingColdTier ?? ""
                 self.expertStreamingColdTierPresent = m.expertStreamingColdTierPresent ?? false
+                self.expertStreamingHotFraction = s?.expertStreamingHotFraction.map { String($0) } ?? ""
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -737,6 +740,17 @@ final class ModelSettingsScreenVM {
                 patch.expertStreamingColdTier = String(Int(v))
             } else {
                 lastError = "Cold tier must be 2 or 3"
+                return
+            }
+        case .expertStreamingHotFraction:
+            guard expertStreamingSupported, expertStreamingEnabled, expertStreamingColdTierPresent else { return }
+            let frac = expertStreamingHotFraction.trimmingCharacters(in: .whitespacesAndNewlines)
+            if frac.isEmpty {
+                patch.expertStreamingHotFraction = nil
+            } else if let v = Double(frac), v >= 0, v <= 1 {
+                patch.expertStreamingHotFraction = v
+            } else {
+                lastError = "Hot fraction must be between 0 and 1"
                 return
             }
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled

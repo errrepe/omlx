@@ -1490,6 +1490,7 @@ def test_io_overrides_resolution_and_clamping():
         "expert_streaming_pilot": None,
         "expert_streaming_per_layer_eval": None,
         "expert_streaming_pins": None,
+        "expert_streaming_hot_fraction": None,
         "expert_streaming_pin_gib": None,
     }
 
@@ -1866,3 +1867,298 @@ def test_save_expert_pin_profile_hook():
     # Nothing attached anywhere: silent no-op (and the model-side holder path).
     bare = MagicMock(spec=object)
     save_expert_pin_profile(bare)
+
+class _TieredDictBacking:
+    """HOBBIT test backing: `load_expert` serves the source (4-bit) bank for
+    hot experts and a requantized (3-bit) bank for the rest, keyed by the
+    same (layer, proj) layout the dict fallback reads."""
+
+    def __init__(self, e: int, hot: set, out_d: int, in_d: int, seed: int = 3):
+        import mlx.core as mx
+        import numpy as np
+        mx.random.seed(seed)
+        dense = mx.random.normal((e, out_d, in_d))
+        w4, s4, b4 = mx.quantize(dense, group_size=32, bits=4)
+        w3, s3, b3 = mx.quantize(dense, group_size=32, bits=3)
+        self.banks = {
+            "weight": {"hot": w4, "cold": w3},
+            "scales": {"hot": s4, "cold": s3},
+            "biases": {"hot": b4, "cold": b3},
+        }
+        self.hot = {int(h) for h in hot}
+
+    def load_expert(self, key: str, expert_id: int):
+        part = key.rsplit(".", 1)[1] if "." in key else key
+        tier = "hot" if int(expert_id) in self.hot else "cold"
+        bank = self.banks[part][tier]
+        w = bank[int(expert_id)]
+        return w
+
+
+def test_hobbit_split_matches_tiered_reference():
+    """Dual-tier gather (I6): the split output must equal composing each
+    position's expert from ITS OWN tier's packing — hot positions at 4-bit
+    source values, cold positions at the 3-bit tier values."""
+    import mlx.core as mx
+    import numpy as np
+
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+    )
+
+    E, D_in, D_out = 8, 64, 32
+    hot = {1, 3}
+    backing = _TieredDictBacking(E, hot, D_out, D_in)
+
+    lin = StreamingQuantizedSwitchLinear(
+        layer_idx=0,
+        proj_name="down_proj",
+        stacked_weight_key="k.down_proj.weight",
+        stacked_scales_key="k.down_proj.scales",
+        stacked_biases_key="k.down_proj.biases",
+        num_experts=E,
+        input_dims=D_in,
+        output_dims=D_out,
+        backing=backing,
+        cache=ExpertLRUCache(1 << 26, 1 << 18, num_layers=1),
+        group_size=32,
+        bits=4,  # source (hot) packing
+        mode="affine",
+    )
+    lin.set_hobbit_split(hot, cold_bits=3, cold_gs=32)
+
+    rng = np.random.default_rng(11)
+    T = 40
+    # Linear contract (post _gather_sort): one x row per route, rhs flat ids.
+    # x_exp is [N, 1, D] where N = len(indices.flat); rhs is [N].
+    x_rows = rng.standard_normal((T, D_in)).astype(np.float32)
+    x_rows_mx = mx.array(x_rows)
+    flat_ids = rng.integers(0, E, size=T).astype(np.int32)
+    x = mx.array(x_rows[:, None, :])  # [T, 1, D_in]
+    idx = mx.array(flat_ids)  # [T]
+
+    out = lin(x, idx)
+    assert out.shape == (T, 1, D_out), out.shape
+
+    # Reference: per position, dequantize that expert's tier and matmul.
+    banks = backing.banks
+    outs = np.zeros((T, 1, D_out), dtype=np.float32)
+    for t in range(T):
+        e = int(flat_ids[t])
+        tier = "hot" if e in hot else "cold"
+        w = banks["weight"][tier][e]
+        s = banks["scales"][tier][e]
+        b = banks["biases"][tier][e]
+        dense = mx.dequantize(w, s, b, group_size=32, bits=4 if tier == "hot" else 3)
+        r = x_rows_mx[t] @ dense.T
+        mx.eval(r)
+        outs[t, 0] = np.array(r).astype(np.float32)
+    diff = np.abs(np.array(out.astype(mx.float32)) - outs).max()
+    assert diff < 1e-3, f"split output mismatch: {diff}"
+
+    # All-hot and all-cold degenerate arms must equal the uniform banks.
+    # Each arm gets its OWN backing tier set — the runtime contract is that
+    # the backing and the linear share one hot set (installed by the convert).
+    all_hot_backing = _TieredDictBacking(E, set(range(E)), D_out, D_in)
+    lin_all_hot = StreamingQuantizedSwitchLinear(
+        layer_idx=1, proj_name="down_proj",
+        stacked_weight_key="k.down_proj.weight",
+        stacked_scales_key="k.down_proj.scales",
+        stacked_biases_key="k.down_proj.biases",
+        num_experts=E, input_dims=D_in, output_dims=D_out,
+        backing=all_hot_backing, cache=ExpertLRUCache(1 << 26, 1 << 18, num_layers=1),
+        group_size=32, bits=4, mode="affine",
+    )
+    lin_all_hot.set_hobbit_split(set(range(E)), cold_bits=3, cold_gs=32)
+    out_all_hot = lin_all_hot(x, idx)
+    ref4 = mx.gather_qmm(
+        x, all_hot_backing.banks["weight"]["hot"], all_hot_backing.banks["scales"]["hot"], all_hot_backing.banks["biases"]["hot"],
+        rhs_indices=idx.astype(mx.uint32), transpose=True, group_size=32,
+        bits=4, mode="affine", sorted_indices=False,
+    )
+    assert mx.allclose(out_all_hot, ref4, atol=1e-3).item()
+
+    # Uniform-cold arm (I5 contract): an empty hot set means split INACTIVE
+    # and the converter overrides bits to the tier packing — here modeled by
+    # a bits=3 linear reading the all-cold backing.
+    all_cold_backing = _TieredDictBacking(E, set(), D_out, D_in)
+    lin_all_cold = StreamingQuantizedSwitchLinear(
+        layer_idx=2, proj_name="down_proj",
+        stacked_weight_key="k.down_proj.weight",
+        stacked_scales_key="k.down_proj.scales",
+        stacked_biases_key="k.down_proj.biases",
+        num_experts=E, input_dims=D_in, output_dims=D_out,
+        backing=all_cold_backing, cache=ExpertLRUCache(1 << 26, 1 << 18, num_layers=1),
+        group_size=32, bits=3, mode="affine",
+    )
+    out_all_cold = lin_all_cold(x, idx)
+    ref3 = mx.gather_qmm(
+        x, all_cold_backing.banks["weight"]["cold"], all_cold_backing.banks["scales"]["cold"], all_cold_backing.banks["biases"]["cold"],
+        rhs_indices=idx.astype(mx.uint32), transpose=True, group_size=32,
+        bits=3, mode="affine", sorted_indices=False,
+    )
+    assert mx.allclose(out_all_cold, ref3, atol=1e-3).item()
+
+
+# --- Fase I6: hotness signal, profile cap, and fraction denominator ------------
+
+
+def _i6_tmp_profile(pairs, layer="0"):
+    import json
+    import os
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"freq": {layer: pairs}}, f)
+    return path
+
+
+def test_pin_controller_counts_per_token_usage():
+    """Fase I6: the per-token bincount payload makes the learned profile rank
+    experts by USE — id 1 (5 of 6 routed positions) dominates; the old
+    presence signal counted each uniq expert exactly once and flattened
+    every frequency (the 42x64 all-count-4 profile)."""
+    from collections import Counter
+
+    import numpy as np
+
+    from omlx.patches.expert_streaming import warmer
+
+    flat = np.array([1, 1, 4, 1, 1, 1], dtype=np.int32)
+    pc = warmer.PinController({0: []}, None, num_experts=8)
+    pc.on_layer_plan(0, [1, 4], int(flat.size), np.bincount(flat, minlength=8))
+    assert pc.freq[0] == Counter({1: 5, 4: 1})
+    # Position-weighted prefill-sized calls accumulate too (never pin).
+    pc.on_layer_plan(0, [1, 4], 4096, np.bincount(flat, minlength=8))
+    assert pc.freq[0] == Counter({1: 10, 4: 2})
+    assert pc.pinned is False
+
+    # dict and list payloads coerce identically; oversized lists clamp to
+    # the controller's expert width.
+    pc2 = warmer.PinController({0: []}, None, num_experts=4)
+    pc2.on_layer_plan(0, [0, 2], 8, {0: 3, 2: 1})
+    assert pc2.freq[0] == Counter({0: 3, 2: 1})
+    pc2.on_layer_plan(0, [1], 8, [5, 7, 0, 0, 9])
+    # list clamped to the expert width (first 4): experts 0/1 gain 5/7.
+    assert pc2.freq[0] == Counter({0: 8, 1: 7, 2: 1})
+    # Unusable payloads fall back to the presence signal.
+    pc3 = warmer.PinController({0: []}, None, num_experts=8)
+    pc3.on_layer_plan(0, [2, 6], 8, "not-a-payload")
+    assert pc3.freq[0] == Counter({2: 1, 6: 1})
+
+
+def test_pin_controller_three_arg_fallback_compat():
+    """Old wiring calls on_layer_plan(layer, uniq, positions) with no counts:
+    the presence-based fallback must keep the pre-I6 behavior unchanged."""
+    from collections import Counter
+
+    from omlx.patches.expert_streaming import warmer
+
+    pc = warmer.PinController({0: []}, None)
+    pc.on_layer_plan(0, [3, 7], 8)
+    pc.on_layer_plan(0, [3], 8)
+    assert pc.freq[0] == Counter({3: 2, 7: 1})
+    pc.on_layer_plan(0, [3, 7], 4096)  # prefill-sized: presence, no pin
+    assert pc.freq[0] == Counter({3: 3, 7: 2})
+    assert pc.pinned is False
+
+
+def test_warm_pin_hook_forwards_counts_only_to_pin_and_recorder():
+    """WarmPinHook repasse: counts reach the pinner and the recorder, never
+    the readahead warmer (its contiguous-run F_RDADVISE grouping is
+    set-based); a warmer-only hook asks for no histogram at all."""
+    from unittest.mock import MagicMock
+
+    from omlx.patches.expert_streaming import warmer
+
+    counts = [1, 2, 0, 0]
+    w = MagicMock(spec=["on_layer_plan", "on_layer_start"])
+    p = MagicMock(spec=["on_layer_plan"])
+    rec = MagicMock(spec=["on_layer_plan", "maybe_seed"])
+    hook = warmer.WarmPinHook(w, p, rec)
+    assert hook.wants_usage_counts is True
+    hook.on_layer_plan(0, [0, 1], 8, counts)
+    p.on_layer_plan.assert_called_once_with(0, [0, 1], 8, counts)
+    rec.on_layer_plan.assert_called_once_with(0, [0, 1], 8, counts)
+    # Warmer got the 3-arg contract: NO counts payload.
+    w.on_layer_plan.assert_called_once_with(0, [0, 1], 8)
+    hook2 = warmer.WarmPinHook(w, None, None)
+    assert hook2.wants_usage_counts is False
+
+
+def test_pin_profile_keep_cap_env_default_and_truncation(tmp_path, monkeypatch):
+    """_PIN_PROFILE_KEEP defaults to 512 (OMLX_EXPERT_STREAMING_PIN_KEEP) and
+    caps the per-layer record list in the saved JSON without changing the
+    format — a 288-expert model must not be truncated to 64 entries."""
+    import json
+
+    from omlx.patches.expert_streaming import warmer as warmer_mod
+
+    assert warmer_mod._PIN_PROFILE_KEEP == 512
+    monkeypatch.setenv("OMLX_EXPERT_STREAMING_PIN_KEEP", "300")
+    import importlib
+    from collections import Counter
+
+    warmer2 = importlib.reload(warmer_mod)
+    try:
+        assert warmer2._PIN_PROFILE_KEEP == 300
+        profile = str(tmp_path / "expert_pin_profile.json")
+        linears = {0: [MagicMock()], 1: [MagicMock()]}
+        ctl = warmer2.PinController(
+            linears,
+            MagicMock(),
+            per_expert_bytes=1024,
+            profile_path=profile,
+        )
+        # 400 distinct experts observed: only the top 300 survive the cap.
+        # Counts are 400-e (expert 0 hottest), so the top 300 are 0..299.
+        ctl.freq = {0: Counter({e: 400 - e for e in range(400)})}
+        ctl.save_profile()
+        data = json.loads(open(profile).read())
+        assert len(data["freq"]["0"]) == 300
+        assert {e for e, _ in data["freq"]["0"]} == set(range(300))
+    finally:
+        monkeypatch.delenv("OMLX_EXPERT_STREAMING_PIN_KEEP")
+        importlib.reload(warmer_mod)
+
+
+def test_hot_set_loader_real_denominator():
+    """Fase I6 fraction semantics: ceil(fraction * num_experts) hot experts
+    (clamped to available records); without num_experts the record count
+    stays the denominator so legacy 2-arg calls are unchanged."""
+    from omlx.patches.expert_streaming.shard_bank import load_hot_set_from_profile
+
+    # Full-width profile on a 288-expert model: the fraction's denominator
+    # is the model width, not the record count.
+    pairs = [[i, 288 - i] for i in range(288)]  # descending counts
+    p = _i6_tmp_profile(pairs)
+    p2 = _i6_tmp_profile([[5, 9], [2, 4]])
+    try:
+        hot = load_hot_set_from_profile(p, 0.25, num_experts=288)
+        assert len(hot["layer_0"]) == 72  # ceil(0.25 * 288)
+        assert hot["layer_0"] == {e for e, _ in pairs[:72]}
+        # Legacy 2-arg (no num_experts): denominator is the record count.
+        hot_legacy = load_hot_set_from_profile(p, 0.25)
+        assert len(hot_legacy["layer_0"]) == 72  # ceil(0.25 * 288 records)
+        # Truncated profile (64 records, the pre-I6 keep cap) on a wide
+        # model: the real denominator would ask 72 but only 64 exist.
+        p_trunc = _i6_tmp_profile(pairs[:64])
+        hot_trunc = load_hot_set_from_profile(p_trunc, 0.25, num_experts=288)
+        assert len(hot_trunc["layer_0"]) == 64  # clamped to available
+        # Fraction beyond the records clamps to what was observed.
+        hot_full = load_hot_set_from_profile(p, 0.99, num_experts=288)
+        assert len(hot_full["layer_0"]) == 286  # ceil(0.99 * 288)
+        # Sparse profile on a wide model: cannot elect unseen experts.
+        hot_sparse = load_hot_set_from_profile(p2, 0.5, num_experts=288)
+        assert hot_sparse["layer_0"] == {5, 2}
+        import os
+
+        os.unlink(p_trunc)
+    finally:
+        import os
+
+        os.unlink(p)
+        os.unlink(p2)
+

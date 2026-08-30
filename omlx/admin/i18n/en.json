@@ -1145,5 +1145,7 @@
   "modal.model_settings.expert_streaming_pin_gib": "Pin budget (GiB)",
   "modal.model_settings.expert_streaming_pin_gib_hint": "Wired-memory cap for pinned experts. Empty = 1.25 GiB default.",
   "modal.model_settings.expert_streaming_cold_tier": "Cold expert tier (bits)",
-  "modal.model_settings.expert_streaming_cold_tier_hint": "Requires tools/requant_cold_tier.py (expert_cold/ present). Reads streamed experts from the low-precision tier — fewer bytes per token on the I/O floor. Approximate: gate with the perplexity harness. Empty = off."
+  "modal.model_settings.expert_streaming_cold_tier_hint": "Requires tools/requant_cold_tier.py (expert_cold/ present). Reads streamed experts from the low-precision tier — fewer bytes per token on the I/O floor. Approximate: gate with the perplexity harness. Empty = off.",
+  "modal.model_settings.expert_streaming_hot_fraction": "Hot expert fraction (HOBBIT split)",
+  "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1. With a cold tier and a learned pin profile, this fraction of each layer's most-used experts keeps the original 4-bit packing; the rest read the cold tier. Empty/0 = uniform tier."
 }

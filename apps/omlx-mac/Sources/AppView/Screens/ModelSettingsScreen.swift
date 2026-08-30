@@ -858,6 +858,21 @@ private struct AdvancedTab: View {
                                 }
                             ), mono: true, width: 110)
                         }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.hot_fraction.label",
+                                          defaultValue: "Hot expert fraction (HOBBIT split)",
+                                          comment: "Row label for the hot fraction field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.hot_fraction.sub",
+                                             defaultValue: "0–1. With a cold tier and a learned pin profile, this fraction of each layer's most-used experts keeps the original 4-bit; the rest read the cold tier. Empty = uniform tier.",
+                                             comment: "Sublabel for the hot fraction field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingHotFraction,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingHotFraction, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
                     }
                 }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",

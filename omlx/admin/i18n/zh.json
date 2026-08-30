@@ -1145,5 +1145,7 @@
   "modal.model_settings.expert_streaming_pin_gib": "锁定预算（GiB）",
   "modal.model_settings.expert_streaming_pin_gib_hint": "锁定专家所占用的内存上限。留空 = 默认 1.25 GiB。",
   "modal.model_settings.expert_streaming_cold_tier": "冷专家层（位宽）",
-  "modal.model_settings.expert_streaming_cold_tier_hint": "需要先运行 tools/requant_cold_tier.py（expert_cold/ 已存在）。从低精度层读取流式专家——降低 I/O 下限上的每 token 字节。近似计算：请用困惑度基准把关。留空 = 关闭。"
+  "modal.model_settings.expert_streaming_cold_tier_hint": "需要先运行 tools/requant_cold_tier.py（expert_cold/ 已存在）。从低精度层读取流式专家——降低 I/O 下限上的每 token 字节。近似计算：请用困惑度基准把关。留空 = 关闭。",
+  "modal.model_settings.expert_streaming_hot_fraction": "热专家比例（HOBBIT 分层）",
+  "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1。开启冷精度层且有学习到的 pin profile 时，每层使用频率最高的一部分专家保持原始 4-bit，其余读取冷层。留空/0 = 统一冷层。"
 }
