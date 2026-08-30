@@ -1,0 +1,1 @@
+{"weight_map": {"model.layers.0.mlp.switch_mlp.gate_proj.weight": "model-00001-of-00001.safetensors", "model.layers.0.mlp.switch_mlp.gate_proj.scales": "model-00001-of-00001.safetensors", "model.layers.0.mlp.switch_mlp.gate_proj.biases": "model-00001-of-00001.safetensors"}}

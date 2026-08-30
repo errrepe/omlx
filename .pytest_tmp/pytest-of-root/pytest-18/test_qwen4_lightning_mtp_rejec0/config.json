@@ -1,0 +1,1 @@
+{"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2, "num_nextn_predict_layers": 1}}

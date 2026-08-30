@@ -1,0 +1,1 @@
+{"quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}
