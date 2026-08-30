@@ -325,6 +325,14 @@
                                                        class="w-20 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                                 <span class="block text-xs text-neutral-400 mt-1" x-text="t('bench.config.ane_sweep_runs_hint')"></span>
                                             </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1" x-text="t('bench.config.ane_sweep_pp_sizes')"></label>
+                                                <input type="text" x-model="benchSweepPpSizes"
+                                                       :disabled="benchRunning || benchSweepRunning"
+                                                       placeholder="2048, 4096, 8192"
+                                                       class="w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                                <span class="block text-xs text-neutral-400 mt-1" x-text="t('bench.config.ane_sweep_pp_sizes_hint')"></span>
+                                            </div>
                                             <button type="button"
                                                     @click="runSweep()"
                                                     :disabled="benchSweepRunning || benchRunning || benchExternalEnabled || (!benchSweepSwiglu &amp;&amp; !benchSweepMoeShared &amp;&amp; !benchSweepOproj)"
@@ -335,36 +343,41 @@
                                                     <span x-text="benchSweepProgress ? (benchSweepProgress.current + '/' + benchSweepProgress.total + ' · ' + benchSweepProgress.name) : ''"></span>
                                                 </span>
                                             </button>
-                                            <div x-show="benchSweepResults.length" x-cloak class="mt-3 overflow-x-auto border border-neutral-200 rounded-lg">
-                                                <table class="w-full text-sm">
-                                                    <thead class="bg-neutral-50 text-neutral-500">
-                                                        <tr>
-                                                            <th class="text-left font-medium px-3 py-2" x-text="t('bench.config.ane_sweep_col_config')"></th>
-                                                            <th class="text-right font-medium px-3 py-2" x-text="t('bench.config.ane_sweep_col_pp')"></th>
-                                                            <th class="text-right font-medium px-3 py-2" x-text="t('bench.config.ane_sweep_col_gen')"></th>
-                                                            <th class="text-right font-medium px-3 py-2" x-text="t('bench.config.ane_sweep_col_speedup')"></th>
-                                                        </tr>
-                                                    </thead>
-                                                    <tbody>
-                                                        <template x-for="r in benchSweepResults" :key="r.name">
-                                                            <tr :class="r.best ? 'bg-green-50 font-semibold' : 'border-t border-neutral-100'">
-                                                                <td class="px-3 py-2 text-neutral-700">
-                                                                    <span x-text="r.name"></span>
-                                                                    <span x-show="r.best" class="ml-2 inline-block text-xs text-green-700" x-text="t('bench.config.ane_sweep_best')"></span>
-                                                                </td>
-                                                                <td class="px-3 py-2 text-right text-neutral-700">
-                                                                    <span x-text="r.ppTps != null ? r.ppTps.toFixed(1) : '—'"></span>
-                                                                    <span x-show="r.runs > 1 &amp;&amp; r.ppMin != null &amp;&amp; r.ppMax != null" class="block text-xs text-neutral-400" x-text="'(' + r.ppMin.toFixed(1) + '–' + r.ppMax.toFixed(1) + ')'"></span>
-                                                                </td>
-                                                                <td class="px-3 py-2 text-right text-neutral-700">
-                                                                    <span x-text="r.genTps != null ? r.genTps.toFixed(1) : '—'"></span>
-                                                                    <span x-show="r.runs > 1 &amp;&amp; r.genMin != null &amp;&amp; r.genMax != null" class="block text-xs text-neutral-400" x-text="'(' + r.genMin.toFixed(1) + '–' + r.genMax.toFixed(1) + ')'"></span>
-                                                                </td>
-                                                                <td class="px-3 py-2 text-right" :class="r.speedup > 1 ? 'text-green-700' : 'text-neutral-700'" x-text="r.speedup ? ((r.speedup >= 1 ? '+' : '') + ((r.speedup - 1) * 100).toFixed(0) + '%') : '—'"></td>
-                                                            </tr>
-                                                        </template>
-                                                    </tbody>
-                                                </table>
+                                            <div x-show="benchSweepResultsByPp.length" x-cloak class="mt-3 space-y-4">
+                                                <template x-for="grp in benchSweepResultsByPp" :key="grp.ppSize">
+                                                    <div class="overflow-x-auto border border-neutral-200 rounded-lg">
+                                                        <div class="px-3 py-2 text-xs font-semibold text-neutral-600 bg-neutral-50 border-b border-neutral-100" x-text="t('bench.config.ane_sweep_table_title').replace('{size}', grp.ppSize)"></div>
+                                                        <table class="w-full text-sm">
+                                                            <thead class="bg-neutral-50 text-neutral-500">
+                                                                <tr>
+                                                                    <th class="text-left font-medium px-3 py-2" x-text="t('bench.config.ane_sweep_col_config')"></th>
+                                                                    <th class="text-right font-medium px-3 py-2" x-text="t('bench.config.ane_sweep_col_pp')"></th>
+                                                                    <th class="text-right font-medium px-3 py-2" x-text="t('bench.config.ane_sweep_col_gen')"></th>
+                                                                    <th class="text-right font-medium px-3 py-2" x-text="t('bench.config.ane_sweep_col_speedup')"></th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody>
+                                                                <template x-for="r in grp.rows" :key="r.name">
+                                                                    <tr :class="r.best ? 'bg-green-50 font-semibold' : 'border-t border-neutral-100'">
+                                                                        <td class="px-3 py-2 text-neutral-700">
+                                                                            <span x-text="r.name"></span>
+                                                                            <span x-show="r.best" class="ml-2 inline-block text-xs text-green-700" x-text="t('bench.config.ane_sweep_best')"></span>
+                                                                        </td>
+                                                                        <td class="px-3 py-2 text-right text-neutral-700">
+                                                                            <span x-text="r.ppTps != null ? r.ppTps.toFixed(1) : '—'"></span>
+                                                                            <span x-show="r.runs > 1 &amp;&amp; r.ppMin != null &amp;&amp; r.ppMax != null" class="block text-xs text-neutral-400" x-text="'(' + r.ppMin.toFixed(1) + '–' + r.ppMax.toFixed(1) + ')'"></span>
+                                                                        </td>
+                                                                        <td class="px-3 py-2 text-right text-neutral-700">
+                                                                            <span x-text="r.genTps != null ? r.genTps.toFixed(1) : '—'"></span>
+                                                                            <span x-show="r.runs > 1 &amp;&amp; r.genMin != null &amp;&amp; r.genMax != null" class="block text-xs text-neutral-400" x-text="'(' + r.genMin.toFixed(1) + '–' + r.genMax.toFixed(1) + ')'"></span>
+                                                                        </td>
+                                                                        <td class="px-3 py-2 text-right" :class="r.speedup > 1 ? 'text-green-700' : 'text-neutral-700'" x-text="r.speedup ? ((r.speedup >= 1 ? '+' : '') + ((r.speedup - 1) * 100).toFixed(0) + '%') : '—'"></td>
+                                                                    </tr>
+                                                                </template>
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                </template>
                                             </div>
                                         </div>
                                     </div>

@@ -746,8 +746,16 @@
             benchSweepOproj: false,
             benchSweepRunning: false,
             benchSweepProgress: null,  // { current, total, name } during a sweep
-            benchSweepResults: [],     // [{ name, ppTps, genTps, speedup, best, ppMin, ppMax, genMin, genMax, runs }]
+            benchSweepResults: [],     // [{ ppSize, name, ppTps, genTps, speedup, best, ppMin, ppMax, genMin, genMax, runs }]
             benchSweepRuns: 3,         // benches per combination; table shows mean + min-max range
+            benchSweepPpSizes: "2048, 4096, 8192", // PP sizes to sweep over (comma-separated)
+            get benchSweepResultsByPp() {
+                const groups = {};
+                for (const r of this.benchSweepResults) {
+                    (groups[r.ppSize] ??= []).push(r);
+                }
+                return Object.keys(groups).map(pp => ({ ppSize: Number(pp), rows: groups[pp] }));
+            },
             // Shared external endpoint settings (persisted in localStorage,
             // used by both the throughput and accuracy bench tabs)
             externalBaseUrl: localStorage.getItem('omlx_bench_external_base_url') || '',
@@ -9645,10 +9653,23 @@
                     return;
                 }
 
+                // Parse PP sizes to sweep over. Defaults to the current form PP
+                // sizes if the field is left blank; dedupe and drop invalid.
+                const ppSizes = (this.benchSweepPpSizes || '')
+                    .split(',')
+                    .map((s) => parseInt(String(s).trim(), 10))
+                    .filter((n) => Number.isInteger(n) && n >= 1)
+                    .filter((n, i, a) => a.indexOf(n) === i);
+                if (ppSizes.length === 0) {
+                    this.benchError = 'Enter at least one PP size';
+                    return;
+                }
+
                 // Snapshot current benchAne* state so we can restore it after the sweep.
                 const saved = {
                     benchAneCustomize: this.benchAneCustomize,
                     benchAnePrefillEnabled: this.benchAnePrefillEnabled,
+                    benchPromptLengths: { ...this.benchPromptLengths },
                     benchSwigluInAne: this.benchSwigluInAne,
                     benchMoeSharedExpert: this.benchMoeSharedExpert,
                     benchOproj: this.benchOproj,
@@ -9683,7 +9704,7 @@
                 // is not dominated by a single run landing in the margin of error
                 // (thermal, OS scheduling, ANE compile-cache warmup, etc.).
                 const runs = Math.max(1, Math.min(5, parseInt(this.benchSweepRuns, 10) || 3));
-                const totalRuns = combos.length * runs;
+                const totalRuns = combos.length * ppSizes.length * runs;
 
                 this.benchSweepRunning = true;
                 this.benchSweepResults = [];
@@ -9694,63 +9715,72 @@
 
                 let failed = null;
                 try {
-                    for (let i = 0; i < combos.length; i++) {
-                        const c = combos[i];
-                        // Apply this combination's settings once for the whole combo.
-                        this.benchAneCustomize = true;
-                        this.benchAnePrefillEnabled = c.master;
-                        this.benchSwigluInAne = c.swiglu;
-                        this.benchMoeSharedExpert = c.moe_shared;
-                        this.benchOproj = c.oproj;
+                    for (let pi = 0; pi < ppSizes.length; pi++) {
+                        const ppSize = ppSizes[pi];
+                        // Force a single prompt length for this PP size so each
+                        // combination is measured at the same context length.
+                        // Restored in finally with the rest of the benchAne* snapshot.
+                        this.benchPromptLengths = { [ppSize]: true };
+                        for (let i = 0; i < combos.length; i++) {
+                            const c = combos[i];
+                            // Apply this combination's settings once for the whole combo.
+                            this.benchAneCustomize = true;
+                            this.benchAnePrefillEnabled = c.master;
+                            this.benchSwigluInAne = c.swiglu;
+                            this.benchMoeSharedExpert = c.moe_shared;
+                            this.benchOproj = c.oproj;
 
-                        const comboRuns = [];
-                        for (let r = 1; r <= runs; r++) {
-                            this.benchSweepProgress = {
-                                current: i * runs + r,
-                                total: totalRuns,
-                                name: `${c.name} · run ${r}/${runs}`,
-                            };
-                            // startBenchmark sets benchRunning=true and
-                            // connectBenchSSE clears it when the run finishes.
-                            await this.startBenchmark();
-                            // Wait for the SSE 'done' to clear benchRunning.
-                            await this._waitForBenchComplete();
-                            if (this.benchError) {
-                                failed = this.benchError;
-                                break;
+                            const comboRuns = [];
+                            for (let r = 1; r <= runs; r++) {
+                                this.benchSweepProgress = {
+                                    current: pi * combos.length * runs + i * runs + r,
+                                    total: totalRuns,
+                                    name: `PP ${ppSize} · ${c.name} · run ${r}/${runs}`,
+                                };
+                                // startBenchmark sets benchRunning=true and
+                                // connectBenchSSE clears it when the run finishes.
+                                await this.startBenchmark();
+                                // Wait for the SSE 'done' to clear benchRunning.
+                                await this._waitForBenchComplete();
+                                if (this.benchError) {
+                                    failed = this.benchError;
+                                    break;
+                                }
+                                // Collect metrics from this run.
+                                const m = this._extractSweepMetrics();
+                                if (m.ppTps != null || m.genTps != null) comboRuns.push(m);
                             }
-                            // Collect metrics from this run.
-                            const m = this._extractSweepMetrics();
-                            if (m.ppTps != null || m.genTps != null) comboRuns.push(m);
+                            if (failed) break;
+
+                            if (comboRuns.length === 0) {
+                                this.benchSweepResults.push({
+                                    ppSize, name: c.name, ppTps: null, genTps: null,
+                                    ppMin: null, ppMax: null, genMin: null, genMax: null,
+                                    runs: 0, speedup: null, best: false,
+                                });
+                                continue;
+                            }
+
+                            const ppVals = comboRuns.map(m => m.ppTps).filter(v => typeof v === 'number');
+                            const genVals = comboRuns.map(m => m.genTps).filter(v => typeof v === 'number');
+                            this.benchSweepResults.push({
+                                ppSize,
+                                name: c.name,
+                                ppTps: meanOf(ppVals),
+                                genTps: meanOf(genVals),
+                                ppMin: ppVals.length ? Math.min(...ppVals) : null,
+                                ppMax: ppVals.length ? Math.max(...ppVals) : null,
+                                genMin: genVals.length ? Math.min(...genVals) : null,
+                                genMax: genVals.length ? Math.max(...genVals) : null,
+                                runs: comboRuns.length,
+                                speedup: null,
+                                best: false,
+                            });
                         }
                         if (failed) break;
-
-                        if (comboRuns.length === 0) {
-                            this.benchSweepResults.push({
-                                name: c.name, ppTps: null, genTps: null,
-                                ppMin: null, ppMax: null, genMin: null, genMax: null,
-                                runs: 0, speedup: null, best: false,
-                            });
-                            continue;
-                        }
-
-                        const ppVals = comboRuns.map(m => m.ppTps).filter(v => typeof v === 'number');
-                        const genVals = comboRuns.map(m => m.genTps).filter(v => typeof v === 'number');
-                        this.benchSweepResults.push({
-                            name: c.name,
-                            ppTps: meanOf(ppVals),
-                            genTps: meanOf(genVals),
-                            ppMin: ppVals.length ? Math.min(...ppVals) : null,
-                            ppMax: ppVals.length ? Math.max(...ppVals) : null,
-                            genMin: genVals.length ? Math.min(...genVals) : null,
-                            genMax: genVals.length ? Math.max(...genVals) : null,
-                            runs: comboRuns.length,
-                            speedup: null,
-                            best: false,
-                        });
                     }
                 } finally {
-                    // Restore original benchAne* state.
+                    // Restore original benchAne* + prompt-length state.
                     Object.assign(this, saved);
                     this.benchSweepRunning = false;
                     this.benchSweepProgress = null;
@@ -9761,19 +9791,26 @@
                     return;
                 }
 
-                // Compute speedup vs baseline (first result, averaged).
-                const baseline = this.benchSweepResults[0];
-                if (baseline && baseline.ppTps != null) {
-                    for (const r of this.benchSweepResults) {
-                        r.speedup = r.ppTps != null ? (r.ppTps / baseline.ppTps) : null;
+                // Compute speedup vs the baseline (first combo) and highlight the
+                // best config WITHIN each PP-size group independently.
+                const groups = {};
+                for (const row of this.benchSweepResults) {
+                    (groups[row.ppSize] ??= []).push(row);
+                }
+                for (const ppSize of Object.keys(groups)) {
+                    const grp = groups[ppSize];
+                    const baseline = grp[0]; // baseline is always the first combo
+                    if (baseline && baseline.ppTps != null) {
+                        for (const r of grp) {
+                            r.speedup = r.ppTps != null ? (r.ppTps / baseline.ppTps) : null;
+                        }
                     }
+                    let best = null;
+                    for (const r of grp) {
+                        if (r.ppTps != null && (!best || r.ppTps > best.ppTps)) best = r;
+                    }
+                    if (best) best.best = true;
                 }
-                // Highlight the best (highest averaged pp TPS).
-                let best = null;
-                for (const r of this.benchSweepResults) {
-                    if (r.ppTps != null && (!best || r.ppTps > best.ppTps)) best = r;
-                }
-                if (best) best.best = true;
             },
 
             _waitForBenchComplete() {
