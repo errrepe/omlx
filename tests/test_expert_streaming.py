@@ -1764,7 +1764,13 @@ def test_io_pool_for_clamps_and_caches():
 
 def _stream_eval_recorder(monkeypatch):
     """Swap the module's mx for a recorder so the wrapper's eval/clear calls
-    are observable without touching the real allocator."""
+    are observable without touching the real allocator.
+
+    The clear goes through ``omlx.utils.metal_sync._sync_and_clear_cache``
+    (Etapa C: a pool clear must never run unsynchronized — on M4 the driver
+    panics with 'completeMemory() prepare count underflow'), so that helper is
+    patched too. Whichever route the wrapper takes is counted exactly once.
+    """
     import types
 
     from omlx.patches.expert_streaming import qwen35_stream_eval as qse
@@ -1779,6 +1785,9 @@ def _stream_eval_recorder(monkeypatch):
 
     monkeypatch.setattr(
         qse, "mx", types.SimpleNamespace(eval=_bump("eval"), clear_cache=_bump("clear"))
+    )
+    monkeypatch.setattr(
+        "omlx.utils.metal_sync._sync_and_clear_cache", _bump("clear")
     )
     return qse, calls
 
@@ -2419,3 +2428,154 @@ def test_glu_forward_emits_memtrace_events():
     # Indices of shape (B, T, 1) keep the trailing singleton — stock SwitchGLU
     # returns the same rank here, so this is parity, not an artifact.
     assert out.shape == (1, 80, 1, D)
+
+
+# ---------------------------------------------------------------------------
+# Fase J — Etapa C: per-layer eval boundary (G2, qwen4_exp parity)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_eval_applies_to_qwen_decoder_classes():
+    """The boundary must install on every qwen decoder that ignores
+    _stream_eval, and re-applying must not double-wrap (a double wrap would
+    cost two syncs per layer and change nothing else)."""
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+
+    assert qse.apply_qwen35_moe_stream_eval() is True
+    names = qse.wrapped_class_names()
+    assert "Qwen3_5MoeDecoderLayer" in names
+
+    classes = dict(qse._candidate_decoder_classes())
+    before = {name: cls.__call__ for name, cls in classes.items()}
+    assert qse.apply_qwen35_moe_stream_eval() is True
+    # Identity check: a second apply short-circuits on the class flag.
+    for name, cls in classes.items():
+        assert cls.__call__ is before[name], f"{name} was re-wrapped"
+
+
+def test_stream_eval_boundary_gating_and_bit_exactness():
+    """The boundary fires only on prefill-shaped calls of streamed layers, and
+    never changes the returned values.
+
+    Prefill-shaped = _stream_eval set, not an MTP verify pass, and T > 1.
+    Decode (T == 1) and verify passes stay lazy: 48 forced syncs per token
+    would erase the QD16 decode win.
+    """
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+
+    class _Stub:
+        def __init__(self, stream_eval: bool):
+            self._stream_eval = stream_eval
+            self.seen = 0
+
+        def __call__(self, x, target_verify: bool = False):
+            self.seen += 1
+            return x * 3.0
+
+    unwrapped = _Stub.__call__
+
+    counters = {"eval": 0, "clear": 0}
+    real_eval, real_clear = mx.eval, mx.clear_cache
+    real_thresh, real_enabled = qse._cache_threshold_bytes, qse._per_layer_eval_enabled
+
+    def counting_eval(*args, **kwargs):
+        counters["eval"] += 1
+        return real_eval(*args, **kwargs)
+
+    def counting_clear():
+        counters["clear"] += 1
+        return real_clear()
+
+    qse._per_layer_eval_enabled = True
+    qse._cache_threshold_bytes = lambda: 0  # force the clear branch
+    mx.eval = counting_eval
+    mx.clear_cache = counting_clear
+    try:
+        wrapped = qse._wrap_call(unwrapped)
+
+        # 1) prefill-shaped, streamed -> boundary fires
+        stub = _Stub(True)
+        prefill = mx.arange(16, dtype=mx.float32).reshape(1, 8, 2)
+        out = wrapped(stub, prefill)
+        mx.eval(out)
+        base_eval, base_clear = counters["eval"], counters["clear"]
+        assert base_eval >= 1
+        assert base_clear >= 1
+        # bit-exact: the wrapper returns the layer's own output untouched
+        assert mx.array_equal(out, unwrapped(stub, prefill) * 1.0)
+
+        # 2) decode-shaped (T == 1) -> stays lazy
+        counters["eval"] = counters["clear"] = 0
+        wrapped(stub, mx.zeros((1, 1, 2)))
+        assert counters["eval"] == 0
+        assert counters["clear"] == 0
+
+        # 3) MTP verify pass -> stays lazy
+        counters["eval"] = counters["clear"] = 0
+        wrapped(stub, mx.zeros((1, 8, 2)), target_verify=True)
+        assert counters["eval"] == 0
+        assert counters["clear"] == 0
+
+        # 4) layer without _stream_eval -> untouched
+        counters["eval"] = counters["clear"] = 0
+        plain = _Stub(False)
+        wrapped(plain, mx.zeros((1, 8, 2)))
+        assert counters["eval"] == 0
+        assert counters["clear"] == 0
+
+        # 5) knob off -> boundary disabled entirely
+        qse._per_layer_eval_enabled = False
+        counters["eval"] = counters["clear"] = 0
+        wrapped(stub, mx.zeros((1, 8, 2)))
+        assert counters["eval"] == 0
+        assert counters["clear"] == 0
+    finally:
+        mx.eval = real_eval
+        mx.clear_cache = real_clear
+        qse._cache_threshold_bytes = real_thresh
+        qse._per_layer_eval_enabled = real_enabled
+
+
+def test_stream_eval_clear_goes_through_sync_helper():
+    """Etapa C requires every pool clear to be synchronized first — an
+    unsynchronized mx.clear_cache() panics the M4 driver. The helper must
+    prefer _sync_and_clear_cache and still work if it cannot be imported."""
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+
+    # Prefer the locked helper when importable.
+    qse._clear_cache_synced()
+    # And degrade gracefully when it is not.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name.startswith("omlx.utils.metal_sync"):
+            raise ImportError("blocked")
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = blocked_import
+    try:
+        qse._clear_cache_synced()  # must not raise
+    finally:
+        builtins.__import__ = real_import
+
+
+def test_qwen4_exp_decoder_is_a_boundary_candidate():
+    """qwen4_exp's decoder does NOT honour _stream_eval, so it must be in the
+    wrap list — this is the G2 gap that left the flag inert on qwen4_exp."""
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+
+    names = [name for name, _ in qse._candidate_decoder_classes()]
+    # The installed qwen3_5_moe decoder is always present in this environment.
+    assert "Qwen3_5MoeDecoderLayer" in names
+    # qwen4_exp is vendored: present when the compat patch can register it.
+    if "Qwen4ExpDecoderLayer" in names:
+        classes = dict(qse._candidate_decoder_classes())
+        q4 = classes["Qwen4ExpDecoderLayer"]
+        q35 = classes["Qwen3_5MoeDecoderLayer"]
+        # Independent hierarchies: wrapping both cannot double-eval.
+        assert q4 is not q35
+        assert not issubclass(q4, q35)

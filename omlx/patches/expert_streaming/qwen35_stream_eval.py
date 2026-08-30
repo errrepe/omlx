@@ -4,14 +4,21 @@
 The streaming converter flags every converted decoder layer with
 ``_stream_eval``. The vendored GLM-5.3 decoder honors the flag inline
 (``Glm5NextDecoderLayer.__call__``); the installed ``mlx_vlm``
-``Qwen3_5MoeDecoderLayer`` does not, so on qwen4_exp the flag is inert and a
-long prefill chunk accumulates one streaming mini-bank per layer in the lazy
+``Qwen3_5MoeDecoderLayer`` does not, and neither does the vendored
+``Qwen4ExpDecoderLayer`` — so on qwen4_exp the flag is inert and a long
+prefill chunk accumulates one streaming mini-bank per layer in the lazy
 graph until the chunk-end eval (~17 MB/token measured, intra-chunk pool
-peaks ~29 GiB). This wraps the decoder with the DeepSeek/GLM boundary:
-evaluate the layer output as soon as the layer returns and trim the
-allocator cache so the retained pool cannot grow past the layer's working
-set and evict the OS page cache the streaming path depends on (the Fase G
-post-mortem's 341 s/8k case).
+peaks ~29 GiB, process phys_footprint ~35.7 GiB of which ~34.5 GiB is
+IOAccelerator). This wraps every such decoder with the DeepSeek/GLM
+boundary: evaluate the layer output as soon as the layer returns and trim
+the allocator cache so the retained pool cannot grow past the layer's
+working set and evict the OS page cache the streaming path depends on
+(the Fase G post-mortem's 341 s/8k case).
+
+This is the dominant term of the Fase J prefill-memory work: everything
+else (demand-set tiling, the rolling bank load) bounds a *single* layer's
+transient, but without a per-layer boundary the graph still accumulates one
+transient per layer across all 48 layers.
 
 Prefill-shaped calls only (``x.shape[1] > 1``; batch decode is [B, 1, H]):
 decode graphs are small and 48 forced syncs/token would erode the QD16 win,
@@ -60,6 +67,24 @@ def configure_from_settings(value: Any) -> bool:
     return _per_layer_eval_enabled
 
 
+def _clear_cache_synced() -> None:
+    """Release the reusable Metal pool, but only after a full sync.
+
+    ``mx.clear_cache`` must never run with command buffers in flight: on M4
+    the driver panics with 'completeMemory() prepare count underflow'. The
+    caller has already done ``mx.eval(out)``, but ``_sync_and_clear_cache``
+    additionally takes the buffer-access lock that keeps the async
+    store-cache worker from observing a half-reclaimed pool (#1106), so it is
+    preferred whenever it is importable.
+    """
+    try:
+        from omlx.utils.metal_sync import _sync_and_clear_cache
+
+        _sync_and_clear_cache()
+    except Exception:
+        mx.clear_cache()
+
+
 def _wrap_call(orig_call: Any) -> Any:
     def call(self, x, *args, **kwargs):
         out = orig_call(self, x, *args, **kwargs)
@@ -73,27 +98,87 @@ def _wrap_call(orig_call: Any) -> Any:
             mx.eval(out)
             get_cache_memory = getattr(mx, "get_cache_memory", None)
             if get_cache_memory is None or get_cache_memory() >= _cache_threshold_bytes():
-                mx.clear_cache()
+                _clear_cache_synced()
         return out
 
     return call
 
 
-def apply_qwen35_moe_stream_eval() -> bool:
-    """Wrap ``Qwen3_5MoeDecoderLayer.__call__`` with the streaming eval
-    boundary. Idempotent (the class flag short-circuits re-wrapping); the
-    per-call behavior follows the current module flag so a settings change
-    that reloads the engine takes effect without a process restart. Returns
-    True when the installed mlx_vlm exposes the target class."""
+def _qwen4_exp_language_module() -> Any:
+    """Resolve the qwen4_exp decoder module, applying the compat patch if the
+    vendored tree has not been registered with mlx_vlm yet."""
+    try:
+        from mlx_vlm.models.qwen4_exp import language as q4e
+
+        return q4e
+    except ImportError:
+        pass
+    try:
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        if apply_mlx_vlm_qwen4_exp_compat_patch():
+            from mlx_vlm.models.qwen4_exp import language as q4e
+
+            return q4e
+    except Exception:  # noqa: BLE001
+        logger.debug("qwen4_exp language module unavailable", exc_info=True)
+    return None
+
+
+def _candidate_decoder_classes() -> list[tuple[str, Any]]:
+    """Decoder layer classes that ignore ``_stream_eval`` and need wrapping.
+
+    ``Qwen4ExpDecoderLayer`` derives from ``nn.Module`` directly, not from
+    ``Qwen3_5MoeDecoderLayer``, so wrapping both cannot double-wrap.
+    """
+    found: list[tuple[str, Any]] = []
     try:
         from mlx_vlm.models.qwen3_5_moe import language as q35
     except ImportError:
-        return False
-    cls = getattr(q35, "Qwen3_5MoeDecoderLayer", None)
-    if cls is None or getattr(cls, _APPLIED_FLAG, False):
-        return cls is not None
+        q35 = None
+    if q35 is not None:
+        cls = getattr(q35, "Qwen3_5MoeDecoderLayer", None)
+        if cls is not None:
+            found.append(("Qwen3_5MoeDecoderLayer", cls))
 
-    cls.__call__ = _wrap_call(cls.__call__)
-    cls._omlx_stream_eval_wrapped = True
-    logger.info("Qwen3.5/qwen4_exp streaming per-layer eval boundary installed")
-    return True
+    q4e = _qwen4_exp_language_module()
+    if q4e is not None:
+        cls = getattr(q4e, "Qwen4ExpDecoderLayer", None)
+        if cls is not None:
+            found.append(("Qwen4ExpDecoderLayer", cls))
+    return found
+
+
+def apply_qwen35_moe_stream_eval() -> bool:
+    """Wrap every qwen decoder that ignores ``_stream_eval`` with the
+    streaming eval boundary.
+
+    Idempotent (a per-class flag short-circuits re-wrapping); the per-call
+    behavior follows the current module flag so a settings change that
+    reloads the engine takes effect without a process restart. Returns True
+    when at least one target class was found (wrapped now or previously).
+    """
+    wrapped = False
+    for name, cls in _candidate_decoder_classes():
+        if getattr(cls, _APPLIED_FLAG, False):
+            wrapped = True
+            continue
+        cls.__call__ = _wrap_call(cls.__call__)
+        setattr(cls, _APPLIED_FLAG, True)
+        wrapped = True
+        logger.info(
+            "Qwen3.5/qwen4_exp streaming per-layer eval boundary installed on %s",
+            name,
+        )
+    return wrapped
+
+
+def wrapped_class_names() -> list[str]:
+    """Names of decoder classes currently carrying the boundary (test hook)."""
+    return [
+        cls.__name__
+        for _, cls in _candidate_decoder_classes()
+        if getattr(cls, _APPLIED_FLAG, False)
+    ]
