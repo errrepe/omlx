@@ -515,4 +515,66 @@ ganha o novo atributo). Suíte: 168 passed.
 
 ---
 
+### 15. Etapa D — cadência de `_sync_and_clear_cache` no scheduler: VALIDADA e REVERTIDA
+
+Item (b) da conclusão de §13.1, investigado e **rejeitado** com medida.
+
+**Tentativa:** gatear os ~11 sites restantes do scheduler que ainda chamavam
+`_sync_and_clear_cache` **incondicionalmente** (sem `should_clear_cache()`),
+usando o predicado de cadência `should_clear_cache()` (limpa só quando
+`get_cache_memory() >= 2 GiB`, ou sempre se a medição for indisponível). Os
+sites pré-gateados (L2324, e L12026/L12145 em `step`) ficaram de fora. Os 11
+alvos:
+- 2 *lambdas*: L8930 (`_try_specprefill_scoring`), L10365 (scoring de spec-prefill).
+- 9 chamadas diretas: L9528 (teardown/error-recovery), L10398 (spec-prefill
+  abort cleanup), L10478 (`_PrefillAbortedError`), L10505/L10529 (prefill
+  evict/reject), L10545 (prefill *done*), L10583/L10588/L10610
+  (capacity-reject / memory-exception / runtime-error), L11557
+  (generation-overflow recovery).
+- Deliberadamente **DEIXADOS incondicionais** (mantêm o pico BAIXO, aviso de
+  §13): L3658/3768/3828 (`_do_external_prefill`), L5071
+  (`_reclaim_prefill_headroom`), L5538 (`_step_prefill_chunk`), L5605
+  (`_finalize_chunked_prefill_cache_for_insert`), L5746/5765/5778/5806
+  (`_advance_chunked_prefills`).
+
+**Validação (o passo "medir" que §13 exigia — "NÃO fazer sem medir"):** rodou a
+suíte de regressão de prefill. **4 testes de `TestPrefillCleanupUsesEngineStream`
+FALHARAM**:
+`test_first_chunk_capacity_rejection_drains_engine_stream`,
+`test_first_chunk_runtime_error_drains_engine_stream`,
+`test_non_chunked_capacity_rejection_drains_engine_stream`,
+`test_non_chunked_runtime_error_drains_engine_stream`.
+
+**Causa-raiz:** o gate envolve o clear em `if should_clear_cache():`. No
+ambiente de teste `mx.get_cache_memory()` retorna 0 (< limiar default de 2 GiB)
+→ `should_clear_cache()` retorna `False` → o **dreno obrigatório do engine
+stream do Metal** em erro/abort/evict/reject de prefill é PULADO. O teste
+afirma que o engine stream FOI drenado → falha a asserção
+(`assert streams, "prefill cleanup did not clear the Metal buffer cache"`).
+
+**Não é artefato de test-env:** em produção `should_clear_cache()` *também*
+retorna `False` sempre que o pool estiver abaixo do limiar no momento do erro
+de prefill — então um erro de prefill pequeno/já-drenado vazaria os transients
+(subiria o pico E quebraria o invariante documentado de "dreno em erro").
+O aviso de §13 está, portanto, correto e foi confirmado pela medição.
+
+**Decisão:** **REVERTIDO** o gateamento no scheduler
+(`git checkout -- omlx/scheduler.py`). Após o revert, a suíte completa de
+prefill = **168 passed** (restaurada). O comportamento de manter o pico baixo
+é preservado pelos clears incondicionais do prefill-hot-path + reclaim
+(L5538, L5071 etc.) e pelo eval por camada threshold-gated da Etapa C/D.
+Nada de código de pico pendente; nenhum commit de `scheduler.py` necessário
+(voltou ao estado limpo de `25e9016e`).
+
+**Recomendação para um refinamento de cadência futuro e seguro:** desacoplar
+"dreno obrigatório de error-recovery" (deve ser **INCONDICIONAL** — é
+corretude/invariante, não otimização de cadência) de "cadência steady-state"
+(a única coisa que pode ser gateada). Um predicado correto seria
+`should_clear_cache() OR is_error_recovery_path`. Ou, melhor: gatear só sites
+comprovadamente FORA do prefill E FORA de qualquer error-recovery (ex.: cadência
+de decode-step, já tratada em `step` em L12026/L12145). Revisitar só com um
+harness de medição de pico *por site*.
+
+---
+
 **Fim do handoff.**
