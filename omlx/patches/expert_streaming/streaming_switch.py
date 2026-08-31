@@ -2159,6 +2159,15 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             cold_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 1]
             tier_demand[0] = [uniq[i] for i in hot_idx]
             tier_demand[1] = [uniq[i] for i in cold_idx]
+            if memtrace.enabled:
+                memtrace.record(
+                    "dual_tier.enter",
+                    layer=self.layer_idx,
+                    proj=self.proj_name,
+                    positions=len(plan.uniq_list),
+                    hot_positions=len(hot_idx),
+                    cold_positions=len(cold_idx),
+                )
             for i, eid in enumerate(uniq):
                 t = 0 if i in set(hot_idx) else 1  # hot_rank lookup
                 if t in tier_single:
@@ -2226,12 +2235,29 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     w_b, s_b, b_b = _stack_tier(t, idxs)
                 bits_ = self.bits if t == 0 else self._cold_bits
                 gs_ = self.group_size if t == 0 else self._cold_gs
+                if memtrace.enabled:
+                    memtrace.record(
+                        "dual_tier.bank_promoted",
+                        layer=self.layer_idx,
+                        proj=self.proj_name,
+                        tier=t,
+                        experts=len(idxs),
+                        bank_bytes=self._tier_bank_bytes_for(idxs),
+                    )
                 # expert-id -> rank within THIS tier's bank (flat ids here,
                 # not compact uniq ranks); -1 where the other tier owns it.
                 tier_map = np.full((self.num_experts,), -1, dtype=np.int32)
                 for rank, i in enumerate(idxs):
                     tier_map[uniq[i]] = rank
                 tier_remapped_np = tier_map[flat_np].reshape(plan.indices_shape)
+                if memtrace.enabled:
+                    memtrace.record(
+                        "dual_tier.qmm_submitted",
+                        layer=self.layer_idx,
+                        proj=self.proj_name,
+                        tier=t,
+                        positions=(tier_remapped_np >= 0).sum(),
+                    )
                 # gather_qmm takes UNSIGNED row indices — -1 wraps to a huge
                 # OOB index (garbage/nan) that the keep mask cannot undo
                 # (nan * 0 = nan). Clamp the gather indices to 0 (any valid
@@ -2258,8 +2284,31 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 keep_np = (tier_remapped_np >= 0).astype(np.float32)
                 keep_shape = tuple(plan.indices_shape) + (1,) * (tier_out.ndim - len(plan.indices_shape))
                 keep = mx.array(keep_np).reshape(keep_shape)
+                if memtrace.enabled:
+                    memtrace.record(
+                        "dual_tier.mask_created",
+                        layer=self.layer_idx,
+                        proj=self.proj_name,
+                        tier=t,
+                    )
                 tier_out = tier_out * keep
+                if memtrace.enabled:
+                    memtrace.record(
+                        "dual_tier.outputs_added",
+                        layer=self.layer_idx,
+                        proj=self.proj_name,
+                        tier=t,
+                        first_add=(out is None),
+                    )
                 out = tier_out if out is None else out + tier_out
+            if memtrace.enabled:
+                memtrace.record(
+                    "dual_tier.exit",
+                    layer=self.layer_idx,
+                    proj=self.proj_name,
+                    hot_positions=len(hot_idx),
+                    cold_positions=len(cold_idx),
+                )
             if out is None:
                 # Degenerate: every unique expert hot (hot bank == full uniq
                 # order) — identical to the uniform path.

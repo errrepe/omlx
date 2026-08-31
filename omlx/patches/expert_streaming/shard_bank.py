@@ -146,6 +146,14 @@ def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
 # token-ID bit-exact.
 _RUN_IO_QD = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_QD", "16")))
 
+# Fase 5b: completion-order window. 'completion' pops whichever read
+# finishes first (scatter per descriptor, rows disjoint) instead of
+# waiting on the oldest submission; default 'order' keeps submission
+# order. Merge decision held to A/B evidence (>=2-3% at 8k).
+_RUN_WINDOW_COMPLETION = (
+    os.environ.get("OMLX_EXPERT_STREAMING_RUN_WINDOW", "") == "completion"
+)
+
 # Fase 2: demand-read telemetry, collected ONLY under the profiling env
 # (the bench sets OMLX_EXPERT_STREAMING_PROFILE=1). Zero cost otherwise:
 # one module-global guard read per read_expert_into call.
@@ -939,22 +947,88 @@ class ExpertBackingStore:
                     return False
                 scatter_one(off, first, js, buf)
             else:
-                # Sliding window (K11): keep up to _RUN_IO_QD reads in
-                # flight continuously. The old drain-all-per-batch loop
-                # emptied the queue at every batch boundary — a sawtooth
-                # that let the device idle even though demand was waiting.
-                # The window pops the OLDEST descriptor (submission order)
-                # so out bytes stay deterministic descriptor by descriptor.
+                # Sliding window (K11 + Fase 5b): keep up to _RUN_IO_QD
+                # reads in flight continuously. The old drain-all-per-batch
+                # loop emptied the queue at every batch boundary — a
+                # sawtooth that let the device idle even though demand was
+                # waiting. Two pop orders (env OMLX_EXPERT_STREAMING_RUN_
+                # WINDOW): 'order' (default) pops the OLDEST submission;
+                # 'completion' pops whichever read finished first so a slow
+                # run cannot head-of-line-block the rest. Either way out
+                # bytes stay deterministic: each descriptor scatters its
+                # own disjoint rows.
                 io_exec = _run_io_pool()
-                window: list = []  # (off, first, js, buf, future)
-                ok = True
-                for idx, (off, first, count, js) in enumerate(runs):
-                    buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
-                    window.append(
-                        (off, first, js, buf, io_exec.submit(reader._read_into, off, buf))
-                    )
-                    if len(window) >= _RUN_IO_QD or idx == len(runs) - 1:
-                        wo, wfirst, wjs, wbuf, wfut = window.pop(0)
+                if _RUN_WINDOW_COMPLETION:
+                    from concurrent.futures import wait
+
+                    window: dict = {}  # future -> (off, first, js, buf)
+                    pending_runs = iter(runs)
+                    ok = True
+
+                    def submit_next():
+                        run = next(pending_runs, None)
+                        if run is None:
+                            return None
+                        (off, first, cnt, js) = run
+                        buf = np.empty(cnt * rp.expert_bytes, dtype=np.uint8)
+                        fut = io_exec.submit(reader._read_into, off, buf)
+                        window[fut] = (off, first, js, buf)
+                        return fut
+
+                    # Prime exactly one window's worth: the completion
+                    # loop refills one-for-one, so <= _RUN_IO_QD reads are
+                    # ever in flight.
+                    for _ in range(_RUN_IO_QD):
+                        if submit_next() is None:
+                            break
+                    while window:
+                        done, _ = wait(
+                            list(window), return_when="FIRST_COMPLETED"
+                        )
+                        for fut in done:
+                            off, first, js, buf = window.pop(fut)
+                            try:
+                                fut.result()
+                            except Exception:
+                                ok = False
+                            else:
+                                scatter_one(off, first, js, buf)
+                            submit_next()
+                        if not ok:
+                            for fut in list(window):
+                                try:
+                                    fut.result()
+                                except Exception:
+                                    pass
+                                window.pop(fut, None)
+                            return False
+                else:
+                    window: list = []  # (off, first, js, buf, future)
+                    ok = True
+                    for idx, (off, first, count, js) in enumerate(runs):
+                        buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                        window.append(
+                            (
+                                off, first, js, buf,
+                                io_exec.submit(reader._read_into, off, buf),
+                            )
+                        )
+                        if len(window) >= _RUN_IO_QD or idx == len(runs) - 1:
+                            wo, wfirst, wjs, wbuf, wfut = window.pop(0)
+                            try:
+                                wfut.result()
+                            except Exception:
+                                ok = False
+                            if ok:
+                                scatter_one(wo, wfirst, wjs, wbuf)
+                        if not ok:
+                            for _o, _f, _j, _b, fut in window:
+                                try:
+                                    fut.result()
+                                except Exception:
+                                    pass
+                            return False
+                    for wo, wfirst, wjs, wbuf, wfut in window:
                         try:
                             wfut.result()
                         except Exception:
@@ -962,27 +1036,7 @@ class ExpertBackingStore:
                         if ok:
                             scatter_one(wo, wfirst, wjs, wbuf)
                     if not ok:
-                        # Drain the rest so no exception is left unretrieved
-                        # and no read keeps writing into a buffer the caller
-                        # has already been told to discard.
-                        for _o, _f, _j, _b, fut in window:
-                            try:
-                                fut.result()
-                            except Exception:
-                                pass
                         return False
-                # The window may still hold descriptors submitted on the
-                # final iterations (when the run count is below the window
-                # size); drain them in submission order.
-                for wo, wfirst, wjs, wbuf, wfut in window:
-                    try:
-                        wfut.result()
-                    except Exception:
-                        ok = False
-                    if ok:
-                        scatter_one(wo, wfirst, wjs, wbuf)
-                if not ok:
-                    return False
             if _PROFILE_READS:
                 # Fase 2 demand-read telemetry (bench-only cost).
                 _READ_STATS["calls"] = _READ_STATS.get("calls", 0) + 1

@@ -836,6 +836,23 @@ re-base and rewrites the bench's chunk_schedule reference together.
   real split too (2k 55.0 vs 47.5 s, 8k 107.2 vs 98.9 s) -> default 0.
   memtrace shows tier-aware bank_bytes (217.8 MiB for a 275-expert
   mixed chunk, under the 256 MiB cap) — K6 arithmetic coherent.
+### Fase 4/5 — dual-tier memory diagnosis and run-window evidence
+
+- F4A (bench/results/fasek/f4a/): dual-tier memtrace events show the 8k
+  split prefill peak (14.23 GiB Metal / 11.92 GiB active) as a PLATEAU
+  across the whole chain (bank_promoted -> qmm_submitted -> mask_created
+  -> outputs_added) — the extra ~3.9 GiB vs single-tier is the per-layer
+  second bank + mask + add accumulating in the lazy graph until the
+  chunk-end eval, not a step-specific spike. Cold carries ~73% of the
+  demand (337 experts, 246.8 MB) vs hot (124, 91.8 MB). F4B: within the
+  28 GiB ceiling; compute-order changes stay a release-time Re-baseline
+  option gated by the ppl gate.
+- F5b (bench/results/fasek/f5ab/): the completion-order run window
+  (OMLX_EXPERT_STREAMING_RUN_WINDOW=completion) measured WORSE than the
+  submission-order default (8k: TTFT 86.7 vs 86.0s, decode 3.082 vs
+  3.308 tok/s, 2 interleaved reps, tokens identical) — no head-of-line
+  gain on this SSD. Default stays 'order'; the variant remains a
+  diagnostic knob only.
 ### Fase 2/3 — F_RDADVISE telemetry and the speculation decision (closed)
 
 advise_expert_run now reports (ok, bytes, tier_segments) and the advisor

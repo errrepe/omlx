@@ -3086,6 +3086,53 @@ def test_read_stats_collected_under_profile():
         finally:
             sb_mod._READ_STATS.clear()
 
+
+
+def test_run_window_completion_vs_order_byte_identical():
+    """Fase 5b: the completion-order window scatters the same bytes as
+    the submission-order window even when reads complete out of order
+    (a slow early run must not block the rest, and must not corrupt
+    anyone's rows)."""
+    import time
+
+    import numpy as np
+
+    from omlx.patches.expert_streaming import shard_bank as sb_mod
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        per = 4 * 4 * 2
+        _write_shard_filled(tmp / "model.safetensors", {key: ((64, 4, 4), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        eids = list(range(0, 32, 2))  # 16 single-expert runs
+        reader = backing._reader_for_key(key)
+        orig = reader._read_into
+
+        def out_of_order(off, buf):
+            # Earlier rows take MUCH longer: completions come reversed.
+            time.sleep(0.015 if off < 10 * per else 0.001)
+            return orig(off, buf)
+
+        reader._read_into = out_of_order
+
+        def run(mode, out):
+            with patch.object(sb_mod, "_RUN_WINDOW_COMPLETION", mode):
+                assert backing.read_expert_into([(key, eids)], [out])
+
+        out_order = np.empty((len(eids), per), dtype=np.uint8)
+        out_comp = np.empty((len(eids), per), dtype=np.uint8)
+        run(False, out_order)
+        run(True, out_comp)
+        assert np.array_equal(out_order, out_comp), "windows must scatter identical bytes"
+        for slot, eid in enumerate(eids):
+            expect = backing.load_expert_slice(key, eid).view(np.uint8).reshape(-1)
+            assert np.array_equal(out_comp[slot], expect), f"row {eid} corrupted"
+
 def test_memtrace_disabled_by_default_is_noop():
     """With the env var unset the singleton is a null tracer: recording is
     a no-op and enabled is False, so the hot path stays free."""
