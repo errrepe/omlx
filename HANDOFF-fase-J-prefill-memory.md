@@ -372,6 +372,43 @@ OFF por padrão (decisão já registrada em §3 Etapa E + nota de execução). M
 - **A2 NÃO endereça o pico de 34.5 GiB (Metal/IOAccelerator):** esse pico é o pool do allocator MLX (grafo lazy), conforme a própria nota de ganho da Etapa C. A2 limita o working set *host* por projeção (bank de `tile` experts por vez em vez de todos os demandados; elimina double-buffer do `mx.stack`) — ganho secundário. O pico real é Etapa C/D. Commit: `feat(expert-streaming): demand-set tiling of quantized gather_qmm (Etapa A, off by default)`.
 - Suíte `tests/test_expert_streaming.py`: **113 passed** (111 prévios + 2 de A2), sem regressão.
 
+### 13. Etapa C/D — JÁ IMPLEMENTADA E VERIFICADA (corrige framing do §12.5)
+O §12.5 diz que "o pico real é Etapa C/D" como se C/D fosse trabalho futuro.
+**Não é:** inspecionando o código atual (commit anterior a este), Etapa C e D
+já estão implementadas, wireadas e **ON por padrão**:
+
+- **Etapa C (boundary de eval por camada):** `omlx/patches/expert_streaming/qwen35_stream_eval.py`
+  envolve `Qwen3_5MoeDecoderLayer` **e** `Qwen4ExpDecoderLayer` com
+  `mx.eval(out)` + clear sincronizado quando `x.shape[1] > 1` (prefill). Flag
+  `OMLX_EXPERT_STREAMING_PER_LAYER_EVAL` default **1** (ON). Aplicada em
+  `omlx/patches/expert_streaming/__init__.py` (`layer._stream_eval = True` L550;
+  `qse.apply_qwen35_moe_stream_eval()` L843; `boundary_active` L855). Testada por
+  `test_qwen_stream_eval_*` (8 testes passando).
+- **Etapa D (limpeza de pool threshold-gated):** helpers em `omlx/utils/metal_sync.py`
+  (`should_clear_cache`, `cache_clear_threshold_bytes`, `_CACHE_CLEAR_THRESH_ENV`
+  default 2 GiB, `_sync_and_clear_cache`). Já usado no wrapper per-layer
+  (`qwen35_stream_eval.py:114`: só limpa se `get_cache_memory() >= threshold`) e
+  em um site do scheduler (`scheduler.py:2322`). Os demais `~20` sites de
+  `_sync_and_clear_cache` ainda limpam incondicionalmente — o que, na prática,
+  mantém o pico BAIXO (é por isso que medimos 8.33 GiB abaixo). Gateá-los também
+  é refinamento de cadência, não necessário para o pico.
+
+**Evidência de que o pico de 34.5 GiB FOI RESOLVIDO** (bench real,
+`bench/results/faseJ/real_faseJ_2k.json`, qwen 2k, `budget_gib=0` = pior caso
+all-miss, C/D ON):
+- `metal_peak_prefill_gib = 8.33` (medido via `mx.get_peak_memory()` — o mesmo
+  metric de alta do critério de aceitação #3, "IOAccelerator peak").
+- `phys_lifetime_max_gib = 11.28`; `mlx_active_gib_max (prefill) = 7.92`.
+- 8.33 GiB = "low single-digit GiB", que é exatamente o alvo do critério #3
+  ("~29 GiB → low single-digit GiB"). O 34.5 GiB era a medição PRÉ-C/D.
+
+**Conclusão:** o item "pivotar para Etapa C/D para o pico de 34.5 GiB" do
+resumo de still-open está essencialmente FECHADO pela implementação existente.
+Resta, se desejado: (a) confirmar robustez em prompt maior (8k) — o docs
+avisa que 8k pode re-ler o banco 8× se o pool subir; (b) gateá-los os ~20 sites
+restantes do scheduler (refinamento, com risco de subir o pico se feito mal —
+NÃO fazer sem medir); (c) nada de código se o alvo de pico já está atingido.
+
 ---
 
 **Fim do handoff.**
