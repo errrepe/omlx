@@ -500,6 +500,14 @@ def _scatter_unsort(x, inv_order, shape=None):
 class _LayerLoadContext:
     """Shared quantized demand load for one MoE layer's projections.
 
+    Scope: quantized only (Fase J G4). The context is driven through hooks
+    that exist solely on ``StreamingQuantizedSwitchLinear`` —
+    ``stacked_weight_key``, ``_bank_bytes_for`` and ``_load_expert_bank_np`` —
+    and it is only constructed when the owning GLU is quantized, so
+    ``StreamingSwitchLinear`` (bf16) never participates. That is intentional:
+    the bf16 path resolves one projection at a time inside its own ``__call__``
+    and therefore has no cross-projection union for the context to collapse.
+
     Two modes, selected by ``OMLX_EXPERT_STREAMING_CTX_ROLLING``:
 
     rolling (default — Etapa B)
@@ -834,6 +842,17 @@ class StreamingSwitchLinear(nn.Module):
         if built:
             _build_plan_into(plan, indices)
         t2 = time.perf_counter()
+        # NOTE (Fase J G4): ``plan.ctx`` is deliberately NOT consulted here.
+        # ``_RemapPlan.ctx`` is populated only when the GLU is quantized
+        # (StreamingSwitchGLU.__call__ gates on ``self.quantized``), and
+        # ``_LayerLoadContext`` drives quantized-only hooks
+        # (``stacked_weight_key``, ``_bank_bytes_for``, ``_load_expert_bank_np``).
+        # The bf16 path never sees a context, and would not benefit from one
+        # the way the quantized path does: each projection resolves its own
+        # experts inside its own __call__, so there is no cross-projection
+        # union to collapse — the context's win there is memory, here it would
+        # only be I/O overlap. Left as-is; see docs/expert-streaming.md.
+        #
         # Load each unique expert weight. C4 avoids retaining a large prefill
         # demand set while the hotness seeder is active.
         cache_result = not (
@@ -1348,6 +1367,16 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 # Etapa A1: every demanded expert is a miss, so the demand set
                 # is one contiguous bank — promote it once instead of building
                 # U per-expert mx arrays and stacking them.
+                #
+                # SCOPE (measured, bench/prefill_mem_harness.py): this branch
+                # is only reachable when the Etapa B layer context did NOT
+                # pre-resolve the demand set — i.e. ``_LAYER_BARRIER`` off,
+                # the context failed, or it was never built. With the barrier
+                # on (the default) the context fills ``bundles`` above, so
+                # ``missing`` is empty and this never runs: A1 measured 0
+                # calls vs 24 for the legacy path. It is a fallback-path win,
+                # not a main-path one — do not read its benchmark gain as a
+                # default-configuration gain.
                 banked = self._load_expert_bank_mx(missing)
             if banked is not None:
                 rows = banked[3]
