@@ -775,8 +775,40 @@ I/O-concurrency pipeline (rolling layer-context prefetch, per-run read
 parallelism, single-promotion banks, throttled pool clears, the eval boundary
 for the vendored qwen4_exp decoder, the 3x-over-measured static cap) onto the
 HOBBIT dual-tier + I6b ports. All Fase K timing-only changes are bit-exact
-(tokens unchanged at the same chunk schedule); the throttle cap (F4) is a
+and the gate now proves it at the TOKEN-ID level (K8: 48/48 ids identical
+across the pipeline, legacy and depth-1 arms, bench/results/fasek/tokgate2/,
+every sidecar at bit_exact_kind=tokens); the throttle cap (F4) is a
 re-base and rewrites the bench's chunk_schedule reference together.
+
+### Corrections from the static review (K1-K8, signed off on this branch)
+
+- K1/K7 (8cab5436): the O2 speculation state (stash ring, routing history,
+  linears registry, advise stats, pending futures) moved from module
+  globals into SpeculationState, one instance per conversion; backing.
+  close() drains speculation workers with the readers; all ring mutations
+  sit under one lock and the pending queue is bounded (speculation never
+  blocks demand). Two engines with identical tensor keys can no longer
+  share ring bytes.
+- K3 (f31d0b8b + 1f998e1b): a restored prior is NOT measured signal —
+  load_prior zeroes the raw deltas and _predicted_chunk_transient gates
+  its measured MAX on tracker.samples > 0, so the first chunk prices the
+  static estimate until the first real update() replaces the prior. The
+  reclaim ledger stays independent (it charges releases, not samples).
+- K2 (5644c2b3): one shared segmentation (segment_runs) for the demand
+  planner, the stash and the advisor — contiguous ids within one reader;
+  sparse stash speculation reads exact keys (the old reader-only segment-
+  ation stored hole experts).
+- K5 (2e16f40f): the F7 run-gap bridge reaches the C2 read path
+  (read_expert_into, merge_gap) with the split-active re-gate; the
+  scatter writes ONLY the demanded ids at (eid - first) rows.
+- K4 (dc980cc5): the PREFILL_QD regime pool now serves the rolling
+  prefetch and union paths, not just the legacy fallback call.
+- K6 (e4b402f9): tier-aware bank bytes under HOBBIT — the prefetch and
+  bank caps measure hot segments at the source packing width.
+- K8 (5fb3c23c): vlm engines propagate output_token_ids on
+  GenerationOutput.tokens; the bench requires non-empty token lists
+  under --gate-tokens instead of silently falling back to text.
+
 
 ### F1 — the O2 advisor advised the wrong layer (fixed)
 
@@ -810,10 +842,14 @@ I/O. _ADVISE_STATS is exported into the bench results JSON (advise_stats).
 The static SDPA+KV estimate entered _predicted_chunk_transient's MAX
 unconditionally; on Qwen3.8-Flash-Next-oQ4e it is ~40x the measured rate, so
 chunks were crushed to 512/1024 tokens forever. Ported the faseJ 3x cap
-(OMLX_PREFILL_STATIC_MAX_OVER_MEASURED): the static is a fallback for the
-first chunk only; with samples it may raise the prediction to at most 3 x the
-measured signal. Chunk schedule changes -> the bench's chunk_schedule and
-token references are regenerated in the same commit.
+(OMLX_PREFILL_STATIC_MAX_OVER_MEASURED): the static is a conservative
+fallback for the first chunk only; once real chunks are measured it may
+raise the prediction to at most 3 x the measured signal. K3 sharpens the
+boundary: a RESTORED PRIOR is not measurement (samples are clamped to 0 on
+load and the raw deltas are zeroed), so the first chunk of a changed
+regime still prices the static estimate instead of a stale prior. Chunk
+schedule changes -> the bench's chunk_schedule and token references are
+regenerated in the same commit.
 
 ### F5 — the qwen4_exp eval boundary
 
@@ -843,23 +879,31 @@ threshold shared with the scheduler's chunk-boundary clears (Etapa D).
   break, and the dual-tier gather_qmm assembly consumes the single-promoted
   per-tier banks directly.
 
-### F7 — run-gap bridging (gated on the HOBBIT split)
+### F7 — run-gap bridging (gated on the HOBBIT split, reaches C2 via K5)
 
 Bridging stretches a same-tier run across a <=2 gap of non-demanded ids
 so split-fragmented prefill demand becomes longer sequential preadvs.
 Re-measurement at 2k with the split inactive showed the idle gap bytes cost
 ~8% of TTFT (34.0 vs 31.4 s, 3 reps, bench/results/fasek/mergeab/) for no
 locality gain: single-tier demand is already contiguous. Bridging is now
-effective ONLY while the split is active; single-tier runs keep the plain
-grouping even when OMLX_EXPERT_STREAMING_RUN_MERGE_GAP > 0 (the env still
-caps the budget; 0 always disables). Token output is unchanged (reads only).
+effective ONLY while the split is active. K5 moved the bridge from the
+legacy fallback planner into read_expert_into itself (shared segmentation
+with the stash and advisor), so it materializes on the C2 path; the
+scatter writes only the demanded ids. The env caps the budget; 0 always
+disables. Token output is unchanged (reads only; the token-ID gate covers
+bridged and unbridged arms).
 
-### F12 — pools per regime (opt-in)
+### F12 — pools per regime (opt-in, wired by K4)
 
 Prefill-shaped calls (positions > 64) can use a separate 24-worker pool while
 decode keeps the process-wide 16 (env OMLX_EXPERT_STREAMING_PREFILL_QD,
-default off). The sweep evidence: QD16 is the decode optimum, QD24 measured
-the better 8k TTFT (85 s); two bounded regime pools avoid oversubscription.
+default off). K4 routed the rolling prefetch and the union path through
+io_pool_for_positions, so the regime pool now serves the HOT path — before
+that fix the prefill pool only ever saw the legacy fallback call. The
+sweep evidence: QD16 is the decode optimum, QD24 measured the better 8k
+TTFT (85 s); two bounded regime pools avoid oversubscription. The 8k gate
+with PREFILL_QD=24 reproduces TTFT <= 85 s; decode tok/s stays on the
+QD16 line.
 
 ### Measured (2026-08-31, dev box, single-request protocol, budget 0)
 
