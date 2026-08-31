@@ -836,6 +836,16 @@ re-base and rewrites the bench's chunk_schedule reference together.
   real split too (2k 55.0 vs 47.5 s, 8k 107.2 vs 98.9 s) -> default 0.
   memtrace shows tier-aware bank_bytes (217.8 MiB for a 275-expert
   mixed chunk, under the 256 MiB cap) — K6 arithmetic coherent.
+### Fase 1 — hybrid decode fast path (measured, kept as default)
+
+Calls with <= 64 routed rows resolve through the UNION mode (all
+projections in flight at once) while prefill keeps rolling (bounded RSS).
+Evidence (interleaved A/B, bench/results/fasek/f1ab/): 2k decode 3.002 vs
+2.651 tok/s mean (+13.2%, 3 reps, hybrid spread 10.2% vs rolling 27.1%);
+8k TTFT 87.6 vs 90.0s (-2.7%, 2 reps) with decode +5.9%; tokens 48/48
+identical across arms and vs the K8 reference; Metal peaks unchanged
+(7.4 GiB 2k / 10.3 GiB 8k). A1b single-promotion stays scoped to the
+rolling (prefill) path by design.
 ### F1 — the O2 advisor advised the wrong layer (fixed)
 
 The ported _advise_next_layer_prev_token took the NEXT layer's expert ids
