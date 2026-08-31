@@ -93,3 +93,95 @@ Kill switches used above:
 `OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT=0` (Etapa E),
 `OMLX_EXPERT_STREAMING_LAYER_BARRIER=0` (Etapa B),
 `OMLX_EXPERT_STREAMING_BANK_PROMOTE=0` + `OMLX_EXPERT_STREAMING_BANK_PROMOTE_CTX=0` (A1/A1b).
+
+---
+
+# Decode regression: root cause
+
+The headline table above shows decode falling 3.059 -> ~1.9 tok/s. The
+handoff predicted this would come from the prefill work changing decode-path
+tiles. It does not. **It is an I/O queue-depth collapse, and it took two
+commits.**
+
+## Attribution
+
+| commit | decode tok/s | decode CPU% | decode disk GiB/s |
+|---|---|---|---|
+| c1be4b98 (baseline) | 3.06 | 85 | 0.92 |
+| 5ef31dd6 | 2.35 | 59 | 0.72 |
+| f799067e | 1.86 | 41 | 0.46 |
+
+Both steps are the same mistake made twice.
+
+**`5ef31dd6` introduced `read_expert_into()`.** It coalesces a demand set into
+one buffer per projection and reads it with a single `preadv` per contiguous
+run. Fewer syscalls and fewer allocations — genuinely the right idea. But the
+runs are issued in a plain `for` loop, one blocking `preadv` at a time. The
+old path submitted one job per run to a 16-thread pool. Queue depth went
+~16 -> 1.
+
+**`f799067e` added the rolling layer-context path** with
+`_CTX_PREFETCH_AHEAD=1`, capping how many of those serialised bank reads can
+be outstanding at once. Depth 1 confirmed.
+
+## Why decode and not prefill
+
+| phase | baseline | Fase J | delta |
+|---|---|---|---|
+| prefill disk GiB/s | 1.59 / 1.72 | 1.37–1.52 | **-9%** |
+| decode disk GiB/s | 0.92 / 0.91 | 0.36–0.50 | **-50%** |
+
+Prefill asks for hundreds of contiguous experts per call, so even a serial
+reader streams well and the device readahead covers it. Decode asks for a
+handful of scattered experts and gets no readahead benefit, so depth was all
+it had.
+
+The decisive number: **Fase J reads ~40% fewer bytes during decode than the
+baseline (8.7 vs 14.5 GiB) and is still 45% slower.** The work got cheaper
+and the pipe got narrower. That is a depth signature, not a volume one, and
+it rules out "we are just reading more" as an explanation.
+
+## Ruled out
+
+- **Async hotness seed** (`maybe_seed`): `seed_done` is set in five places and
+  awaited in exactly one — a test. Nothing in production joins it, so its SSD
+  burst does overlap decode. Measured anyway: seed on 1.72/1.99, seed off
+  1.86/1.70 tok/s. Noise (±8% on this box) exceeds the effect. Real code
+  smell, not the cause.
+- **Etapa A1/A1b** (bank promotion): `promote=0,0` -> 2.100, within Fase J noise.
+- **Etapa E**: it changes the output, not the throughput.
+- **Etapa B** (layer barrier): `barrier=0` -> 2.28 vs ~2.0.
+
+## Fixes tried (2 reps each, same box)
+
+| arm | tok/s | TTFT | phys_lifetime_max | CPU% | tokens vs baseline |
+|---|---|---|---|---|---|
+| control (AHEAD=1) | 1.98 / 1.75 | 92.0 / 97.4 | 11.06 / 11.02 | 42.8 / 39.5 | exact |
+| `CTX_AHEAD=3` | 2.24 / 2.21 | 86.4 / 84.4 | 11.03 / 11.14 | 50.9 / 48.7 | **exact** |
+| `BANK_MAX_BYTES=1` | 2.18 / 2.43 | 72.6 / 73.2 | **9.57 / 9.45** | 70.9 / 75.0 | **exact** |
+
+`CTX_AHEAD=3`: **+19% decode, -9% TTFT, no memory change.** Shipped as the
+default in `072e19e2`. 3 already covers every remaining projection, so the
+knob is maxed out — it cannot go further.
+
+`BANK_MAX_BYTES=1` forces the bank read to fail and falls back to the legacy
+run-parallel path (QD 16). It beats the shipped fix on **all three axes**:
++23% decode, -23% TTFT, *and* 14% lower peak memory. Note it also does 12%
+more cache misses (446,730 vs 398,451) and is still faster — the per-miss
+cost dominates.
+
+## Conclusion and remaining headroom
+
+The coalesced bank read is not earning its place on this workload. It was
+justified by `bench/prefill_mem_harness.py` and by the A1b synthetic
+measurements, both of which measured allocation counts, not I/O depth. On the
+real model it is slower *and* fatter.
+
+Real queue depth has to be restored inside `read_expert_into` — issue the
+per-run `preadv` calls concurrently. That keeps coalescing's allocation wins
+while giving back depth, and it is where the remaining gap to the baseline's
+3.06 tok/s lives. It needs a nested pool (`read_expert_into` is itself called
+from `_EXPERT_IO_POOL` workers, so submitting to that same pool and waiting
+would risk deadlock) and a byte-identity test against
+`load_expert_slice`, which `test_backing_read_expert_into_matches_load_expert_slice`
+already provides in single-threaded form.
