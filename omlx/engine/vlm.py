@@ -63,6 +63,24 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+
+def _output_tokens(output: Any) -> list[int]:
+    """Token IDs from an engine output; [] when absent/non-iterable (K8).
+
+    Production outputs carry output_token_ids (cumulative). Test doubles
+    and exotic engines may not, and a mocked attribute is not iterable;
+    degrade to [] instead of breaking the call. The bench's --gate-tokens
+    fail-high still catches a REAL path that never populates the list.
+    """
+    try:
+        oid = getattr(output, "output_token_ids", None)
+        if oid is None:
+            return []
+        return [int(t) for t in oid]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
 # unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
@@ -3582,7 +3600,7 @@ class VLMBatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
-            tokens=list(output.output_token_ids),
+            tokens=_output_tokens(output),
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
@@ -3707,7 +3725,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 yield GenerationOutput(
                     text=text,
-                    tokens=list(output.output_token_ids),
+                    tokens=_output_tokens(output),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
