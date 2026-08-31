@@ -3060,3 +3060,187 @@ def test_read_expert_banks_matches_legacy_bank_np(tmp_path):
         assert np.array_equal(w1, w2)
         assert np.array_equal(s1, s2)
         assert np.array_equal(b1, b2)
+
+
+# ---------------------------------------------------------------------------
+# Fase J — Etapa A1b: single-promotion bank build on the layer-context path
+# ---------------------------------------------------------------------------
+
+
+def _quant_glu(tmp: Path, n_experts: int = 3):
+    """A quantized StreamingSwitchGLU whose projections sit on real shards.
+
+    Built with ``quantized=True`` so ``StreamingSwitchGLU`` installs a
+    ``_LayerLoadContext`` — the Etapa B path that runs by default and the one
+    A1b targets. A1 itself never fires here: the context pre-resolves every
+    expert, so ``missing`` is empty by the time the linear asks. That gap is
+    exactly why A1b exists.
+    """
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+        StreamingSwitchGLU,
+    )
+
+    hidden, moe_hidden = 128, 64
+    specs = (
+        ("gate_proj", moe_hidden, hidden),
+        ("up_proj", moe_hidden, hidden),
+        ("down_proj", hidden, moe_hidden),
+    )
+    tensors = {}
+    for proj, o, i in specs:
+        base = f"model.layers.0.mlp.switch_mlp.{proj}"
+        tensors[f"{base}.weight"] = ((n_experts, o, i // 8), "U32")
+        tensors[f"{base}.scales"] = ((n_experts, o, i // 64), "BF16")
+        tensors[f"{base}.biases"] = ((n_experts, o, i // 64), "BF16")
+    _write_shard_filled(tmp / "model.safetensors", tensors)
+    (tmp / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
+    )
+
+    backing = ExpertBackingStore(tmp)
+    cache = ExpertLRUCache(64 * 1024, 1024, num_layers=1)
+    glu = StreamingSwitchGLU(
+        input_dims=hidden,
+        hidden_dims=moe_hidden,
+        num_experts=n_experts,
+        layer_idx=0,
+        backing=backing,
+        cache=cache,
+        fused_gate_up=False,
+        inverse_scatter=False,
+        quantized=True,
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+    for proj, o, i in specs:
+        base = f"model.layers.0.mlp.switch_mlp.{proj}"
+        setattr(
+            glu,
+            proj,
+            StreamingQuantizedSwitchLinear(
+                layer_idx=0,
+                proj_name=proj,
+                stacked_weight_key=f"{base}.weight",
+                stacked_scales_key=f"{base}.scales",
+                stacked_biases_key=f"{base}.biases",
+                num_experts=n_experts,
+                input_dims=i,
+                output_dims=o,
+                backing=backing,
+                cache=cache,
+                group_size=64,
+                bits=4,
+                mode="affine",
+                has_bias=False,
+            ),
+        )
+    return glu
+
+
+def test_ctx_bank_promote_is_bit_identical_on_default_path(monkeypatch, tmp_path):
+    """Etapa A1b: with the Etapa B barrier on (the default), the GLU output must
+    be bit-identical whether single-promotion is enabled or not.
+
+    This is the gate that makes A1b lossless rather than near-lossless. It also
+    proves A1b engages where A1 does not: A1 measured zero invocations on this
+    path, and would leave the default configuration with no bank-promotion win.
+    """
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    assert ss._LAYER_BARRIER_ENV  # the default path A1b is scoped to
+
+    x = mx.random.normal((1, 6, 128)).astype(mx.float32)
+    indices = mx.array([2, 0, 1, 2, 0, 1], dtype=mx.int32)
+
+    def run(enabled):
+        monkeypatch.setattr(ss, "_BANK_PROMOTE_CTX_ENV", enabled)
+        # A fresh GLU per arm: reusing one would leave state behind and could
+        # turn the second arm into a hit-only run, making the comparison
+        # vacuous because neither arm would exercise a miss.
+        glu = _quant_glu(tmp_path, n_experts=3)
+        engaged: list[bool] = []
+        real = ss.StreamingQuantizedSwitchLinear._promote_banks
+
+        def spy(self, keys, banks, n):
+            out = real(self, keys, banks, n)
+            engaged.append(out is not None)
+            return out
+
+        monkeypatch.setattr(ss.StreamingQuantizedSwitchLinear, "_promote_banks", spy)
+        out = glu(x, indices)
+        mx.eval(out)
+        return out, engaged
+
+    out_on, engaged_on = run(True)
+    out_off, engaged_off = run(False)
+
+    # One call per projection (gate/up/down). Proves the fast path really ran
+    # in one arm and not the other — otherwise identical outputs prove nothing.
+    assert engaged_on == [True, True, True], engaged_on
+    assert engaged_off == [], engaged_off
+
+    assert out_on.dtype == out_off.dtype
+    # Compare bit patterns, not ==: a NaN payload would fail array_equal even
+    # when the two arms produced byte-identical results.
+    bits_on = np.ascontiguousarray(out_on).view(np.uint32).reshape(-1)
+    bits_off = np.ascontiguousarray(out_off).view(np.uint32).reshape(-1)
+    assert np.array_equal(bits_on, bits_off)
+    # Guard against a vacuous pass: garbage inputs would make every bit 0/NaN.
+    assert bool(mx.all(mx.isfinite(out_on)))
+
+
+def test_ctx_bank_promote_declined_on_partial_demand(monkeypatch, tmp_path):
+    """A bank covering only part of the demand set must not be promoted.
+
+    The missing experts do live in one contiguous bank, but the cache hits
+    would have to be promoted separately and concatenated — a different layout
+    contract that A1b deliberately leaves on the legacy path. Promoting a
+    partial bank as if it were the whole demand set would mis-pair experts.
+    """
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    monkeypatch.setattr(ss, "_BANK_PROMOTE_CTX_ENV", True)
+    glu = _quant_glu(tmp_path, n_experts=3)
+
+    # Seed one expert so gate_proj's demand set is a partial miss.
+    proj = glu.gate_proj
+    rows = proj._load_expert_bank_np([0])
+    assert rows is not None
+    glu._cache.put((0, 0, proj.stacked_weight_key), rows[0])
+
+    recorded: dict = {}
+    real_ensure = ss._LayerLoadContext.ensure
+
+    def spy(ctx, linear, expert_ids):
+        real_ensure(ctx, linear, expert_ids)
+        recorded[linear.proj_name] = (
+            ctx.bank_raw.get(id(linear)),
+            ctx.bank_ids.get(id(linear)),
+            ctx.misses.get(id(linear)),
+        )
+
+    monkeypatch.setattr(ss._LayerLoadContext, "ensure", spy)
+
+    x = mx.random.normal((1, 6, 128)).astype(mx.float32)
+    indices = mx.array([2, 0, 1, 2, 0, 1], dtype=mx.int32)
+    out = glu(x, indices)
+    mx.eval(out)
+
+    # The seeded expert really was a hit: 2 of 3 missing, not 3 of 3.
+    assert recorded["gate_proj"][2] == 2, recorded["gate_proj"]
+    # ...so A1b must record nothing for gate_proj.
+    assert recorded["gate_proj"][0] is None
+    assert recorded["gate_proj"][1] is None
+    # The other two projections were all-miss and stay eligible: the bank
+    # describes exactly the demand set, which is what licenses promotion.
+    assert recorded["up_proj"][0] is not None
+    assert recorded["up_proj"][1] == [0, 1, 2]
+    assert bool(mx.all(mx.isfinite(out)))

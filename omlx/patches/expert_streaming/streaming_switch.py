@@ -43,6 +43,15 @@ _RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
 # at the promotion point, where the U copies and the bank briefly coexist.
 # 0 restores the per-expert promote + stack path.
 _BANK_PROMOTE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_BANK_PROMOTE", "1") != "0"
+# Etapa A1b: same single-promotion trick, but on the *layer-context* path,
+# which is the one that actually runs when the Etapa B barrier is on (the
+# default). The context reads the demand bank as NumPy on an IO pool worker
+# and hands the raw buffers back; promoting them to MLX must happen here, on
+# the inference thread, so no MLX op is ever bound off-stream. 0 restores the
+# per-expert promote + stack path for A/B.
+_BANK_PROMOTE_CTX_ENV = (
+    os.environ.get("OMLX_EXPERT_STREAMING_BANK_PROMOTE_CTX", "1") != "0"
+)
 _LAYER_BARRIER_ENV = os.environ.get("OMLX_EXPERT_STREAMING_LAYER_BARRIER", "1") != "0"
 # Etapa B: rolling per-projection bank load instead of the union load.
 # 0 restores the legacy behaviour (every projection's NumPy bank resident at
@@ -532,6 +541,14 @@ class _LayerLoadContext:
         self.hits: dict[int, int] = {}
         self.misses: dict[int, int] = {}
         self.failed = False
+        # Etapa A1b: the raw contiguous NumPy banks behind ``bundles``, kept so
+        # the linear can promote a whole demand set with one mx.array per key
+        # instead of U per-expert arrays plus a stack. Populated only when the
+        # read covered the *entire* demand set (all-miss); ``bank_ids`` records
+        # exactly which ids the bank holds, so a stale bank can never be
+        # promoted against a demand set it does not describe.
+        self.bank_raw: dict[int, tuple] = {}
+        self.bank_ids: dict[int, list[int]] = {}
         # rolling state
         self._order: dict[int, int] = {id(lin): i for i, lin in enumerate(linears)}
         self._futures: dict[int, Any] = {}
@@ -597,9 +614,16 @@ class _LayerLoadContext:
             bank_bytes = int(nxt._bank_bytes_for(len(missing)))
             if bank_bytes > _CTX_PREFETCH_MAX_BYTES:
                 continue
-            self._futures[nid] = self._pool_for(nxt).submit(
-                nxt._load_expert_bank_np, missing
+            # Etapa A1b: ask for the raw contiguous banks as well when
+            # single-promotion is on. The read is identical either way — only
+            # what the worker hands back differs, and it stays NumPy, so no MLX
+            # op is ever created on a pool thread.
+            reader = (
+                nxt._load_expert_bank_np_full
+                if _BANK_PROMOTE_CTX_ENV
+                else nxt._load_expert_bank_np
             )
+            self._futures[nid] = self._pool_for(nxt).submit(reader, missing)
             self._inflight[nid] = bank_bytes
             submitted += 1
 
@@ -624,11 +648,21 @@ class _LayerLoadContext:
         if missing:
             if fut is not None:
                 try:
-                    rows = fut.result()
+                    got = fut.result()
                 except Exception:
-                    rows = None
+                    got = None
             else:
-                rows = linear._load_expert_bank_np(missing)
+                got = (
+                    linear._load_expert_bank_np_full(missing)
+                    if _BANK_PROMOTE_CTX_ENV
+                    else (None, None, linear._load_expert_bank_np(missing))
+                )
+            # A worker dispatched as bare rows (prefetch submitted before this
+            # call, or with the knob off) yields a list; normalise to the
+            # (keys, banks, rows) shape so the consumer has one contract.
+            if got is not None and not isinstance(got, tuple):
+                got = (None, None, got)
+            rows = None if got is None else got[2]
             if rows is None or len(rows) != len(missing):
                 self.failed = True
                 if memtrace.enabled:
@@ -641,6 +675,13 @@ class _LayerLoadContext:
                     )
                 return
             self.bundles[lid].update(zip(missing, rows))
+            # Etapa A1b: single-promotion is only valid when the read covered
+            # the *whole* demand set. A partial bank would have to be
+            # concatenated with separately promoted cache hits, which changes
+            # the layout contract, so it is left on the legacy path.
+            if _BANK_PROMOTE_CTX_ENV and got[0] is not None and len(missing) == len(ids):
+                self.bank_raw[lid] = (got[0], got[1])
+                self.bank_ids[lid] = list(missing)
 
         self._prefetch(linear)
         if memtrace.enabled:
@@ -1112,25 +1153,29 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         got = self._read_expert_banks(expert_ids)
         return None if got is None else got[2]
 
-    def _load_expert_bank_mx(self, expert_ids: list[int]):
-        """Etapa A1: promote an all-miss demand bank in one shot.
+    def _load_expert_bank_np_full(self, expert_ids: list[int]):
+        """Like :meth:`_load_expert_bank_np`, but keeps the raw contiguous banks.
 
-        Returns ``(w_bank, s_bank, b_bank, rows)`` or ``None`` when the demand
-        set cannot be served as a single bank. *rows* are the per-expert raw
-        views the caller still has to seed into the LRU, so the hit-rate path
-        is unaffected.
-
-        This is **bit-identical** to promoting U per-expert arrays and stacking
-        them: the bank is reinterpreted with exactly the dtype and per-expert
-        shape that ``_slice_view`` uses per row, so ``gather_qmm`` receives the
-        same bytes in the same layout. Only the allocation count differs — one
-        mx.array instead of U of them plus the stack copy.
+        Needed by the Etapa B layer context: the NumPy read may happen on an IO
+        pool worker, yet promoting those buffers to MLX must happen later on the
+        inference thread (MLX ops may not be bound off-stream). Same failure
+        contract as :meth:`_load_expert_bank_np` — ``None`` whenever the backing
+        cannot serve the demand set as banks.
         """
-        got = self._read_expert_banks(expert_ids)
-        if got is None:
-            return None
-        keys, banks, rows = got
-        n = len(expert_ids)
+        return self._read_expert_banks(expert_ids)
+
+    def _promote_banks(self, keys: list[str], banks: list, n: int):
+        """Promote already-read contiguous banks into one mx.array per key.
+
+        Shared by Etapa A1 (read + promote together) and Etapa A1b (read on a
+        pool thread, promote here on the inference thread).
+
+        Bit-identical to promoting U per-expert arrays and stacking them: each
+        bank is reinterpreted with exactly the dtype and per-expert shape that
+        :meth:`_slice_view` applies to a single row, so ``gather_qmm`` receives
+        the same bytes, dtype and layout. Only the allocation count differs —
+        one mx.array per key instead of U of them plus the stack copy.
+        """
         try:
             dt = self._slice_dtypes_lazy()
             promoted = []
@@ -1149,9 +1194,32 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 promoted.append(arr)
             while len(promoted) < 3:
                 promoted.append(None)
-            return (promoted[0], promoted[1], promoted[2], rows)
+            return (promoted[0], promoted[1], promoted[2])
         except Exception:
             return None
+
+    def _load_expert_bank_mx(self, expert_ids: list[int]):
+        """Etapa A1: promote an all-miss demand bank in one shot.
+
+        Returns ``(w_bank, s_bank, b_bank, rows)`` or ``None`` when the demand
+        set cannot be served as a single bank. *rows* are the per-expert raw
+        views the caller still has to seed into the LRU, so the hit-rate path
+        is unaffected.
+
+        This is **bit-identical** to promoting U per-expert arrays and stacking
+        them: the bank is reinterpreted with exactly the dtype and per-expert
+        shape that ``_slice_view`` uses per row, so ``gather_qmm`` receives the
+        same bytes in the same layout. Only the allocation count differs — one
+        mx.array instead of U of them plus the stack copy.
+        """
+        got = self._read_expert_banks(expert_ids)
+        if got is None:
+            return None
+        keys, banks, rows = got
+        promoted = self._promote_banks(keys, banks, len(expert_ids))
+        if promoted is None:
+            return None
+        return (*promoted, rows)
 
     @staticmethod
     def _group_runs(
@@ -1465,11 +1533,30 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             )
 
         dt = self._slice_dtypes_lazy()
+        ctx_bank = None
+        if banked is None and plan.ctx is not None:
+            # Etapa A1b: the layer context read this projection's demand set as
+            # one contiguous NumPy bank (possibly on an IO pool worker). Promote
+            # it *here*, on the inference thread, so MLX ops stay on-stream and
+            # the U per-expert mx arrays plus the stack copy are both skipped.
+            # Guarded by bank_ids: only a bank that describes exactly this
+            # demand set may be promoted, so a stale or partial bank cannot
+            # silently mis-pair experts.
+            raw = plan.ctx.bank_raw.get(id(self))
+            if (
+                raw is not None
+                and _BANK_PROMOTE_CTX_ENV
+                and plan.ctx.bank_ids.get(id(self)) == plan.uniq_list
+            ):
+                ctx_bank = self._promote_banks(raw[0], raw[1], len(plan.uniq_list))
         if banked is not None:
             # Etapa A1: the bank is already promoted, so the U per-expert mx
             # copies and the stack (which briefly doubled the Metal footprint)
             # are both skipped.
             w_bank, s_bank, b_bank = banked[0], banked[1], banked[2]
+            has_b = b_bank is not None
+        elif ctx_bank is not None:
+            w_bank, s_bank, b_bank = ctx_bank
             has_b = b_bank is not None
         else:
             for eid in plan.uniq_list:
