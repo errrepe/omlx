@@ -165,13 +165,15 @@ def read_stats() -> dict | None:
             return None
         return int(vals[min(len(vals) - 1, int(len(vals) * p))])
 
+    run_mean = int(sum(sizes) / len(sizes)) if sizes else None
     return {
         "calls": _READ_STATS.get("calls", 0),
         "runs": _READ_STATS.get("runs", 0),
         "bytes": _READ_STATS.get("bytes", 0),
         "lat_us_p50": pct(lat, 0.5),
         "lat_us_p95": pct(lat, 0.95),
-        "run_sizes": sizes,  # actual sizes histogram source
+        "run_size_mean": run_mean,
+        "run_size_max": max(sizes) if sizes else None,
         "peak_inflight": _READ_STATS.get("peak_inflight", 0),
     }
 

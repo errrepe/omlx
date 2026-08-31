@@ -836,6 +836,18 @@ re-base and rewrites the bench's chunk_schedule reference together.
   real split too (2k 55.0 vs 47.5 s, 8k 107.2 vs 98.9 s) -> default 0.
   memtrace shows tier-aware bank_bytes (217.8 MiB for a 275-expert
   mixed chunk, under the 256 MiB cap) — K6 arithmetic coherent.
+### Fase 2/3 — F_RDADVISE telemetry and the speculation decision (closed)
+
+advise_expert_run now reports (ok, bytes, tier_segments) and the advisor
+accumulates real coverage: a 2k run advises ~55.4 GB across 66,579 runs
+(0 failures; bench/results/fasek/raab/). Demand-read telemetry (PROFILE=1):
+241k runs/call set, latency p50 ~2.1ms / p95 ~5.6ms at peak_inflight 16.
+RA=1 vs RA=0 (3 interleaved reps, 2k): decode 2.910 vs 2.888 tok/s
+(+0.8%), TTFT 48.0 vs 48.7s (-1.4%), demand p50 -8.5% / p95 -3.5%.
+NONE of the 5% thresholds is met -> cross-layer user-space speculation
+is CLOSED for this SSD: STASH stays OFF by default (also net-negative,
+gates4/), F_RDADVISE stays on (kernel-side, free, mildly positive).
+Tokens 48/48 identical on both arms.
 ### Fase 1 — hybrid decode fast path (measured, kept as default)
 
 Calls with <= 64 routed rows resolve through the UNION mode (all
