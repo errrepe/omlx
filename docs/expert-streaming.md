@@ -810,6 +810,24 @@ re-base and rewrites the bench's chunk_schedule reference together.
   under --gate-tokens instead of silently falling back to text.
 
 
+### Post-review gates, re-run (2026-08-31, artifacts bench/results/fasek/gates4/)
+
+- K1/K2 (STASH=1, 2k): tokens 48/48 identical to the K8 reference;
+  stash_hits 36,880 > 0. Ring coverage (inserts/targets) sits at ~33% by
+  design — the 256-entry FIFO churns against 67k advisory inserts — but
+  the K2 fix keeps every INSERTED key exact (no hole experts). NEW
+  finding: STASH=1 measured decode 1.92 tok/s vs ~3.0 without it on the
+  same-period 2k window — the speculative reads saturate the shared IO
+  pool even from a warm page cache; STASH stays experimental and OFF by
+  default until the ring feeds from a separate bounded pool.
+- K3 (8k): TTFT 91.0s vs the historical 74.2s — the evening window drifts
+  +23% (the same hour's 2k TTFT drifted +44%), and a same-window
+  pre-K3 8k reference cannot exist post-fix; K3's own cost is bounded to
+  the first floor-sized chunk, so no K3-specific regression is
+  attributable. Compare same-window variants only.
+- K4 (8k, PREFILL_QD=24): same-window baseline 91.0s vs 89.3s with the
+  regime pool (-1.9%); absolute 89.3s vs the 85s target is window drift,
+  not a pool miss. Decode tok/s unchanged within noise.
 ### F1 — the O2 advisor advised the wrong layer (fixed)
 
 The ported _advise_next_layer_prev_token took the NEXT layer's expert ids
