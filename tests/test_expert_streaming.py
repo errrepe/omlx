@@ -2361,6 +2361,37 @@ class TestFaseKO2StashRing:
         assert spec.stash_insert(existing, (np.zeros(4, np.uint8), None, None)) is False
         assert len(spec.stash) == before
 
+
+    def test_stash_sparse_ids_exact_keys(self):
+        """Fase K K2: sparse speculation reads EXACT keys — [3,5,9] must
+        never read or store experts 4, 6, 7, 8 (reader-only segmentation
+        produced (3,2) jobs that spanned the hole and stored the wrong
+        experts)."""
+        import time
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec = _attach_spec(cache)
+        backing = _AdviseRecorderBacking()
+        lin = _make_advise_linear(1, "up_proj", backing, cache)
+        spec.register_linears(1, [lin])
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+            lin._stash_populate([3, 5, 9])
+        deadline = time.time() + 5.0
+        while spec.stats["stash_inserts"] < 3 and time.time() < deadline:
+            time.sleep(0.02)
+        assert spec.stats["stash_inserts"] == 3, "all three targets must land"
+        assert spec.stats["stash_targets"] == 3
+        assert spec.stats["stash_inserts"] <= spec.stats["stash_targets"], "coverage"
+        for eid in (3, 5, 9):
+            assert lin.bundle_key(eid) in spec.stash, f"missing {eid}"
+        for eid in (4, 6, 7, 8):
+            assert lin.bundle_key(eid) not in spec.stash, f"hole {eid} stored!"
+        # The reads themselves were single-expert runs (no 3,4 span).
+        assert (lin.stacked_weight_key, 3, 1) in backing.read_runs, "run (3,1) expected"
+        assert not any(run[1:] == (3, 2) for run in backing.read_runs), "no span (3,2)"
+
     def test_stash_off_by_default_no_stash_reads(self):
         """Fase K F3: STASH=0 (default) issues advisory hints only."""
         from omlx.patches.expert_streaming import streaming_switch as ss

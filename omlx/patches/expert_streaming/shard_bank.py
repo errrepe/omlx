@@ -179,6 +179,64 @@ def _run_io_pool() -> ThreadPoolExecutor:
     return _RUN_IO_POOL_SINGLETON
 
 
+def segment_runs(
+    eids_sorted: list[int],
+    *,
+    same: Any | None = None,
+    merge_gap: int = 0,
+    max_run: int | None = None,
+) -> list[tuple[int, int]]:
+    """Split ascending expert ids into (first, count) runs (Fase K K2).
+
+    ONE shared segmentation for the demand path (_group_runs), the stash
+    planner, the advisor and read_expert_into, so the four callers can never
+    diverge again: a run groups CONSECUTIVE ids while ``same(first, nxt)``
+    holds (reader identity for tier-aware paths; tier match for the demand
+    fallback).
+
+    With ``merge_gap > 0`` a run may BRIDGE a hole of up to merge_gap
+    missing ids when the next demanded id still satisfies ``same`` — the
+    hole rows are read with the run but the caller scatters only the
+    demanded ids (gap rows never enter the output, the LRU or any promote).
+    ``max_run`` bounds the run length (a bridge clamps to the cap).
+    """
+    if not eids_sorted:
+        return []
+    same = same if same is not None else (lambda a, b: True)
+    limit = max_run if max_run is not None and max_run > 0 else None
+    runs: list[tuple[int, int]] = []
+    i = 0
+    n = len(eids_sorted)
+    while i < n:
+        first = eids_sorted[i]
+        count = 1
+        j = i + 1
+        while j < n:
+            if limit is not None and count >= limit:
+                break
+            nxt = eids_sorted[j]
+            gap = nxt - (first + count)
+            if gap == 0 and same(first, nxt):
+                count += 1
+                j += 1
+                continue
+            if merge_gap > 0 and 1 <= gap <= merge_gap and same(first, nxt):
+                add = gap + 1
+                if limit is not None and count + add > limit:
+                    add = max(1, limit - count)
+                count += add
+                # Consume nxt only when the bridge fully covers it; a
+                # clamped bridge leaves nxt for the NEXT run (the old
+                # demand planner advanced by covered row count, and the
+                # max_run clamp must not swallow demanded ids).
+                if add == gap + 1:
+                    j += 1
+                continue
+            break
+        runs.append((first, count))
+        i = j
+    return runs
+
 class _ReadParams(NamedTuple):
     """Immutable, precomputed per-key read parameters.
 

@@ -165,6 +165,7 @@ class SpeculationState:
             "advised_bytes": 0,
             "stash_hits": 0,
             "stash_misses": 0,
+            "stash_targets": 0,
             "stash_inserts": 0,
             "stash_evictions": 0,
         }
@@ -1500,47 +1501,14 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         tier_of = self._tier_of if self._is_split_active() else None
         max_run = _RUN_MAX if max_run is None else max(1, int(max_run))
         merge_gap = _RUN_MERGE_GAP if tier_of is not None else 0
-        runs: list[tuple[int, int]] = []
-        i = 0
-        n = len(sorted_ids)
-        while i < n:
-            first = sorted_ids[i]
-            first_tier = tier_of(first) if tier_of else 0
-            count = 1
-            # contiguous within the tier
-            while (
-                count < max_run
-                and i + count < n
-                and sorted_ids[i + count] == first + count
-                and (tier_of is None or tier_of(sorted_ids[i + count]) == first_tier)
-            ):
-                count += 1
-            # Fase K F7: bridge a small same-tier gap (rows never promoted).
-            if merge_gap > 0:
-                bridged = count
-                k = i + count
-                while k < n and bridged < max_run:
-                    expect = first + bridged
-                    gap = sorted_ids[k] - expect
-                    # gap 0 = contiguous tail; 1..merge_gap = bridgeable
-                    # hole; a tier mismatch (HOBBIT) or negative gap ends it.
-                    if (
-                        gap < 0
-                        or gap > merge_gap
-                        or (tier_of is not None and tier_of(sorted_ids[k]) != first_tier)
-                    ):
-                        break
-                    bridged = min(bridged + gap + 1, max_run)
-                    k += 1
-                if bridged > count:
-                    count = bridged
-            runs.append((first, count))
-            # advance past the run's ids (gap experts are consumed by the read)
-            j = i + 1
-            while j < n and sorted_ids[j] < first + count:
-                j += 1
-            i = j
-        return runs
+        from .shard_bank import segment_runs
+
+        return segment_runs(
+            sorted_ids,
+            same=(lambda a, b: tier_of(a) == tier_of(b)) if tier_of is not None else None,
+            merge_gap=merge_gap,
+            max_run=max_run,
+        )
 
 
     def bundle_key(self, expert_id: int):
@@ -1696,17 +1664,18 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             sorted_prev = sorted(int(e) for e in prev)
             if not sorted_prev:
                 return
-            # Coalesce into runs for single F_RDADVISE per run
-            runs: list[tuple[int, int]] = []
-            s = sorted_prev[0]
-            cnt = 1
-            for eid in sorted_prev[1:]:
-                if eid == s + cnt:
-                    cnt += 1
-                else:
-                    runs.append((s, cnt))
-                    s, cnt = eid, 1
-            runs.append((s, cnt))
+            # Fase K K2: one shared segmentation with the demand path —
+            # consecutive ids within one resolved reader become one run for
+            # a single F_RDADVISE (tier boundaries break the run).
+            from .shard_bank import segment_runs
+
+            rid_of = {
+                e: id(self.backing._reader_for_key(self.stacked_weight_key, e))
+                for e in sorted_prev
+            }
+            runs = segment_runs(
+                sorted_prev, same=lambda a, b: rid_of[a] == rid_of[b]
+            )
             for target in targets:
                 # Fase K F3: speculate the run into the stash ring (async) —
                 # the read overlaps compute and never blocks demand reads.
@@ -1745,25 +1714,25 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             return
         try:
             ids = [int(e) for e in eids_sorted]
-            # Segment runs by resolved reader (tier boundary) like the demand
-            # path's _group_runs / advise_expert_run: a run reads ONE reader.
-            readers = [
-                self.backing._reader_for_key(self.stacked_weight_key, eid)
-                for eid in ids
-            ]
-            i = 0
-            jobs: list[tuple[int, int]] = []
-            while i < len(ids):
-                j = i
-                here = readers[i]
-                while j + 1 < len(ids) and readers[j + 1] is here:
-                    j += 1
-                jobs.append((ids[i], j - i + 1))
-                i = j + 1
+            # Fase K K2: segment by CONSECUTIVE ids within ONE resolved
+            # reader — reader-only segmentation produced (first, count)
+            # jobs that spanned holes and read+stored the WRONG experts
+            # (e.g. [3,5] read experts 3 AND 4). Same shared segmentation
+            # as the demand path and the advisor.
+            from .shard_bank import segment_runs
+
+            rid_of = {
+                e: id(self.backing._reader_for_key(self.stacked_weight_key, e))
+                for e in ids
+            }
+            jobs = segment_runs(
+                ids, same=lambda a, b: rid_of[a] == rid_of[b]
+            )
         except Exception:
             return
         if not jobs:
             return
+        state.bump("stash_targets", len(ids))
         for first, count in jobs:
             try:
                 # K7: bounded pending queue; a full or closed state drops
