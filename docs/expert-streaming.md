@@ -584,6 +584,55 @@ benchmarks isolados de C2–C6 ainda dependem de uma janela de memória suficien
 a medição C1 ocorreu antes das mudanças posteriores e não deve ser reutilizada
 como medição desses commits.
 
+### RUN_QD — leituras em profundidade por chamada (recuperação do decode)
+
+A leitura coalescida de banco (C2) substituiu o antigo `pool.map` um-job-por-run por
+um loop sequencial: a profundidade efetiva de fila caiu para 1 e o decode de
+`qwen4_exp` perdeu ~45 % de throughput (1,86 tok/s contra o baseline pré-Fase-J de
+3,06). O decode pede poucos experts esparsos por projeção — sem readahead para
+esconder a latência, só a profundidade de fila adianta. O prefill, que pede centenas
+de experts contíguos, já atinge 2,58 GB/s contra o teto de 2,8 GB/s do dispositivo
+mesmo em série e quase não percebe.
+
+**O que mudou em `read_expert_into`** (`shard_bank.py`): os `preadv` por run de um
+mesmo componente agora são emitidos em paralelo num pool dedicado e limitado
+(`_RUN_IO_POOL`, `_RUN_IO_QD` workers), em lotes, e o espalhamento para `out` só
+acontece depois que o lote inteiro pousa, na ordem dos descritores. Assim o conteúdo
+de `out` nunca depende da ordem de conclusão das leituras — **bit-exact por
+construção** (validado por mutação: inverter o pareamento run→buffer quebra o teste).
+
+**Pool aninhado (sem deadlock):** `read_expert_into` é despachado em `_EXPERT_IO_POOL`
+(16 workers) via `_prefetch` e o `pool.map` do caminho de union. Submeter a esse
+mesmo pool e esperar deadlockaria assim que todos os workers fossem pais bloqueados
+em filhos enfileirados. O pool de run é separado e suas tarefas nunca submetem a
+lugar nenhum, então sempre escoa. Limitado a `_RUN_IO_QD` workers por chamada (memória
+transitória delimitada), mas N pais concorrentes ainda enxergam até N×`_RUN_IO_QD`
+leituras no dispositivo — é essa profundidade total que compramos, e é por isso que o
+padrão é 16 e não maior (32 mediu mais lento: sobrescrição, não paralelismo).
+
+**Varredura QD** (qwen4_exp, prompt 2k, 48 decode, single-request; duas rodadas, 2 e
+3 repetições por braço; baseline pré-Fase-J 3,06 tok/s):
+
+| QD | tok/s (r1 / r2) | TTFT s | phys GiB | cpu % |
+|----|----------------|--------|----------|-------|
+| 1 (serial) | 2,184 | 85,7 | 11,02 | ~41 |
+| 8 | 3,203 / 3,059 | 71,0 / 70,8 | ~10,9 | ~68 |
+| **16 (padrão)** | **3,324 / 3,419** | 68,0 / 69,6 | ~10,96 | ~73 |
+| 32 | — / 3,138 | — / 70,0 | ~10,82 | ~74 |
+
+16 é o pico **e** de longe o braço mais estável: stdev 0,046 tok/s contra 0,390 no
+QD=8 (que teve um outlier 2,61 que 16 nunca teve). Recupera toda a regressão do decode
+e passa: **+55 % sobre profundidade 1 e acima do baseline pré-Fase-J de 3,06**, com o
+ganho de memória da Fase J intacto (`phys_lifetime_max` plano em ~10,9 GiB contra os
+37 GiB de onde partimos). **Todas as 15 execuções token-ID bit-exact.**
+
+**Knobs / testes:** `OMLX_EXPERT_STREAMING_RUN_QD` sobrescreve (1 = serial, antigo).
+`tests/test_expert_streaming.py::test_backing_read_expert_into_matches_load_expert_slice`
+agora usa `_write_shard_filled` (payload não-nulo determinístico) + guarda
+`out1.any()` — o fixture anterior `_write_shard` escrevia zeros e tornava o teste
+vácuo (deixou passar um pareamento run→buffer invertido); mutação confirma que agora
+falha corretamente.
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.

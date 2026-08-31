@@ -16,6 +16,8 @@ import mmap
 import os
 import struct
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
 
@@ -122,6 +124,67 @@ def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
     if dtype_str == "F8_E4M3":
         return mx.from_fp8(mx.array(np_view), dtype=mx.bfloat16)
     return mx.array(np_view)
+
+
+# Queue depth for the per-run preadvs issued inside one read_expert_into call.
+# This is the depth that matters: the coalesced bank read replaced the old
+# one-job-per-run pool.map with a sequential loop, which dropped effective
+# depth to 1 and cost ~45% of decode throughput on qwen4_exp. Decode demand is
+# sparse (a handful of scattered experts per layer), so it has no readahead to
+# fall back on and depth is all it has — prefill, which asks for hundreds of
+# contiguous experts, already reaches 2.58 GB/s against this device's 2.8 GB/s
+# ceiling even serially, and barely notices.
+#
+# Default 16: measured on qwen (2k prompt, 48 decode, single request), two
+# rounds, 2 and 3 reps per arm. QD=1 is the old sequential behaviour.
+#
+#   QD   tok/s (r1 / r2)   TTFT s      phys GiB   cpu %
+#    1   2.184              85.7        11.02      ~41
+#    8   3.203 / 3.059      71.0/70.8   ~10.9      ~68
+#   16   3.324 / 3.419      68.0/69.6   ~10.96     ~73
+#   32   --    / 3.138      --  /70.0   ~10.82     ~74
+#
+# 16 is the peak AND by far the steadiest arm: stdev 0.046 tok/s against 0.390
+# at QD=8, which threw a 2.61 outlier that 16 never did. 32 regresses — past
+# the device's useful queue depth the extra threads are oversubscription, not
+# parallelism. This recovers the whole decode regression and then some: +55%
+# over depth 1 and above the 3.06 tok/s pre-Fase-J baseline, with the Fase J
+# memory win untouched (phys_lifetime_max flat at ~10.9 GiB vs the 37 GiB we
+# started from). All 15 runs token-ID bit-exact.
+_RUN_IO_QD = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_QD", "16")))
+
+# NOTE: the singleton and the accessor must not share a name — a module-level
+# `def _run_io_pool` would rebind the very global the accessor is meant to
+# populate, and it would then return itself instead of an executor.
+_RUN_IO_POOL_SINGLETON: ThreadPoolExecutor | None = None
+_run_io_pool_lock = threading.Lock()
+
+
+def _run_io_pool() -> ThreadPoolExecutor:
+    """Threads for the per-run preadvs of a single read_expert_into call.
+
+    Deliberately NOT the caller's pool. read_expert_into is dispatched on
+    _EXPERT_IO_POOL (16 workers) via _prefetch and the union path's pool.map,
+    so submitting to that same bounded pool and then waiting would deadlock
+    as soon as every worker was a parent blocked on a queued child. This pool
+    is separate and its tasks never submit anywhere, so it always drains.
+
+    Bounded at _RUN_IO_QD workers, which caps the reads ONE call can have in
+    flight. It does not cap the process: with N concurrent parents the device
+    can see up to N * _RUN_IO_QD outstanding reads. That is intentional —
+    total depth is what we are buying — and it is why the default is 16 and
+    not higher, since 32 measured slower (oversubscription, not parallelism).
+    The per-call bound is what keeps the transient buffer memory bounded.
+    """
+    global _RUN_IO_POOL_SINGLETON
+    if _RUN_IO_POOL_SINGLETON is None:
+        with _run_io_pool_lock:
+            if _RUN_IO_POOL_SINGLETON is None:
+                _RUN_IO_POOL_SINGLETON = ThreadPoolExecutor(
+                    max_workers=_RUN_IO_QD,
+                    thread_name_prefix="omlx-expert-run",
+                )
+    return _RUN_IO_POOL_SINGLETON
 
 
 class _ReadParams(NamedTuple):
@@ -578,6 +641,10 @@ class ExpertBackingStore:
         *component* instead of one resolution + one read per *expert*, which
         is the win for dense demand sets (long-prompt prefill).
 
+        The per-run ``preadv`` calls of a single component are issued
+        concurrently on :func:`_run_io_pool` (see ``_RUN_IO_QD``), in batches,
+        so a fragmented demand set keeps the device's queue depth above 1.
+
         Returns ``True`` on success, ``False`` if any component could not be
         served (caller must fall back to :meth:`load_expert_slice`). Bytes are
         written in expert-id order so ``outs[i][j]`` is expert ``eids[j]``.
@@ -602,24 +669,71 @@ class ExpertBackingStore:
             # Read contiguous runs separately. This keeps sparse demand from
             # over-reading the gap between the first and last expert.
             order = sorted(range(n), key=lambda j: eids[j])
+            # Plan every run up front. A descriptor is just an offset, a count
+            # and the slice of `order` it fills — cheap, and planning first is
+            # what lets the reads below go out as a batch instead of one
+            # blocking syscall at a time.
+            runs: list[tuple[int, int, list[int]]] = []  # (abs_off, count, order slice)
             start = 0
             while start < n:
                 first = eids[order[start]]
                 end = start + 1
                 while end < n and eids[order[end]] == eids[order[end - 1]] + 1:
                     end += 1
-                count = end - start
                 off = rp.tensor_abs_off + first * rp.expert_bytes
-                buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
-                try:
-                    reader._read_into(off, buf)
-                except Exception:
-                    return False
-                for pos in range(count):
-                    j = order[start + pos]
-                    base = pos * rp.expert_bytes
-                    out[j, :] = buf[base : base + rp.expert_bytes]
+                runs.append((off, end - start, order[start:end]))
                 start = end
+
+            # Issue each batch's preadvs concurrently. One at a time they are
+            # a chain of blocking syscalls, which pins the device's I/O queue
+            # depth at 1: the device idles for a full round trip between runs.
+            # Prefill largely hides this — its runs are long and contiguous, so
+            # kernel readahead covers it and it already reaches 2.58 GB/s
+            # against this device's 2.8 GB/s ceiling. Decode has no such luck:
+            # its demand is a handful of scattered experts per projection and
+            # depth is all it has. Measured on qwen4_exp (2k prompt, 48
+            # decode), depth 1 gave 0.46 GiB/s and 1.86 tok/s against the
+            # baseline's 0.92 GiB/s and 3.06 tok/s.
+            #
+            # Batched rather than all-at-once so peak transient memory stays
+            # at _RUN_IO_QD run buffers instead of one per run — a fully
+            # fragmented component is one run per expert, which would
+            # otherwise double the component's footprint.
+            for bstart in range(0, len(runs), _RUN_IO_QD):
+                batch = runs[bstart : bstart + _RUN_IO_QD]
+                bufs = [
+                    np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                    for _off, count, _js in batch
+                ]
+                if len(batch) == 1:
+                    try:
+                        reader._read_into(batch[0][0], bufs[0])
+                    except Exception:
+                        return False
+                else:
+                    io_exec = _run_io_pool()
+                    futs = [
+                        io_exec.submit(reader._read_into, off, buf)
+                        for (off, _count, _js), buf in zip(batch, bufs)
+                    ]
+                    # Drain every future even after a failure, so no exception
+                    # is left unretrieved and no read keeps writing into a
+                    # buffer the caller has already been told to discard.
+                    ok = True
+                    for fut in futs:
+                        try:
+                            fut.result()
+                        except Exception:
+                            ok = False
+                    if not ok:
+                        return False
+                # Scatter only once the whole batch has landed, and in
+                # descriptor order, so the bytes in `out` never depend on the
+                # order the reads happened to complete in.
+                for (_off, _count, js), buf in zip(batch, bufs):
+                    for pos, j in enumerate(js):
+                        base = pos * rp.expert_bytes
+                        out[j, :] = buf[base : base + rp.expert_bytes]
         return True
 
     def advise_expert_run(self, key: str, first_id: int, count: int) -> bool:

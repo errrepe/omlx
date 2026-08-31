@@ -776,7 +776,18 @@ def test_shard_reader_short_read_raises_os_error():
 def test_backing_read_expert_into_matches_load_expert_slice():
     """C2: the coalesced read_expert_into must be byte-identical to the
     per-expert load_expert_slice path (correctness contract for the miss
-    path consolidation in _load_expert_bundle)."""
+    path consolidation in _load_expert_bundle).
+
+    Data comes from _write_shard_filled, NOT _write_shard. The latter writes
+    an all-zero payload, which makes every byte comparison pass regardless of
+    which expert lands in which slot — with it this test was vacuous and let
+    a reversed run->buffer pairing through undetected. The ``.any()`` check
+    below guards the guard: if the payload ever goes back to zeros the test
+    fails loudly instead of silently passing.
+
+    eids [3, 0, 2] sorts to runs [0] and [2, 3], so this exercises the
+    multi-run (parallel preadv) branch, not just the single-run shortcut.
+    """
     from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
 
     with tempfile.TemporaryDirectory() as td:
@@ -784,7 +795,7 @@ def test_backing_read_expert_into_matches_load_expert_slice():
         key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
         # 4 experts, BF16 -> 16*32*2 bytes per expert
         per = 16 * 32 * 2
-        _write_shard(tmp / "model.safetensors", {key: ((4, 16, 32), "BF16")})
+        _write_shard_filled(tmp / "model.safetensors", {key: ((4, 16, 32), "BF16")})
         (tmp / "model.safetensors.index.json").write_text(
             json.dumps({"weight_map": {key: "model.safetensors"}})
         )
@@ -792,6 +803,7 @@ def test_backing_read_expert_into_matches_load_expert_slice():
         # single-expert coalesced read
         out1 = np.empty((1, per), dtype=np.uint8)
         assert backing.read_expert_into([(key, [0])], [out1])
+        assert out1.any(), "fixture payload is all zeros; this gate proves nothing"
         assert np.array_equal(out1[0], backing.load_expert_slice(key, 0).view(np.uint8).reshape(-1))
         # multi-expert (out of order) coalesced read, in id order in the buffer
         eids = [3, 0, 2]
