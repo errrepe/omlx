@@ -439,10 +439,63 @@ em 8k** (§13.1). O alvo de pico do critério #3 está atingido em 2k e 8k.
 Resta, se desejado (nenhum é bloqueador do critério de pico):
 (a) ~FEITO — robustez em 8k confirmada; (b) gateá-los os ~20 sites restantes
 do scheduler com `should_clear_cache` (refinamento de cadência, com risco de
-subir o pico se feito mal — NÃO fazer sem medir); (c) investigar o
-`adaptive_prefill_throttle` que superestima o uso de memória em ~6× (67.46 GB
-previsto vs 11.64 GiB real) e encolhe o chunk sem necessidade — isso é o que
-infla o TTFT em 8k, não a memória. Nada de código de pico pendente.
+subir o pico se feito mal — NÃO fazer sem medir); (c) ~FEITO — `adaptive_prefill_throttle`
+investigado e corrigido (§14): a estimativa estática SDPA+KV era ~40× o medido
+para o MoE 4-bit e dominava o MAX permanentemente; agora é limitada a
+`_PREFILL_STATIC_MAX_OVER_MEASURED` (3×) do medido quando há amostras. Nada de
+código de pico pendente.
+
+---
+
+### 14. `adaptive_prefill_throttle` — correção da superestimativa de memória (TTFT em 8k)
+Item (c) da conclusão de §13.1, implementado e testado.
+
+**Sintoma (§13.1):** no bench 8k all-miss, o scheduler previu `predicted=67.46 GB`
+para o chunk de prefill mas o pico real foi `11.64 GiB` (`metal_peak 6.95`).
+Como o alvo de throttle era `23.94 GB`, o scheduler encolheu o chunk
+`2048 → 512` e pausou para LRU eviction — inflacionando o TTFT de ~35 s (2k)
+para ~254 s (8k), ~7×. A causa NÃO é o pico de memória (critério #3 ok), é o
+*scheduler tuning*.
+
+**Raiz:** `Scheduler._predicted_chunk_transient` (em `omlx/scheduler.py`) fazia
+`per_token = MAX(medido_last, EWMA, estática_SDPA+KV)` **incondicionalmente**.
+Para Qwen3.8-Flash-Next-oQ4e (MoE 4-bit) a estimativa estática genérica
+(~34.5 MB/token) era ~40× o medido (~0.9 MB/token). Por estar no `MAX`, o valor
+errado **dominava permanentemente** — o sinal medido (`mx.get_peak_memory`,
+ground truth) nunca sobrepunha. Resultado: todo chunk era estrangulado ao
+tamanho de piso (512). Isso também contradizia o próprio docstring de
+`_adaptive_chunk_size` ("Measured: once the per-scheduler EWMA has samples,
+use its `bytes_per_token` ... First chunk: fall back to the static estimate").
+
+**Correção:** a estimativa estática só entra no `MAX` quando NÃO há amostras
+medidas (primeiro chunk de um modelo recém-carregado — fallback conservador).
+Uma vez que o `PrefillTransientTracker` tem amostras, a estática pode apenas
+*elevar* a predição por-token até `_PREFILL_STATIC_MAX_OVER_MEASURED` (default
+3.0, env `OMLX_PREFILL_STATIC_MAX_OVER_MEASURED`) vezes a taxa medida:
+- estática modestamente maior que o medido (crescimento de kv_len que o EWMA
+  atrasa) ainda vence o MAX → backstop de segurança preservado;
+- estática absurdamente maior (fórmula densa superestimando MoE 4-bit em ~40×)
+  é truncada em 3× o medido → não domina mais.
+
+A predição resultante nunca fica abaixo de `medido × 1.3` (safety factor),
+então NÃO há risco de subestimar o pico (o ground truth medido sempre vale).
+As chamadas ao `memory_monitor` e `_streaming_bank_bytes` foram envolvidas em
+`try/except` — uma falha do monitor não quebra o dimensionamento do chunk; o
+sinal medido (ou o fallback de watermark do caller) still aplica.
+
+**Resultado esperado no bench 8k:** o primeiro chunk ainda usa o fallback
+estático (1 pausa de eviction + 1 chunk de 512, seguro), mas após a 1ª medição
+(`~0.9 MB/token`) os chunks seguintes rodam em `2048` (previsto 2048-chunk ≈
+2–7 GiB ≪ alvo 23.94 GB). O prefill 8k passa de ~16 chunks de 512 para ~5
+chunks → TTFT deve cair de ~254 s para a faixa de ~80–120 s (o residual vem da
+amplificação de leitura all-miss do §13.1, não do throttle). **A confirmar com
+re-run do bench 8k** (`bench/results/faseJ/real_faseJ_8k.json` re-executado).
+
+**Arquivos:** `omlx/scheduler.py` (`_predicted_chunk_transient`,
+`_PREFILL_STATIC_MAX_OVER_MEASURED`), `tests/test_scheduler_chunked_prefill.py`
+(3 testes de regressão: medido-vence-estática, fallback-estático-sem-amostras,
+falha-do-monitor-é-segura), `tests/test_prefill_oom_graceful.py` (`_throttle_ctx`
+ganha o novo atributo). Suíte: 168 passed.
 
 ---
 

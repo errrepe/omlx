@@ -3877,6 +3877,19 @@ class Scheduler:
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
 
+    # When measured samples exist, the static SDPA+KV estimate may only RAISE
+    # the per-token prediction up to this multiple of the measured rate. A
+    # static estimate that is wildly higher (e.g. a generic dense / head-count
+    # formula over-predicting a 4-bit MoE model by ~40x) is treated as
+    # untrustworthy and capped, so it cannot force every chunk to the floor
+    # and inflate TTFT (8k Qwen3.8: predicted ~67 GB vs actual ~11.6 GiB peak,
+    # throttled 2048 -> 512, ~7x slower). A static that is modestly higher than
+    # the measured rate (legitimate kv_len-growth the EWMA lags) still wins,
+    # preserving the MAX-of-signals safety backstop. Env-overridable.
+    _PREFILL_STATIC_MAX_OVER_MEASURED: float = float(
+        os.environ.get("OMLX_PREFILL_STATIC_MAX_OVER_MEASURED", "") or 3.0
+    )
+
     # Streaming expert mini-banks: predicted unique experts touched per layer
     # per chunk, as a fraction of chunk tokens. Measured ~0.145 on qwen4_exp
     # (215 uniq experts/layer at 1488-token chunks — real-text expert selection
@@ -3996,12 +4009,19 @@ class Scheduler:
         the per-token cost GROWS with context length. A long-run EWMA average
         lags that growth and underestimates the next chunk — the cause of the
         Metal command-buffer OOM crash at large kv_len. We therefore take the
-        MAX of three signals and apply a safety factor:
+        MAX of the available signals and apply a safety factor:
           - the most recently MEASURED per-token growth (last_delta / last_n)
             — anchored on reality at the current kv_len regime,
           - the long-run EWMA (model-specific constants the static misses),
           - the kv_len-aware static estimate (SDPA transient + this chunk's
-            newly allocated KV).
+            newly allocated KV), used ONLY as a fallback for the first chunk
+            of a freshly loaded model, before any measurement exists.
+
+        Once the tracker has samples the measured signals dominate: a static
+        estimate can be off by an order of magnitude for some model classes
+        (a generic dense formula over-predicts a 4-bit MoE model by ~40x), so
+        letting it win the MAX permanently would throttle every chunk to the
+        floor and inflate TTFT (see the 8k Qwen3.8 case in the commit log).
         Returns 0 only when nothing is known (first chunk, no model info).
         """
         if n_tokens <= 0:
@@ -4010,31 +4030,70 @@ class Scheduler:
         static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
+        measured_signal = 0.0
         if tracker is not None:
             if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                per_token = max(
-                    per_token, tracker.last_delta_bytes / tracker.last_n_tokens
+                measured_signal = max(
+                    measured_signal, tracker.last_delta_bytes / tracker.last_n_tokens
                 )
             if tracker.bytes_per_token > 0:
-                per_token = max(per_token, tracker.bytes_per_token)
+                measured_signal = max(measured_signal, tracker.bytes_per_token)
             recent_reclaim = tracker.recent_reclaim_bytes
+
+        # Static SDPA+KV estimate. Model-specific by construction: a generic
+        # dense / head-count formula can over-predict a quantized MoE model by
+        # an order of magnitude (observed ~34.5 MB/token vs ~0.9 MB/token
+        # measured on Qwen3.8-Flash-Next-oQ4e). Wrap in try/except so a monitor
+        # failure can never break chunk sizing — the measured signal (or the
+        # caller's watermark fallback) still applies.
         static_total = 0.0
-        if self.memory_monitor is not None:
-            static_total = float(
-                self.memory_monitor.estimate_chunk_transient_bytes(
-                    n_tokens, kv_len + n_tokens
+        try:
+            if self.memory_monitor is not None:
+                static_total = float(
+                    self.memory_monitor.estimate_chunk_transient_bytes(
+                        n_tokens, kv_len + n_tokens
+                    )
                 )
-            )
-            static_total += float(
-                self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
-            )
-        bank_bytes = self._streaming_bank_bytes(n_tokens)
+                static_total += float(
+                    self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
+                )
+        except Exception:  # noqa: BLE001
+            static_total = 0.0
+        bank_bytes = 0
+        try:
+            bank_bytes = self._streaming_bank_bytes(n_tokens)
+        except Exception:  # noqa: BLE001
+            bank_bytes = 0
+
+        # Reconcile the static estimate with the measured signal:
+        #  - NO measured samples yet (first chunk of a freshly loaded model):
+        #    use the static estimate as the conservative fallback.
+        #  - measured samples exist: the static may only RAISE the per-token
+        #    prediction up to _PREFILL_STATIC_MAX_OVER_MEASURED x the measured
+        #    rate. A static that is modestly higher (legitimate kv_len-growth
+        #    the EWMA lags) still wins the MAX, preserving the safety backstop;
+        #    a static that is wildly higher (a generic dense formula
+        #    over-predicting a 4-bit MoE model by ~40x) is treated as
+        #    untrustworthy and capped, so it cannot permanently dominate the
+        #    MAX and force every chunk to the floor, inflating TTFT (observed:
+        #    an 8k prefill predicted ~67 GB vs an actual ~11.6 GiB peak was
+        #    throttled 2048 -> 512 and ran ~7x slower).
+        effective_static_per_token = 0.0
         if bank_bytes > 0 or static_total > 0:
-            static_per_token = (static_total + bank_bytes) / n_tokens
-            per_token = max(per_token, static_per_token)
+            raw_static_per_token = (static_total + bank_bytes) / n_tokens
+            if measured_signal <= 0:
+                effective_static_per_token = raw_static_per_token
+                per_token = max(measured_signal, raw_static_per_token)
+            else:
+                cap = measured_signal * self._PREFILL_STATIC_MAX_OVER_MEASURED
+                effective_static_per_token = min(raw_static_per_token, cap)
+                per_token = max(measured_signal, effective_static_per_token)
+        else:
+            per_token = measured_signal
+
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
-            static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+            effective_static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
             + recent_reclaim
         )
         return max(base_prediction, reallocation_prediction)
