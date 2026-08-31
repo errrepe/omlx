@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 from omlx.admin import routes as admin_routes
@@ -1640,6 +1641,12 @@ def _stream_eval_recorder(monkeypatch):
     monkeypatch.setattr(
         qse, "mx", types.SimpleNamespace(eval=_bump("eval"), clear_cache=_bump("clear"))
     )
+    # The clear routes through omlx.utils.metal_sync (Fase J Etapa C/D — a
+    # pool clear must never run unsynchronized), so that helper is patched
+    # too. Whichever route the wrapper takes is counted exactly once.
+    monkeypatch.setattr(
+        "omlx.utils.metal_sync._sync_and_clear_cache", _bump("clear")
+    )
     return qse, calls
 
 
@@ -2452,3 +2459,711 @@ class TestFaseKPriorPath:
             assert (cache_dir / "prefill_prior_m1.json").exists()
             t2 = pt.PrefillTransientTracker("m1")
             assert t2.load_prior() is True
+
+# ---------------------------------------------------------------------------
+# Fase K F6 — read_expert_into, bank promotion (A1/A1b), rolling layer
+# context (Etapa B), memtrace (ports of the faseJ pipeline tests)
+# ---------------------------------------------------------------------------
+
+
+def _write_shard_filled(path: Path, tensors: dict, seed: int = 1234) -> None:
+    """Minimal safetensors file with deterministic non-zero payloads.
+
+    _write_shard writes all-zero data, which would make any bit-exactness
+    comparison vacuous — every byte pattern would match trivially.
+
+    BF16 tensors get values from a small positive range rather than random
+    bit patterns: random bf16 words decode to exponents around 1e30, the
+    dequantized products overflow to inf/NaN, and then array_equal fails
+    on NaN != NaN for outputs whose bit patterns are in fact identical.
+    """
+    import mlx.core as mx
+
+    _DTY_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "U32": 4, "U8": 1}
+    rng = np.random.default_rng(seed)
+    header: dict = {}
+    offset = 0
+    blobs = []
+    for key, (shape, dtype) in tensors.items():
+        nbytes = int(np.prod(shape)) * _DTY_BYTES[dtype]
+        header[key] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        if dtype == "BF16":
+            vals = rng.uniform(0.5, 2.0, size=int(np.prod(shape))).astype(np.float32)
+            words = np.asarray(
+                mx.array(vals).astype(mx.bfloat16).view(mx.uint16), dtype="<u2"
+            )
+            blobs.append(words.tobytes())
+        else:
+            blobs.append(
+                rng.integers(1, 256, size=nbytes, dtype=np.uint8).tobytes()
+            )
+        offset += nbytes
+    hb = json.dumps(header).encode()
+    with path.open("wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+        for blob in blobs:
+            f.write(blob)
+
+
+def _quant_linear(tmp: Path, n_experts: int = 4):
+    """A StreamingQuantizedSwitchLinear backed by a real shard store."""
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+    )
+
+    w_key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+    s_key = "model.layers.0.mlp.switch_mlp.gate_proj.scales"
+    b_key = "model.layers.0.mlp.switch_mlp.gate_proj.biases"
+    # 4-bit packed in uint32 (8 values/word): 128 in / 16 out, group_size 64.
+    # MLX requires scales and biases to share a shape, so biases are
+    # per-group too, matching what a real affine-quantized checkpoint stores.
+    _write_shard_filled(
+        tmp / "model.safetensors",
+        {
+            w_key: ((n_experts, 16, 16), "U32"),
+            s_key: ((n_experts, 16, 2), "BF16"),
+            b_key: ((n_experts, 16, 2), "BF16"),
+        },
+    )
+    (tmp / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {k: "model.safetensors" for k in (w_key, s_key, b_key)}}
+        )
+    )
+    backing = ExpertBackingStore(tmp)
+    cache = ExpertLRUCache(64 * 1024, 1024, num_layers=1)
+    linear = StreamingQuantizedSwitchLinear(
+        layer_idx=0,
+        proj_name="gate_proj",
+        stacked_weight_key=w_key,
+        stacked_scales_key=s_key,
+        stacked_biases_key=b_key,
+        num_experts=n_experts,
+        input_dims=128,
+        output_dims=16,
+        backing=backing,
+        cache=cache,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        has_bias=False,
+    )
+    return linear
+
+
+def test_backing_read_expert_into_matches_load_expert_slice():
+    """C2: the coalesced read_expert_into must be byte-identical to the
+    per-expert load_expert_slice path (correctness contract for the miss
+    path consolidation in the linear's bank reader).
+
+    The payload is deterministic NON-zero (filled shard), so a reversed
+    run->buffer pairing cannot slip through undetected.
+    """
+    import numpy as np
+
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        per = 16 * 32 * 2
+        _write_shard_filled(tmp / "model.safetensors", {key: ((4, 16, 32), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        out1 = np.empty((1, per), dtype=np.uint8)
+        assert backing.read_expert_into([(key, [0])], [out1])
+        assert out1.any(), "fixture payload is all zeros; this gate proves nothing"
+        assert np.array_equal(
+            out1[0], backing.load_expert_slice(key, 0).view(np.uint8).reshape(-1)
+        )
+        # Multi-expert, out of order: exercises the multi-run parallel branch.
+        eids = [3, 0, 2]
+        out3 = np.empty((3, per), dtype=np.uint8)
+        assert backing.read_expert_into([(key, eids)], [out3])
+        for slot, eid in enumerate(eids):
+            assert np.array_equal(
+                out3[slot], backing.load_expert_slice(key, eid).view(np.uint8).reshape(-1)
+            )
+        # Wrong buffer shape -> False (safe fallback signal).
+        bad = np.empty((2, per + 1), dtype=np.uint8)
+        assert not backing.read_expert_into([(key, [0, 1])], [bad])
+        empty = np.empty((0, per), dtype=np.uint8)
+        assert backing.read_expert_into([(key, [])], [empty])
+
+
+def test_memtrace_disabled_by_default_is_noop():
+    """With the env var unset the singleton is a null tracer: recording is
+    a no-op and enabled is False, so the hot path stays free."""
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    assert ss.memtrace.enabled is False
+    assert ss.memtrace.record("linear.resolve", layer=0) is None
+
+
+def test_memtracer_records_rows_and_tracks_peaks():
+    """An armed tracer records one row per call with the memory counters
+    and keeps a running per-metric peak."""
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tracer = MemTracer(path=None)
+    tracer.record("linear.stack", layer=3, proj="up_proj", bank_bytes=1234)
+    tracer.record("linear.stack", layer=3, proj="down_proj", bank_bytes=7)
+
+    rows = tracer.rows()
+    assert len(rows) == 2
+    first = rows[0]
+    for key in ("seq", "t", "event", "layer", "proj", "active", "cache", "peak",
+                "footprint", "rss", "bank_bytes"):
+        assert key in first, f"missing field {key}"
+    assert first["event"] == "linear.stack"
+    assert first["layer"] == 3
+    assert first["proj"] == "up_proj"
+    assert rows[1]["seq"] == 2
+
+    peaks = tracer.peaks()
+    assert peaks["bank_bytes"] == 1234
+    assert peaks["active"] >= 0 and isinstance(peaks["active"], int)
+    assert int(mx.get_active_memory()) >= 0
+
+
+def test_memtracer_writes_jsonl():
+    """A path-armed tracer appends valid JSONL rows flush-on-write."""
+    import json
+
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "trace.jsonl"
+        tracer = MemTracer(path=str(path))
+        tracer.record("glu.enter", layer=1, uniq=8)
+        tracer.record("glu.exit", layer=1, uniq=8)
+        tracer.flush()
+        lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 2
+        rows = [json.loads(ln) for ln in lines]
+        assert [r["event"] for r in rows] == ["glu.enter", "glu.exit"]
+        assert tracer.rows() == []
+
+
+def test_memtracer_scope_emits_enter_exit():
+    """scope brackets a block with .enter/.exit rows, even on exception."""
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tracer = MemTracer(path=None)
+    with tracer.scope("ctx.ensure", layer=2):
+        pass
+    assert [r["event"] for r in tracer.rows()] == ["ctx.ensure.enter", "ctx.ensure.exit"]
+
+    tracer.reset()
+    try:
+        with tracer.scope("ctx.ensure", layer=2):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert [r["event"] for r in tracer.rows()] == ["ctx.ensure.enter", "ctx.ensure.exit"]
+
+
+def test_memtracer_summary_reports_gib_peaks():
+    """summary() exposes both raw bytes and GiB-normalized peaks."""
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tracer = MemTracer(path=None)
+    tracer.record("linear.stack", bank_bytes=2 << 30)
+    s = tracer.summary()
+    assert s["enabled"] is True
+    assert s["peaks_bytes"]["bank_bytes"] == 2 << 30
+    assert s["peak_bank_bytes_gib"] == 2.0
+
+
+def _ctx_modes_setup():
+    """Build (tmp, linears, cache) for the _LayerLoadContext mode tests."""
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    tmp, _warmer, _backing, linears = _ra_warmer_setup()
+    # budget 0 -> every expert misses, so all three projections must load.
+    return tmp, linears, ExpertLRUCache(0, 1 << 12, num_layers=2)
+
+
+def test_ctx_union_mode_traces_union_bank_bytes():
+    """Legacy union mode (rolling=0) holds every projection's NumPy bank at
+    once; the trace must report that union, not one projection."""
+    import shutil
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tmp, linears, cache = _ctx_modes_setup()
+    tracer = MemTracer(path=None)
+    original_trace, original_mode = ss.memtrace, ss._CTX_ROLLING_ENV
+    ss.memtrace = tracer
+    ss._CTX_ROLLING_ENV = False
+    try:
+        ctx = ss._LayerLoadContext(linears[0], cache)
+        ctx.ensure(linears[0][0], [0, 1, 2, 3])
+
+        events = [r["event"] for r in tracer.rows()]
+        assert "ctx.ensure.enter" in events
+        assert "ctx.ensure.exit" in events
+
+        exit_row = next(r for r in tracer.rows() if r["event"] == "ctx.ensure.exit")
+        assert exit_row["n_proj"] == 3
+        assert exit_row["uniq"] == 4
+        assert exit_row["n_loaded"] == 3
+        assert exit_row["miss_per_proj"] == [4, 4, 4]
+        expected = sum(lin._bank_bytes_for(4) for lin in linears[0])
+        assert expected > 0
+        assert exit_row["bank_bytes"] == expected
+        assert exit_row["bank_bytes"] == 3 * linears[0][0]._bank_bytes_for(4)
+        assert ctx.failed is False
+        for lin in linears[0]:
+            assert len(ctx.bundles[id(lin)]) == 4
+    finally:
+        ss.memtrace = original_trace
+        ss._CTX_ROLLING_ENV = original_mode
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ctx_rolling_mode_resolves_one_projection_at_a_time():
+    """Rolling mode (default): each call resolves only the asking projection
+    and keeps at most _CTX_PREFETCH_AHEAD banks in flight — never the union."""
+    import shutil
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+    from omlx.patches.expert_streaming.memtrace import MemTracer
+
+    tmp, linears, cache = _ctx_modes_setup()
+    tracer = MemTracer(path=None)
+    original_trace, original_mode = ss.memtrace, ss._CTX_ROLLING_ENV
+    ss.memtrace = tracer
+    ss._CTX_ROLLING_ENV = True
+    try:
+        ctx = ss._LayerLoadContext(linears[0], cache)
+
+        ctx.ensure(linears[0][0], [0, 1, 2, 3])
+        assert len(ctx.bundles[id(linears[0][0])]) == 4
+        assert len(ctx.bundles[id(linears[0][1])]) == 0
+        assert len(ctx._futures) <= max(1, ss._CTX_PREFETCH_AHEAD)
+        first_row = next(r for r in tracer.rows() if r["event"] == "ctx.ensure.exit")
+        assert first_row["proj"] == linears[0][0].proj_name
+        assert first_row["miss"] == 4
+        assert first_row["bank_bytes"] == linears[0][0]._bank_bytes_for(4)
+        assert first_row["bank_bytes"] * 3 == sum(
+            lin._bank_bytes_for(4) for lin in linears[0]
+        )
+
+        ctx.ensure(linears[0][1], [0, 1, 2, 3])
+        ctx.ensure(linears[0][2], [0, 1, 2, 3])
+        for lin in linears[0]:
+            assert len(ctx.bundles[id(lin)]) == 4
+            assert ctx.hits[id(lin)] == 0
+            assert ctx.misses[id(lin)] == 4
+        assert ctx.failed is False
+        assert ctx._futures == {}
+        assert ctx._inflight_bytes == 0
+
+        exits = [r for r in tracer.rows() if r["event"] == "ctx.ensure.exit"]
+        assert [r["proj"] for r in exits] == [lin.proj_name for lin in linears[0]]
+        before = len(tracer.rows())
+        ctx.ensure(linears[0][0], [0, 1, 2, 3])
+        assert len(tracer.rows()) == before
+    finally:
+        ss.memtrace = original_trace
+        ss._CTX_ROLLING_ENV = original_mode
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ctx_rolling_mode_prefetch_ahead_zero_reads_on_demand():
+    """With the prefetch window closed, each projection reads synchronously
+    and no future is ever held in flight (still correct, just no overlap)."""
+    import shutil
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    tmp, linears, cache = _ctx_modes_setup()
+    original_ahead, original_mode = ss._CTX_PREFETCH_AHEAD, ss._CTX_ROLLING_ENV
+    ss._CTX_ROLLING_ENV = True
+    ss._CTX_PREFETCH_AHEAD = 0
+    try:
+        ctx = ss._LayerLoadContext(linears[0], cache)
+        for lin in linears[0]:
+            ctx.ensure(lin, [0, 1, 2, 3])
+            assert ctx._futures == {}
+        assert ctx.failed is False
+        for lin in linears[0]:
+            assert len(ctx.bundles[id(lin)]) == 4
+    finally:
+        ss._CTX_PREFETCH_AHEAD = original_ahead
+        ss._CTX_ROLLING_ENV = original_mode
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ctx_prefetch_ahead_default_keeps_io_depth_above_one():
+    """The rolling path must keep more than one projection's read in flight.
+    read_expert_into issues its preadv calls one at a time, so the prefetch
+    window is the only thing giving the layer call an I/O queue depth above
+    1. Pins the default so a revert to 1 fails here rather than as an
+    unexplained throughput regression."""
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    assert ss._CTX_PREFETCH_AHEAD >= 2
+
+
+def test_ctx_rolling_mode_matches_union_mode_results():
+    """Both modes must produce identical bundles — the rolling path is a
+    scheduling change, not a data change. Bit-exactness of the loaded rows
+    is what protects the token-ID gate downstream."""
+    import shutil
+
+    import numpy as np
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    tmp, _warmer, backing, linears = _ra_warmer_setup()
+    original_mode = ss._CTX_ROLLING_ENV
+    try:
+        results = {}
+        for mode in (False, True):
+            cache = ExpertLRUCache(0, 1 << 12, num_layers=2)
+            ss._CTX_ROLLING_ENV = mode
+            ctx = ss._LayerLoadContext(linears[0], cache)
+            for lin in linears[0]:
+                ctx.ensure(lin, [3, 1, 0, 2])  # deliberately unsorted
+            per_proj = {}
+            for lin in linears[0]:
+                bundles = ctx.bundles[id(lin)]
+                per_proj[lin.proj_name] = {
+                    eid: tuple(
+                        np.asarray(part) if part is not None else None
+                        for part in bundle
+                    )
+                    for eid, bundle in sorted(bundles.items())
+                }
+            results[mode] = per_proj
+        assert set(results[False]) == set(results[True])
+        for proj in results[False]:
+            for eid in results[False][proj]:
+                a, b = results[False][proj][eid], results[True][proj][eid]
+                assert len(a) == len(b)
+                for pa, pb in zip(a, b):
+                    if pa is None or pb is None:
+                        assert pa is pb
+                    else:
+                        assert np.array_equal(pa, pb)
+    finally:
+        ss._CTX_ROLLING_ENV = original_mode
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_bank_bytes_for_scales_linearly_and_zeroes():
+    """_bank_bytes_for is the tile-sizing primitive; it must be linear in
+    the expert count and return 0 for a non-positive count."""
+    import shutil
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    tmp, linears, cache = _ctx_modes_setup()
+    try:
+        lin = linears[0][0]
+        assert lin._bank_bytes_for(0) == 0
+        one = lin._bank_bytes_for(1)
+        assert one > 0
+        assert lin._bank_bytes_for(3) == 3 * one
+    finally:
+        ss.memtrace = getattr(ss, "memtrace", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def test_bank_promote_is_bit_identical_to_per_expert_stack(tmp_path):
+    """Etapa A1: promoting the whole demand bank in one mx.array must yield
+    byte-for-byte the same tensors as promoting U per-expert slices and
+    stacking them — so gather_qmm sees an identical bank."""
+    import mlx.core as mx
+
+    linear = _quant_linear(tmp_path, n_experts=5)
+
+    ids = [4, 1, 3]  # deliberately out of order: row order must be preserved
+    got = linear._load_expert_bank_mx(ids)
+    assert got is not None
+    segments, rows = got
+    # Non-split linear: exactly one segment holding every asked expert.
+    assert len(segments) == 1
+    seg_ids, (w_fast, s_fast, b_fast) = segments[0]
+    assert seg_ids == ids
+
+    dt = linear._slice_dtypes_lazy()
+    mini_w, mini_s, mini_b = [], [], []
+    for w, s, b in rows:
+        mini_w.append(linear._promote_np(w))
+        mini_s.append(linear._promote_np(s, dt[0]))
+        mini_b.append(linear._promote_np(b, dt[1]))
+
+    assert w_fast.dtype == mx.stack(mini_w, axis=0).dtype
+    assert mx.array_equal(w_fast, mx.stack(mini_w, axis=0))
+    assert s_fast.dtype == mx.stack(mini_s, axis=0).dtype
+    assert mx.array_equal(s_fast, mx.stack(mini_s, axis=0))
+    assert mx.array_equal(b_fast, mx.stack(mini_b, axis=0))
+
+    # Row k of the bank is expert ids[k], not file order.
+    assert mx.array_equal(w_fast[0], mini_w[0])
+    assert mx.array_equal(w_fast[2], mini_w[2])
+    assert not mx.array_equal(w_fast[0], mini_w[1])
+
+
+def test_quantized_call_identical_with_and_without_bank_promote(monkeypatch, tmp_path):
+    """Etapa A1 end-to-end: the layer output must be bit-identical whether
+    the single-promotion fast path is enabled or not. This is the gate that
+    makes A1 lossless rather than near-lossless."""
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    x = mx.random.normal((6, 128)).astype(mx.float32)
+    indices = mx.array([2, 0, 1, 2, 0, 1], dtype=mx.int32)
+
+    def run(enabled):
+        # A fresh linear per arm: reusing one would leave the LRU populated,
+        # turning the second arm into a hit-only run and making the comparison
+        # vacuous (neither arm would exercise a miss).
+        linear = _quant_linear(tmp_path, n_experts=3)
+        engaged: list[bool] = []
+        real = linear._load_expert_bank_mx
+
+        def spy(ids):
+            out = real(ids)
+            engaged.append(out is not None)
+            return out
+
+        monkeypatch.setattr(ss, "_BANK_PROMOTE_ENV", enabled)
+        monkeypatch.setattr(linear, "_load_expert_bank_mx", spy)
+        out = linear(x, indices)
+        mx.eval(out)
+        return out, engaged
+
+    out_on, engaged_on = run(True)
+    out_off, engaged_off = run(False)
+
+    assert engaged_on == [True], engaged_on
+    assert engaged_off == [], engaged_off
+
+    assert out_on.dtype == out_off.dtype
+    bits_on = np.ascontiguousarray(out_on).view(np.uint32).reshape(-1)
+    bits_off = np.ascontiguousarray(out_off).view(np.uint32).reshape(-1)
+    assert np.array_equal(bits_on, bits_off)
+    assert bool(mx.all(mx.isfinite(out_on)))
+
+
+def test_bank_promote_returns_none_without_bank_backing(tmp_path):
+    """A dict backing cannot serve contiguous banks, so A1 must decline and
+    let the legacy per-expert path run."""
+    import mlx.core as mx
+
+    linear = _quant_linear(tmp_path, n_experts=3)
+    linear.backing = {(0, "gate_proj", "weight"): mx.zeros((3, 16, 16))}
+    assert linear._load_expert_bank_mx([0, 1]) is None
+
+
+def test_read_expert_banks_matches_legacy_bank_np(tmp_path):
+    """The _read_expert_banks refactor must not change what
+    _load_expert_bank_np returns to its callers."""
+    linear = _quant_linear(tmp_path, n_experts=5)
+    ids = [4, 1, 3]
+
+    rows = linear._load_expert_bank_np(ids)
+    got = linear._read_expert_banks(ids)
+    assert rows is not None and got is not None
+    segments, rows2 = got
+
+    assert len(segments) == 1
+    seg_ids, banks = segments[0]
+    assert seg_ids == ids
+    assert banks[0].shape == (len(ids), linear._slice_bytes(linear.stacked_weight_key))
+    assert len(rows) == len(rows2) == len(ids)
+    for (w1, s1, b1), (w2, s2, b2) in zip(rows, rows2):
+        assert np.array_equal(w1, w2)
+        assert np.array_equal(s1, s2)
+        assert np.array_equal(b1, b2)
+
+
+# ---------------------------------------------------------------------------
+# Fase J — Etapa A1b: single-promotion bank build on the layer-context path
+# ---------------------------------------------------------------------------
+
+
+def _quant_glu(tmp: Path, n_experts: int = 3):
+    """A quantized StreamingSwitchGLU whose projections sit on real shards.
+
+    Built with quantized=True so StreamingSwitchGLU installs a
+    _LayerLoadContext — the Etapa B path that runs by default and the one
+    A1b targets. A1 itself never fires here: the context pre-resolves every
+    expert, so missing is empty by the time the linear asks. That gap is
+    exactly why A1b exists.
+    """
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+        StreamingSwitchGLU,
+    )
+
+    hidden, moe_hidden = 128, 64
+    specs = (
+        ("gate_proj", moe_hidden, hidden),
+        ("up_proj", moe_hidden, hidden),
+        ("down_proj", hidden, moe_hidden),
+    )
+    tensors = {}
+    for proj, o, i in specs:
+        base = f"model.layers.0.mlp.switch_mlp.{proj}"
+        tensors[f"{base}.weight"] = ((n_experts, o, i // 8), "U32")
+        tensors[f"{base}.scales"] = ((n_experts, o, i // 64), "BF16")
+        tensors[f"{base}.biases"] = ((n_experts, o, i // 64), "BF16")
+    _write_shard_filled(tmp / "model.safetensors", tensors)
+    (tmp / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
+    )
+
+    backing = ExpertBackingStore(tmp)
+    cache = ExpertLRUCache(64 * 1024, 1024, num_layers=1)
+    glu = StreamingSwitchGLU(
+        input_dims=hidden,
+        hidden_dims=moe_hidden,
+        num_experts=n_experts,
+        layer_idx=0,
+        backing=backing,
+        cache=cache,
+        fused_gate_up=False,
+        inverse_scatter=False,
+        quantized=True,
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+    for proj, o, i in specs:
+        base = f"model.layers.0.mlp.switch_mlp.{proj}"
+        setattr(
+            glu,
+            proj,
+            StreamingQuantizedSwitchLinear(
+                layer_idx=0,
+                proj_name=proj,
+                stacked_weight_key=f"{base}.weight",
+                stacked_scales_key=f"{base}.scales",
+                stacked_biases_key=f"{base}.biases",
+                num_experts=n_experts,
+                input_dims=i,
+                output_dims=o,
+                backing=backing,
+                cache=cache,
+                group_size=64,
+                bits=4,
+                mode="affine",
+                has_bias=False,
+            ),
+        )
+    return glu
+
+
+def test_ctx_bank_promote_is_bit_identical_on_default_path(monkeypatch, tmp_path):
+    """Etapa A1b: with the Etapa B barrier on (the default), the GLU output
+    must be bit-identical whether single-promotion is enabled or not.
+
+    This is the gate that makes A1b lossless rather than near-lossless. It
+    also proves A1b engages where A1 does not: A1 measured zero invocations
+    on this path, and would leave the default configuration with no
+    bank-promotion win.
+    """
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    assert ss._LAYER_BARRIER_ENV  # the default path A1b is scoped to
+
+    x = mx.random.normal((1, 6, 128)).astype(mx.float32)
+    indices = mx.array([2, 0, 1, 2, 0, 1], dtype=mx.int32)
+
+    def run(enabled):
+        monkeypatch.setattr(ss, "_BANK_PROMOTE_CTX_ENV", enabled)
+        glu = _quant_glu(tmp_path, n_experts=3)
+        engaged: list[bool] = []
+        real = ss.StreamingQuantizedSwitchLinear._promote_banks
+
+        def spy(self, segments):
+            out = real(self, segments)
+            engaged.append(out is not None)
+            return out
+
+        monkeypatch.setattr(ss.StreamingQuantizedSwitchLinear, "_promote_banks", spy)
+        out = glu(x, indices)
+        mx.eval(out)
+        return out, engaged
+
+    out_on, engaged_on = run(True)
+    out_off, engaged_off = run(False)
+
+    # One call per projection (gate/up/down).
+    assert engaged_on == [True, True, True], engaged_on
+    assert engaged_off == [], engaged_off
+
+    assert out_on.dtype == out_off.dtype
+    bits_on = np.ascontiguousarray(out_on).view(np.uint32).reshape(-1)
+    bits_off = np.ascontiguousarray(out_off).view(np.uint32).reshape(-1)
+    assert np.array_equal(bits_on, bits_off)
+    assert bool(mx.all(mx.isfinite(out_on)))
+
+
+def test_ctx_bank_promote_declined_on_partial_demand(monkeypatch, tmp_path):
+    """A bank covering only part of the demand set must not be promoted.
+
+    The missing experts do live in one contiguous bank, but the cache hits
+    would have to be promoted separately and concatenated — a different
+    layout contract that A1b deliberately leaves on the legacy path.
+    """
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    monkeypatch.setattr(ss, "_BANK_PROMOTE_CTX_ENV", True)
+    glu = _quant_glu(tmp_path, n_experts=3)
+
+    # Seed one expert so gate_proj's demand set is a partial miss.
+    proj = glu.gate_proj
+    rows = proj._load_expert_bank_np([0])
+    assert rows is not None
+    glu._cache.put((0, 0, proj.stacked_weight_key), rows[0])
+
+    recorded: dict = {}
+    real_ensure = ss._LayerLoadContext.ensure
+
+    def spy(ctx, linear, expert_ids):
+        real_ensure(ctx, linear, expert_ids)
+        recorded[linear.proj_name] = (
+            ctx.bank_raw.get(id(linear)),
+            ctx.bank_ids.get(id(linear)),
+            ctx.misses.get(id(linear)),
+        )
+
+    monkeypatch.setattr(ss._LayerLoadContext, "ensure", spy)
+
+    x = mx.random.normal((1, 6, 128)).astype(mx.float32)
+    indices = mx.array([2, 0, 1, 2, 0, 1], dtype=mx.int32)
+    out = glu(x, indices)
+    mx.eval(out)
+
+    assert recorded["gate_proj"][2] == 2, recorded["gate_proj"]
+    assert recorded["gate_proj"][0] is None
+    assert recorded["gate_proj"][1] is None
+    assert recorded["up_proj"][0] is not None
+    assert recorded["up_proj"][1] == [0, 1, 2]
+    assert bool(mx.all(mx.isfinite(out)))
+

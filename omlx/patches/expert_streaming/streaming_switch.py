@@ -25,9 +25,64 @@ import mlx.nn as nn
 import numpy as np
 
 logger = logging.getLogger(__name__)
+# Opt-in per-layer / per-projection Metal memory trace (Fase J prefill-memory
+# work). Null-tracer by default: call sites cost one attribute lookup.
+from .memtrace import memtrace  # noqa: E402
+
 
 _PROFILE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
 _COALESCE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_COALESCE", "") != "0"
+# Fase K F6 (port of faseJ f799067e / 0a4d3c7 / 4d7609b / 80bf9b9):
+# bank sizing + single-promotion + rolling layer-context knobs.
+_BANK_MAX_BYTES = max(
+    1,
+    int(os.environ.get("OMLX_EXPERT_STREAMING_BANK_MAX_BYTES", str(256 * 1024**2))),
+)
+_RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
+# Etapa A1: promote an all-miss demand bank with a single mx.array instead of
+# U per-expert mx arrays followed by mx.stack. Bit-identical — gather_qmm
+# receives the same bytes, dtype and shape — but it halves the Metal transient
+# at the promotion point, where the U copies and the bank briefly coexist.
+# 0 restores the per-expert promote + stack path.
+_BANK_PROMOTE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_BANK_PROMOTE", "1") != "0"
+# Etapa A1b: same single-promotion trick, but on the *layer-context* path,
+# which is the one that actually runs when the Etapa B barrier is on (the
+# default). The context reads the demand bank as NumPy on an IO pool worker
+# and hands the raw buffers back; promoting them to MLX must happen here, on
+# the inference thread, so no MLX op is ever bound off-stream. 0 restores the
+# per-expert promote + stack path for A/B.
+_BANK_PROMOTE_CTX_ENV = (
+    os.environ.get("OMLX_EXPERT_STREAMING_BANK_PROMOTE_CTX", "1") != "0"
+)
+_LAYER_BARRIER_ENV = os.environ.get("OMLX_EXPERT_STREAMING_LAYER_BARRIER", "1") != "0"
+# Etapa B: rolling per-projection bank load instead of the union load.
+# 0 restores the legacy behaviour (every projection's NumPy bank resident at
+# once) for A/B against the new pipelined path.
+_CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "0"
+# How many *following* projections to read in the background while the
+# current one is promoted/computed. 0 disables prefetch entirely.
+#
+# Default 3 (faseJ 072e19e2): this is the only knob that widens the I/O queue
+# depth on the rolling path and depth is what the decode regression turned
+# on. read_expert_into issues its preadv calls strictly one at a time (see
+# _RUN_IO_QD in shard_bank for the in-call depth), so with AHEAD=1 the whole
+# layer call had a queue depth of 1: the NVMe sat idle between reads and
+# decode throughput tracked that idleness (CPU 41%, 0.46 GiB/s, 1.86 tok/s).
+# Raising it to 3 keeps the following projections in flight: CPU 50%,
+# 0.56 GiB/s, 2.22 tok/s (+19% decode, -9% TTFT) at no measured memory cost.
+_CTX_PREFETCH_AHEAD = max(
+    0, int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_AHEAD", "3"))
+)
+# Banks larger than this are never held speculatively; they are read on demand.
+_CTX_PREFETCH_MAX_BYTES = max(
+    0,
+    int(
+        os.environ.get(
+            "OMLX_EXPERT_STREAMING_CTX_AHEAD_BYTES", str(512 * 1024**2)
+        )
+    ),
+)
+
 # Prefill attribution diag: sync the GPU at every prefill-sized MoE GLU call
 # and record the drain as a per-layer gpu bucket. Serializes CPU/GPU overlap
 # (wall inflates), so use it for attribution only — never for latency claims.
@@ -547,6 +602,254 @@ def _scatter_unsort(x, inv_order, shape=None):
 # Shared per-layer routing plan (one host sync per MoE layer)
 # ---------------------------------------------------------------------------
 
+class _LayerLoadContext:
+    """Shared quantized demand load for one MoE layer's projections.
+
+    Scope: quantized only (Fase J G4). The context is driven through hooks
+    that exist solely on StreamingQuantizedSwitchLinear — bundle_key,
+    _bank_bytes_for and _load_expert_bank_np(_full) — and it is only
+    constructed when the owning GLU is quantized, so StreamingSwitchLinear
+    (bf16) never participates. That is intentional: the bf16 path resolves
+    one projection at a time inside its own __call__ and therefore has no
+    cross-projection union for the context to collapse.
+
+    Fase K adaptation: cache keys go through linear.bundle_key, so under
+    the HOBBIT split hot and cold copies of one expert never alias, and the
+    bank reads are tier-segmented (read_expert_into components are
+    tier-homogeneous by contract).
+
+    Two modes, selected by OMLX_EXPERT_STREAMING_CTX_ROLLING:
+
+    rolling (default — Etapa B)
+        Each projection resolves its own bank on demand. At most
+        _CTX_PREFETCH_AHEAD following projections are read on pool workers
+        in the background, so the next bank is in flight while the current
+        one is promoted and consumed on the GPU. Peak NumPy residency drops
+        from the *union* of every projection (~3 banks) to ~1-2 banks.
+
+    union (legacy — set the env var to 0)
+        One pool.map across every projection; all banks are resident until
+        the last projection is consumed. Maximum I/O parallelism, highest RSS.
+
+    Both modes preserve the C6 contract: one shared routing plan, and reads
+    performed on IO-pool workers that never allocate MLX arrays.
+    """
+
+    def __init__(self, linears: list[Any], cache: ExpertLRUCache):
+        self.linears = linears
+        self.cache = cache
+        self.bundles: dict[int, dict[int, tuple]] = {}
+        self.hits: dict[int, int] = {}
+        self.misses: dict[int, int] = {}
+        self.failed = False
+        # Etapa A1b: the raw contiguous NumPy banks behind bundles, kept so
+        # the linear can promote a whole demand set with one mx.array per key
+        # instead of U per-expert arrays plus a stack. Populated only when the
+        # read covered the *entire* demand set (all-miss); bank_ids records
+        # exactly which ids the bank holds, so a stale bank can never be
+        # promoted against a demand set it does not describe.
+        self.bank_raw: dict[int, Any] = {}
+        self.bank_ids: dict[int, list[int]] = {}
+        # rolling state
+        self._order: dict[int, int] = {id(lin): i for i, lin in enumerate(linears)}
+        self._futures: dict[int, Any] = {}
+        self._inflight: dict[int, int] = {}
+        self._resolved: set[int] = set()
+        self._expert_ids: list[int] = []
+        # legacy union latch
+        self._loaded = False
+
+    # -- helpers ------------------------------------------------------------
+
+    def _split(self, linear: Any, expert_ids: list[int]) -> tuple[dict, list[int]]:
+        """Partition expert_ids into cached bundles and missing ids."""
+        cached: dict[int, tuple] = {}
+        missing: list[int] = []
+        for eid in expert_ids:
+            key = linear.bundle_key(eid)
+            value = self.cache.get(key)
+            if value is None:
+                missing.append(eid)
+            else:
+                cached[eid] = value
+        return cached, missing
+
+    @staticmethod
+    def _pool_for(linear: Any):
+        return getattr(linear, "_io_pool_override", None) or _EXPERT_IO_POOL
+
+    @property
+    def _inflight_bytes(self) -> int:
+        return sum(self._inflight.values())
+
+    # -- rolling path -------------------------------------------------------
+
+    def _prefetch(self, linear: Any) -> None:
+        """Start background reads for the following projections, bounded.
+
+        Bounded two ways: at most _CTX_PREFETCH_AHEAD submissions per call,
+        and no single bank larger than _CTX_PREFETCH_MAX_BYTES is held
+        speculatively (it is read on demand instead).
+        """
+        if _CTX_PREFETCH_AHEAD <= 0:
+            return
+        start = self._order.get(id(linear), -1)
+        if start < 0:
+            return
+        submitted = 0
+        for nxt in self.linears[start + 1 :]:
+            if submitted >= _CTX_PREFETCH_AHEAD:
+                break
+            nid = id(nxt)
+            if nid in self._resolved or nid in self._futures:
+                continue
+            cached, missing = self._split(nxt, self._expert_ids)
+            self.bundles[nid] = cached
+            self.hits[nid] = len(cached)
+            self.misses[nid] = len(missing)
+            if not missing:
+                # Fully cached: nothing to read, mark resolved so the linear
+                # short-circuits when it asks.
+                self._resolved.add(nid)
+                continue
+            bank_bytes = int(nxt._bank_bytes_for(len(missing)))
+            if bank_bytes > _CTX_PREFETCH_MAX_BYTES:
+                continue
+            # Etapa A1b: ask for the raw contiguous banks as well when
+            # single-promotion is on. The read is identical either way — only
+            # what the worker hands back differs, and it stays NumPy, so no
+            # MLX op is ever created on a pool thread.
+            reader = (
+                nxt._load_expert_bank_np_full
+                if _BANK_PROMOTE_CTX_ENV
+                else nxt._load_expert_bank_np
+            )
+            self._futures[nid] = self._pool_for(nxt).submit(reader, missing)
+            self._inflight[nid] = bank_bytes
+            submitted += 1
+
+    def _ensure_rolling(self, linear: Any, expert_ids: list[int]) -> None:
+        lid = id(linear)
+        if lid in self._resolved:
+            return
+        self._resolved.add(lid)
+        if not self._expert_ids:
+            self._expert_ids = list(expert_ids)
+        ids = self._expert_ids
+
+        # A prefetch may already be in flight; the split is recomputed because
+        # the cache can change between submit and await.
+        fut = self._futures.pop(lid, None)
+        self._inflight.pop(lid, None)
+        cached, missing = self._split(linear, ids)
+        self.bundles[lid] = cached
+        self.hits[lid] = len(cached)
+        self.misses[lid] = len(missing)
+
+        if missing:
+            if fut is not None:
+                try:
+                    got = fut.result()
+                except Exception:
+                    got = None
+            else:
+                got = (
+                    linear._load_expert_bank_np_full(missing)
+                    if _BANK_PROMOTE_CTX_ENV
+                    else (None, linear._load_expert_bank_np(missing))
+                )
+            # A worker dispatched as bare rows (prefetch submitted before this
+            # call, or with the knob off) yields a list; normalise to the
+            # (segments, rows) shape so the consumer has one contract.
+            if got is not None and not isinstance(got, tuple):
+                got = (None, got)
+            rows = None if got is None else got[1]
+            if rows is None or len(rows) != len(missing):
+                self.failed = True
+                if memtrace.enabled:
+                    memtrace.record(
+                        "ctx.ensure.fail",
+                        layer=linear.layer_idx,
+                        proj=getattr(linear, "proj_name", "?"),
+                        uniq=len(ids),
+                        miss=len(missing),
+                    )
+                return
+            self.bundles[lid].update(zip(missing, rows))
+            # Etapa A1b: single-promotion is only valid when the read covered
+            # the *whole* demand set. A partial bank would have to be
+            # concatenated with separately promoted cache hits, which changes
+            # the layout contract, so it is left on the legacy path.
+            if _BANK_PROMOTE_CTX_ENV and got[0] is not None and len(missing) == len(ids):
+                self.bank_raw[lid] = got[0]
+                self.bank_ids[lid] = list(missing)
+
+        self._prefetch(linear)
+        if memtrace.enabled:
+            memtrace.record(
+                "ctx.ensure.exit",
+                layer=linear.layer_idx,
+                proj=getattr(linear, "proj_name", "?"),
+                uniq=len(ids),
+                miss=len(missing),
+                bank_bytes=int(linear._bank_bytes_for(len(missing))),
+                inflight=len(self._futures),
+                inflight_bytes=self._inflight_bytes,
+            )
+
+    # -- legacy union path --------------------------------------------------
+
+    def _ensure_union(self, linear: Any, expert_ids: list[int]) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        layer = self.linears[0].layer_idx if self.linears else -1
+        if memtrace.enabled:
+            memtrace.record(
+                "ctx.ensure.enter",
+                layer=layer,
+                n_proj=len(self.linears),
+                uniq=len(expert_ids),
+            )
+        jobs: list[tuple[Any, list[int]]] = []
+        for proj in self.linears:
+            cached, missing = self._split(proj, expert_ids)
+            self.bundles[id(proj)] = cached
+            self.hits[id(proj)] = len(cached)
+            self.misses[id(proj)] = len(missing)
+            if missing:
+                jobs.append((proj, missing))
+        if not jobs:
+            return
+        pool = self._pool_for(jobs[0][0])
+        results = list(pool.map(lambda job: job[0]._load_expert_bank_np(job[1]), jobs))
+        for (proj, ids), rows in zip(jobs, results):
+            if rows is None or len(rows) != len(ids):
+                self.failed = True
+                return
+            self.bundles[id(proj)].update(zip(ids, rows))
+        if memtrace.enabled:
+            live = sum(proj._bank_bytes_for(len(ids)) for proj, ids in jobs)
+            memtrace.record(
+                "ctx.ensure.exit",
+                layer=layer,
+                n_proj=len(self.linears),
+                uniq=len(expert_ids),
+                n_loaded=len(jobs),
+                miss_per_proj=[len(ids) for _, ids in jobs],
+                bank_bytes=live,
+            )
+
+    # -- public API ---------------------------------------------------------
+
+    def ensure(self, linear: Any, expert_ids: list[int]) -> None:
+        """Resolve linear's demand set for this layer call."""
+        if _CTX_ROLLING_ENV:
+            self._ensure_rolling(linear, expert_ids)
+        else:
+            self._ensure_union(linear, expert_ids)
+
+
 @dataclass
 class _RemapPlan:
     """Routing plan shared by every streaming linear of one MoE layer call.
@@ -563,6 +866,8 @@ class _RemapPlan:
     positions: int = 0
     gate_s: float = 0.0
     unique_s: float = 0.0
+    uniq_mx: Any = None  # MLX unique expert IDs reused by bias gather
+    ctx: Any = None  # Fase K F6: per-layer load context (quantized GLU)
     # Fase K F2: (target_linear_id, run_first, run_count) already advised in
     # this layer call — the 3 projections share one plan, so dedupe here.
     advised_runs: set = field(default_factory=set)
@@ -596,6 +901,7 @@ def _build_plan_into(plan: _RemapPlan, indices) -> None:
     plan.flat_np = flat_np
     plan.uniq_list = uniq_list
     plan.remapped = mx.array(remapped_np.reshape(indices.shape))
+    plan.uniq_mx = mx.array(uniq_np)
     plan.positions = int(flat_np.size)
     plan.gate_s = t1 - t0
     plan.unique_s = t2 - t1
@@ -815,6 +1121,231 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # Metal FTZ and cost ~9x more on 4 MB slices).
             return mx.array(v).view(mx.bfloat16)
         return mx.array(v)  # np.ndarray -> mx.array copy on this thread
+    def _slice_bytes(self, key: str) -> int:
+        """Per-expert byte size of *key* (truthful: read from the backing reader).
+
+        Tier-blind (cold-first); only used for sizing estimates — actual
+        reads resolve per expert.
+        """
+        try:
+            reader = self.backing._reader_for_key(key)
+            return int(reader._rp_for(key).expert_bytes)
+        except Exception:
+            return 0
+
+    def _per_expert_bytes(self) -> int:
+        """Summed per-expert bytes across this projection's stacked tensors."""
+        keys = [self.stacked_weight_key, self.stacked_scales_key]
+        if self.stacked_biases_key:
+            keys.append(self.stacked_biases_key)
+        return sum(self._slice_bytes(k) for k in keys)
+
+    def _bank_bytes_for(self, n_experts: int) -> int:
+        """Bytes of raw NumPy bank needed to hold n_experts of this projection.
+
+        Used by the layer-context memory bookkeeping and by the demand-set
+        bank reader to size reads under the bank cap.
+        """
+        if n_experts <= 0:
+            return 0
+        return n_experts * self._per_expert_bytes()
+
+    def _slice_view(self, key: str, buf: np.ndarray, expert_id: int) -> np.ndarray:
+        """Reshape a raw uint8 expert buffer exactly as expert_slice would.
+
+        Resolves the reader per expert id so a HOBBIT hot expert reinterprets
+        with the SOURCE packing and a cold expert with the tier packing —
+        mirrors _ShardReader.expert_slice so the promoted mx.array is
+        bit-identical to the legacy per-slice path (C2 correctness).
+        """
+        reader = self.backing._reader_for_key(key, int(expert_id))
+        rp = reader._rp_for(key)
+        return np.frombuffer(buf, dtype=rp.np_dtype).reshape(rp.per_shape)
+
+    def _read_expert_banks(self, expert_ids: list[int]):
+        """Read a contiguous demand bank per (key, tier).
+
+        Returns (segments, rows): segments is a list of (tier_ids, banks)
+        with banks[i] a raw (n_tier, per_bytes) uint8 buffer per stacked
+        key (weight, scales, bias); rows are the per-expert typed views in
+        expert_ids order that the LRU caches. None when the backing cannot
+        serve the demand set as banks (dict backing, unsupported layout,
+        oversized demand set, or a tier-mixed component the backing rejects).
+        """
+        if not hasattr(self.backing, "read_expert_into") or not expert_ids:
+            return None
+        keys = [self.stacked_weight_key, self.stacked_scales_key]
+        if self.stacked_biases_key:
+            keys.append(self.stacked_biases_key)
+        try:
+            split = self._is_split_active()
+            if split:
+                groups: list[tuple[int, list[int]]] = []
+                for t in (0, 1):
+                    ids_t = [e for e in expert_ids if self._tier_of(e) == t]
+                    if ids_t:
+                        groups.append((t, ids_t))
+            else:
+                groups = [(0, list(expert_ids))]
+            segments: list[tuple[list[int], list]] = []
+            rows: list[tuple] = []
+            total = 0
+            for _t, ids_t in groups:
+                per_bytes = []
+                for key in keys:
+                    reader = self.backing._reader_for_key(key, ids_t[0])
+                    per_bytes.append(reader._rp_for(key).expert_bytes)
+                if any(size <= 0 for size in per_bytes):
+                    return None
+                total += len(ids_t) * sum(per_bytes)
+                if total > _BANK_MAX_BYTES:
+                    return None
+                banks = [
+                    np.empty((len(ids_t), size), dtype=np.uint8) for size in per_bytes
+                ]
+                components = [(key, ids_t) for key in keys]
+                if not self.backing.read_expert_into(components, banks):
+                    return None
+                segments.append((ids_t, banks))
+                for i, eid in enumerate(ids_t):
+                    w = self._slice_view(keys[0], banks[0][i], eid)
+                    s = self._slice_view(keys[1], banks[1][i], eid)
+                    b = (
+                        self._slice_view(keys[2], banks[2][i], eid)
+                        if self.stacked_biases_key
+                        else None
+                    )
+                    rows.append((w, s, b))
+            if split:
+                # rows arrive tier-grouped; restore expert_ids order so the
+                # caller can zip missing -> rows directly.
+                flat = [e for _t, ids_t in groups for e in ids_t]
+                by_id = {int(e): r for e, r in zip(flat, rows)}
+                rows = [by_id[int(e)] for e in expert_ids]
+            return segments, rows
+        except Exception:
+            return None
+
+    def _load_expert_bank_np(self, expert_ids: list[int]) -> list[tuple] | None:
+        """Read a demand set into one raw NumPy bank per (key, tier).
+
+        The backing performs coalesced contiguous reads into caller-owned
+        banks; rows are then exposed as views for the existing LRU
+        representation. Returning None preserves the legacy per-expert
+        fallback for dict backings and unsupported layouts.
+        """
+        got = self._read_expert_banks(expert_ids)
+        return None if got is None else got[1]
+
+    def _load_expert_bank_np_full(self, expert_ids: list[int]):
+        """Like _load_expert_bank_np, but keeps the raw contiguous banks.
+
+        Needed by the Etapa B layer context: the NumPy read may happen on an
+        IO pool worker, yet promoting those buffers to MLX must happen later
+        on the inference thread (MLX ops may not be bound off-stream). Same
+        failure contract as _load_expert_bank_np — None whenever the backing
+        cannot serve the demand set as banks.
+        """
+        return self._read_expert_banks(expert_ids)
+
+    def _promote_banks(self, segments: list) -> list | None:
+        """Promote raw contiguous per-tier banks into one mx.array per key.
+
+        Shared by Etapa A1 (read + promote together) and Etapa A1b (read on
+        a pool thread, promote here on the inference thread).
+
+        Bit-identical to promoting U per-expert arrays and stacking them:
+        each bank is reinterpreted with exactly the dtype and per-expert
+        shape that _slice_view applies to a single row, so gather_qmm
+        receives the same bytes, dtype and layout. Only the allocation count
+        differs — one mx.array per key instead of U of them plus the stack.
+
+        Returns a list aligned with segments: one (w_bank, s_bank, b_bank)
+        triple per (tier_ids, banks) segment.
+        """
+        try:
+            dt = self._slice_dtypes_lazy()
+            promoted = []
+            keys = [self.stacked_weight_key, self.stacked_scales_key]
+            if self.stacked_biases_key:
+                keys.append(self.stacked_biases_key)
+            for ids_t, banks in segments:
+                n = len(ids_t)
+                one: list = []
+                for i, key in enumerate(keys):
+                    reader = self.backing._reader_for_key(key, ids_t[0])
+                    rp = reader._rp_for(key)
+                    typed = np.frombuffer(banks[i], dtype=rp.np_dtype).reshape(
+                        n, *rp.per_shape
+                    )
+                    arr = mx.array(typed)
+                    # scales/biases can be bf16 stored as raw uint16 bits.
+                    dtype_str = dt[0] if i == 1 else (dt[1] if i == 2 else None)
+                    if dtype_str == "BF16" and arr.dtype == mx.uint16:
+                        arr = arr.view(mx.bfloat16)
+                    one.append(arr)
+                while len(one) < 3:
+                    one.append(None)
+                promoted.append((one[0], one[1], one[2]))
+            return promoted
+        except Exception:
+            return None
+
+    def _load_expert_bank_mx(self, expert_ids: list[int]):
+        """Etapa A1: promote an all-miss demand bank in one shot (per tier).
+
+        Returns (segments_promoted, rows) or None when the demand set cannot
+        be served as banks. segments_promoted is a list of
+        (tier_ids, (w_bank, s_bank, b_bank)); rows are the per-expert raw
+        views the caller still has to seed into the LRU, so the hit-rate
+        path is unaffected.
+
+        Bit-identical to promoting U per-expert arrays and stacking them:
+        each bank is reinterpreted with exactly the dtype and per-expert
+        shape that _slice_view uses per row, so gather_qmm receives the same
+        bytes in the same layout. Only the allocation count differs.
+        """
+        got = self._read_expert_banks(expert_ids)
+        if got is None:
+            return None
+        segments, rows = got
+        promoted = self._promote_banks(segments)
+        if promoted is None:
+            return None
+        return [(ids_t, triple) for (ids_t, _banks), triple in zip(segments, promoted)], rows
+
+    def _group_runs(
+        self, sorted_ids: list[int], max_run: int | None = None
+    ) -> list[tuple[int, int]]:
+        """Split ascending expert ids into bounded contiguous runs.
+
+        Under the HOBBIT split a run must NOT cross a tier boundary: the
+        coalesced pread reads from ONE backing reader (resolved by the first
+        id — source shard vs expert_cold/), so experts past the boundary
+        would come back in the wrong packing. Runs therefore end at the
+        first id whose tier differs from the run's first id. The bound comes
+        from _RUN_MAX (env OMLX_EXPERT_STREAMING_RUN_MAX).
+        """
+        tier_of = self._tier_of if self._is_split_active() else None
+        max_run = _RUN_MAX if max_run is None else max(1, int(max_run))
+        runs: list[tuple[int, int]] = []
+        i = 0
+        n = len(sorted_ids)
+        while i < n:
+            first = sorted_ids[i]
+            first_tier = tier_of(first) if tier_of else 0
+            count = 1
+            while (
+                count < max_run
+                and i + count < n
+                and sorted_ids[i + count] == first + count
+                and (tier_of is None or tier_of(sorted_ids[i + count]) == first_tier)
+            ):
+                count += 1
+            runs.append((first, count))
+            i += count
+        return runs
+
 
     def bundle_key(self, expert_id: int):
         # Tier-suffixed under the HOBBIT split so a hot (source-packing)
@@ -873,33 +1404,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             ]
         except Exception:
             return None
-
-    def _group_runs(self, sorted_ids: list[int], max_run: int = 16) -> list[tuple[int, int]]:
-        """Split ascending expert ids into (first, count) contiguous runs.
-
-        Under the HOBBIT split a run must NOT cross a tier boundary: the
-        coalesced pread reads from ONE backing reader (resolved by the
-        first id — source shard vs expert_cold/), so experts past the
-        boundary would come back in the wrong packing. Runs therefore end
-        at the first id whose tier differs from the run's first id."""
-        tier_of = self._tier_of if self._is_split_active() else None
-        runs: list[tuple[int, int]] = []
-        i = 0
-        n = len(sorted_ids)
-        while i < n:
-            first = sorted_ids[i]
-            first_tier = tier_of(first) if tier_of else 0
-            count = 1
-            while (
-                count < max_run
-                and i + count < n
-                and sorted_ids[i + count] == first + count
-                and (tier_of is None or tier_of(sorted_ids[i + count]) == first_tier)
-            ):
-                count += 1
-            runs.append((first, count))
-            i += count
-        return runs
 
     def _bundle_cached_or_staged(self, expert_id: int):
         """Resolve a bundle without touching the disk (inference thread only).
@@ -1146,11 +1650,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         built = plan.flat_np is None
         if built:
             _build_plan_into(plan, indices)
+        # C4: while the hotness seeder is active a prefill demand set is not
+        # cached — seeding the LRU with prefill-only experts would evict the
+        # decode working set.
+        cache_result = not (
+            getattr(self.cache, "prefill_bypass", False) and plan.positions > 64
+        )
         t2 = time.perf_counter()
-        # Load bundles: cache/staging resolution on this thread, then one
-        # parallel os.pread fetch per missing bundle (QD1 -> QD8). Pool
-        # workers return raw np slices only; promotion to mx.array happens
-        # in the loop below on the inference thread.
         bundles: Dict[int, tuple] = {}
         mini_w, mini_s, mini_b = [], [], []
         has_b = False
@@ -1158,53 +1664,101 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         misses = 0
         missing: list[int] = []
         t_res_start = time.perf_counter()
-        for eid in plan.uniq_list:
-            eid = int(eid)
-            b = self._bundle_cached_or_staged(eid)
-            if b is not None:
-                bundles[eid] = b
-                hits += 1
-            else:
-                misses += 1
-                missing.append(eid)
+        context_bundles = None
+        if plan.ctx is not None:
+            # Fase K F6 (Etapa B): resolve *this* projection through the
+            # layer context; the context prefetches the next one in the
+            # background so banks are not all resident at once.
+            plan.ctx.ensure(self, plan.uniq_list)
+            if not plan.ctx.failed:
+                context_bundles = plan.ctx.bundles.get(id(self))
+                hits = plan.ctx.hits.get(id(self), 0)
+                misses = plan.ctx.misses.get(id(self), 0)
+                if context_bundles is not None and len(context_bundles) == len(plan.uniq_list):
+                    bundles.update(context_bundles)
+                else:
+                    context_bundles = None
+        if context_bundles is None:
+            for eid in plan.uniq_list:
+                eid = int(eid)
+                b = self._bundle_cached_or_staged(eid)
+                if b is not None:
+                    bundles[eid] = b
+                    hits += 1
+                else:
+                    misses += 1
+                    missing.append(eid)
+        banked = None
         if missing:
             # ascending expert id = ascending file offset within the stacked
             # bank (row-major) — sorted reads keep the NVMe's locality
             missing.sort()
-            if hasattr(self.backing, "load_expert_slice"):
+            if (
+                _BANK_PROMOTE_ENV
+                and len(missing) == len(plan.uniq_list)
+                and hasattr(self.backing, "read_expert_into")
+            ):
+                # Etapa A1: every demanded expert is a miss, so the demand set
+                # is one contiguous bank per key (two segments under the
+                # HOBBIT split) — promote each once instead of building U
+                # per-expert mx arrays and stacking them.
+                banked = self._load_expert_bank_mx(missing)
+            if banked is not None:
+                rows = banked[1]
+                dt_per = time.perf_counter() - t_res_start
+                for eid, raw in zip(missing, rows):
+                    bundles[eid] = raw
+                    if cache_result:
+                        self.cache.put(self.bundle_key(eid), raw)  # type: ignore[arg-type]
+                    if p is not None:
+                        p.add_load_source(
+                            self.layer_idx, staged=False, dt=dt_per / len(missing)
+                        )
+            elif hasattr(self.backing, "load_expert_slice"):
                 io_pool = self._io_pool_override or _EXPERT_IO_POOL
-                coalesce_on = (
-                    _COALESCE_ENV
-                    if self._coalesce_override is None
-                    else bool(self._coalesce_override)
-                )
-                raws: list = [None] * len(missing)
-                # Coalesce consecutive ids into single-pread runs (dense in
-                # long-prompt prefill; rare in decode, where runs are size 1
-                # and the path degenerates to the per-expert fetch).
-                # B2/O6: map keeps a sliding window of 16 in flight (singleton
-                # pool), so the device queue stays full; batch drain/sawtooth
-                # is avoided without moving promotion off the inference thread.
-                runs = self._group_runs(missing)
-                if coalesce_on and len(runs) < len(missing):
-                    results_by_run = list(
-                        io_pool.map(lambda r: (r, self._load_expert_run_np(r[0], r[1])), runs)
+                # Fase K F6 (C2 bank-first path): read all missing experts
+                # into one raw bank per (key, tier) on this thread, then
+                # expose rows as views. Avoids one task/result allocation per
+                # expert on dense demand sets and one reader resolution per
+                # expert on every set.
+                raws = self._load_expert_bank_np(missing)
+                if raws is None:
+                    coalesce_on = (
+                        _COALESCE_ENV
+                        if self._coalesce_override is None
+                        else bool(self._coalesce_override)
                     )
-                    idx_of = {eid: i for i, eid in enumerate(missing)}
-                    leftover: list[int] = []
-                    for (first, count), out in results_by_run:
-                        if out is not None:
-                            for j in range(count):
-                                raws[idx_of[first + j]] = out[j]
-                        else:
-                            leftover.extend(range(first, first + count))
-                    if leftover:
-                        for eid, raw in zip(
-                            leftover, io_pool.map(self._load_expert_np, leftover)
-                        ):
-                            raws[idx_of[eid]] = raw
-                else:
-                    raws = list(io_pool.map(self._load_expert_np, missing))
+                    raws = [None] * len(missing)
+                    # Legacy fallback: coalesce consecutive ids into
+                    # single-pread runs (dense in long-prompt prefill; rare in
+                    # decode, where runs are size 1 and the path degenerates
+                    # to the per-expert fetch). map keeps a sliding window of
+                    # 16 in flight (singleton pool), so the device queue stays
+                    # full; batch drain/sawtooth is avoided without moving
+                    # promotion off the inference thread.
+                    runs = self._group_runs(missing)
+                    if coalesce_on and len(runs) < len(missing):
+                        results_by_run = list(
+                            io_pool.map(
+                                lambda r: (r, self._load_expert_run_np(r[0], r[1])),
+                                runs,
+                            )
+                        )
+                        idx_of = {eid: i for i, eid in enumerate(missing)}
+                        leftover: list[int] = []
+                        for (first, count), out in results_by_run:
+                            if out is not None:
+                                for j in range(count):
+                                    raws[idx_of[first + j]] = out[j]
+                            else:
+                                leftover.extend(range(first, first + count))
+                        if leftover:
+                            for eid, raw in zip(
+                                leftover, io_pool.map(self._load_expert_np, leftover)
+                            ):
+                                raws[idx_of[eid]] = raw
+                    else:
+                        raws = list(io_pool.map(self._load_expert_np, missing))
                 dt_per = time.perf_counter() - t_res_start
                 for eid, raw in zip(missing, raws):
                     if raw is None:
@@ -1217,12 +1771,14 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     # Metal active on a 6GiB budget and the guard killed the
                     # second prefill outright (F2 post-mortem).
                     bundles[eid] = raw
-                    # Tier-suffixed key (bundle_key): under the HOBBIT split a
-                    # hot (source-packing) and cold (tier-packing) bundle of
-                    # the same expert must never alias in the LRU — the raw
-                    # pread path staged unsuffixed keys and served a cold-packing
-                    # bundle to a hot slot (mixed widths, mx.stack crash).
-                    self.cache.put(self.bundle_key(eid), raw)  # type: ignore[arg-type]
+                    if cache_result:
+                        # Tier-suffixed key (bundle_key): under the HOBBIT
+                        # split a hot (source-packing) and cold (tier-packing)
+                        # bundle of the same expert must never alias in the
+                        # LRU — the raw pread path staged unsuffixed keys and
+                        # served a cold-packing bundle to a hot slot (mixed
+                        # widths, mx.stack crash).
+                        self.cache.put(self.bundle_key(eid), raw)  # type: ignore[arg-type]
                     if p is not None:
                         p.add_load_source(self.layer_idx, staged=False, dt=dt_per / len(missing))
             else:
@@ -1231,8 +1787,56 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     bundles[eid] = self._load_expert_bundle(eid)
         t_load = time.perf_counter() - t_res_start
 
+        if memtrace.enabled:
+            memtrace.record(
+                "linear.resolve",
+                layer=self.layer_idx,
+                proj=self.proj_name,
+                uniq=len(plan.uniq_list),
+                hits=hits,
+                misses=misses,
+                bank_bytes=self._bank_bytes_for(len(missing)),
+                from_ctx=context_bundles is not None,
+            )
+
         dt = self._slice_dtypes_lazy()
+        ctx_banks = None
+        if banked is None and plan.ctx is not None and _BANK_PROMOTE_CTX_ENV:
+            # Etapa A1b: the layer context read this projection's demand set
+            # as one contiguous NumPy bank per key (possibly on an IO pool
+            # worker). Promote it *here*, on the inference thread, so MLX
+            # ops stay on-stream and the U per-expert mx arrays plus the
+            # stack copy are both skipped. Guarded by bank_ids: only a bank
+            # that describes exactly this demand set may be promoted, so a
+            # stale or partial bank cannot silently mis-pair experts.
+            segs = plan.ctx.bank_raw.get(id(self))
+            if (
+                segs is not None
+                and plan.ctx.bank_ids.get(id(self)) == plan.uniq_list
+            ):
+                promoted = self._promote_banks(segs)
+                if promoted is not None:
+                    ctx_banks = [
+                        (ids_t, triple)
+                        for (ids_t, _banks), triple in zip(segs, promoted)
+                    ]
+
         split = self._is_split_active()
+        # Fase K F6: single-promoted per-tier banks. A segment whose ids
+        # match EXACTLY the tier's demanded ids can feed gather_qmm directly
+        # (no per-expert promote, no mx.stack) — bit-identical by
+        # construction. Anything else falls back per tier.
+        tier_single: dict[int, tuple] = {}
+        if banked is not None:
+            for ids_t, triple in banked[0]:
+                tier = self._tier_of(ids_t[0]) if split else 0
+                tier_single[tier] = triple
+                has_b = has_b or triple[2] is not None
+        elif ctx_banks is not None:
+            for ids_t, triple in ctx_banks:
+                tier = self._tier_of(ids_t[0]) if split else 0
+                tier_single[tier] = triple
+                has_b = has_b or triple[2] is not None
         # Per-tier bundle lists under the HOBBIT split: hot (source packing)
         # and cold (tier packing) widths differ (e.g. 8 vs 6 u32 cols per
         # row at gs 64), so a single stacked mini-bank is impossible — build
@@ -1243,35 +1847,63 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         uniq: list[int] = []
         hot_idx: list[int] = []
         cold_idx: list[int] = []
+        tier_demand: dict[int, list[int]] = {}
         if split:
             uniq = [int(e) for e in plan.uniq_list]
             hot_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 0]
             cold_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 1]
-            hot_rank = {i: r for r, i in enumerate(hot_idx)}
-            cold_rank = {i: r for r, i in enumerate(cold_idx)}
+            tier_demand[0] = [uniq[i] for i in hot_idx]
+            tier_demand[1] = [uniq[i] for i in cold_idx]
             for i, eid in enumerate(uniq):
+                t = 0 if i in set(hot_idx) else 1  # hot_rank lookup
+                if t in tier_single:
+                    continue
                 w, s, b = bundles[eid]
-                if i in hot_rank:
-                    t = 0
-                else:
-                    t = 1
                 tier_w[t].append(self._promote_np(w))
                 tier_s[t].append(self._promote_np(s, dt[0]))
                 if b is not None:
                     has_b = True
                     tier_b[t].append(self._promote_np(b, dt[1]))
         else:
-            for eid in plan.uniq_list:
-                w, s, b = bundles[int(eid)]
-                w = self._promote_np(w)
-                s = self._promote_np(s, dt[0])
-                if b is not None:
-                    has_b = True
-                    b = self._promote_np(b, dt[1])
-                mini_w.append(w)
-                mini_s.append(s)
-                if b is not None:
-                    mini_b.append(b)
+            if 0 not in tier_single:
+                for eid in plan.uniq_list:
+                    w, s, b = bundles[int(eid)]
+                    w = self._promote_np(w)
+                    s = self._promote_np(s, dt[0])
+                    if b is not None:
+                        has_b = True
+                        b = self._promote_np(b, dt[1])
+                    mini_w.append(w)
+                    mini_s.append(s)
+                    if b is not None:
+                        mini_b.append(b)
+
+        if memtrace.enabled:
+            # Sampled *before* the QMM runs: at this instant the U promoted
+            # per-expert mx copies and the freshly stacked bank coexist,
+            # which is the transient double-buffer that single-promotion
+            # removes.
+            memtrace.record(
+                "linear.stack",
+                layer=self.layer_idx,
+                proj=self.proj_name,
+                uniq=len(plan.uniq_list),
+                bank_bytes=self._bank_bytes_for(len(plan.uniq_list)),
+            )
+        remapped = plan.remapped
+
+        def _stack_tier(t: int, idxs: list[int]) -> tuple:
+            """Legacy per-expert stack for one tier (no matching segment)."""
+            ws, ss, bs_ = tier_w[t], tier_s[t], tier_b[t]
+            if len(ws) == 1:
+                w_b = mx.expand_dims(ws[0], 0)
+                s_b = mx.expand_dims(ss[0], 0)
+                b_b = mx.expand_dims(bs_[0], 0) if bs_ else None
+            else:
+                w_b = mx.stack(ws, axis=0)
+                s_b = mx.stack(ss, axis=0)
+                b_b = mx.stack(bs_, axis=0) if bs_ else None
+            return w_b, s_b, b_b
 
         # HOBBIT dual-tier assembly (Fase I6): one mini-bank per tier and a
         # masked add — positions are mutually exclusive (each position
@@ -1280,21 +1912,15 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         if split:
             flat_np = np.asarray(plan.flat_np).reshape(-1)
             out = None
-            for t, idxs, bits_, gs_ in (
-                (0, hot_idx, self.bits, self.group_size),
-                (1, cold_idx, self._cold_bits, self._cold_gs),
-            ):
+            for t, idxs in ((0, hot_idx), (1, cold_idx)):
                 if not idxs:
                     continue
-                ws, ss, bs_ = tier_w[t], tier_s[t], tier_b[t]
-                if len(ws) == 1:
-                    w_b = mx.expand_dims(ws[0], 0)
-                    s_b = mx.expand_dims(ss[0], 0)
-                    b_b = mx.expand_dims(bs_[0], 0) if bs_ else None
+                if t in tier_single:
+                    w_b, s_b, b_b = tier_single[t]
                 else:
-                    w_b = mx.stack(ws, axis=0)
-                    s_b = mx.stack(ss, axis=0)
-                    b_b = mx.stack(bs_, axis=0) if bs_ else None
+                    w_b, s_b, b_b = _stack_tier(t, idxs)
+                bits_ = self.bits if t == 0 else self._cold_bits
+                gs_ = self.group_size if t == 0 else self._cold_gs
                 # expert-id -> rank within THIS tier's bank (flat ids here,
                 # not compact uniq ranks); -1 where the other tier owns it.
                 tier_map = np.full((self.num_experts,), -1, dtype=np.int32)
@@ -1332,17 +1958,17 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             if out is None:
                 # Degenerate: every unique expert hot (hot bank == full uniq
                 # order) — identical to the uniform path.
-                ws, ss, bs_ = tier_w[0], tier_s[0], tier_b[0]
-                w_b = mx.stack(ws, axis=0) if len(ws) > 1 else mx.expand_dims(ws[0], 0)
-                s_b = mx.stack(ss, axis=0) if len(ss) > 1 else mx.expand_dims(ss[0], 0)
-                b_b = (mx.stack(bs_, axis=0) if len(bs_) > 1 else mx.expand_dims(bs_[0], 0)) if (has_b and bs_) else None
+                if 0 in tier_single:
+                    w_b, s_b, b_b = tier_single[0]
+                else:
+                    w_b, s_b, b_b = _stack_tier(0, hot_idx)
                 out = mx.gather_qmm(
                     x, w_b, s_b, b_b, rhs_indices=plan.remapped,
                     transpose=True, group_size=self.group_size, bits=self.bits,
                     mode=self.mode, sorted_indices=sorted_indices,
                 )
             if self._bias is not None and self._has_bias:
-                b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)
+                b_mini = mx.take(self._bias, plan.uniq_mx, axis=0)
                 out = out + mx.expand_dims(b_mini[plan.remapped], -2)
             t4 = time.perf_counter()
             p.record_observed(self.layer_idx, plan.uniq_list)
@@ -1361,14 +1987,17 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             _PREV_UNIQ_BY_LAYER[self.layer_idx] = [int(e) for e in plan.uniq_list]
             return out
 
-        if len(mini_w) == 1:
-            w_bank = mx.expand_dims(mini_w[0], 0)
-            s_bank = mx.expand_dims(mini_s[0], 0)
-            b_bank = mx.expand_dims(mini_b[0], 0) if has_b and mini_b else None
+        if 0 in tier_single:
+            w_bank, s_bank, b_bank = tier_single[0]
         else:
-            w_bank = mx.stack(mini_w, axis=0)
-            s_bank = mx.stack(mini_s, axis=0)
-            b_bank = mx.stack(mini_b, axis=0) if has_b and mini_b else None
+            if len(mini_w) == 1:
+                w_bank = mx.expand_dims(mini_w[0], 0)
+                s_bank = mx.expand_dims(mini_s[0], 0)
+                b_bank = mx.expand_dims(mini_b[0], 0) if has_b and mini_b else None
+            else:
+                w_bank = mx.stack(mini_w, axis=0)
+                s_bank = mx.stack(mini_s, axis=0)
+                b_bank = mx.stack(mini_b, axis=0) if has_b and mini_b else None
         remapped = plan.remapped
         out = mx.gather_qmm(
             x,
@@ -1383,7 +2012,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             sorted_indices=sorted_indices,
         )
         if self._bias is not None and self._has_bias:
-            b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)
+            b_mini = mx.take(self._bias, plan.uniq_mx, axis=0)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
         # O2: remember this layer's routing for next token's speculation
@@ -1401,7 +2030,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             positions=plan.positions,
         )
         return out
-
 
 class StreamingSwitchGLU(nn.Module):
     """Streaming SwitchGLU that delegates to streaming linears."""
@@ -1482,6 +2110,18 @@ class StreamingSwitchGLU(nn.Module):
         # One shared routing plan for the whole layer: the first linear
         # invoked builds it (single mx.eval + unique + remap), the rest reuse.
         plan = _RemapPlan()
+        if self.quantized and _LAYER_BARRIER_ENV:
+            projections = (
+                [self.gate_up_proj, self.down_proj]
+                if has_fused
+                else [self.up_proj, self.gate_proj, self.down_proj]
+            )
+            if all(hasattr(proj, '_load_expert_bank_np') for proj in projections):
+                plan.ctx = _LayerLoadContext(projections, self._cache)
+        if memtrace.enabled:
+            memtrace.record(
+                'glu.enter', layer=self.layer_idx, positions=int(indices.size)
+            )
 
         if has_fused:
             x_gate_up = self.gate_up_proj(x_exp, idx, sorted_indices=do_sort, plan=plan)  # type: ignore[attr-defined]

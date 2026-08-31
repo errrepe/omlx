@@ -77,6 +77,7 @@ from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
     _sync_and_clear_cache,
+    should_clear_cache,
 )
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -2311,6 +2312,26 @@ class Scheduler:
             return False
         return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
 
+    def _clear_cache_if_pool_large(self) -> bool:
+        """Trim the MLX pool, but only once it is big enough to be worth it.
+
+        Fase J Etapa D. Prefill clears the pool at every chunk boundary; on
+        a long streaming prefill that is dozens of unconditional walks of the
+        allocator, and the re-reads they force on the mmap'd expert shards
+        are what Fase G measured as ~8x full-bank re-reads at a 30.4 GiB
+        pool. Gating on pool size keeps the reclaim without the thrash — the
+        threshold (OMLX_EXPERT_STREAMING_CACHE_THRESH, 2 GiB) bounds the
+        steady-state pool.
+
+        The clear itself still goes through _sync_and_clear_cache, so this
+        module keeps one patchable sync-before-clear choke point.
+        Returns True when a clear ran.
+        """
+        if not should_clear_cache():
+            return False
+        _sync_and_clear_cache(self._stream)
+        return True
+
     def _should_release_streaming_pool(self) -> bool:
         """Byte-threshold pool release for expert-streaming models.
 
@@ -2329,7 +2350,9 @@ class Scheduler:
         clear, ``_mx_buffer_access_lock``), so the #978/#1040 panic-class
         gating semantics are preserved.
         """
-        info = self._resolve_streaming_guard_info()
+        info = self._streaming_guard_info
+        if info is None:
+            info = self._resolve_streaming_guard_info()
         pool = mx.get_cache_memory()
         if not info:
             # Diagnostic: the streaming hooks are inert without the backing's
@@ -3547,7 +3570,8 @@ class Scheduler:
             n_to_process = min(prefill_step_size, remaining)
 
             if processed_tokens == 0:
-                _sync_and_clear_cache(self._stream)
+                # Etapa D: gated — see _clear_cache_if_pool_large.
+                self._clear_cache_if_pool_large()
 
             # Boundary-limited step size
             if boundary_enabled and block_size > 0:
@@ -3753,7 +3777,12 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            _sync_and_clear_cache(self._stream)
+            # Etapa D: gated on pool size — a long prefill runs this once per
+            # chunk and an unconditional clear each time is what produced the
+            # 30.4 GiB pool / ~8x full-bank re-read pattern of Fase G. The
+            # end-of-prefill clear below stays unconditional so decode always
+            # starts from a trimmed pool.
+            self._clear_cache_if_pool_large()
             if getattr(request, "benchmark_trace", False):
                 _trace_total_ms = (
                     time.perf_counter() - _trace_chunk_start
@@ -3800,6 +3829,10 @@ class Scheduler:
                     request, prompt_cache, total_tokens
                 )
 
+        # Etapa D: deliberately UNGATED. This is the one clear a prefill is
+        # guaranteed to reach, and it is the handoff point to decode — the
+        # steady-state pool must not carry the whole prefill's working set
+        # into the decode loop. Every other clear in this loop is gated.
         _sync_and_clear_cache(self._stream)
 
         # Restore _rope_deltas after cached VLM prefill (for decode capture)
@@ -3852,6 +3885,20 @@ class Scheduler:
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
 
+    # Fase K F4 (port of faseJ 061d8b9): when measured samples exist, the
+    # static SDPA+KV estimate may only RAISE the per-token prediction up to
+    # this multiple of the measured rate. A static estimate that is wildly
+    # higher (e.g. a generic dense / head-count formula over-predicting a
+    # 4-bit MoE model by ~40x) is treated as untrustworthy and capped, so it
+    # cannot force every chunk to the floor and inflate TTFT (8k Qwen3.8:
+    # predicted ~67 GB vs actual ~11.6 GiB peak, throttled 2048 -> 512, ~7x
+    # slower). A static that is modestly higher than the measured rate
+    # (legitimate kv_len-growth the EWMA lags) still wins, preserving the
+    # MAX-of-signals safety backstop. Env-overridable.
+    _PREFILL_STATIC_MAX_OVER_MEASURED: float = float(
+        os.environ.get("OMLX_PREFILL_STATIC_MAX_OVER_MEASURED", "") or 3.0
+    )
+
     # Streaming expert mini-banks: predicted unique experts touched per layer
     # per chunk, as a fraction of chunk tokens. Measured ~0.145 on qwen4_exp
     # (215 uniq experts/layer at 1488-token chunks — real-text expert selection
@@ -3860,6 +3907,20 @@ class Scheduler:
     # Env-overridable.
     _STREAMING_BANK_TOKEN_RATIO: float = float(
         os.environ.get("OMLX_STREAMING_BANK_TOKEN_RATIO", "") or 0.10
+    )
+    # Fase J Etapa E: when a per-layer eval boundary is live the lazy graph
+    # no longer retains one streaming mini-bank per MoE layer, and charging
+    # all of them makes the guard reject/undersize chunks that would actually
+    # fit (the 26 GB term on qwen4_exp). Off restores the pre-Etapa-E charge.
+    #
+    # DEFAULT OFF — faseJ measured that with E on the generated text differs
+    # from the boundary-off baseline (the admitted chunk sizes change, hence
+    # GEMM shapes/reduction order, hence logits), while the memory win is
+    # identical with E off (phys 37.03 -> 11.09 GiB, pool 30.46 -> 2.37 GiB,
+    # boundary running, conservative charge kept). E is available behind the
+    # env var for whoever wants the TTFT win and accepts the re-base.
+    _STREAMING_BANK_BOUNDARY_ACCOUNT: bool = (
+        os.environ.get("OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT", "0") != "0"
     )
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
@@ -3885,7 +3946,23 @@ class Scheduler:
             int(info["experts_per_layer"]),
             int(self._STREAMING_BANK_TOKEN_RATIO * max(0, n_tokens)),
         )
-        return int(info["num_moe_layers"]) * uniq * int(info["per_expert_bytes"])
+        tile_bytes = uniq * int(info["per_expert_bytes"])
+        # Fase J Etapa E: with a live per-layer eval boundary the decoder
+        # layer's output is evaluated as soon as the layer returns, so layer
+        # N's bank is freed before layer N+1 assembles its own: the live set
+        # collapses from one bank per layer to the bank under construction
+        # plus at most one rolling prefetch (min(2, projections)), plus one
+        # layer's materialized activation. On qwen4_exp that is ~1.1 GB
+        # instead of ~26 GB. The flag is set by the converter only when a
+        # boundary is actually installed, so models that never got one keep
+        # the conservative per-layer charge. Default OFF (re-base trade).
+        if self._STREAMING_BANK_BOUNDARY_ACCOUNT and info.get("boundary_active"):
+            projections = max(1, int(info.get("projections") or 1))
+            activation = int(info.get("activation_bytes_per_token") or 0) * max(
+                0, n_tokens
+            )
+            return min(2, projections) * tile_bytes + activation
+        return int(info["num_moe_layers"]) * tile_bytes
 
     def _resolve_streaming_guard_info(self) -> dict:
         """Find the streaming backing's guard metadata on the model tree.
@@ -3923,45 +4000,90 @@ class Scheduler:
         the per-token cost GROWS with context length. A long-run EWMA average
         lags that growth and underestimates the next chunk — the cause of the
         Metal command-buffer OOM crash at large kv_len. We therefore take the
-        MAX of three signals and apply a safety factor:
+        MAX of the available signals and apply a safety factor:
           - the most recently MEASURED per-token growth (last_delta / last_n)
             — anchored on reality at the current kv_len regime,
           - the long-run EWMA (model-specific constants the static misses),
           - the kv_len-aware static estimate (SDPA transient + this chunk's
-            newly allocated KV).
+            newly allocated KV), used ONLY as a fallback for the first chunk
+            of a freshly loaded model, before any measurement exists.
+
+        Once the tracker has samples the measured signals dominate: a static
+        estimate can be off by an order of magnitude for some model classes
+        (a generic dense formula over-predicts a 4-bit MoE model by ~40x), so
+        letting it win the MAX permanently would throttle every chunk to the
+        floor and inflate TTFT (Fase K F4 — the 8k Qwen3.8 case: predicted
+        ~67 GB vs actual ~11.6 GiB peak, throttled 2048 -> 512).
         Returns 0 only when nothing is known (first chunk, no model info).
         """
         if n_tokens <= 0:
             return 0.0
-        per_token = 0.0
-        static_per_token = 0.0
+        measured_signal = 0.0
+        effective_static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
         if tracker is not None:
             if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                per_token = max(
-                    per_token, tracker.last_delta_bytes / tracker.last_n_tokens
+                measured_signal = max(
+                    measured_signal, tracker.last_delta_bytes / tracker.last_n_tokens
                 )
             if tracker.bytes_per_token > 0:
-                per_token = max(per_token, tracker.bytes_per_token)
+                measured_signal = max(measured_signal, tracker.bytes_per_token)
             recent_reclaim = tracker.recent_reclaim_bytes
+
+        # Static SDPA+KV estimate. Model-specific by construction: a generic
+        # dense / head-count formula can over-predict a quantized MoE model
+        # by an order of magnitude (observed ~34.5 MB/token vs ~0.9 MB/token
+        # measured on Qwen3.8-Flash-Next-oQ4e). Wrapped so a monitor failure
+        # can never break chunk sizing — the measured signal (or the caller's
+        # watermark fallback) still applies.
         static_total = 0.0
-        if self.memory_monitor is not None:
-            static_total = float(
-                self.memory_monitor.estimate_chunk_transient_bytes(
-                    n_tokens, kv_len + n_tokens
+        try:
+            if self.memory_monitor is not None:
+                static_total = float(
+                    self.memory_monitor.estimate_chunk_transient_bytes(
+                        n_tokens, kv_len + n_tokens
+                    )
                 )
-            )
-            static_total += float(
-                self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
-            )
-        bank_bytes = self._streaming_bank_bytes(n_tokens)
+                static_total += float(
+                    self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
+                )
+        except Exception:  # noqa: BLE001
+            static_total = 0.0
+        bank_bytes = 0
+        try:
+            bank_bytes = self._streaming_bank_bytes(n_tokens)
+        except Exception:  # noqa: BLE001
+            bank_bytes = 0
+
+        # Fase K F4 (port of faseJ 061d8b9): reconcile the static estimate
+        # with the measured signal.
+        #  - NO measured samples yet (first chunk of a freshly loaded model):
+        #    the static estimate is the conservative fallback.
+        #  - measured samples exist: the static may only RAISE the per-token
+        #    prediction up to _PREFILL_STATIC_MAX_OVER_MEASURED x the
+        #    measured rate. A static that is modestly higher (legitimate
+        #    kv_len-growth the EWMA lags) still wins the MAX, preserving the
+        #    safety backstop; a static that is wildly higher (a generic dense
+        #    formula over-predicting a 4-bit MoE model by ~40x) is treated as
+        #    untrustworthy and capped, so it cannot permanently dominate the
+        #    MAX and force every chunk to the floor, inflating TTFT.
+        per_token = 0.0
         if bank_bytes > 0 or static_total > 0:
-            static_per_token = (static_total + bank_bytes) / n_tokens
-            per_token = max(per_token, static_per_token)
+            raw_static_per_token = (static_total + bank_bytes) / n_tokens
+            if measured_signal <= 0:
+                effective_static_per_token = raw_static_per_token
+                per_token = max(measured_signal, raw_static_per_token)
+            else:
+                cap = measured_signal * self._PREFILL_STATIC_MAX_OVER_MEASURED
+                effective_static_per_token = min(raw_static_per_token, cap)
+                per_token = max(measured_signal, effective_static_per_token)
+        else:
+            per_token = measured_signal
+
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
-            static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+            effective_static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
             + recent_reclaim
         )
         return max(base_prediction, reallocation_prediction)
@@ -5250,7 +5372,8 @@ class Scheduler:
         n = min(prefill_step_size, remaining)
 
         if state.tokens_processed == 0:
-            _sync_and_clear_cache(self._stream)
+            # Etapa D: gated, same rationale as the external prefill path.
+            self._clear_cache_if_pool_large()
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:
@@ -5673,6 +5796,8 @@ class Scheduler:
             # Prefill complete — emit final boundary snapshot and insert.
             self._prefill_states.pop(rid, None)
             self._emit_final_boundary_if_needed(state)
+            # Etapa D: deliberately UNGATED — same handoff-to-decode role as
+            # the external prefill path's end-of-prefill clear.
             _sync_and_clear_cache(self._stream)
 
             # Ensure a BatchGenerator exists (may not if all requests were
@@ -12183,6 +12308,7 @@ class Scheduler:
                     layer.self_attn.cache = None
 
         # Release model and tokenizer references for GC
+        self._streaming_guard_info = None
         self.model = None
         self.tokenizer = None
 

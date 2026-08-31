@@ -572,6 +572,18 @@ def _convert_switch_mlp_module(
             ],
         )
 
+    # Fase J Etapa E: the per-layer load context's projection list (2 fused
+    # gate_up+down, 3 split) — consumed by the scheduler's guard accounting
+    # (_glu_projection_count).
+    streaming_glu.linears = [  # type: ignore[attr-defined]
+        getattr(streaming_glu, a, None)
+        for a in ("gate_up_proj", "down_proj") if hasattr(streaming_glu, "gate_up_proj")
+    ] or [
+        getattr(streaming_glu, a, None)
+        for a in ("up_proj", "gate_proj", "down_proj")
+        if getattr(streaming_glu, a, None) is not None
+    ]
+
     # Replace
     moe.switch_mlp = streaming_glu  # type: ignore[attr-defined]
     # Disable decoder FFN compilation (GLM-5.3 Glm5NextDecoderLayer
@@ -591,6 +603,28 @@ def _convert_switch_mlp_module(
         except Exception:
             pass
     return True
+
+
+def _glu_projection_count(layers: Any) -> int:
+    """Projections sharing one per-layer load context on a converted model.
+
+    A converted StreamingSwitchGLU holds linears: 2 when the checkpoint
+    fuses gate_up_proj (plus down_proj), 3 when gate/up are split. The
+    scheduler's prefill guard charges min(2, projections) banks when a
+    per-layer eval boundary is live, so any value >= 2 collapses to the
+    same 2; only a 1 (no shared context) changes the charge. Defaults to 3
+    (the conservative split case) when no converted GLU is reachable.
+    """
+    try:
+        for layer in layers or ():
+            linears = getattr(getattr(layer, "switch_mlp", None), "linears", None)
+            # An empty/unsized linears is not a converted GLU — keep
+            # looking rather than reporting 0 projections.
+            if linears and len(linears) > 0:
+                return len(linears)
+    except Exception:  # noqa: BLE001
+        pass
+    return 3
 
 
 def convert_model_to_streaming(
@@ -737,10 +771,23 @@ def convert_model_to_streaming(
             # and admits chunks whose real peak reaches ~26 GB on qwen4_exp
             # (48 layers x ~215 uniq experts x ~2.5 MB) and squeezes the
             # machine (docs F-series F1).
+            # Fase J Etapa E: boundary_active starts False — the per-layer
+            # bank charge is the safe default, and it is only relaxed once a
+            # per-layer eval boundary has actually been installed on a
+            # decoder class (set below, after conversion). projections is
+            # the number of projections sharing one per-layer load context
+            # (2 fused gate_up+down, or 3 split); the guard charges
+            # min(2, projections) banks. bf16/fp16 activation: one
+            # materialized layer output per token. 0 when the config hid
+            # hidden_size — conservative.
+            _hidden_size = int(getattr(estimate, "hidden_size", 0) or 0)
             backing.streaming_guard_info = {
                 "num_moe_layers": estimate.num_moe_layers,
                 "experts_per_layer": estimate.experts_per_layer,
                 "per_expert_bytes": estimate.per_expert_bytes,
+                "boundary_active": False,
+                "projections": 3,
+                "activation_bytes_per_token": 2 * _hidden_size,
             }
             backing_kind = "mmap"
         except Exception as e:
@@ -908,6 +955,32 @@ def convert_model_to_streaming(
                 "Expert streaming: qwen per-layer eval boundary %s",
                 "on" if eval_on else "off",
             )
+        # Etapa E: tell the scheduler's prefill guard whether a boundary is
+        # really live. Only then may it stop charging one mini-bank per MoE
+        # layer; the flag stays False when the knob is off or no decoder
+        # class was wrapped, so glm5_next (which honors _stream_eval inline
+        # and is not wrapped here) keeps the conservative charge.
+        from .qwen35_stream_eval import boundary_active as _qse_boundary_active
+        from .qwen35_stream_eval import wrapped_class_names as _qse_wrapped
+
+        _guard_info = getattr(backing, "streaming_guard_info", None)
+        if isinstance(_guard_info, dict):
+            _guard_info["boundary_active"] = bool(
+                eval_on and _qse_boundary_active()
+            )
+            _guard_info["projections"] = _glu_projection_count(layers)
+            if _guard_info["boundary_active"]:
+                logger.info(
+                    "Expert streaming: prefill guard boundary accounting on "
+                    "(projections=%d, activation=%d B/token)",
+                    _guard_info["projections"],
+                    _guard_info.get("activation_bytes_per_token", 0),
+                )
+            elif _qse_wrapped():
+                logger.info(
+                    "Expert streaming: boundary installed but eval off/class "
+                    "mismatch — per-layer bank charge kept (conservative)"
+                )
         # PILOT: async router-lookahead prefetch into the LRU (glm5_next's
         # Glm5NextModel loop scores the next MoE layer's router against the
         # current layer output). mmap backing only; off when the RAM dict
