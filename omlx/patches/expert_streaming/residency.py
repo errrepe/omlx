@@ -28,6 +28,11 @@ class ExpertStreamingEstimate:
     per_expert_bytes: int
     per_layer_expert_bytes: int
     reason: str | None = None
+    # Fase J Etapa E: text hidden size, used to charge one materialized layer
+    # activation to the prefill guard when a per-layer eval boundary is live.
+    # 0 when the config does not expose it (the guard then charges the bank
+    # term only — still conservative).
+    hidden_size: int = 0
 
     def force_streaming(self, memory_ceiling: int) -> bool:
         """True when streaming turns an impossible load into a viable one."""
@@ -389,6 +394,21 @@ def _cached_estimate(
         elif expert_bytes <= 0:
             reason = "expert byte size 0"
 
+    # Hidden size: prefer text_config (VLMs put the vision tower's width at
+    # the top level and the language model's under text_config).
+    hidden_size = 0
+    for src in (
+        config.get("text_config") if isinstance(config.get("text_config"), dict) else {},
+        config,
+    ):
+        raw_hidden = src.get("hidden_size")
+        if raw_hidden:
+            try:
+                hidden_size = int(raw_hidden)
+            except (TypeError, ValueError):
+                hidden_size = 0
+            break
+
     dense_bytes = max(0, checkpoint_bytes - expert_bytes)
     resident_bytes = int(checkpoint_bytes * _MODEL_OVERHEAD_FACTOR)
     # streaming default = page-cache only: dense bytes are committed; expert
@@ -409,6 +429,7 @@ def _cached_estimate(
         per_expert_bytes=per_expert,
         per_layer_expert_bytes=per_layer_expert,
         reason=reason,
+        hidden_size=hidden_size,
     )
 
 

@@ -37,6 +37,12 @@ _BANK_MAX_BYTES = max(
     int(os.environ.get("OMLX_EXPERT_STREAMING_BANK_MAX_BYTES", str(256 * 1024**2))),
 )
 _RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
+# Etapa A1: promote an all-miss demand bank with a single mx.array instead of
+# U per-expert mx arrays followed by mx.stack. Bit-identical — gather_qmm
+# receives the same bytes, dtype and shape — but it halves the Metal transient
+# at the promotion point, where the U copies and the bank briefly coexist.
+# 0 restores the per-expert promote + stack path.
+_BANK_PROMOTE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_BANK_PROMOTE", "1") != "0"
 _LAYER_BARRIER_ENV = os.environ.get("OMLX_EXPERT_STREAMING_LAYER_BARRIER", "1") != "0"
 # Etapa B: rolling per-projection bank load instead of the union load.
 # 0 restores the legacy behaviour (every projection's NumPy bank resident at
@@ -1036,13 +1042,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         except Exception:
             return None
 
-    def _load_expert_bank_np(self, expert_ids: list[int]) -> list[tuple] | None:
-        """Read a demand set into one raw NumPy bank per projection.
+    def _read_expert_banks(self, expert_ids: list[int]):
+        """Read a contiguous demand bank per projection.
 
-        The backing performs coalesced contiguous reads into caller-owned banks;
-        rows are then exposed as views for the existing LRU representation.
-        Returning ``None`` preserves the legacy per-expert fallback for dict
-        backings and unsupported/cold layouts.
+        Returns ``(keys, banks, rows)``: *banks* are raw ``(U, per_bytes)``
+        uint8 buffers and *rows* are the per-expert typed views that the LRU
+        caches. ``None`` when the backing cannot serve the demand set as banks
+        (dict backing, unsupported layout, oversized demand set).
         """
         if not hasattr(self.backing, "read_expert_into") or not expert_ids:
             return None
@@ -1072,7 +1078,59 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     else None
                 )
                 rows.append((w, s, b))
-            return rows
+            return keys, banks, rows
+        except Exception:
+            return None
+
+    def _load_expert_bank_np(self, expert_ids: list[int]) -> list[tuple] | None:
+        """Read a demand set into one raw NumPy bank per projection.
+
+        The backing performs coalesced contiguous reads into caller-owned banks;
+        rows are then exposed as views for the existing LRU representation.
+        Returning ``None`` preserves the legacy per-expert fallback for dict
+        backings and unsupported/cold layouts.
+        """
+        got = self._read_expert_banks(expert_ids)
+        return None if got is None else got[2]
+
+    def _load_expert_bank_mx(self, expert_ids: list[int]):
+        """Etapa A1: promote an all-miss demand bank in one shot.
+
+        Returns ``(w_bank, s_bank, b_bank, rows)`` or ``None`` when the demand
+        set cannot be served as a single bank. *rows* are the per-expert raw
+        views the caller still has to seed into the LRU, so the hit-rate path
+        is unaffected.
+
+        This is **bit-identical** to promoting U per-expert arrays and stacking
+        them: the bank is reinterpreted with exactly the dtype and per-expert
+        shape that ``_slice_view`` uses per row, so ``gather_qmm`` receives the
+        same bytes in the same layout. Only the allocation count differs — one
+        mx.array instead of U of them plus the stack copy.
+        """
+        got = self._read_expert_banks(expert_ids)
+        if got is None:
+            return None
+        keys, banks, rows = got
+        n = len(expert_ids)
+        try:
+            dt = self._slice_dtypes_lazy()
+            promoted = []
+            for i, key in enumerate(keys):
+                rp = self.backing._reader_for_key(key)._rp_for(key)
+                # Same reinterpretation _slice_view applies to one row, applied
+                # to the whole contiguous bank at once.
+                typed = np.frombuffer(banks[i], dtype=rp.np_dtype).reshape(
+                    n, *rp.per_shape
+                )
+                arr = mx.array(typed)
+                # scales/biases can be bf16 stored as raw uint16 bits.
+                dtype_str = dt[0] if i == 1 else (dt[1] if i == 2 else None)
+                if dtype_str == "BF16" and arr.dtype == mx.uint16:
+                    arr = arr.view(mx.bfloat16)
+                promoted.append(arr)
+            while len(promoted) < 3:
+                promoted.append(None)
+            return (promoted[0], promoted[1], promoted[2], rows)
         except Exception:
             return None
 
@@ -1277,11 +1335,34 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 else:
                     misses += 1
                     missing.append(eid)
+        banked = None
         if missing:
             # ascending expert id = ascending file offset within the stacked
             # bank (row-major) — sorted reads keep the NVMe's locality
             missing.sort()
-            if hasattr(self.backing, "load_expert_slice"):
+            if (
+                _BANK_PROMOTE_ENV
+                and len(missing) == len(plan.uniq_list)
+                and hasattr(self.backing, "read_expert_into")
+            ):
+                # Etapa A1: every demanded expert is a miss, so the demand set
+                # is one contiguous bank — promote it once instead of building
+                # U per-expert mx arrays and stacking them.
+                banked = self._load_expert_bank_mx(missing)
+            if banked is not None:
+                rows = banked[3]
+                dt_per = time.perf_counter() - t_res_start
+                for eid, raw in zip(missing, rows):
+                    bundles[eid] = raw
+                    if cache_result:
+                        self.cache.put(
+                            (self.layer_idx, eid, self.stacked_weight_key), raw
+                        )  # type: ignore[arg-type]
+                    if p is not None:
+                        p.add_load_source(
+                            self.layer_idx, staged=False, dt=dt_per / len(missing)
+                        )
+            elif hasattr(self.backing, "load_expert_slice"):
                 io_pool = self._io_pool_override or _EXPERT_IO_POOL
                 # C2 bank-first path: read all missing experts into one raw
                 # bank per projection, then expose rows as views. This avoids
@@ -1355,25 +1436,32 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             )
 
         dt = self._slice_dtypes_lazy()
-        for eid in plan.uniq_list:
-            w, s, b = bundles[int(eid)]
-            w = self._promote_np(w)
-            s = self._promote_np(s, dt[0])
-            if b is not None:
-                has_b = True
-                b = self._promote_np(b, dt[1])
-            mini_w.append(w)
-            mini_s.append(s)
-            if b is not None:
-                mini_b.append(b)
-        if len(mini_w) == 1:
-            w_bank = mx.expand_dims(mini_w[0], 0)
-            s_bank = mx.expand_dims(mini_s[0], 0)
-            b_bank = mx.expand_dims(mini_b[0], 0) if has_b and mini_b else None
+        if banked is not None:
+            # Etapa A1: the bank is already promoted, so the U per-expert mx
+            # copies and the stack (which briefly doubled the Metal footprint)
+            # are both skipped.
+            w_bank, s_bank, b_bank = banked[0], banked[1], banked[2]
+            has_b = b_bank is not None
         else:
-            w_bank = mx.stack(mini_w, axis=0)
-            s_bank = mx.stack(mini_s, axis=0)
-            b_bank = mx.stack(mini_b, axis=0) if has_b and mini_b else None
+            for eid in plan.uniq_list:
+                w, s, b = bundles[int(eid)]
+                w = self._promote_np(w)
+                s = self._promote_np(s, dt[0])
+                if b is not None:
+                    has_b = True
+                    b = self._promote_np(b, dt[1])
+                mini_w.append(w)
+                mini_s.append(s)
+                if b is not None:
+                    mini_b.append(b)
+            if len(mini_w) == 1:
+                w_bank = mx.expand_dims(mini_w[0], 0)
+                s_bank = mx.expand_dims(mini_s[0], 0)
+                b_bank = mx.expand_dims(mini_b[0], 0) if has_b and mini_b else None
+            else:
+                w_bank = mx.stack(mini_w, axis=0)
+                s_bank = mx.stack(mini_s, axis=0)
+                b_bank = mx.stack(mini_b, axis=0) if has_b and mini_b else None
         if memtrace.enabled:
             # Sampled *before* the QMM runs: at this instant the U promoted
             # per-expert mx copies and the freshly stacked bank coexist, which

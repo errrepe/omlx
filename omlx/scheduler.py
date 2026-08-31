@@ -77,6 +77,7 @@ from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
     _sync_and_clear_cache,
+    should_clear_cache,
 )
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -2303,6 +2304,26 @@ class Scheduler:
             return False
         return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
 
+    def _clear_cache_if_pool_large(self) -> bool:
+        """Trim the MLX pool, but only once it is big enough to be worth it.
+
+        Fase J Etapa D. Prefill clears the pool at every chunk boundary; on
+        a long streaming prefill that is dozens of unconditional walks of the
+        allocator, and the re-reads they force on the mmap'd expert shards
+        are what Fase G measured as ~8x full-bank re-reads at a 30.4 GiB
+        pool. Gating on pool size keeps the reclaim without the thrash — the
+        threshold (``OMLX_EXPERT_STREAMING_CACHE_THRESH``, 2 GiB) bounds the
+        steady-state pool.
+
+        The clear itself still goes through ``_sync_and_clear_cache``, so
+        this module keeps one patchable sync-before-clear choke point.
+        Returns True when a clear ran.
+        """
+        if not should_clear_cache():
+            return False
+        _sync_and_clear_cache(self._stream)
+        return True
+
     def _should_release_streaming_pool(self) -> bool:
         """Byte-threshold pool release for expert-streaming models.
 
@@ -3541,7 +3562,8 @@ class Scheduler:
             n_to_process = min(prefill_step_size, remaining)
 
             if processed_tokens == 0:
-                _sync_and_clear_cache(self._stream)
+                # Etapa D: gated — see _clear_cache_if_pool_large.
+                self._clear_cache_if_pool_large()
 
             # Boundary-limited step size
             if boundary_enabled and block_size > 0:
@@ -3747,7 +3769,12 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            _sync_and_clear_cache(self._stream)
+            # Etapa D: gated on pool size — a long prefill runs this once per
+            # chunk and an unconditional clear each time is what produced the
+            # 30.4 GiB pool / ~8x full-bank re-read pattern of Fase G. The
+            # end-of-prefill clear below stays unconditional so decode always
+            # starts from a trimmed pool.
+            self._clear_cache_if_pool_large()
             if getattr(request, "benchmark_trace", False):
                 _trace_total_ms = (
                     time.perf_counter() - _trace_chunk_start
@@ -3794,6 +3821,10 @@ class Scheduler:
                     request, prompt_cache, total_tokens
                 )
 
+        # Etapa D: deliberately UNGATED. This is the one clear a prefill is
+        # guaranteed to reach, and it is the handoff point to decode — the
+        # steady-state pool must not carry the whole prefill's working set
+        # into the decode loop. Every other clear in this loop is gated.
         _sync_and_clear_cache(self._stream)
 
         # Restore _rope_deltas after cached VLM prefill (for decode capture)
@@ -3855,6 +3886,13 @@ class Scheduler:
     _STREAMING_BANK_TOKEN_RATIO: float = float(
         os.environ.get("OMLX_STREAMING_BANK_TOKEN_RATIO", "") or 0.2
     )
+    # Fase J Etapa E: when a per-layer eval boundary is live the lazy graph no
+    # longer retains one streaming mini-bank per MoE layer, and charging all
+    # of them makes the guard reject/undersize chunks that would actually fit
+    # (the 26 GB term on qwen4_exp). Off restores the pre-Etapa-E charge.
+    _STREAMING_BANK_BOUNDARY_ACCOUNT: bool = (
+        os.environ.get("OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT", "1") != "0"
+    )
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
@@ -3863,12 +3901,32 @@ class Scheduler:
     def _streaming_bank_bytes(self, n_tokens: int) -> int:
         """Predicted live expert mini-bank bytes for one streaming chunk.
 
-        The chunk forward is lazy: every MoE layer's assembled mini-bank stays
-        referenced by the graph until the chunk-end eval, so the peak carries
-        roughly one bank per layer simultaneously. The static transient model
-        (SDPA + KV) cannot see this term — without it the guard admits 400+
-        token chunks whose real peak reaches ~26 GB on qwen4_exp (48 layers x
-        ~215 uniq experts x ~2.5 MB) and starves the machine (F1 finding).
+        Two charge models, selected by ``boundary_active``:
+
+        No boundary. The chunk forward is lazy: every MoE layer's assembled
+        mini-bank stays referenced by the graph until the chunk-end eval, so
+        the peak carries roughly one bank per layer simultaneously. The static
+        transient model (SDPA + KV) cannot see this term — without it the
+        guard admits 400+ token chunks whose real peak reaches ~26 GB on
+        qwen4_exp (48 layers x ~215 uniq experts x ~2.5 MB) and starves the
+        machine (F1 finding).
+
+        Boundary active (Fase J Etapa C/E). The decoder layer's output is
+        evaluated as soon as the layer returns, so layer N's bank is freed
+        before layer N+1 assembles its own: the live set collapses from one
+        bank per layer to the bank under construction plus at most one
+        rolling prefetch (``min(2, projections)``), plus one layer's
+        materialized activation. On qwen4_exp that is ~1.1 GB instead of
+        ~26 GB — the difference between a guard that refuses to admit chunks
+        and one that sizes them correctly. The measured (EWMA /
+        ``last_delta``) path in ``_predicted_chunk_transient`` is untouched:
+        this only replaces the static term, and the transient tracker still
+        takes the max, so a real regression re-widens the prediction.
+
+        The flag is set by the streaming converter only when a boundary is
+        actually installed, so models that never got one (e.g. glm5_next,
+        which honors ``_stream_eval`` inline and is not wrapped here) keep
+        the conservative per-layer charge.
         """
         info = self._streaming_guard_info
         if info is None:
@@ -3879,7 +3937,14 @@ class Scheduler:
             int(info["experts_per_layer"]),
             int(self._STREAMING_BANK_TOKEN_RATIO * max(0, n_tokens)),
         )
-        return int(info["num_moe_layers"]) * uniq * int(info["per_expert_bytes"])
+        tile_bytes = uniq * int(info["per_expert_bytes"])
+        if self._STREAMING_BANK_BOUNDARY_ACCOUNT and info.get("boundary_active"):
+            projections = max(1, int(info.get("projections") or 1))
+            activation = int(info.get("activation_bytes_per_token") or 0) * max(
+                0, n_tokens
+            )
+            return min(2, projections) * tile_bytes + activation
+        return int(info["num_moe_layers"]) * tile_bytes
 
     def _resolve_streaming_guard_info(self) -> dict:
         """Find the streaming backing's guard metadata on the model tree.
@@ -5239,7 +5304,8 @@ class Scheduler:
         n = min(prefill_step_size, remaining)
 
         if state.tokens_processed == 0:
-            _sync_and_clear_cache(self._stream)
+            # Etapa D: gated, same rationale as the external prefill path.
+            self._clear_cache_if_pool_large()
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:
@@ -5662,6 +5728,8 @@ class Scheduler:
             # Prefill complete — emit final boundary snapshot and insert.
             self._prefill_states.pop(rid, None)
             self._emit_final_boundary_if_needed(state)
+            # Etapa D: deliberately UNGATED — same handoff-to-decode role as
+            # the external prefill path's end-of-prefill clear.
             _sync_and_clear_cache(self._stream)
 
             # Ensure a BatchGenerator exists (may not if all requests were

@@ -48,6 +48,20 @@ _APPLIED_FLAG = "_omlx_stream_eval_wrapped"
 
 
 def _cache_threshold_bytes() -> int:
+    """Pool size (bytes) above which the per-layer clear is worth running.
+
+    Delegates to ``omlx.utils.metal_sync.cache_clear_threshold_bytes`` so
+    the knob has one home: the scheduler's chunk-boundary clears (Etapa D)
+    gate on the same number as this per-layer clear. Imported lazily — the
+    model path must keep working when that module is unavailable, and the
+    local parse below is the fallback.
+    """
+    try:
+        from omlx.utils.metal_sync import cache_clear_threshold_bytes
+
+        return cache_clear_threshold_bytes()
+    except Exception:  # noqa: BLE001
+        pass
     raw = os.environ.get("OMLX_EXPERT_STREAMING_CACHE_THRESH")
     if raw:
         try:
@@ -182,3 +196,17 @@ def wrapped_class_names() -> list[str]:
         for _, cls in _candidate_decoder_classes()
         if getattr(cls, _APPLIED_FLAG, False)
     ]
+
+
+def boundary_active() -> bool:
+    """True when the per-layer boundary is really engaged on this process.
+
+    Feeds the scheduler's ``streaming_guard_info["boundary_active"]``
+    (Fase J Etapa E). It is only safe to stop charging one streaming
+    mini-bank per MoE layer to the prefill guard when a boundary actually
+    runs: the flag must be on AND at least one decoder class must be
+    carrying the wrapper. Models that honor ``_stream_eval`` inline
+    (``Glm5NextDecoderLayer``) wrap nothing here and therefore stay on the
+    conservative per-layer charge.
+    """
+    return bool(_per_layer_eval_enabled and wrapped_class_names())

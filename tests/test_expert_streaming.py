@@ -2579,3 +2579,484 @@ def test_qwen4_exp_decoder_is_a_boundary_candidate():
         # Independent hierarchies: wrapping both cannot double-eval.
         assert q4 is not q35
         assert not issubclass(q4, q35)
+
+
+# ---------------------------------------------------------------------------
+# Fase J — Etapa D (threshold-gated pool clears) and Etapa E (guard accounting)
+# ---------------------------------------------------------------------------
+
+
+def test_cache_clear_threshold_bytes_default_and_env(monkeypatch):
+    """OMLX_EXPERT_STREAMING_CACHE_THRESH is in GiB; 2 GiB when unset, and an
+    unparseable value must fall back rather than crash a running prefill."""
+    from omlx.utils import metal_sync as ms
+
+    monkeypatch.delenv(ms._CACHE_CLEAR_THRESH_ENV, raising=False)
+    assert ms.cache_clear_threshold_bytes() == 2 * 1024**3
+
+    monkeypatch.setenv(ms._CACHE_CLEAR_THRESH_ENV, "0.5")
+    assert ms.cache_clear_threshold_bytes() == int(0.5 * 1024**3)
+
+    # 0 disables the gate: every clear runs.
+    monkeypatch.setenv(ms._CACHE_CLEAR_THRESH_ENV, "0")
+    assert ms.cache_clear_threshold_bytes() == 0
+
+    monkeypatch.setenv(ms._CACHE_CLEAR_THRESH_ENV, "not-a-number")
+    assert ms.cache_clear_threshold_bytes() == 2 * 1024**3
+
+
+def test_should_clear_cache_gates_on_pool_size(monkeypatch):
+    """Below threshold the pool stays pooled; above it, the clear is
+    justified. The helper returns only the decision — the caller keeps its
+    own sync-before-clear call site."""
+    import mlx.core as mx
+
+    from omlx.utils import metal_sync as ms
+
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 128 * 1024**2)
+    assert ms.should_clear_cache() is False
+
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 8 * 1024**3)
+    assert ms.should_clear_cache() is True
+
+    # threshold=0 -> always justified, even with an empty pool.
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    assert ms.should_clear_cache(threshold_bytes=0) is True
+
+    # Boundary: exactly at the threshold counts as worth clearing.
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 2 * 1024**3)
+    assert ms.should_clear_cache() is True
+
+
+def test_should_clear_cache_without_cache_probe(monkeypatch):
+    """get_cache_memory unavailable -> always clear. The pool cannot be
+    measured, so the conservative (pre-Fase-J) branch must win."""
+    import types
+
+    from omlx.utils import metal_sync as ms
+
+    # A stub mx with no get_cache_memory at all.
+    monkeypatch.setattr(
+        ms,
+        "mx",
+        types.SimpleNamespace(synchronize=lambda *a: None, clear_cache=lambda: None),
+    )
+    assert ms.should_clear_cache() is True
+
+
+def test_scheduler_clear_cache_if_pool_large_keeps_sync_choke_point(monkeypatch):
+    """Etapa D must not bypass the module's single patchable
+    ``_sync_and_clear_cache`` — the prefill tests instrument it."""
+    import mlx.core as mx
+
+    from omlx import scheduler as sched_mod
+    from omlx.scheduler import Scheduler
+
+    calls = []
+    sched = Scheduler.__new__(Scheduler)
+    sched._stream = "ENGINE"
+    monkeypatch.setattr(
+        sched_mod, "_sync_and_clear_cache", lambda stream=None: calls.append(stream)
+    )
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 128 * 1024**2)
+    assert sched._clear_cache_if_pool_large() is False
+    assert calls == []
+
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 8 * 1024**3)
+    assert sched._clear_cache_if_pool_large() is True
+    assert calls == ["ENGINE"]
+
+
+def test_stream_eval_threshold_delegates_to_shared_resolver(monkeypatch):
+    """Etapa D: the knob has ONE home. The per-layer gate and the scheduler's
+    chunk-boundary clears must not be able to drift apart."""
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+    from omlx.utils import metal_sync as ms
+
+    monkeypatch.setenv(ms._CACHE_CLEAR_THRESH_ENV, "3")
+    assert qse._cache_threshold_bytes() == 3 * 1024**3
+    assert qse._cache_threshold_bytes() == ms.cache_clear_threshold_bytes()
+
+
+def test_prefill_clears_are_gated_with_ungated_handoff():
+    """Etapa D: chunk-boundary clears are gated on pool size, but each prefill
+    path keeps a single unconditional clear at the handoff to decode so the
+    pool never carries the prefill working set into the decode loop.
+
+    Source-level via AST (driving either loop needs a fully wired scheduler).
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from omlx.scheduler import Scheduler
+
+    def clear_calls(fn):
+        out = []
+        src = textwrap.dedent(inspect.getsource(fn))
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+            if name in ("_sync_and_clear_cache", "_clear_cache_if_pool_large"):
+                out.append((node.lineno, name))
+        return sorted(out)
+
+    ext = clear_calls(Scheduler._do_external_prefill)
+    # First-chunk + between-chunk clears are both gated.
+    assert [n for _, n in ext].count("_clear_cache_if_pool_large") >= 2
+    # ...and the LAST clear the external path issues is unconditional.
+    assert ext[-1][1] == "_sync_and_clear_cache"
+
+    # Chunked path: gate inside the chunk step...
+    chunk = [n for _, n in clear_calls(Scheduler._step_prefill_chunk)]
+    assert chunk.count("_clear_cache_if_pool_large") >= 1
+    # ...unconditional completion clear where the request is handed to decode.
+    adv = [n for _, n in clear_calls(Scheduler._advance_chunked_prefills)]
+    assert "_sync_and_clear_cache" in adv
+
+
+def _boundary_backing(**over):
+    """Guard info as the converter emits it, with Etapa E's keys."""
+    info = {
+        "num_moe_layers": 48,
+        "experts_per_layer": 512,
+        "per_expert_bytes": 2_500_000,
+        "boundary_active": False,
+        "projections": 3,
+        "activation_bytes_per_token": 0,
+    }
+    info.update(over)
+    back = MagicMock()
+    back.streaming_guard_info = info
+    return back
+
+
+def _sched_with(**over):
+    model = MagicMock()
+    model._expert_streaming_backing = _boundary_backing(**over)
+    return _guard_scheduler(model)
+
+
+def test_streaming_bank_bytes_boundary_collapses_per_layer_charge():
+    """Etapa E: with a live per-layer eval boundary the lazy graph no longer
+    retains one mini-bank per MoE layer, so the charge drops from 48 banks to
+    min(2, projections) — the difference between a guard that refuses to
+    admit chunks and one that sizes them correctly."""
+    n = 10_000  # saturates uniq at experts_per_layer
+    tile = 512 * 2_500_000
+
+    off = _sched_with(boundary_active=False)
+    assert off._streaming_bank_bytes(n) == 48 * tile
+
+    on = _sched_with(boundary_active=True)
+    assert on._streaming_bank_bytes(n) == 2 * tile
+    assert on._streaming_bank_bytes(n) < off._streaming_bank_bytes(n) // 20
+
+
+@pytest.mark.parametrize(
+    "projections,mult", [(1, 1), (2, 2), (3, 2), (4, 2), (0, 1)]
+)
+def test_streaming_bank_bytes_projections_clamped_at_two(
+    projections, mult, monkeypatch
+):
+    """min(2, projections): the bank under construction plus at most one
+    rolling prefetch. A bogus 0/absent count must floor at one bank, never
+    shrink the charge to zero."""
+    sched = _sched_with(boundary_active=True, projections=projections)
+    tile = 512 * 2_500_000
+    assert sched._streaming_bank_bytes(10_000) == mult * tile
+
+
+def test_streaming_bank_bytes_adds_one_layer_activation():
+    """The boundary materializes the layer output, so one activation is live
+    on top of the bank term."""
+    sched = _sched_with(boundary_active=True, activation_bytes_per_token=4096 * 2)
+    n = 100
+    uniq = min(512, int(sched._STREAMING_BANK_TOKEN_RATIO * n))
+    tile = uniq * 2_500_000
+    assert sched._streaming_bank_bytes(n) == 2 * tile + 4096 * 2 * n
+
+
+def test_streaming_bank_bytes_boundary_kill_switch(monkeypatch):
+    """OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT=0 restores the per-layer charge
+    without a code change — the ops escape hatch if the boundary regresses."""
+    sched = _sched_with(boundary_active=True)
+    tile = 512 * 2_500_000
+    assert sched._streaming_bank_bytes(10_000) == 2 * tile
+    monkeypatch.setattr(sched, "_STREAMING_BANK_BOUNDARY_ACCOUNT", False)
+    assert sched._streaming_bank_bytes(10_000) == 48 * tile
+
+
+def test_glu_projection_count():
+    """Projections sharing one per-layer load context: 2 when the checkpoint
+    fuses gate_up_proj, 3 when gate/up are split."""
+    from omlx.patches.expert_streaming import _glu_projection_count
+
+    fused = MagicMock()
+    fused.switch_mlp.linears = [MagicMock(), MagicMock()]
+    split = MagicMock()
+    split.switch_mlp.linears = [MagicMock()] * 3
+
+    assert _glu_projection_count([fused]) == 2
+    assert _glu_projection_count([split]) == 3
+    # No converted GLU reachable -> conservative split default.
+    assert _glu_projection_count([MagicMock()]) == 3
+    assert _glu_projection_count(None) == 3
+
+    class Boom:
+        @property
+        def switch_mlp(self):
+            raise RuntimeError("boom")
+
+    assert _glu_projection_count([Boom()]) == 3
+
+
+def test_boundary_active_requires_enabled_and_wrapped(monkeypatch):
+    """The guard may only relax the bank charge when a boundary is really
+    installed: knob on AND at least one decoder class carrying the wrapper."""
+    from omlx.patches.expert_streaming import qwen35_stream_eval as qse
+
+    monkeypatch.setattr(qse, "_per_layer_eval_enabled", True)
+    monkeypatch.setattr(qse, "wrapped_class_names", lambda: [])
+    assert qse.boundary_active() is False
+
+    monkeypatch.setattr(
+        qse, "wrapped_class_names", lambda: ["Qwen4ExpDecoderLayer"]
+    )
+    assert qse.boundary_active() is True
+
+    monkeypatch.setattr(qse, "_per_layer_eval_enabled", False)
+    assert qse.boundary_active() is False
+
+
+def test_residency_estimate_exposes_hidden_size():
+    """Etapa E sources the activation term (hidden_size x 2 bytes/token) from
+    the checkpoint config."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_glm_checkpoint(tmp, num_layers=4, experts=8, hidden=32)
+        assert expert_streaming_estimate(tmp).hidden_size == 32
+
+
+def test_residency_hidden_size_prefers_text_config():
+    """VLMs expose the vision tower's width at the top level and the language
+    model's under text_config — the activation term must use the latter."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_glm_checkpoint(tmp, num_layers=4, experts=8, hidden=32)
+        cfg = json.loads((tmp / "config.json").read_text())
+        cfg["hidden_size"] = 999
+        cfg["text_config"] = {"hidden_size": 4096}
+        (tmp / "config.json").write_text(json.dumps(cfg))
+        assert expert_streaming_estimate(tmp).hidden_size == 4096
+
+
+# ---------------------------------------------------------------------------
+# Fase J — Etapa A1: single-promotion bank build (bit-exact)
+# ---------------------------------------------------------------------------
+
+
+def _write_shard_filled(path: Path, tensors: dict, seed: int = 1234) -> None:
+    """Minimal safetensors file with deterministic non-zero payloads.
+
+    ``_write_shard`` writes all-zero data, which would make any bit-exactness
+    comparison vacuous — every byte pattern would match trivially.
+
+    BF16 tensors get values from a small positive range rather than random
+    bit patterns: random bf16 words decode to exponents around 1e30, the
+    dequantized products overflow to inf/NaN, and then ``array_equal`` fails
+    on NaN != NaN for outputs whose bit patterns are in fact identical.
+    """
+    import mlx.core as mx
+
+    _DTY_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "U32": 4, "U8": 1}
+    rng = np.random.default_rng(seed)
+    header: dict = {}
+    offset = 0
+    blobs = []
+    for key, (shape, dtype) in tensors.items():
+        nbytes = int(np.prod(shape)) * _DTY_BYTES[dtype]
+        header[key] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        if dtype == "BF16":
+            vals = rng.uniform(0.5, 2.0, size=int(np.prod(shape))).astype(np.float32)
+            words = np.asarray(
+                mx.array(vals).astype(mx.bfloat16).view(mx.uint16), dtype="<u2"
+            )
+            blobs.append(words.tobytes())
+        else:
+            # Packed weights: random bytes, no zero lanes.
+            blobs.append(
+                rng.integers(1, 256, size=nbytes, dtype=np.uint8).tobytes()
+            )
+        offset += nbytes
+    hb = json.dumps(header).encode()
+    with path.open("wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+        for blob in blobs:
+            f.write(blob)
+
+
+def _quant_linear(tmp: Path, n_experts: int = 4):
+    """A StreamingQuantizedSwitchLinear backed by a real shard store."""
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+    )
+
+    w_key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+    s_key = "model.layers.0.mlp.switch_mlp.gate_proj.scales"
+    b_key = "model.layers.0.mlp.switch_mlp.gate_proj.biases"
+    # 4-bit packed in uint32 (8 values/word): 128 in / 16 out, group_size 64.
+    # MLX requires scales and biases to share a shape, so biases are per-group
+    # too, matching what a real affine-quantized checkpoint stores.
+    _write_shard_filled(
+        tmp / "model.safetensors",
+        {
+            w_key: ((n_experts, 16, 16), "U32"),
+            s_key: ((n_experts, 16, 2), "BF16"),
+            b_key: ((n_experts, 16, 2), "BF16"),
+        },
+    )
+    (tmp / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {k: "model.safetensors" for k in (w_key, s_key, b_key)}}
+        )
+    )
+    backing = ExpertBackingStore(tmp)
+    cache = ExpertLRUCache(64 * 1024, 1024, num_layers=1)
+    linear = StreamingQuantizedSwitchLinear(
+        layer_idx=0,
+        proj_name="gate_proj",
+        stacked_weight_key=w_key,
+        stacked_scales_key=s_key,
+        stacked_biases_key=b_key,
+        num_experts=n_experts,
+        input_dims=128,
+        output_dims=16,
+        backing=backing,
+        cache=cache,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        has_bias=False,
+    )
+    return linear
+
+
+def test_bank_promote_is_bit_identical_to_per_expert_stack(tmp_path):
+    """Etapa A1: promoting the whole demand bank in one mx.array must yield
+    byte-for-byte the same tensors as promoting U per-expert slices and
+    stacking them — so gather_qmm sees an identical bank."""
+    import mlx.core as mx
+
+    linear = _quant_linear(tmp_path, n_experts=5)
+
+    ids = [4, 1, 3]  # deliberately out of order: row order must be preserved
+    got = linear._load_expert_bank_mx(ids)
+    assert got is not None
+    w_fast, s_fast, b_fast, rows = got
+
+    dt = linear._slice_dtypes_lazy()
+    mini_w, mini_s, mini_b = [], [], []
+    for w, s, b in rows:
+        mini_w.append(linear._promote_np(w))
+        mini_s.append(linear._promote_np(s, dt[0]))
+        mini_b.append(linear._promote_np(b, dt[1]))
+
+    assert w_fast.dtype == mx.stack(mini_w, axis=0).dtype
+    assert mx.array_equal(w_fast, mx.stack(mini_w, axis=0))
+    assert s_fast.dtype == mx.stack(mini_s, axis=0).dtype
+    assert mx.array_equal(s_fast, mx.stack(mini_s, axis=0))
+    assert mx.array_equal(b_fast, mx.stack(mini_b, axis=0))
+
+    # Row k of the bank is expert ids[k], not file order.
+    assert mx.array_equal(w_fast[0], mini_w[0])
+    assert mx.array_equal(w_fast[2], mini_w[2])
+    assert not mx.array_equal(w_fast[0], mini_w[1])
+
+
+def test_quantized_call_identical_with_and_without_bank_promote(monkeypatch, tmp_path):
+    """Etapa A1 end-to-end: the layer output must be bit-identical whether the
+    single-promotion fast path is enabled or not. This is the gate that makes
+    A1 lossless rather than near-lossless."""
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    x = mx.random.normal((6, 128)).astype(mx.float32)
+    indices = mx.array([2, 0, 1, 2, 0, 1], dtype=mx.int32)
+
+    def run(enabled):
+        # A fresh linear per arm: reusing one would leave the LRU populated,
+        # turning the second arm into a hit-only run and making the comparison
+        # vacuous (neither arm would exercise a miss).
+        linear = _quant_linear(tmp_path, n_experts=3)
+        engaged: list[bool] = []
+        real = linear._load_expert_bank_mx
+
+        def spy(ids):
+            out = real(ids)
+            engaged.append(out is not None)
+            return out
+
+        monkeypatch.setattr(ss, "_BANK_PROMOTE_ENV", enabled)
+        monkeypatch.setattr(linear, "_load_expert_bank_mx", spy)
+        out = linear(x, indices)
+        mx.eval(out)
+        return out, engaged
+
+    out_on, engaged_on = run(True)
+    out_off, engaged_off = run(False)
+
+    # Prove the fast path really ran in one arm and not the other — otherwise
+    # identical outputs would prove nothing.
+    assert engaged_on == [True], engaged_on
+    assert engaged_off == [], engaged_off
+
+    assert out_on.dtype == out_off.dtype
+
+    # Compare bit patterns, not ==: a NaN payload would fail array_equal even
+    # when the two arms produced byte-identical results.
+    bits_on = np.ascontiguousarray(out_on).view(np.uint32).reshape(-1)
+    bits_off = np.ascontiguousarray(out_off).view(np.uint32).reshape(-1)
+    assert np.array_equal(bits_on, bits_off)
+    # Guard against a vacuous pass: garbage inputs would make every bit 0/NaN.
+    assert bool(mx.all(mx.isfinite(out_on)))
+
+
+def test_bank_promote_returns_none_without_bank_backing(tmp_path):
+    """A dict backing cannot serve contiguous banks, so A1 must decline and
+    let the legacy per-expert path run."""
+    import mlx.core as mx
+
+    linear = _quant_linear(tmp_path, n_experts=3)
+    linear.backing = {(0, "gate_proj", "weight"): mx.zeros((3, 16, 16))}
+    assert linear._load_expert_bank_mx([0, 1]) is None
+
+
+def test_read_expert_banks_matches_legacy_bank_np(tmp_path):
+    """The _read_expert_banks refactor must not change what
+    _load_expert_bank_np returns to its callers."""
+    linear = _quant_linear(tmp_path, n_experts=5)
+    ids = [4, 1, 3]
+
+    rows = linear._load_expert_bank_np(ids)
+    got = linear._read_expert_banks(ids)
+    assert rows is not None and got is not None
+    keys, banks, rows2 = got
+
+    assert keys[0] == linear.stacked_weight_key
+    assert len(rows) == len(rows2) == len(ids)
+    assert banks[0].shape == (len(ids), linear._slice_bytes(keys[0]))
+    for (w1, s1, b1), (w2, s2, b2) in zip(rows, rows2):
+        assert np.array_equal(w1, w2)
+        assert np.array_equal(s1, s2)
+        assert np.array_equal(b1, b2)

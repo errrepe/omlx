@@ -836,6 +836,11 @@ def test_record_chunk_transient_keeps_partial_context_sample():
 
 
 def test_step_prefill_reclaims_before_first_guard():
+    """The first-chunk reclaim must land before the adaptive/ guard steps.
+
+    Etapa D gates that reclaim on pool size, so the pool is driven above the
+    threshold here to exercise the firing branch.
+    """
     events = []
     request = SimpleNamespace(request_id="req-prefill")
     state = _PrefillState(
@@ -880,6 +885,7 @@ def test_step_prefill_reclaims_before_first_guard():
         "_others_decoding",
         "_should_clear_after_chunk",
         "_should_release_streaming_pool",
+        "_clear_cache_if_pool_large",
         "_accrue_decode_debt",
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
@@ -894,6 +900,8 @@ def test_step_prefill_reclaims_before_first_guard():
         patch.object(sched_mod.mx, "stream"),
         patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
         patch.object(sched_mod, "get_phys_footprint", side_effect=[100, 300]),
+        # Etapa D: a big pool is what makes the gated first-chunk clear fire.
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=8 * 1024**3),
     ):
         done = ns._step_prefill_chunk(state)
 
@@ -959,6 +967,7 @@ def _streaming_chunk_ns(events):
         "_should_release_streaming_pool",
         "_periodic_clear_threshold_bytes",
         "_note_streaming_release",
+        "_clear_cache_if_pool_large",
         "_accrue_decode_debt",
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
@@ -994,7 +1003,8 @@ def test_step_prefill_releases_streaming_pool_when_gate_skips():
 
 
 def test_step_prefill_keeps_pool_below_threshold_without_release():
-    """Below the byte threshold the streaming release must not add a clear."""
+    """Below the byte threshold nothing clears: Etapa D also gates the
+    first-chunk reclaim, not just the streaming tail release."""
     events = []
     ns, state = _streaming_chunk_ns(events)
 
@@ -1012,8 +1022,9 @@ def test_step_prefill_keeps_pool_below_threshold_without_release():
         done = ns._step_prefill_chunk(state)
 
     assert done is False
-    # Only the first-chunk sync; the small pool stays pooled.
-    assert events.count("sync") == 1
+    # Small pool: neither the gated first-chunk reclaim nor the streaming
+    # tail release fires, so the pool is left alone entirely.
+    assert events.count("sync") == 0
 
 
 # --------------------------------------------------------------------------
