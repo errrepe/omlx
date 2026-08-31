@@ -488,8 +488,24 @@ estático (1 pausa de eviction + 1 chunk de 512, seguro), mas após a 1ª mediç
 (`~0.9 MB/token`) os chunks seguintes rodam em `2048` (previsto 2048-chunk ≈
 2–7 GiB ≪ alvo 23.94 GB). O prefill 8k passa de ~16 chunks de 512 para ~5
 chunks → TTFT deve cair de ~254 s para a faixa de ~80–120 s (o residual vem da
-amplificação de leitura all-miss do §13.1, não do throttle). **A confirmar com
-re-run do bench 8k** (`bench/results/faseJ/real_faseJ_8k.json` re-executado).
+amplificação de leitura all-miss do §13.1, não do throttle).
+
+**CONFIRMADO por re-run (bench/results/faseJ/real_faseJ_8k_postthrottle.json,
+mesmas condições do §13.1):**
+
+| metric | pré-fix | pós-fix | delta |
+|---|---|---|---|
+| `ttft_s` | 253.84 | **119.61** | **−53% (2.12× mais rápido)** |
+| `metal_peak_prefill_gib` | 6.95 | 8.40 | single-digit, critério #3 ok |
+| `phys_lifetime_max_gib` | 11.64 | 12.14 | plano, ≪ teto 28 GiB |
+
+O log pós-fix mostra o throttle ainda disparando uma vez no 1º chunk
+(`2048 -> 512`, `per_token=34539.1KB` — fallback estático conservador, seguro),
+mas após a 1ª medição (`~0.9 MB/token`) os chunks seguintes rodam em 2048
+(sinal medido domina). O `metal_peak` subiu de 6.95→8.40 GiB (chunks maiores
+carregam mais tokens por eval) — ainda single-digit e dentro do alvo. O ganho
+de latência vem de eliminar os ~15 chunks de piso; o residual de ~120 s é a
+amplificação de leitura all-miss (§13.1), não o throttle.
 
 **Arquivos:** `omlx/scheduler.py` (`_predicted_chunk_transient`,
 `_PREFILL_STATIC_MAX_OVER_MEASURED`), `tests/test_scheduler_chunked_prefill.py`
