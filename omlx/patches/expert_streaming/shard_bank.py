@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+import bisect
 import ctypes
 import fcntl
 import json
@@ -797,6 +798,8 @@ class ExpertBackingStore:
         self,
         components: list[tuple[str, list[int]]],
         outs: list[np.ndarray],
+        *,
+        merge_gap: int = 0,
     ) -> bool:
         """Coalesced zero-copy read of several (key, expert-ids) components.
 
@@ -851,22 +854,28 @@ class ExpertBackingStore:
             if any(eid < 0 or eid >= rp.num_experts for eid in eids):
                 return False
             # Read contiguous runs separately. This keeps sparse demand from
-            # over-reading the gap between the first and last expert.
+            # over-reading the gap between the first and last expert. Fase K
+            # K5: with merge_gap > 0 a run may BRIDGE holes of up to
+            # merge_gap missing ids — the hole rows are read with the run
+            # but the scatter below writes ONLY the demanded ids, so gap
+            # bytes can never enter the output (or the LRU). Same shared
+            # segmentation as the demand planner and the stash.
             order = sorted(range(n), key=lambda j: eids[j])
-            # Plan every run up front. A descriptor is just an offset, a count
-            # and the slice of order it fills — cheap, and planning first is
-            # what lets the reads below go out as a batch instead of one
-            # blocking syscall at a time.
-            runs: list[tuple[int, int, list[int]]] = []  # (abs_off, count, order slice)
-            start = 0
-            while start < n:
-                first = eids[order[start]]
-                end = start + 1
-                while end < n and eids[order[end]] == eids[order[end - 1]] + 1:
-                    end += 1
+            sorted_ids = [eids[j] for j in order]
+            segments = segment_runs(sorted_ids, merge_gap=merge_gap)
+            # Map each run back to its order slice: every demanded id inside
+            # [first, first+count) belongs to this run in id order. The
+            # scatter base for a demanded id is (eid - first) rows into the
+            # buffer — bridge rows shift the demanded ids away from the
+            # leading positions, so the base can never be the index of the
+            # order slice.
+            runs: list[tuple[int, int, int, list[int]]] = []
+            # (abs_off, first_id, count, order slice)
+            for first, count in segments:
+                lo = bisect.bisect_left(sorted_ids, first)
+                hi = bisect.bisect_left(sorted_ids, first + count)
                 off = rp.tensor_abs_off + first * rp.expert_bytes
-                runs.append((off, end - start, order[start:end]))
-                start = end
+                runs.append((off, first, count, order[lo:hi]))
 
             # Issue each batch's preadvs concurrently. One at a time they are
             # a chain of blocking syscalls, which pins the device's I/O queue
@@ -886,7 +895,7 @@ class ExpertBackingStore:
                 batch = runs[bstart : bstart + _RUN_IO_QD]
                 bufs = [
                     np.empty(count * rp.expert_bytes, dtype=np.uint8)
-                    for _off, count, _js in batch
+                    for _off, _first, count, _js in batch
                 ]
                 if len(batch) == 1:
                     try:
@@ -897,7 +906,7 @@ class ExpertBackingStore:
                     io_exec = _run_io_pool()
                     futs = [
                         io_exec.submit(reader._read_into, off, buf)
-                        for (off, _count, _js), buf in zip(batch, bufs)
+                        for (off, _first, _count, _js), buf in zip(batch, bufs)
                     ]
                     # Drain every future even after a failure, so no exception
                     # is left unretrieved and no read keeps writing into a
@@ -912,10 +921,12 @@ class ExpertBackingStore:
                         return False
                 # Scatter only once the whole batch has landed, and in
                 # descriptor order, so the bytes in out never depend on the
-                # order the reads happened to complete in.
-                for (_off, _count, js), buf in zip(batch, bufs):
-                    for pos, j in enumerate(js):
-                        base = pos * rp.expert_bytes
+                # order the reads happened to complete in. The row base for
+                # a demanded id is (eid - first) — never the slice index,
+                # which is what would corrupt every id behind a bridge.
+                for (off, first, _count, js), buf in zip(batch, bufs):
+                    for j in js:
+                        base = (eids[j] - first) * rp.expert_bytes
                         out[j, :] = buf[base : base + rp.expert_bytes]
         return True
 

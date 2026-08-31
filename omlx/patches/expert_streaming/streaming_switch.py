@@ -1340,6 +1340,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             keys.append(self.stacked_biases_key)
         try:
             split = self._is_split_active()
+            # Fase K K5: bridge holes in the C2 read path ONLY while the
+            # split is active (the re-gate from the mergeab A/B: unbridged
+            # 31.4s vs bridged 34.0s at 2k single-tier). Gap rows are read
+            # with the run; the scatter never promotes them.
+            merge_gap = _RUN_MERGE_GAP if split else 0
             if split:
                 groups: list[tuple[int, list[int]]] = []
                 for t in (0, 1):
@@ -1365,7 +1370,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     np.empty((len(ids_t), size), dtype=np.uint8) for size in per_bytes
                 ]
                 components = [(key, ids_t) for key in keys]
-                if not self.backing.read_expert_into(components, banks):
+                if not self.backing.read_expert_into(
+                    components, banks, merge_gap=merge_gap
+                ):
                     return None
                 segments.append((ids_t, banks))
                 for i, eid in enumerate(ids_t):

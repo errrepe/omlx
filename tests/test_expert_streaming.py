@@ -2749,6 +2749,63 @@ def test_backing_read_expert_into_matches_load_expert_slice():
         assert backing.read_expert_into([(key, [])], [empty])
 
 
+
+
+def test_read_expert_into_bridges_gap_but_scatters_only_demand():
+    """Fase K K5: with merge_gap=2 a hole is read as ONE run, yet out
+    receives ONLY the demanded rows — byte-identical to the unbridged
+    path, and gap bytes can never leak into the output."""
+    import numpy as np
+
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        per = 4 * 4 * 2  # BF16 (4,4) -> 32 B/expert
+        _write_shard_filled(tmp / "model.safetensors", {key: ((16, 4, 4), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        eids = [3, 4, 7, 8]  # hole ids 5,6
+        reads: list[int] = []
+        reader = backing._reader_for_key(key)
+        orig = reader._read_into
+
+        def spy(off, buf):
+            reads.append(len(buf))
+            return orig(off, buf)
+
+        reader._read_into = spy
+        out = np.empty((4, per), dtype=np.uint8)
+        assert backing.read_expert_into([(key, eids)], [out], merge_gap=2)
+        # ONE preadv covering rows 3..8 inclusive: 6 experts x per bytes.
+        assert reads == [6 * per], f"expected one 6-row read, got {reads}"
+        for slot, eid in enumerate(eids):
+            assert np.array_equal(
+                out[slot], backing.load_expert_slice(key, eid).view(np.uint8).reshape(-1)
+            ), f"demanded row {eid} corrupted"
+        # Unbridged run gives the SAME output bytes (gap rows never appear).
+        reads.clear()
+        out2 = np.empty((4, per), dtype=np.uint8)
+        assert backing.read_expert_into([(key, eids)], [out2])
+        assert len(reads) == 2, "unbridged: 2 separate reads"
+        assert np.array_equal(out, out2), "bridge must not change the output"
+
+
+def test_read_expert_banks_no_bridge_without_split():
+    """Fase K K5 + re-gate: the C2 bank reader bridges ONLY while the
+    HOBBIT split is active — without a split, merge_gap stays 0 and the
+    rows returned are exactly the demanded ids (no hole rows)."""
+    with tempfile.TemporaryDirectory() as td:
+        lin = _quant_linear(Path(td), n_experts=16)
+        got = lin._read_expert_banks([3, 4, 7, 8])
+        assert got is not None
+        segments, rows = got
+        assert len(rows) == 4, f"exactly the demanded rows: {len(rows)}"
+        assert segments[0][0] == [3, 4, 7, 8], segments[0][0]
+
 def test_memtrace_disabled_by_default_is_noop():
     """With the env var unset the singleton is a null tracer: recording is
     a no-op and enabled is False, so the hot path stays free."""
