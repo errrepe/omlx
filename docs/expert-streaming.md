@@ -869,10 +869,20 @@ Evidence in bench/results/fasek/ (artifacts qwen_*_arm*.json):
   single-promotion, read_expert_into RUN_QD=16), legacy (bank reads and
   promotion off), and extreme scheduling (AHEAD=1 + RUN_QD=1). The Fase 2
   timing changes are Safe on Qwen3.8-Flash-Next-oQ4e-mtp.
-- Decode throughput varies within ~±25% across reps on this box (other
-  users active); AHEAD=1 + RUN_QD=1 is consistently slowest (1.57-1.63
-  tok/s at 512) — the I/O-depth finding reproduces: depth 1 pins the
-  device queue.
+- Re-measure (2026-08-31, 3 reps/arm, 2k prompt, 48 decode tokens, load
+  2.2-3.6, artifacts in bench/results/fasek/rem/): 9/9 runs byte-identical
+  (262 chars). Decode tok/s mean ± sigma: legacy 3.157 ± 0.4%, pipeline
+  2.575 ± 7.3% (2.32-2.78), AHEAD=1+RUN_QD=1 1.919 ± 1.2%. The earlier
+  ±25% band was noise — the maximum rep spread is now ±7.3%; the
+  earlier single-run 3.17 for the pipeline arm sat at the top of that
+  band (the 3-rep mean is 2.575). TTFT is arm-equal: legacy 34.6 s,
+  pipeline 34.6 s, extreme 35.8 s.
+- On this box at 2k with a warm page cache (budget 0), the legacy arm is
+  ~22% faster in decode than the pipeline (15.2 s vs 18.8 s per 48
+  tokens). The rolling AHEAD=3 prefetch and run-merge add CPU work that
+  cache-hot reads do not repay at 2k scale. AHEAD=1+RUN_QD=1 stays
+  slowest (25.0 s, 1.90-1.95 tok/s) — the I/O-depth finding reproduces:
+  depth 1 pins the device queue.
 - Live logs confirm the F5 boundary installed on Qwen4ExpDecoderLayer and
   the guard's boundary accounting (projections=3, activation=5120 B/token);
   advise stats exported (F1/F2/F3 telemetry: advised=16-22k per run,
