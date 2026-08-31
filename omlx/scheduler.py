@@ -3890,8 +3890,22 @@ class Scheduler:
     # longer retains one streaming mini-bank per MoE layer, and charging all
     # of them makes the guard reject/undersize chunks that would actually fit
     # (the 26 GB term on qwen4_exp). Off restores the pre-Etapa-E charge.
+    #
+    # DEFAULT OFF, and that is a correctness call, not caution. Etapa E does
+    # not just change an accounting number — it changes the chunk size the
+    # guard admits, and chunk size changes the GEMM shapes, hence the
+    # reduction order, hence the logits. Measured on qwen4_exp (2k prompt,
+    # 48 decode, greedy): with E on the generated text differs from baseline
+    # at token 3 of 48, deterministically, in 6/6 runs. With E off the output
+    # hash matches baseline in 2/2 runs AND the memory win is fully retained
+    # (phys_footprint 37.03 -> 11.09 GiB, allocator pool 30.46 -> 2.37 GiB).
+    #
+    # So E is a pure trade: it buys the 62% TTFT win and pays for it with
+    # bit-exactness. It stays available behind the env var for whoever wants
+    # the latency and accepts a different greedy decode — see
+    # bench/results/faseJ/real_2k/SUMMARY.md for the full table.
     _STREAMING_BANK_BOUNDARY_ACCOUNT: bool = (
-        os.environ.get("OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT", "1") != "0"
+        os.environ.get("OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT", "0") != "0"
     )
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0

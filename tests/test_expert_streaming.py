@@ -2733,21 +2733,48 @@ def _boundary_backing(**over):
     return back
 
 
-def _sched_with(**over):
+def _sched_with(etapa_e=True, **over):
+    """Scheduler over a synthetic streaming backing.
+
+    ``etapa_e`` opts into Etapa E explicitly. It is off by default in the
+    product (it changes chunk size, hence the numerics), so these tests must
+    ask for it rather than inherit it.
+    """
     model = MagicMock()
     model._expert_streaming_backing = _boundary_backing(**over)
-    return _guard_scheduler(model)
+    sched = _guard_scheduler(model)
+    sched._STREAMING_BANK_BOUNDARY_ACCOUNT = etapa_e
+    return sched
+
+
+def test_streaming_bank_bytes_defaults_to_per_layer_charge():
+    """Etapa E must ship OFF.
+
+    The collapsed charge is not an accounting detail: it changes the chunk
+    size the guard admits, and chunk size changes the GEMM shapes and hence
+    the reduction order. Measured on qwen4_exp with Etapa E on, the greedy
+    decode diverges from baseline at token 3 of 48 (deterministic, 6/6 runs).
+    The memory win does not depend on it — with E off, phys_footprint still
+    drops 37.03 -> 11.09 GiB. So correctness wins and E becomes opt-in.
+    """
+    from omlx.scheduler import Scheduler
+
+    assert Scheduler._STREAMING_BANK_BOUNDARY_ACCOUNT is False
+    sched = _sched_with(etapa_e=False, boundary_active=True)
+    tile = 512 * 2_500_000
+    assert sched._streaming_bank_bytes(10_000) == 48 * tile
 
 
 def test_streaming_bank_bytes_boundary_collapses_per_layer_charge():
-    """Etapa E: with a live per-layer eval boundary the lazy graph no longer
-    retains one mini-bank per MoE layer, so the charge drops from 48 banks to
-    min(2, projections) — the difference between a guard that refuses to
-    admit chunks and one that sizes them correctly."""
+    """Etapa E (opt-in): with a live per-layer eval boundary the lazy graph no
+    longer retains one mini-bank per MoE layer, so the charge drops from 48
+    banks to min(2, projections) — the difference between a guard that refuses
+    to admit chunks and one that sizes them correctly. Buying that chunk size
+    is exactly what costs bit-exactness, hence the opt-in default."""
     n = 10_000  # saturates uniq at experts_per_layer
     tile = 512 * 2_500_000
 
-    off = _sched_with(boundary_active=False)
+    off = _sched_with(etapa_e=False, boundary_active=False)
     assert off._streaming_bank_bytes(n) == 48 * tile
 
     on = _sched_with(boundary_active=True)
@@ -2780,13 +2807,16 @@ def test_streaming_bank_bytes_adds_one_layer_activation():
 
 
 def test_streaming_bank_bytes_boundary_kill_switch(monkeypatch):
-    """OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT=0 restores the per-layer charge
-    without a code change — the ops escape hatch if the boundary regresses."""
-    sched = _sched_with(boundary_active=True)
+    """OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT flips Etapa E both ways without a
+    code change — the escape hatch, and the switch an operator pulls to trade
+    bit-exactness for the 62% TTFT win."""
+    sched = _sched_with(etapa_e=True, boundary_active=True)
     tile = 512 * 2_500_000
     assert sched._streaming_bank_bytes(10_000) == 2 * tile
     monkeypatch.setattr(sched, "_STREAMING_BANK_BOUNDARY_ACCOUNT", False)
     assert sched._streaming_bank_bytes(10_000) == 48 * tile
+    monkeypatch.setattr(sched, "_STREAMING_BANK_BOUNDARY_ACCOUNT", True)
+    assert sched._streaming_bank_bytes(10_000) == 2 * tile
 
 
 def test_glu_projection_count():
