@@ -1347,7 +1347,12 @@ class TestPrefillAbortInterrupt:
     def test_external_prefill_abort_reclaims_metal_before_raise(
         self, mock_model, mock_tokenizer
     ):
-        """Aborted external prefill must clear transients before unwinding."""
+        """Aborted external prefill must clear transients before unwinding.
+
+        Fase J Etapa D: the first-chunk clear is gated on pool size, but the
+        abort-path clear is unconditional — it guarantees the transients are
+        dropped even when the pool never grew.
+        """
         from omlx.scheduler import _PrefillAbortedError
 
         scheduler = Scheduler(
@@ -1367,17 +1372,28 @@ class TestPrefillAbortInterrupt:
         uid = 42
         scheduler.request_id_to_uid[request.request_id] = uid
         scheduler.uid_to_request_id[uid] = request.request_id
-        scheduler._pending_abort_ids.add(request.request_id)
+        def abort_once(pool_bytes):
+            scheduler._pending_abort_ids.add(request.request_id)
+            with (
+                patch.object(
+                    scheduler_module.mx, "get_cache_memory", return_value=pool_bytes
+                ),
+                patch.object(scheduler_module, "_sync_and_clear_cache") as clear_cache,
+            ):
+                with pytest.raises(_PrefillAbortedError):
+                    scheduler._do_external_prefill(
+                        request,
+                        request.prompt_token_ids,
+                        cache,
+                    )
+            return clear_cache.call_args_list
 
-        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear_cache:
-            with pytest.raises(_PrefillAbortedError):
-                scheduler._do_external_prefill(
-                    request,
-                    request.prompt_token_ids,
-                    cache,
-                )
-
-        assert clear_cache.call_args_list == [
+        # Small pool: the gated first-chunk clear is skipped, so the
+        # unconditional abort-path clear is the only one — and it still runs,
+        # which is the point of this test.
+        assert abort_once(0) == [call(scheduler._stream)]
+        # Large pool: the gated first-chunk clear fires as well.
+        assert abort_once(8 * 1024**3) == [
             call(scheduler._stream),
             call(scheduler._stream),
         ]

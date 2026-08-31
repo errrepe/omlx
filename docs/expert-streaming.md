@@ -850,6 +850,33 @@ decode keeps the process-wide 16 (env OMLX_EXPERT_STREAMING_PREFILL_QD,
 default off). The sweep evidence: QD16 is the decode optimum, QD24 measured
 the better 8k TTFT (85 s); two bounded regime pools avoid oversubscription.
 
+### Measured (2026-08-31, dev box, single-request protocol, budget 0)
+
+Evidence in bench/results/fasek/ (artifacts qwen_*_arm*.json):
+
+- 8k TTFT 74.2s (7440 prompt tokens, decode 2.75 tok/s) vs 208s pre-port
+  (O1 4096) and 286s before that — the F4 static cap holds: chunks are no
+  longer crushed to 512/1024.
+- 2k TTFT 32.9s vs 55-98s pre-port (same prompt, identical chunk schedule
+  across arms).
+- Metal prefill peak 8.33 GiB (2k) / 10.35 GiB (8k) vs ~34.5 GiB
+  IOAccelerator before the qwen4_exp boundary (F5) — the pool no longer
+  evicts the page cache the streaming reads depend on.
+- Prefill disk 1.5-1.9 GiB/s avg (2.2-2.4 max) against the ~2.8 GiB/s
+  ceiling while the GPU sits ~78% busy — read/compute overlap is effective.
+- Bit-exactness gate (real model): 24 greedy decode tokens byte-identical
+  across three arms — default pipeline (rolling ctx AHEAD=3, A1/A1b
+  single-promotion, read_expert_into RUN_QD=16), legacy (bank reads and
+  promotion off), and extreme scheduling (AHEAD=1 + RUN_QD=1). The Fase 2
+  timing changes are Safe on Qwen3.8-Flash-Next-oQ4e-mtp.
+- Decode throughput varies within ~±25% across reps on this box (other
+  users active); AHEAD=1 + RUN_QD=1 is consistently slowest (1.57-1.63
+  tok/s at 512) — the I/O-depth finding reproduces: depth 1 pins the
+  device queue.
+- Live logs confirm the F5 boundary installed on Qwen4ExpDecoderLayer and
+  the guard's boundary accounting (projections=3, activation=5120 B/token);
+  advise stats exported (F1/F2/F3 telemetry: advised=16-22k per run,
+  stash off by default).
 ### Striping verdict (F11 — closed)
 
 Dual-SSD striping with the 2 TB secondary (10 Gbps, ~0.9-1.1 GB/s real) is
