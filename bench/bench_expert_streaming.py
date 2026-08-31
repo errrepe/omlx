@@ -286,8 +286,39 @@ async def run(
         mlx_callbacks={
             "mlx_active_gib": mx.get_active_memory,
             "mlx_cache_gib": mx.get_cache_memory,
+            # Fase J: the high-water mark Metal ever allocated. Sampled (not
+            # just read at the end) so the curve shows *when* the peak was
+            # reached -- that is what distinguishes a prefill transient from
+            # steady-state decode residency.
+            "mlx_peak_gib": mx.get_peak_memory,
         },
     )
+    _metal_peak: dict[str, float] = {}
+    _reset_peak = getattr(mx, "reset_peak_memory", None)
+
+    def _peak_phase(label: str) -> None:
+        """Freeze the Metal high-water mark for the phase that just ended.
+
+        Acceptance criterion 3 is an IOAccelerator *peak* number, and the
+        bench previously only reported phys_footprint samples at phase
+        boundaries. get_peak_memory() is a process-global high-water mark, so
+        it has to be reset at each boundary to attribute the peak to a phase.
+        """
+        try:
+            _metal_peak[label] = round(mx.get_peak_memory() / 1024**3, 3)
+        except Exception:  # noqa: BLE001
+            pass
+        if _reset_peak is not None:
+            try:
+                _reset_peak()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if _reset_peak is not None:
+        try:
+            _reset_peak()
+        except Exception:  # noqa: BLE001
+            pass
     sampler.start()
     sampler.mark("prefill")
     if single_request:
@@ -305,12 +336,14 @@ async def run(
                 output.completion_tokens > 0 or output.new_text or output.tokens
             ):
                 first_output_at = time.perf_counter()
+                _peak_phase("prefill")
                 sampler.mark("decode")
         if out2 is None:
             raise SystemExit("single-request benchmark produced no output")
         end_request = time.perf_counter()
         if first_output_at is None:
             first_output_at = end_request
+            _peak_phase("prefill")
             sampler.mark("decode")
         ttft = first_output_at - t_request
         t_decode = end_request - first_output_at
@@ -322,6 +355,7 @@ async def run(
         t1 = time.perf_counter()
         out1 = await engine.chat(messages, max_tokens=1, temperature=0.0)
         ttft = time.perf_counter() - t1
+        _peak_phase("prefill")
         sampler.mark("decode")
         print(f"TTFT (1 tok) {ttft:.1f}s prompt {out1.prompt_tokens}")
 
@@ -332,6 +366,7 @@ async def run(
     if n <= 0:
         raise SystemExit("benchmark produced zero completion tokens")
     tokps = n / max(t_decode, 1e-9)
+    _peak_phase("decode")
     sampler.mark("teardown")
     sampler.stop()
     print(f"decode {n} tok in {t_decode:.1f}s -> {tokps:.3f} tok/s")
@@ -408,6 +443,18 @@ async def run(
             print(f"prefetcher {pf_stats}")
 
     phys_end = get_phys_footprint() / 1024**3
+    # Whole-process lifetime high-water mark (anonymous + dirty file-backed +
+    # IOAccelerator). The Fase J problem statement is quoted in this unit
+    # (~35.7 GiB, of which ~34.5 GiB IOAccelerator), so report it alongside the
+    # Metal-only peak to keep the two comparable across commits.
+    try:
+        from omlx.utils.proc_memory import get_lifetime_max_phys_footprint
+
+        phys_lifetime_max = round(
+            get_lifetime_max_phys_footprint() / 1024**3, 2
+        )
+    except Exception:  # noqa: BLE001
+        phys_lifetime_max = None
     results.update(
         {
             "ttft_s": round(ttft, 2),
@@ -415,6 +462,9 @@ async def run(
             "decode_s": round(t_decode, 2),
             "tok_s": round(tokps, 4),
             "phys_after_decode_gib": round(phys_end, 2),
+            "phys_lifetime_max_gib": phys_lifetime_max,
+            "metal_peak_prefill_gib": _metal_peak.get("prefill"),
+            "metal_peak_decode_gib": _metal_peak.get("decode"),
             "active_after_decode_gib": round(mx.get_active_memory() / 1024**3, 2),
             "cache_stats": stats,
             "profile": profile,
