@@ -682,6 +682,88 @@ speed. Fração 0.5 remains the recorded follow-up if the ppl headroom shows
 up elsewhere (Qwen). Artifacts `bench/results/i6/glm_i6_{base,cold3,
 hobbit25}.json` (rep 2).
 
+### I6b — Post-I6 campaign: fraction sweep, Qwen, cold 2-bit, and the
+### profile caveats
+
+**GLM fraction sweep** (same harness as the I6 gate: 24 × 1000-token
+windows, 3-bit cold tier, prefill-learned profile):
+
+| fraction | hot/layer | ppl | Δ ppl vs base | penalty recovered |
+|---|---|---|---|---|
+| 0.125 | 36 | 2.3072 | +3.81% | 74.5% |
+| **0.25** | **72** | **2.2505** | **+1.26%** | **91.6%** |
+| 0.5 | 144 | 2.2317 | +0.42% | 96.7% |
+
+0.25 is the knee: below it the penalty triples, above it the byte savings
+shrink while quality is already ~97% recovered. Artifacts
+`bench/results/ppl_runs/glm_hobbit{125,50}.json`.
+
+**Qwen3.8-Flash-Next (48 layers, 512 experts, 10/tok)** — the skew is
+flatter than GLM's (top-10 experts carry 17% of mass, 375 distinct count
+values over 245,760 routed tokens), yet HOBBIT is even more effective:
+
+| arm | ppl | Δ ppl vs base | tok/s (48-tok decode) | TTFT |
+|---|---|---|---|---|
+| base (oQ4e 4-bit) | 1.3119 | — | 1.622 | 10.7 s |
+| cold3-uniform | 1.3718 | +4.57% | 2.068 (+27%) | 8.5 s |
+| **HOBBIT 0.25 @ 3-bit** | **1.3147** | **+0.21%** | **1.804 (+11%)** | 8.4 s |
+| cold2-uniform | 1.6998 | +29.6% | 2.322 (+43%) | — |
+| **HOBBIT 0.25 @ 2-bit** | **1.3246** | **+0.97%** | **1.955 (+21%)** | — |
+
+Two findings. (1) The 3-bit split is near-lossless on Qwen (+0.21% ppl,
+95.4% of the tier's penalty recovered) — the cold tier + HOBBIT 0.25 is a
+defensible Qwen default, not just an opt-in. (2) The **2-bit tier under
+HOBBIT** turns a catastrophic uniform tier (+29.6% ppl) into a usable
+extreme-speed point: +0.97% ppl for +21% decode vs base. The 2-bit tier
+was generated (`tools/requant_cold_tier.py --bits 2`, 57.4 → 28.7 GiB of
+expert banks, 0.50×) for this measurement and then parked
+(`expert_cold_2bit_measured/`) with the 3-bit tier restored as
+`expert_cold/` — swapping is a directory rename since the backing resolves
+`<model>/expert_cold`. Artifacts `bench/results/ppl_runs/qwen_*.json`,
+`bench/results/i6/qwen_i6_*.json`.
+
+**Profile caveats (measured, not assumed).**
+
+- **Regime mismatch**: a decode-dominant run (48-token decode, 18-token
+  prompt, pins on, clean profile) learns hot sets that share only **35%**
+  of their top-72 experts with the prefill-learned profile (overlap@10 =
+  9%, top-1 expert identical in 1/42 layers); the prefill hot set covers
+  ~40% of decode token mass. Caveat: the decode profile carries few tokens
+  (336 routed tokens on layer 3 vs 192,000 for prefill), so treat this as
+  directional — but the two regimes clearly diverge. A profile learned in
+  long-prefill sessions under-serves decode-heavy chat; a per-regime
+  profile (or a decode-weighted update) is the recorded follow-up.
+- **Prefill vs decode tok/s**: pins themselves cost decode speed on GLM
+  (0.522–0.526 tok/s with pins + pin warm traffic vs 0.575–0.582 pins
+  off) — the mlock pass and seeding add ~10% decode overhead in the
+  bench's cold-cache regime; production benefit comes from the WARM next
+  load, not the current one.
+
+**Bench parity**: `bench_expert_streaming.py --pins` now matches the ppl
+harness (mlock the observed hot experts at 1.25 GiB, persist the learned
+profile on unload) so decode-dominant profiles can be harvested from the
+tok/s bench. The readahead warmer's `F_RDADVISE` runs also break at
+HOBBIT tier boundaries now (`advise_expert_run` segments per resolved
+reader), matching the demand path's run-grouping rule — a straddling run
+previously advised one reader's byte range for both tiers' experts.
+
+**Domain sensitivity (code corpus vs book)**. A 500 KB corpus of the
+project's own .py/.swift/.ts sources (`bench/corpus/omlx_code.txt`) vs
+pg1342: code is an EASIER domain for the split — HOBBIT 0.25 costs
+**+0.39%** ppl on code (2.8072 vs 2.7963 base) versus +1.26% on the book
+corpus, consistent with routing being more skewed on code (top expert
+2,088 of 192,000 tokens on layer 3 vs 1,474 on the book). But the hot
+sets are domain-specific: book×code top-72 overlap is only **22.4%**
+(min 8.3%, max 33.3%; top-1 expert identical in 1/42 layers) — even lower
+than the prefill×decode overlap. The cross-domain run (book-learned
+profile applied to the code corpus) confirms the caveat quantitatively:
+**+2.22%** ppl (2.8585) vs **+0.39%** with the code-learned profile — a
+mismatched profile costs ~5× the penalty of a matched one (still far
+below the uniform tier's +15%, but 3/4 of its hot set is wrong).
+Practical rule: learn the profile on the workload you serve; a profile
+imported from another domain leaves ~3/4 of the hot set cold. Artifacts
+`bench/results/ppl_runs/glm_code_{regen, hobbit25, hobbit25_bookprofile}.json`.
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.

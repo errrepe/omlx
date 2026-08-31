@@ -629,16 +629,31 @@ class ExpertBackingStore:
 
         Row-major stacked banks make a run of ids one contiguous byte range,
         so the whole run collapses into a single F_RDADVISE — the zero-copy
-        readahead counterpart of load_expert_run. Returns False when the
-        platform lacks F_RDADVISE or the key cannot be resolved.
+        readahead counterpart of load_expert_run. Under the HOBBIT split
+        (I6) the run may straddle the hot/cold boundary; a run reads ONE
+        reader (the one its first id resolves), so advise breaks at tier
+        boundaries exactly like the demand path's _group_runs. Returns
+        False when the platform lacks F_RDADVISE or nothing resolved.
         """
         try:
-            reader = self._reader_for_key(key, first_id)
-            start, _ = reader.expert_byte_range(key, first_id)
-            _, end = reader.expert_byte_range(key, max(0, first_id + count - 1))
-            if end <= start:
+            if count <= 0:
                 return False
-            return reader.advise_range(start, end - start)
+            ids = [first_id + i for i in range(count)]
+            readers = [self._reader_for_key(key, eid) for eid in ids]
+            ok = False
+            # group consecutive ids sharing the same reader (tier boundary)
+            i = 0
+            while i < len(ids):
+                j = i
+                reader = readers[i]
+                while j + 1 < len(ids) and readers[j + 1] is reader:
+                    j += 1
+                start, _ = reader.expert_byte_range(key, ids[i])
+                _, end = reader.expert_byte_range(key, ids[j])
+                if end > start:
+                    ok = reader.advise_range(start, end - start) or ok
+                i = j + 1
+            return ok
         except Exception:
             return False
 

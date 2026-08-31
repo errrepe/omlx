@@ -120,6 +120,7 @@ async def run(
     cold_tier: str | None = None,
     prompt_len: str = "short",
     hot_fraction: float | None = None,
+    pins: bool = False,
     mtp_block: int | None = None,
     ane: bool = False,
     warm_control: float = 0.0,
@@ -156,6 +157,11 @@ async def run(
         # learned pin-profile frequency) keeps the ORIGINAL packing while
         # the rest read the cold tier. Requires --cold-tier + a profile.
         expert_streaming_hot_fraction=hot_fraction,
+        # --pins (parity with the ppl harness): mlock the observed hot
+        # experts and LEARN the pin profile this run persists on unload —
+        # the decode-dominant hot set for the prefill×decode overlap study.
+        expert_streaming_pins=pins or None,
+        expert_streaming_pin_gib=1.25 if pins else None,
         qwen4_ple_ssd_offload=True,
         vlm_mtp_enabled=mtp,
         vlm_mtp_draft_block_size=mtp_block,
@@ -361,6 +367,18 @@ async def run(
         }
     )
 
+    # Persist the learned pin profile when pins are active (the server does
+    # this in stop(); the harness tears down via release/unload, so save
+    # explicitly — parity with the ppl harness, which needs the frequencies
+    # for the next HOBBIT-split load).
+    if pins:
+        from omlx.patches.expert_streaming import save_expert_pin_profile
+
+        try:
+            save_expert_pin_profile(engine)
+        except Exception as exc:  # never cost the run its numbers
+            print(f"pin profile save failed: {exc}")
+
     await pool.release_engine(entry_name)
     await pool._unload_engine(entry_name)
 
@@ -387,6 +405,9 @@ def main():
                     help="HOBBIT split fraction (I6): with --cold-tier and a learned pin "
                          "profile, this fraction of each layer's most-used experts keeps the "
                          "original packing; the rest read the cold tier")
+    ap.add_argument("--pins", action="store_true",
+                    help="mlock-pin observed hot experts (1.25 GiB) and persist the learned "
+                         "pin profile on unload (parity with the ppl harness)")
     ap.add_argument("--prompt-len", choices=["short", "512", "2k", "8k"], default="short")
     ap.add_argument("--mtp-block", type=int, default=None, help="vlm_mtp_draft_block_size (MTP tokens per round)")
     ap.add_argument("--ane", action="store_true", help="enable qwen35 ANE prefill")
@@ -429,6 +450,7 @@ def main():
             args.cold_tier,
             prompt_len=args.prompt_len,
             hot_fraction=args.hot_fraction,
+            pins=args.pins,
             mtp_block=args.mtp_block,
             ane=args.ane,
             specprefill_draft=args.specprefill,

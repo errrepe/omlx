@@ -285,3 +285,65 @@ async def test_expert_streaming_hot_fraction_api_validation():
             settings,
             admin_routes.ModelSettingsRequest(expert_streaming_hot_fraction=1.5),
         )
+
+
+def test_advise_expert_run_breaks_at_tier_boundary(tmp_path):
+    """Post-I6: a readahead run that straddles the hot/cold boundary must
+    advise ONE reader per tier segment (a run reads a single reader), not
+    apply the first id's reader to the whole byte range."""
+    from requant_cold_tier import requant_shard
+
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    key_w = _write_quantized_checkpoint(ckpt, bits=4, gs=64)
+    quant_cfg = json.loads((ckpt / "config.json").read_text())["quantization"]
+    requant_shard(
+        ckpt / "model-00001-of-00001.safetensors",
+        ckpt / "expert_cold",
+        quant_cfg,
+        bits=3,
+    )
+
+    cold = ExpertBackingStore(ckpt, cold_root=ckpt / "expert_cold")
+    try:
+        # hot 0..1 (source shard), cold 2..5 (tier shard)
+        cold.set_hot_experts({"layer_0": {0, 1}})
+        advised = []
+        reader_hot = cold._reader_for_key(key_w, 0)
+        reader_cold = cold._reader_for_key(key_w, 2)
+        assert reader_hot is not reader_cold
+
+        def spy_hot(start, length):
+            advised.append(("HOT", start, length))
+            return True
+
+        def spy_cold(start, length):
+            advised.append(("COLD", start, length))
+            return True
+
+        from unittest.mock import patch
+
+        # Both readers are _ShardReader instances — spy per instance, not
+        # per type, or the second patch replaces the first.
+        with patch.object(reader_hot, "advise_range", side_effect=spy_hot):
+            with patch.object(reader_cold, "advise_range", side_effect=spy_cold):
+                # run 0..5 straddles: hot segment [0,1], cold segment [2,5]
+                assert cold.advise_expert_run(key_w, 0, 6) is True
+
+        # exactly one advise per tier segment, never one for the whole run
+        hot_calls = [c for c in advised if c[0] == "HOT"]
+        cold_calls = [c for c in advised if c[0] == "COLD"]
+        assert len(hot_calls) == 1, advised
+        assert len(cold_calls) == 1, advised
+        # hot segment covers ids 0..1 only — NOT the cold ids' bytes
+        _, start_h, len_h = hot_calls[0]
+        _, end_h = reader_hot.expert_byte_range(key_w, 1)
+        assert len_h == end_h - start_h
+        # cold segment covers ids 2..5 in the tier shard
+        start_c, len_c = cold_calls[0][1], cold_calls[0][2]
+        _, end_c = reader_cold.expert_byte_range(key_w, 5)
+        assert len_c == end_c - start_c
+    finally:
+        cold.close()
