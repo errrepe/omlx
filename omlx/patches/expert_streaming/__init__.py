@@ -557,6 +557,21 @@ def _convert_switch_mlp_module(
             if lin_ is not None and hasattr(lin_, "set_hobbit_split"):
                 lin_.set_hobbit_split(hot_ids, hobbit_cold_params[0], hobbit_cold_params[1])
 
+    # Fase K F1: register this layer's quantized streaming linears for the
+    # O2 next-layer advisor (main layers only — MTP stages have their own
+    # layer-id space and never feed the streaming decode chain).
+    if needle.startswith("layers."):
+        from .streaming_switch import register_streaming_linears
+
+        register_streaming_linears(
+            layer_idx,
+            [
+                getattr(streaming_glu, a, None)
+                for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+                if isinstance(getattr(streaming_glu, a, None), StreamingQuantizedSwitchLinear)
+            ],
+        )
+
     # Replace
     moe.switch_mlp = streaming_glu  # type: ignore[attr-defined]
     # Disable decoder FFN compilation (GLM-5.3 Glm5NextDecoderLayer

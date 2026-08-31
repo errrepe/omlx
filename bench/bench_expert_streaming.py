@@ -435,6 +435,15 @@ async def run(
         if pf is not None:
             pf_stats = dict(pf.stats)
             print(f"prefetcher {pf_stats}")
+        # Fase K F3: export the O2 F_RDADVISE/stash speculation counters so
+        # the readahead coverage is measurable (advised experts, stash hits).
+        try:
+            from omlx.patches.expert_streaming.streaming_switch import _ADVISE_STATS
+
+            advise_stats = dict(_ADVISE_STATS)
+            print(f"advise {advise_stats}")
+        except Exception:
+            advise_stats = None
 
     phys_end = get_phys_footprint() / 1024**3
     try:
@@ -459,6 +468,7 @@ async def run(
             "cache_stats": stats,
             "profile": profile,
             "prefetcher": pf_stats,
+            "advise_stats": advise_stats,
             "resources": res_summary,
             "tokens": _tokens if isinstance(_tokens, list) else None,
             "bit_exact_kind": _bit_exact_kind,

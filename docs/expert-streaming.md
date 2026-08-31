@@ -768,6 +768,99 @@ Practical rule: learn the profile on the workload you serve; a profile
 imported from another domain leaves ~3/4 of the hot set cold. Artifacts
 `bench/results/ppl_runs/glm_code_{regen, hobbit25, hobbit25_bookprofile}.json`.
 
+## Fase K — I/O concurrency on expert streaming (branch feature/expert-streaming)
+
+Fase K merges the two halves of the c1be4b98 divergence: the faseJ
+I/O-concurrency pipeline (rolling layer-context prefetch, per-run read
+parallelism, single-promotion banks, throttled pool clears, the eval boundary
+for the vendored qwen4_exp decoder, the 3x-over-measured static cap) onto the
+HOBBIT dual-tier + I6b ports. All Fase K timing-only changes are bit-exact
+(tokens unchanged at the same chunk schedule); the throttle cap (F4) is a
+re-base and rewrites the bench's chunk_schedule reference together.
+
+### F1 — the O2 advisor advised the wrong layer (fixed)
+
+The ported _advise_next_layer_prev_token took the NEXT layer's expert ids
+(_PREV_UNIQ_BY_LAYER[layers.N+1]) but called advise_expert_run with THIS
+linear's stacking key — warming the CURRENT layer's byte range with the next
+layer's ids (zero useful readahead + page-cache pollution; under HOBBIT the
+hot-set routing followed the wrong key too). The advisor now resolves the
+next layer's converted linears (_STREAM_LINEARS_BY_LAYER registry, populated
+at convert) and advises their real keys; backing.advise_expert_run still
+segments runs per resolved reader so tier boundaries are respected.
+
+### F2 — speculative traffic guard (fixed)
+
+The advisor fired on prefill-shaped sets (hundreds of experts/layer) three
+times per layer, flooding the device queue with speculative F_RDADVISE next
+to demand reads. Now guarded at _MAX_ADVISE_ROWS=64 (the warmer G2's guard)
+and deduped per layer call via the shared routing plan, so the 3 projections
+of one layer issue each next-layer (bank, run) at most once.
+
+### F3 — stash telemetry (fixed)
+
+_SPEC_STASH was never populated (STASH=1 was pure overhead + misleading
+counters). The advisor now queues the speculated runs to the IO pool; the
+workers read raw NumPy bundles into the ring (FIFO, <=256 entries) under the
+next layer's tier-aware bundle keys, so a demand hit returns without disk
+I/O. _ADVISE_STATS is exported into the bench results JSON (advise_stats).
+
+### F4 — the prefill throttle (re-base)
+
+The static SDPA+KV estimate entered _predicted_chunk_transient's MAX
+unconditionally; on Qwen3.8-Flash-Next-oQ4e it is ~40x the measured rate, so
+chunks were crushed to 512/1024 tokens forever. Ported the faseJ 3x cap
+(OMLX_PREFILL_STATIC_MAX_OVER_MEASURED): the static is a fallback for the
+first chunk only; with samples it may raise the prediction to at most 3 x the
+measured signal. Chunk schedule changes -> the bench's chunk_schedule and
+token references are regenerated in the same commit.
+
+### F5 — the qwen4_exp eval boundary
+
+The I1 port wrapped only mlx_vlm's Qwen3_5MoeDecoderLayer; on Qwen3.8-Flash-
+Next the model resolves the vendored Qwen4ExpDecoderLayer, leaving the flag
+inert: the lazy graph retained one streaming mini-bank per layer per chunk
+(pool peaked ~29 GiB / ~34.5 GiB IOAccelerator on an 8k prefill). The wrap
+now covers both decoder classes (candidate-resolution at apply time, double
+wrap is idempotent), and the per-layer clear is gated on the Metal pool
+threshold shared with the scheduler's chunk-boundary clears (Etapa D).
+
+### F6/F13 — the I/O pipeline (read_expert_into, rolling ctx, single promotion)
+
+- shard_bank: read_expert_into replaces the per-expert slice loop with one
+  reader resolution per (key, tier-segment) and batched preadvs at RUN_QD=16
+  on a dedicated run pool; tier-homogeneous components keep the uniform
+  per-expert-byte contract under HOBBIT (callers split by tier).
+- streaming_switch: _LayerLoadContext (rolling, CTX_AHEAD=3 default) prefetches
+  the following projections' banks while the current one is promoted/computed;
+  the legacy union path remains behind OMLX_EXPERT_STREAMING_CTX_ROLLING=0.
+- A1/A1b single-promotion: an all-miss demand tier-set is promoted with one
+  mx.array per key instead of U per-expert arrays plus mx.stack (bit-identical
+  by construction; the LRU is still seeded with the per-expert rows so hit
+  rate is unchanged). Knobs: OMLX_EXPERT_STREAMING_BANK_PROMOTE[_CTX]=0.
+- HOBBIT is preserved throughout: bundle_key keeps the tier suffix (hot and
+  cold copies of one expert never alias), _group_runs keeps the tier boundary
+  break, and the dual-tier gather_qmm assembly consumes the single-promoted
+  per-tier banks directly.
+
+### F12 — pools per regime (opt-in)
+
+Prefill-shaped calls (positions > 64) can use a separate 24-worker pool while
+decode keeps the process-wide 16 (env OMLX_EXPERT_STREAMING_PREFILL_QD,
+default off). The sweep evidence: QD16 is the decode optimum, QD24 measured
+the better 8k TTFT (85 s); two bounded regime pools avoid oversubscription.
+
+### Striping verdict (F11 — closed)
+
+Dual-SSD striping with the 2 TB secondary (10 Gbps, ~0.9-1.1 GB/s real) is
+DISCOURAGED for this box: the measured 2k decode was ~1.85x slower than the
+primary-only arm (bench/results/qwen_2k_striped_C.json vs qwen_2k_primary_A.json).
+Expected by construction: the secondary takes ~50% of the bytes at ~1/3 the
+bandwidth, every layer waits for its slowest run, and slow jobs hold pool
+workers (head-of-line). max(0.5/2.8, 0.5/1.0) ~= 1.4x + occupancy ~= 1.85x.
+Stripe only across disks of comparable speed; the EXTRA_ROOTS mechanism stays
+for that case.
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.

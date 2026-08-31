@@ -45,15 +45,49 @@ _ADMISSION_WINDOW = 1024
 # and can be disabled with OMLX_EXPERT_STREAMING_RA=0. When enabled, each
 # MoE layer advises (or stashes, if OMLX_EXPERT_STREAMING_STASH=1) the next
 # layer's previous-token experts via F_RDADVISE so the NVMe fetch overlaps
-# compute. The stash is a small per-layer ring (<=256 experts total, ~650 MB
-# worst) that bypasses the LRU and never blocks demand reads.
+# compute. The stash is a small ring (<=256 experts total, ~650 MB worst)
+# that bypasses the LRU and never blocks demand reads: the advisor submits
+# the speculated runs to the IO pool (async) and the worker stores the raw
+# NumPy bundles into the ring, so a later demand gets them without disk I/O.
+#
+# Fase K F1: the advisor targets the NEXT layer's banks (ids come from
+# _PREV_UNIQ_BY_LAYER[next_layer]); the F_RDADVISE key must be the next
+# layer's stacking key, resolved through the converted-linears registry
+# (_STREAM_LINEARS_BY_LAYER), never __self__'s key — the old port advised
+# the CURRENT layer's byte range for the NEXT layer's ids (warmed the wrong
+# bytes, and under the HOBBIT split applied the wrong hot-set routing).
+# Fase K F2: the advisory is guarded like the warmer G2 (_MAX_ADVISE_ROWS)
+# and deduped per layer call (_RemapPlan.advised_runs) so the 3 projections
+# of one layer issue each next-layer run at most once.
 _RA_ENV = os.environ.get("OMLX_EXPERT_STREAMING_RA", "") != "0"
 _STASH_ENV = os.environ.get("OMLX_EXPERT_STREAMING_STASH", "") == "1"
 _STASH_MAX_ENTRIES = 256
+# Fase K F2: hard cap on the advisory row set, matching the warmer G2's
+# _MAX_WARM_ROWS (rows > 64 are prefill-shaped, not decode speculation).
+_MAX_ADVISE_ROWS = 64
 _PREV_UNIQ_BY_LAYER: Dict[int, list[int]] = {}
 _SPEC_STASH: Dict[Tuple[int, int, str], Any] = {}
 _SPEC_STASH_ORDER: list[Tuple[int, int, str]] = []
-_ADVISE_STATS = {"advised": 0, "advised_bytes": 0, "stash_hits": 0, "stash_misses": 0}
+_ADVISE_STATS = {
+    "advised": 0,
+    "advised_bytes": 0,
+    "stash_hits": 0,
+    "stash_misses": 0,
+    "stash_inserts": 0,
+    "stash_evictions": 0,
+}
+
+# Fase K F1: converted quantized streaming linears per layer, registered by
+# the converter (_convert_switch_mlp_module) for main layers only. The O2
+# advisor resolves the next layer's real stacking keys and tier routing
+# through these objects, so F_RDADVISE and the stash target the right banks.
+_STREAM_LINEARS_BY_LAYER: Dict[int, list[Any]] = {}
+
+
+def register_streaming_linears(layer_idx: int, linears: list[Any]) -> None:
+    """Record the converted quantized linears of one MoE layer (convert-time)."""
+    if linears:
+        _STREAM_LINEARS_BY_LAYER[int(layer_idx)] = [l for l in linears if l is not None]
 
 # Routing trace (Fase I3): when OMLX_EXPERT_STREAMING_TRACE is set, append one
 # JSONL row per MoE layer call ({call, layer, positions, uniq}) so
@@ -86,10 +120,12 @@ def _trace_row(layer_idx: int, uniq_list: list, positions: int) -> None:
 # ~2.5 GB/s (+34% decode) — see E1. OMLX_EXPERT_STREAMING_QD overrides.
 #
 # B1 correction (Fase J): _EXPERT_IO_POOL is a process-wide SINGLETON with
-# 16 workers shared across all concurrent parents. With CTX_AHEAD=3, each
-# parent sees ~5 workers on average, not 16. Device depth is 16 total,
-# not N*16. Do not "fix" this to per-call pools — that oversubscribes and
-# regressed at QD32 (commit 0a4d3c7). The sweep value 16 is process-wide.
+# 16 workers shared across all concurrent parents. Device depth is 16
+# total, not N*16. Do not "fix" this to per-call pools — that oversubscribes
+# and regressed at QD32 (faseJ bench 0a4d3c7: 3.324/3.419 tok/s at QD16 vs
+# 3.138 at QD32). The sweep value 16 is process-wide. (Fase K F6 port brings
+# the rolling layer-context prefetch; see _CTX_PREFETCH_AHEAD — that knob
+# raises depth on the rolling path, this pool stays 16.)
 _EXPERT_IO_POOL = ThreadPoolExecutor(
     max_workers=max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_QD", "") or 16)),
     thread_name_prefix="omlx-expert-io",
@@ -355,8 +391,11 @@ class ExpertLRUCache:
         self._layer_counts: Dict[int, int] = {}
         self.stats = CacheStats()
         self.profile = ProfileAccumulator(enabled=_PROFILE_ENV)
-        # B5 admission filter: scan-resistant frequency window (only when env set)
-        self._admission_enabled = bool(_ADMISSION_ENV and self.capacity > 0 and self.capacity < 4096)
+        # B5 admission filter: scan-resistant frequency window (only when env set).
+        # Fase K F9: the old capacity < 4096 cap meant the filter never engaged
+        # at the 6 GiB budgets measured net-negative (capacity ~6847): a
+        # 1024-entry window is trivial next to the read volume, so drop it.
+        self._admission_enabled = bool(_ADMISSION_ENV and self.capacity > 0)
         self._admission_counts: Dict[Tuple[int, int], int] = {}
         self._admission_order: deque[Tuple[int, int]] = deque()  # type: ignore[type-arg]
         self.admission_drops = 0
@@ -524,6 +563,9 @@ class _RemapPlan:
     positions: int = 0
     gate_s: float = 0.0
     unique_s: float = 0.0
+    # Fase K F2: (target_linear_id, run_first, run_count) already advised in
+    # this layer call — the 3 projections share one plan, so dedupe here.
+    advised_runs: set = field(default_factory=set)
 
 
 def _build_plan_into(plan: _RemapPlan, indices) -> None:
@@ -909,21 +951,39 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 return bundle
         return None
 
-    def _advise_next_layer_prev_token(self) -> None:
+    def _advise_next_layer_prev_token(self, plan: _RemapPlan | None = None) -> None:
+        """Speculate the NEXT layer's previous-token experts (Fase K F1/F2).
+
+        _PREV_UNIQ_BY_LAYER holds layer N+1's expert ids; the advisory must
+        therefore hit layer N+1's banks. The converted-linears registry
+        resolves the next layer's real stacking keys (and its HOBBIT tier
+        routing — backing.advise_expert_run segments runs per resolved
+        reader, so hot/cold boundaries are respected automatically).
+
+        F2 guards: the advisory is capped at _MAX_ADVISE_ROWS experts
+        (prefill-shaped sets are skipped: they are dense demand, not decode
+        speculation, and advising them would flood the device queue with
+        speculative traffic), and each (target, run) fires at most once per
+        layer call through plan.advised_runs.
+        """
         if not _RA_ENV:
             return
         next_layer = self.layer_idx + 1
         prev = _PREV_UNIQ_BY_LAYER.get(next_layer)
-        if not prev:
+        if not prev or len(prev) > _MAX_ADVISE_ROWS:
             return
+        targets = _STREAM_LINEARS_BY_LAYER.get(next_layer)
+        if not targets:
+            return
+        advised_runs = plan.advised_runs if plan is not None else None
         try:
             sorted_prev = sorted(int(e) for e in prev)
             if not sorted_prev:
                 return
             # Coalesce into runs for single F_RDADVISE per run
+            runs: list[tuple[int, int]] = []
             s = sorted_prev[0]
             cnt = 1
-            runs: list[tuple[int, int]] = []
             for eid in sorted_prev[1:]:
                 if eid == s + cnt:
                     cnt += 1
@@ -931,13 +991,95 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     runs.append((s, cnt))
                     s, cnt = eid, 1
             runs.append((s, cnt))
-            for first, count in runs:
+            for target in targets:
+                # Fase K F3: speculate the run into the stash ring (async) —
+                # the read overlaps compute and never blocks demand reads.
+                if _STASH_ENV:
+                    target._stash_populate(sorted_prev)
+                for first, count in runs:
+                    if advised_runs is not None:
+                        dedupe_key = (id(target), first, count)
+                        if dedupe_key in advised_runs:
+                            continue
+                        advised_runs.add(dedupe_key)
+                    try:
+                        ok = target.backing.advise_expert_run(
+                            target.stacked_weight_key, first, count
+                        )
+                        if ok:
+                            _ADVISE_STATS["advised"] += count
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _stash_populate(self, eids_sorted: list[int]) -> None:
+        """Queue async ring-stash reads for the speculated expert runs.
+
+        The worker reads each run through THIS linear's keys (tier-aware
+        reader resolution by expert id) and stores raw NumPy bundles under
+        this linear's bundle_key — exactly the key the next layer's demand
+        path looks up, so a stash hit returns without disk I/O. Never blocks
+        the caller: reads run on the IO pool.
+        """
+        if not hasattr(self.backing, "load_expert_run"):
+            return
+        try:
+            ids = [int(e) for e in eids_sorted]
+            # Segment runs by resolved reader (tier boundary) like the demand
+            # path's _group_runs / advise_expert_run: a run reads ONE reader.
+            readers = [
+                self.backing._reader_for_key(self.stacked_weight_key, eid)
+                for eid in ids
+            ]
+            i = 0
+            jobs: list[tuple[int, int]] = []
+            while i < len(ids):
+                j = i
+                here = readers[i]
+                while j + 1 < len(ids) and readers[j + 1] is here:
+                    j += 1
+                jobs.append((ids[i], j - i + 1))
+                i = j + 1
+        except Exception:
+            return
+        if not jobs:
+            return
+        for first, count in jobs:
+            try:
+                _EXPERT_IO_POOL.submit(self._stash_read_run, first, count)  # noqa: SIM115
+            except Exception:
+                pass
+
+    def _stash_read_run(self, first_id: int, count: int) -> None:
+        """IO-pool worker: read one run into the stash ring (FIFO, bounded)."""
+        try:
+            ws = self.backing.load_expert_run(self.stacked_weight_key, first_id, count)
+            ss = self.backing.load_expert_run(self.stacked_scales_key, first_id, count)
+            bs: list | None = None
+            if self.stacked_biases_key:
                 try:
-                    ok = self.backing.advise_expert_run(self.stacked_weight_key, first, count)
-                    if ok:
-                        _ADVISE_STATS["advised"] += count
+                    bs = self.backing.load_expert_run(
+                        self.stacked_biases_key, first_id, count
+                    )
                 except Exception:
-                    pass
+                    bs = None
+            for i in range(count):
+                eid = first_id + i
+                key = self.bundle_key(eid)
+                if key in _SPEC_STASH:
+                    continue
+                _SPEC_STASH[key] = (
+                    ws[i],
+                    ss[i],
+                    bs[i] if bs is not None and i < len(bs) else None,
+                )
+                _SPEC_STASH_ORDER.append(key)
+                _ADVISE_STATS["stash_inserts"] += 1
+            while len(_SPEC_STASH) > _STASH_MAX_ENTRIES:
+                old = _SPEC_STASH_ORDER.pop(0)
+                if _SPEC_STASH.pop(old, None) is not None:
+                    _ADVISE_STATS["stash_evictions"] += 1
         except Exception:
             pass
 
@@ -991,14 +1133,16 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         return bundle
 
     def __call__(self, x, indices, sorted_indices=False, plan: _RemapPlan | None = None):
-        if _RA_ENV and _PREV_UNIQ_BY_LAYER:
-            try:
-                self._advise_next_layer_prev_token()
-            except Exception:
-                pass
         p = self.cache.profile
         if plan is None:
             plan = _RemapPlan()
+        # Fase K F1/F2: speculation for layer+1, deduped per layer call
+        # through plan.advised_runs (the GLU shares one plan).
+        if _RA_ENV and _PREV_UNIQ_BY_LAYER:
+            try:
+                self._advise_next_layer_prev_token(plan)
+            except Exception:
+                pass
         built = plan.flat_np is None
         if built:
             _build_plan_into(plan, indices)

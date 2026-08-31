@@ -22,21 +22,28 @@ logger = logging.getLogger(__name__)
 _PRIOR_DIR = Path(os.environ.get("OMLX_PREFILL_PRIOR_DIR", "") or Path.home() / ".cache" / "omlx")
 
 
-def _prior_path(model_id: str) -> Path | None:
+def _prior_path(model_id: str, model_path: str | Path | None = None) -> Path | None:
     if not model_id:
         return None
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in model_id)[:80]
-    # Prefer per-model .omlx dir if model exists on SSD (like pin profile), else cache dir
-    for base in ["/Volumes/SSD 4TB/AI Models", "/Volumes/SSD 2TB"]:
-        cand = Path(base) / model_id / ".omlx" / "prefill_transient_prior.json"
-        # Also check subdirs that contain model_id as substring (e.g., Qwen alias)
-        if cand.parent.exists():
-            return cand
-        # search one level deep for matching dir
+    # Fase K F10: resolve from the REAL model path the scheduler already
+    # knows (no hardcoded device roots, no iterdir scan per load). The
+    # .omlx dir next to the model is created on save; a read-only model
+    # dir falls back to the env/cache dir below.
+    if model_path:
         try:
-            for p in Path(base).iterdir():
-                if model_id in p.name and (p / ".omlx").exists():
-                    return p / ".omlx" / "prefill_transient_prior.json"
+            base = Path(model_path)
+            if base.is_dir():
+                cand = base / ".omlx" / "prefill_transient_prior.json"
+                try:
+                    if cand.parent.is_dir():
+                        return cand
+                    # writable check: can we create parent? best-effort probe
+                    cand.parent.mkdir(parents=True, exist_ok=True)
+                    if cand.parent.is_dir():
+                        return cand
+                except Exception:
+                    pass
         except Exception:
             pass
     return _PRIOR_DIR / f"prefill_prior_{safe}.json"
@@ -70,8 +77,10 @@ class PrefillTransientTracker:
     # observed outlier.
     _EWMA_OUTLIER_RATIO = 8.0
 
-    def __init__(self, model_id: str = "") -> None:
+    def __init__(self, model_id: str = "", model_path: str | Path | None = None) -> None:
         self._model_id = model_id
+        # Fase K F10: real model dir used by _prior_path (no hardcoded roots).
+        self._model_path = model_path
         self._ewma_per_token: float = 0.0
         self._samples: int = 0
         # Last observed delta for debug log inspection.
@@ -228,7 +237,7 @@ class PrefillTransientTracker:
     def save_prior(self) -> None:
         if not self._model_id or self._samples == 0 or self._ewma_per_token <= 0:
             return
-        path = _prior_path(self._model_id)
+        path = _prior_path(self._model_id, self._model_path)
         if path is None:
             return
         try:
@@ -249,7 +258,7 @@ class PrefillTransientTracker:
             logger.debug("save_prior failed %s: %s", path, e)
 
     def load_prior(self) -> bool:
-        path = _prior_path(self._model_id)
+        path = _prior_path(self._model_id, self._model_path)
         if path is None or not path.exists():
             return False
         try:
@@ -258,7 +267,15 @@ class PrefillTransientTracker:
             if bpt <= 0 or bpt > 100 * 1024 * 1024:  # sanity: 100 MB/tok max
                 return False
             self._ewma_per_token = bpt
-            self._samples = int(data.get("samples", 1))
+            # Fase K F10: seed the EWMA but do NOT inherit the prior's sample
+            # count — with the full count a regime change (e.g. cold tier
+            # toggled on/off, which shifts bytes/token by ~2x) would need
+            # dozens of chunks to move the EWMA. Clamping to 0 makes the
+            # first measured chunk of the new session REPLACE the prior
+            # immediately (update() seeds when samples == 0). predict()
+            # returns 0 until then, so the first chunk sizes against the
+            # static estimate — the exact pre-prior fallback.
+            self._samples = 0
             self._observed_max_bytes = int(data.get("observed_max_bytes", 0))
             self._last_delta_bytes = int(data.get("last_delta_bytes", 0))
             self._last_n_tokens = int(data.get("last_n_tokens", 0))

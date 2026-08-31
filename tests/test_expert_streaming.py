@@ -2162,3 +2162,293 @@ def test_hot_set_loader_real_denominator():
         os.unlink(p)
         os.unlink(p2)
 
+
+
+# ---------------------------------------------------------------------------
+# Fase K F1/F2/F3 — O2 advisor key fix, speculation guard, stash ring
+# ---------------------------------------------------------------------------
+
+class _AdviseRecorderBacking:
+    """Backing double for the O2 advisor: records advise_expert_run calls
+    and serves fake runs/slices for the stash ring."""
+
+    def __init__(self, per_expert_bytes: int = 64, num_experts: int = 64):
+        self.advised: list[tuple[str, int, int]] = []
+        self.read_runs: list[tuple[str, int, int]] = []
+        self.per_expert_bytes = per_expert_bytes
+        self.num_experts = num_experts
+        self.reader = _FakeReaderShim(self)
+
+    def advise_expert_run(self, key: str, first_id: int, count: int) -> bool:
+        self.advised.append((key, first_id, count))
+        return True
+
+    def _reader_for_key(self, key: str, expert_id: int | None = None):
+        return self.reader
+
+    def load_expert_run(self, key: str, first_id: int, count: int) -> list:
+        import numpy as np
+
+        self.read_runs.append((key, first_id, count))
+        return [
+            np.arange(self.per_expert_bytes, dtype=np.uint8).reshape(
+                (self.per_expert_bytes,)
+            )
+            + (first_id + i)
+            for i in range(count)
+        ]
+
+    def load_expert_slice(self, key: str, expert_id: int):
+        import numpy as np
+
+        return np.arange(self.per_expert_bytes, dtype=np.uint8)
+
+    def tensor_dtype(self, key: str):
+        return None
+
+
+class _FakeReaderShim:
+    def __init__(self, backing):
+        self.backing = backing
+        self.path = "/fake/shard.safetensors"
+
+    def _rp_for(self, key: str):
+        return None  # unused by the advisor
+
+
+def _make_advise_linear(layer_idx: int, proj: str, backing, cache):
+    from omlx.patches.expert_streaming.streaming_switch import (
+        StreamingQuantizedSwitchLinear,
+    )
+
+    return StreamingQuantizedSwitchLinear(
+        layer_idx=layer_idx,
+        proj_name=proj,
+        stacked_weight_key=f"model.layers.{layer_idx}.mlp.switch_mlp.{proj}.weight",
+        stacked_scales_key=f"model.layers.{layer_idx}.mlp.switch_mlp.{proj}.scales",
+        stacked_biases_key=None,
+        num_experts=backing.num_experts,
+        input_dims=32,
+        output_dims=32,
+        backing=backing,
+        cache=cache,
+    )
+
+
+class TestFaseKO2Advisor:
+    def test_advise_uses_next_layer_key(self):
+        """Fase K F1: the advisor must F_RDADVISE the NEXT layer's banks."""
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        backing = _AdviseRecorderBacking()
+        lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
+        lin1_up = _make_advise_linear(1, "up_proj", backing, cache)
+        lin1_down = _make_advise_linear(1, "down_proj", backing, cache)
+        ss._STREAM_LINEARS_BY_LAYER.clear()
+        ss.register_streaming_linears(1, [lin1_up, lin1_down])
+        ss._PREV_UNIQ_BY_LAYER[1] = [3, 4, 9]
+        ss._SPEC_STASH.clear()
+        ss._SPEC_STASH_ORDER.clear()
+        old_stats = dict(ss._ADVISE_STATS)
+        try:
+            with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", False):
+                plan = ss._RemapPlan()
+                lin0._advise_next_layer_prev_token(plan)
+            keys = {k for k, _, _ in backing.advised}
+            assert keys == {
+                "model.layers.1.mlp.switch_mlp.up_proj.weight",
+                "model.layers.1.mlp.switch_mlp.down_proj.weight",
+            }, f"advised wrong banks: {keys}"
+            # 2 targets x 3 experts (runs (3,2) + (9,1))
+            assert ss._ADVISE_STATS["advised"] - old_stats["advised"] == 6
+        finally:
+            ss._STREAM_LINEARS_BY_LAYER.clear()
+            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
+            ss._SPEC_STASH.clear()
+            ss._SPEC_STASH_ORDER.clear()
+
+    def test_advise_guard_skips_prefill_shaped_sets(self):
+        """Fase K F2: > _MAX_ADVISE_ROWS experts is prefill-shaped, skip."""
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        backing = _AdviseRecorderBacking(num_experts=512)
+        lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
+        lin1 = _make_advise_linear(1, "up_proj", backing, cache)
+        ss._STREAM_LINEARS_BY_LAYER.clear()
+        ss.register_streaming_linears(1, [lin1])
+        ss._PREV_UNIQ_BY_LAYER[1] = list(range(200))
+        try:
+            with patch.object(ss, "_RA_ENV", True):
+                plan = ss._RemapPlan()
+                lin0._advise_next_layer_prev_token(plan)
+            assert backing.advised == [], "prefill-shaped set must not be advised"
+        finally:
+            ss._STREAM_LINEARS_BY_LAYER.clear()
+            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
+
+    def test_advise_dedupes_runs_per_layer_call(self):
+        """Fase K F2: the 3 projections share one plan -> no double advise."""
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        backing = _AdviseRecorderBacking()
+        lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
+        lin1 = _make_advise_linear(1, "up_proj", backing, cache)
+        ss._STREAM_LINEARS_BY_LAYER.clear()
+        ss.register_streaming_linears(1, [lin1])
+        ss._PREV_UNIQ_BY_LAYER[1] = [3, 4]
+        try:
+            with patch.object(ss, "_RA_ENV", True):
+                plan = ss._RemapPlan()
+                lin0._advise_next_layer_prev_token(plan)
+                lin0._advise_next_layer_prev_token(plan)
+            assert len(backing.advised) == 1, f"expected 1 run, got {backing.advised}"
+        finally:
+            ss._STREAM_LINEARS_BY_LAYER.clear()
+            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
+
+
+class TestFaseKO2StashRing:
+    def test_stash_populate_serves_demand(self):
+        """Fase K F3: speculated runs land in the ring under tier-aware
+        bundle keys and a later demand get() hits them."""
+        import time
+
+        import numpy as np
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        backing = _AdviseRecorderBacking()
+        lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
+        lin1 = _make_advise_linear(1, "up_proj", backing, cache)
+        ss._STREAM_LINEARS_BY_LAYER.clear()
+        ss.register_streaming_linears(1, [lin1])
+        ss._PREV_UNIQ_BY_LAYER[1] = [3, 4]
+        ss._SPEC_STASH.clear()
+        ss._SPEC_STASH_ORDER.clear()
+        try:
+            with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+                plan = ss._RemapPlan()
+                lin0._advise_next_layer_prev_token(plan)
+                deadline = time.time() + 5.0
+                while ss._ADVISE_STATS["stash_inserts"] < 2 and time.time() < deadline:
+                    time.sleep(0.02)
+            assert ss._ADVISE_STATS["stash_inserts"] == 2, "stash reads must land"
+            for eid in (3, 4):
+                key = lin1.bundle_key(eid)
+                assert key in ss._SPEC_STASH, f"stash missing {key}"
+                w, s, b = ss._SPEC_STASH[key]
+                assert w.shape == (64,)
+            # A demand get() against the LRU resolution path must hit the ring.
+            with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+                got = lin1._bundle_cached_or_staged(3)
+            assert got is not None and got[0].shape == (64,)
+            # FIFO ring: inserting beyond _STASH_MAX_ENTRIES evicts the oldest.
+            for eid in range(10, 10 + ss._STASH_MAX_ENTRIES):
+                key = (1, eid, lin1.stacked_weight_key)
+                ss._SPEC_STASH[key] = (np.zeros(4, np.uint8), None, None)
+                ss._SPEC_STASH_ORDER.append(key)
+            while len(ss._SPEC_STASH) > ss._STASH_MAX_ENTRIES:
+                old = ss._SPEC_STASH_ORDER.pop(0)
+                ss._SPEC_STASH.pop(old, None)
+            assert len(ss._SPEC_STASH) <= ss._STASH_MAX_ENTRIES
+        finally:
+            ss._STREAM_LINEARS_BY_LAYER.clear()
+            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
+            ss._SPEC_STASH.clear()
+            ss._SPEC_STASH_ORDER.clear()
+
+    def test_stash_off_by_default_no_stash_reads(self):
+        """Fase K F3: STASH=0 (default) issues advisory hints only."""
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        backing = _AdviseRecorderBacking()
+        lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
+        lin1 = _make_advise_linear(1, "up_proj", backing, cache)
+        ss._STREAM_LINEARS_BY_LAYER.clear()
+        ss.register_streaming_linears(1, [lin1])
+        ss._PREV_UNIQ_BY_LAYER[1] = [3, 4]
+        ss._SPEC_STASH.clear()
+        ss._SPEC_STASH_ORDER.clear()
+        try:
+            with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", False):
+                plan = ss._RemapPlan()
+                lin0._advise_next_layer_prev_token(plan)
+            assert backing.read_runs == [], "stash disabled: no speculative reads"
+            assert len(backing.advised) == 1, "F_RDADVISE still fires"
+        finally:
+            ss._STREAM_LINEARS_BY_LAYER.clear()
+            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
+            ss._SPEC_STASH.clear()
+            ss._SPEC_STASH_ORDER.clear()
+
+
+class TestFaseKAdmissionFilter:
+    def test_admission_engages_at_large_budget(self):
+        """Fase K F9: the baggy capacity < 4096 cap is gone — the filter
+        must engage at a 6 GiB budget (measured capacity ~6847)."""
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        cache = ss.ExpertLRUCache(6 * 1024**3, 920_000, num_layers=48)
+        assert cache.capacity > 4096, "premise: 6 GiB budget exceeds the old cap"
+        with patch.object(ss, "_ADMISSION_ENV", True):
+            cache2 = ss.ExpertLRUCache(6 * 1024**3, 920_000, num_layers=48)
+            assert cache2._admission_enabled is True
+        with patch.object(ss, "_ADMISSION_ENV", False):
+            cache3 = ss.ExpertLRUCache(6 * 1024**3, 920_000, num_layers=48)
+            assert cache3._admission_enabled is False
+
+
+class TestFaseKPriorPath:
+    def test_prior_round_trip_via_model_path(self, tmp_path):
+        """Fase K F10: prior persists next to the real model dir; load clamps
+        the sample count to 1 so the first measured chunk dominates."""
+        from unittest.mock import MagicMock
+
+        from omlx import prefill_transient_tracker as pt
+
+        model_dir = tmp_path / "models" / "Qwen3.8-Flash-Next-oQ4e-mtp"
+        model_dir.mkdir(parents=True)
+        with patch.object(
+            pt, "_PRIOR_DIR", tmp_path / "cache"
+        ), patch.object(
+            pt, "logger", MagicMock()
+        ):
+            t = pt.PrefillTransientTracker("qwen", model_path=model_dir)
+            t.update(1000, 200_000)
+            for _ in range(10):
+                t.update(1000, 200_000)
+            assert t.samples == 11
+            t.save_prior()
+            prior_file = model_dir / ".omlx" / "prefill_transient_prior.json"
+            assert prior_file.exists(), "prior must live next to the model"
+            t2 = pt.PrefillTransientTracker("qwen", model_path=model_dir)
+            assert t2.load_prior() is True
+            assert t2.bytes_per_token == 200.0
+            assert t2.samples == 0, "samples must be clamped to 0 on load"
+            t2.update(1000, 400_000)
+            assert t2.bytes_per_token == 400.0, "first measured chunk replaces prior"
+            assert t2.samples == 1
+
+    def test_prior_no_hardcoded_roots(self, tmp_path):
+        """Fase K F10: without a model path the prior falls back to the
+        env/cache dir — never a hardcoded device root."""
+        from unittest.mock import MagicMock
+
+        from omlx import prefill_transient_tracker as pt
+
+        cache_dir = tmp_path / "omlx-cache"
+        cache_dir.mkdir()
+        with patch.object(pt, "_PRIOR_DIR", cache_dir), patch.object(
+            pt, "logger", MagicMock()
+        ):
+            t = pt.PrefillTransientTracker("m1")
+            t.update(100, 50_000)
+            t.save_prior()
+            assert (cache_dir / "prefill_prior_m1.json").exists()
+            t2 = pt.PrefillTransientTracker("m1")
+            assert t2.load_prior() is True

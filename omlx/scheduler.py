@@ -1960,10 +1960,13 @@ class Scheduler:
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
+        _tracker_model_path = None
         if config is not None and config.model_name:
             _tracker_model_id = config.model_name
+            _tracker_model_path = getattr(config, "model_path", None) or None
         self._prefill_transient_tracker = PrefillTransientTracker(
-            model_id=_tracker_model_id
+            model_id=_tracker_model_id,
+            model_path=_tracker_model_path,
         )
         # B3: seed EWMA from per-model persisted prior (same infra as pin profile)
         try:
