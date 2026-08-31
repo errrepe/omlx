@@ -133,6 +133,7 @@ async def run(
     specprefill_keep: float | None = None,
     out_dir: str = "bench/results",
     single_request: bool = False,
+    gate_tokens: bool = False,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -395,6 +396,15 @@ async def run(
             f"(tokens={type(_tokens).__name__}, text={type(_text).__name__}); "
             "cannot compare runs. Aborting."
         )
+    # Fase K K8: arms that REQUIRE the token-ID gate must fail high when
+    # the engine produced no token list — a text-only gate cannot prove
+    # identical token IDs, so it must never silently pass.
+    if gate_tokens and _bit_exact_kind != "tokens":
+        raise SystemExit(
+            f"token-ID gate FAILED: bit_exact_kind={_bit_exact_kind} "
+            f"(tokens={type(_tokens).__name__}); run with the engine fix that "
+            "populates output_token_ids. Aborting."
+        )
     _json.dump(
         {
             "bit_exact_kind": _bit_exact_kind,
@@ -531,6 +541,8 @@ def main():
                     help="scheduler memory ceiling propagated as throttle/guard watermarks (the server "
                          "gets this from the ProcessMemoryEnforcer; the bench has no enforcer)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--gate-tokens", action="store_true",
+                    help="require non-empty token-ID lists for the bit-exactness gate; fail high on empty")
     ap.add_argument("--out-dir", default="bench/results", metavar="DIR",
                     help="directory for the _samples/_output side-effect files (default bench/results)")
     ap.add_argument(
@@ -572,6 +584,7 @@ def main():
             mem_ceiling=args.mem_ceiling_gib,
             out_dir=args.out_dir,
             single_request=args.single_request,
+            gate_tokens=args.gate_tokens,
         )
     )
 

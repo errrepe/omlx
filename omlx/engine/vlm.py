@@ -3525,6 +3525,7 @@ class VLMBatchedEngine(BaseEngine):
                 return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
             return GenerationOutput(
                 text=full_text,
+                tokens=list(last_output.tokens),
                 prompt_tokens=last_output.prompt_tokens,
                 completion_tokens=last_output.completion_tokens,
                 finish_reason=last_output.finish_reason,
@@ -3581,6 +3582,7 @@ class VLMBatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
+            tokens=list(output.output_token_ids),
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
@@ -3705,6 +3707,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 yield GenerationOutput(
                     text=text,
+                    tokens=list(output.output_token_ids),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -3776,6 +3779,7 @@ class VLMBatchedEngine(BaseEngine):
                 return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
             return GenerationOutput(
                 text=full_text,
+                tokens=list(last_output.tokens),
                 prompt_tokens=last_output.prompt_tokens,
                 completion_tokens=last_output.completion_tokens,
                 finish_reason=last_output.finish_reason,
