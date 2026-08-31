@@ -21,6 +21,7 @@ import re
 import struct
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Dict, NamedTuple, Tuple
 
@@ -144,6 +145,35 @@ def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
 # past the device's useful queue depth). +55% over depth 1, all runs
 # token-ID bit-exact.
 _RUN_IO_QD = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_QD", "16")))
+
+# Fase 2: demand-read telemetry, collected ONLY under the profiling env
+# (the bench sets OMLX_EXPERT_STREAMING_PROFILE=1). Zero cost otherwise:
+# one module-global guard read per read_expert_into call.
+_PROFILE_READS = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
+_READ_STATS: dict = {}
+
+
+def read_stats() -> dict | None:
+    """Fase 2 demand-read telemetry snapshot (None when unarmed)."""
+    if not _PROFILE_READS:
+        return None
+    lat = sorted(_READ_STATS.get("lat_us", []))
+    sizes = sorted(_READ_STATS.get("run_sizes", []))
+
+    def pct(vals: list, p: float) -> int | None:
+        if not vals:
+            return None
+        return int(vals[min(len(vals) - 1, int(len(vals) * p))])
+
+    return {
+        "calls": _READ_STATS.get("calls", 0),
+        "runs": _READ_STATS.get("runs", 0),
+        "bytes": _READ_STATS.get("bytes", 0),
+        "lat_us_p50": pct(lat, 0.5),
+        "lat_us_p95": pct(lat, 0.95),
+        "run_sizes": sizes,  # actual sizes histogram source
+        "peak_inflight": _READ_STATS.get("peak_inflight", 0),
+    }
 
 # NOTE: the singleton and the accessor must not share a name — a module-level
 # def _run_io_pool would rebind the very global the accessor is meant to
@@ -824,6 +854,7 @@ class ExpertBackingStore:
         (caller must fall back to load_expert_slice). Bytes are written in
         expert-id order so outs[i][j] is expert eids[j].
         """
+        _read_t0 = time.perf_counter_ns() if _PROFILE_READS else None
         if len(components) != len(outs):
             return False
         for (key, eids), out in zip(components, outs):
@@ -950,9 +981,28 @@ class ExpertBackingStore:
                         scatter_one(wo, wfirst, wjs, wbuf)
                 if not ok:
                     return False
+            if _PROFILE_READS:
+                # Fase 2 demand-read telemetry (bench-only cost).
+                _READ_STATS["calls"] = _READ_STATS.get("calls", 0) + 1
+                _READ_STATS["runs"] = _READ_STATS.get("runs", 0) + len(runs)
+                _READ_STATS["bytes"] = _READ_STATS.get("bytes", 0) + sum(
+                    cnt * rp.expert_bytes for (_o, _f, cnt, _js) in runs
+                )
+                _READ_STATS.setdefault("run_sizes", []).extend(
+                    cnt for (_o, _f, cnt, _js) in runs
+                )
+                _READ_STATS.setdefault("lat_us", []).append(
+                    (time.perf_counter_ns() - _read_t0) // 1000
+                )
+                _READ_STATS["peak_inflight"] = max(
+                    _READ_STATS.get("peak_inflight", 0),
+                    min(_RUN_IO_QD, len(runs)),
+                )
         return True
 
-    def advise_expert_run(self, key: str, first_id: int, count: int) -> bool:
+    def advise_expert_run(
+        self, key: str, first_id: int, count: int
+    ) -> tuple[bool, int, int]:
         """Kernel readahead of experts [first_id, first_id+count) of one bank.
 
         Row-major stacked banks make a run of ids one contiguous byte range,
@@ -960,15 +1010,23 @@ class ExpertBackingStore:
         readahead counterpart of load_expert_run. Under the HOBBIT split
         (I6) the run may straddle the hot/cold boundary; a run reads ONE
         reader (the one its first id resolves), so advise breaks at tier
-        boundaries exactly like the demand path's _group_runs. Returns
-        False when the platform lacks F_RDADVISE or nothing resolved.
+        boundaries exactly like the demand path's _group_runs.
+
+        Returns (ok, bytes_advised, tier_segments): bytes_advised is the
+        total file range covered by the accepted advisories (Fase 2
+        telemetry — the caller accumulates it, so advised_bytes stops being
+        a permanent zero in the bench output), tier_segments counts the
+        reader groups the run needed. ok is False when the platform lacks
+        F_RDADVISE or nothing resolved.
         """
         try:
             if count <= 0:
-                return False
+                return (False, 0, 0)
             ids = [first_id + i for i in range(count)]
             readers = [self._reader_for_key(key, eid) for eid in ids]
             ok = False
+            total_bytes = 0
+            segments = 0
             # group consecutive ids sharing the same reader (tier boundary)
             i = 0
             while i < len(ids):
@@ -980,10 +1038,12 @@ class ExpertBackingStore:
                 _, end = reader.expert_byte_range(key, ids[j])
                 if end > start:
                     ok = reader.advise_range(start, end - start) or ok
+                    total_bytes += end - start
+                    segments += 1
                 i = j + 1
-            return ok
+            return (ok, total_bytes, segments)
         except Exception:
-            return False
+            return (False, 0, 0)
 
     def pin_expert(self, key: str, expert_id: int) -> int:
         """mlock one expert's file range across the resolved shard.

@@ -454,6 +454,13 @@ async def run(
             print(f"advise {advise_stats}")
         except Exception:
             advise_stats = None
+        # Fase 2: demand-read telemetry (armed only by PROFILE=1).
+        try:
+            from omlx.patches.expert_streaming.shard_bank import read_stats as _rs
+
+            _read_stats_out = _rs()
+        except Exception:
+            _read_stats_out = None
 
     phys_end = get_phys_footprint() / 1024**3
     try:
@@ -479,6 +486,7 @@ async def run(
             "profile": profile,
             "prefetcher": pf_stats,
             "advise_stats": advise_stats,
+            "read_stats": _read_stats_out,
             "resources": res_summary,
             "tokens": _tokens if isinstance(_tokens, list) else None,
             "bit_exact_kind": _bit_exact_kind,

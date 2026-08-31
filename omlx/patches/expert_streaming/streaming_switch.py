@@ -185,7 +185,11 @@ class SpeculationState:
         self.stash_order: list[Tuple[int, int, str]] = []
         self.stats = {
             "advised": 0,
+            "advised_runs": 0,
+            "advised_experts": 0,
             "advised_bytes": 0,
+            "advice_failures": 0,
+            "advice_tier_segments": 0,
             "stash_hits": 0,
             "stash_misses": 0,
             "stash_targets": 0,
@@ -193,6 +197,8 @@ class SpeculationState:
             "stash_evictions": 0,
         }
         self.pending: set[Any] = set()
+        # Fase 5: pending slots reserved before the executor hand-off.
+        self._pending_reserved = 0
 
     # -- registry / history ----------------------------------------------
 
@@ -244,16 +250,31 @@ class SpeculationState:
     # -- futures (K7: bounded pending, close drains) ----------------------
 
     def submit(self, fn: Any) -> bool:
-        """Queue one speculation read; drop silently when full or closed."""
+        """Queue one speculation read; drop silently when full or closed.
+
+        Fase 5: atomically reserves a pending slot UNDER the lock before
+        submitting to the executor — the old check-then-submit window let
+        concurrent callers overshoot the cap between the lock and the
+        executor hand-off. The reservation is released in every path
+        (cancel on close, executor failure, normal completion).
+        """
         with self.lock:
-            if self.closed or len(self.pending) >= _STASH_MAX_PENDING:
+            if self.closed or len(self.pending) + self._pending_reserved >= _STASH_MAX_PENDING:
                 return False
-        fut = _EXPERT_IO_POOL.submit(fn)
+            self._pending_reserved += 1
+        try:
+            fut = _EXPERT_IO_POOL.submit(fn)
+        except Exception:
+            with self.lock:
+                self._pending_reserved -= 1
+            return False
         with self.lock:
             if self.closed:
+                self._pending_reserved -= 1
                 fut.cancel()
                 return False
             self.pending.add(fut)
+            self._pending_reserved -= 1
         fut.add_done_callback(self._drop_pending)
         return True
 
@@ -277,6 +298,7 @@ class SpeculationState:
             self.closed = True
             futs = list(self.pending)
             self.pending.clear()
+            self._pending_reserved = 0
         if futs:
             for fut in futs:
                 if not fut.running():
@@ -1766,11 +1788,17 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                             continue
                         advised_runs.add(dedupe_key)
                     try:
-                        ok = target.backing.advise_expert_run(
+                        ok, adv_bytes, adv_segs = target.backing.advise_expert_run(
                             target.stacked_weight_key, first, count
                         )
                         if ok:
                             state.bump("advised", count)
+                            state.bump("advised_experts", count)
+                            state.bump("advised_runs", 1)
+                            state.bump("advised_bytes", adv_bytes)
+                            state.bump("advice_tier_segments", adv_segs)
+                        else:
+                            state.bump("advice_failures", 1)
                     except Exception:
                         pass
         except Exception:

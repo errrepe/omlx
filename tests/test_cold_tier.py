@@ -330,7 +330,8 @@ def test_advise_expert_run_breaks_at_tier_boundary(tmp_path):
         with patch.object(reader_hot, "advise_range", side_effect=spy_hot):
             with patch.object(reader_cold, "advise_range", side_effect=spy_cold):
                 # run 0..5 straddles: hot segment [0,1], cold segment [2,5]
-                assert cold.advise_expert_run(key_w, 0, 6) is True
+                ok, adv_bytes, segs = cold.advise_expert_run(key_w, 0, 6)
+                assert ok is True and segs == 2 and adv_bytes > 0
 
         # exactly one advise per tier segment, never one for the whole run
         hot_calls = [c for c in advised if c[0] == "HOT"]

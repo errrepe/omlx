@@ -1194,10 +1194,11 @@ def test_backing_advise_expert_run_real_range():
         key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
         got = backing.advise_expert_run(key, 1, 2)  # experts 1..2 contiguous
         if sys.platform == "darwin":
-            assert got is True
+            ok, adv_bytes, adv_segs = got
+            assert ok is True and adv_bytes > 0 and adv_segs == 1
         else:
-            assert got is False
-        assert backing.advise_expert_run("nope.missing.key", 0, 1) is False
+            assert got == (False, 0, 0)
+        assert backing.advise_expert_run("nope.missing.key", 0, 1) == (False, 0, 0)
     finally:
         backing.close()
 
@@ -2187,9 +2188,9 @@ class _AdviseRecorderBacking:
         self.num_experts = num_experts
         self.reader = _FakeReaderShim(self)
 
-    def advise_expert_run(self, key: str, first_id: int, count: int) -> bool:
+    def advise_expert_run(self, key: str, first_id: int, count: int):
         self.advised.append((key, first_id, count))
-        return True
+        return (True, self.per_expert_bytes * count, 1)
 
     def _reader_for_key(self, key: str, expert_id: int | None = None):
         return self.reader
@@ -2282,6 +2283,12 @@ class TestFaseKO2Advisor:
         }, f"advised wrong banks: {keys}"
         # 2 targets x 3 experts (runs (3,2) + (9,1))
         assert spec.stats["advised"] == 6
+        # Fase 2 telemetry: runs/expert/bytes per advised run.
+        assert spec.stats["advised_runs"] == 4, spec.stats
+        assert spec.stats["advised_experts"] == 6
+        assert spec.stats["advised_bytes"] == 2 * (64 * 2 + 64), spec.stats
+        assert spec.stats["advice_tier_segments"] == 4
+        assert spec.stats["advice_failures"] == 0
 
     def test_advise_guard_skips_prefill_shaped_sets(self):
         """Fase K F2: > _MAX_ADVISE_ROWS experts is prefill-shaped, skip."""
@@ -2298,6 +2305,7 @@ class TestFaseKO2Advisor:
             plan = ss._RemapPlan()
             lin0._advise_next_layer_prev_token(plan)
         assert backing.advised == [], "prefill-shaped set must not be advised"
+        assert spec.stats["advised_runs"] == 0, "no advice stats for skipped plans"
 
     def test_advise_dedupes_runs_per_layer_call(self):
         """Fase K F2: the 3 projections share one plan -> no double advise."""
@@ -2535,10 +2543,12 @@ class TestFaseKSpecStateLifecycle:
                 accepted += 1
         with spec2.lock:
             assert len(spec2.pending) <= ss._STASH_MAX_PENDING
+            assert spec2._pending_reserved == 0, "no leaked reservations"
         assert accepted <= ss._STASH_MAX_PENDING + 200
         spec2.close()
         with spec2.lock:
             assert spec2.pending == set()
+            assert spec2._pending_reserved == 0
 
 
 class TestFaseKAdmissionFilter:
@@ -3007,6 +3017,74 @@ def test_ctx_hybrid_preserves_hobbit_keys():
             assert k[2].endswith("#c"), f"cold key must be tier-suffixed: {k}"
         b_u = ctx_u.bundles.get(id(lin0), {})
         assert set(b_u) == set(demand)
+
+
+
+def test_advisor_stats_count_bytes_per_tier_segment():
+    """Fase 2: advise_expert_run reports the REAL byte coverage and the
+    tier segments it needed — a run straddling hot/cold reports two
+    segments and per-tier bytes (the old bool hid both)."""
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    class _FakeReader:
+        def __init__(self, width):
+            self.width = width
+
+        def expert_byte_range(self, key, eid):
+            return eid * self.width, (eid + 1) * self.width
+
+        def advise_range(self, off, length):
+            return True
+
+    class _SegBacking(ExpertBackingStore):
+        def __init__(self):
+            self.hot = _FakeReader(2 * 1024 * 1024)
+            self.cold = _FakeReader(1 * 1024 * 1024)
+
+        def _reader_for_key(self, key, expert_id=None):
+            return self.hot if (expert_id or 0) < 8 else self.cold
+
+    b = _SegBacking()
+    ok, adv_bytes, segs = b.advise_expert_run("k", 0, 16)  # 8 hot + 8 cold
+    assert ok is True and segs == 2, (ok, segs)
+    assert adv_bytes == 8 * 2 * 1024 * 1024 + 8 * 1 * 1024 * 1024, adv_bytes
+    ok2, bytes2, segs2 = b.advise_expert_run("k", 0, 4)
+    assert ok2 is True and segs2 == 1 and bytes2 == 4 * 2 * 1024 * 1024
+
+
+def test_read_stats_collected_under_profile():
+    """Fase 2: with the profile env armed, read_expert_into accumulates
+    demand-read telemetry (calls/runs/bytes/latency); without it the
+    collector stays inert (None snapshot)."""
+    import numpy as np
+
+    from omlx.patches.expert_streaming import shard_bank as sb_mod
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        per = 4 * 4 * 2
+        _write_shard_filled(tmp / "model.safetensors", {key: ((16, 4, 4), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        out = np.empty((4, per), dtype=np.uint8)
+        assert sb_mod.read_stats() is None, "unarmed: no snapshot"
+        sb_mod._READ_STATS.clear()
+        try:
+            with patch.object(sb_mod, "_PROFILE_READS", True):
+                assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+                snap = sb_mod.read_stats()
+            assert snap is not None
+            assert snap["calls"] >= 1
+            assert snap["runs"] == 2, snap
+            assert snap["bytes"] == 4 * per, snap
+            assert snap["lat_us_p95"] is not None
+            assert snap["peak_inflight"] >= 1
+        finally:
+            sb_mod._READ_STATS.clear()
 
 def test_memtrace_disabled_by_default_is_noop():
     """With the env var unset the singleton is a null tracer: recording is
