@@ -40,13 +40,14 @@ _BANK_MAX_BYTES = max(
 )
 _RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
 # Fase K F7: bridge gaps of up to this many experts inside one same-tier
-# coalesced run (gap bytes are read but never promoted/used). 0 disables.
-# Effective only while the HOBBIT split is active: split prefill demand
-# fragments into many single-expert runs, so bridging buys sequential
-# reads; single-tier demand is already contiguous and bridging only adds
-# idle gap bytes (measured 2k TTFT: 34.0s bridged vs 31.4s unbridged, 3
-# reps, bench/results/fasek/mergeab/).
-_RUN_MERGE_GAP = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MERGE_GAP", "2")))
+# coalesced run (gap bytes are read but never promoted/used). DEFAULT 0:
+# three windows on this box measured a NET LOSS from bridging in BOTH
+# regimes — single-tier 2k 34.0s bridged vs 31.4s unbridged (3 reps,
+# mergeab/), and split-active 2k 55.0s vs 47.5s / 8k 107.2s vs 98.9s
+# (split4/). The NVMe at QD16 already saturates without the holes; the
+# bridge only adds idle bytes and longer per-layer waits. The env knob
+# stays for slower/HDD backends where sequential reads may win.
+_RUN_MERGE_GAP = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MERGE_GAP", "0")))
 # Etapa A1: promote an all-miss demand bank with a single mx.array instead of
 # U per-expert mx arrays followed by mx.stack. Bit-identical — gather_qmm
 # receives the same bytes, dtype and shape — but it halves the Metal transient
@@ -1379,10 +1380,10 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             keys.append(self.stacked_biases_key)
         try:
             split = self._is_split_active()
-            # Fase K K5: bridge holes in the C2 read path ONLY while the
-            # split is active (the re-gate from the mergeab A/B: unbridged
-            # 31.4s vs bridged 34.0s at 2k single-tier). Gap rows are read
-            # with the run; the scatter never promotes them.
+            # Fase K K5: bridge holes in the C2 read path when the env
+            # asks for it (RUN_MERGE_GAP defaults to 0 — measured loss in
+            # both regimes, split4/). Gap rows are read with the run; the
+            # scatter never promotes them.
             merge_gap = _RUN_MERGE_GAP if split else 0
             if split:
                 groups: list[tuple[int, list[int]]] = []
@@ -1535,14 +1536,16 @@ class StreamingQuantizedSwitchLinear(nn.Module):
 
         Fase K F7: since the caller neither promotes nor uses extra rows
         (rows outside the requested scatter set are dropped), a run may be
-        stretched to BRIDGE a small gap (_RUN_MERGE_GAP, default 2) of
+        stretched to BRIDGE a small gap (_RUN_MERGE_GAP, default 0 — the
         missing ids within the SAME tier — prefill demand under the HOBBIT
         split fragments into many single-expert runs; bridging turns them
         into longer sequential reads on the 40 Gbps NVMe at the cost of a
         few idle bytes. The gap experts are read but never promoted or used.
-        Bridging applies ONLY while the split is active: single-tier demand
-        is already contiguous, and re-measurement showed bridging costs ~8%
-        of 2k TTFT there (34.0s vs 31.4s, 3 reps, mergeab artifacts).
+        Bridging is OFF by default: re-measurement showed a net cost in
+        BOTH regimes (single-tier 2k 34.0s vs 31.4s; split-active 2k 55.0s
+        vs 47.5s, 8k 107.2s vs 98.9s — mergeab/ and split4/ artifacts). It
+        remains available via the env knob for backends where sequential
+        reads win.
         """
         tier_of = self._tier_of if self._is_split_active() else None
         max_run = _RUN_MAX if max_run is None else max(1, int(max_run))

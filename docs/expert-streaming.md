@@ -799,8 +799,10 @@ re-base and rewrites the bench's chunk_schedule reference together.
   sparse stash speculation reads exact keys (the old reader-only segment-
   ation stored hole experts).
 - K5 (2e16f40f): the F7 run-gap bridge reaches the C2 read path
-  (read_expert_into, merge_gap) with the split-active re-gate; the
-  scatter writes ONLY the demanded ids at (eid - first) rows.
+  (read_expert_into, merge_gap); the scatter writes ONLY the demanded
+  ids at (eid - first) rows. split4/ later measured the bridge as a net
+  TTFT loss in both regimes, so RUN_MERGE_GAP now defaults to 0 (the
+  knob stays for slower backends).
 - K4 (dc980cc5): the PREFILL_QD regime pool now serves the rolling
   prefetch and union paths, not just the legacy fallback call.
 - K6 (e4b402f9): tier-aware bank bytes under HOBBIT — the prefetch and
@@ -828,6 +830,12 @@ re-base and rewrites the bench's chunk_schedule reference together.
 - K4 (8k, PREFILL_QD=24): same-window baseline 91.0s vs 89.3s with the
   regime pool (-1.9%); absolute 89.3s vs the 85s target is window drift,
   not a pool miss. Decode tok/s unchanged within noise.
+- K5/K6 split-active (split4/, cold tier 3-bit + learned pin profile,
+  --cold-tier 3 --hot-fraction 0.25): bridge ON vs OFF is token-
+  identical at 2k and 8k (48/48), and bridging LOSES TTFT under the
+  real split too (2k 55.0 vs 47.5 s, 8k 107.2 vs 98.9 s) -> default 0.
+  memtrace shows tier-aware bank_bytes (217.8 MiB for a 275-expert
+  mixed chunk, under the 256 MiB cap) — K6 arithmetic coherent.
 ### F1 — the O2 advisor advised the wrong layer (fixed)
 
 The ported _advise_next_layer_prev_token took the NEXT layer's expert ids
@@ -897,19 +905,19 @@ threshold shared with the scheduler's chunk-boundary clears (Etapa D).
   break, and the dual-tier gather_qmm assembly consumes the single-promoted
   per-tier banks directly.
 
-### F7 — run-gap bridging (gated on the HOBBIT split, reaches C2 via K5)
+### F7 — run-gap bridging (measured net LOSS in both regimes; default OFF)
 
 Bridging stretches a same-tier run across a <=2 gap of non-demanded ids
 so split-fragmented prefill demand becomes longer sequential preadvs.
-Re-measurement at 2k with the split inactive showed the idle gap bytes cost
-~8% of TTFT (34.0 vs 31.4 s, 3 reps, bench/results/fasek/mergeab/) for no
-locality gain: single-tier demand is already contiguous. Bridging is now
-effective ONLY while the split is active. K5 moved the bridge from the
-legacy fallback planner into read_expert_into itself (shared segmentation
-with the stash and advisor), so it materializes on the C2 path; the
-scatter writes only the demanded ids. The env caps the budget; 0 always
-disables. Token output is unchanged (reads only; the token-ID gate covers
-bridged and unbridged arms).
+The implementation lives in read_expert_into (K5, shared segmentation with
+the stash and advisor; the scatter writes only the demanded ids, so token
+output is bit-identical bridged vs unbridged — proven at 48/48 ids on the
+real HOBBIT split at 2k AND 8k). But three windows on this box measured a
+NET LOSS from bridging in both regimes: single-tier 2k 34.0 vs 31.4 s (3
+reps, mergeab/), split-active 2k 55.0 vs 47.5 s and 8k 107.2 vs 98.9 s
+(split4/). The NVMe at QD16 already saturates without the holes; the
+bridge only adds idle gap bytes and longer per-layer waits. RUN_MERGE_GAP
+defaults to 0; the env knob stays for backends where sequential reads win.
 
 ### F12 — pools per regime (opt-in, wired by K4)
 

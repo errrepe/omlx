@@ -3483,8 +3483,13 @@ class TestFaseKRunMerge:
             assert runs == [(3, 2), (7, 2)], runs
             runs = lin._group_runs([3, 4, 8, 9])
             assert runs == [(3, 2), (8, 2)], runs
-        # Split active, every demanded id hot: bridge engages (covers 3..8).
+        # Split active with the DEFAULT env: bridge is OFF (measured net
+        # loss in both regimes, split4 artifacts) — plain grouping.
         lin.set_hobbit_split({3, 4, 5, 6, 7, 8, 9}, cold_bits=2, cold_gs=32)
+        with patch.object(ss, "_RUN_MERGE_GAP", 0):
+            runs = lin._group_runs([3, 4, 7, 8])
+            assert runs == [(3, 2), (7, 2)], runs
+        # Env-opt-in bridging still engages under the split (covers 3..8).
         with patch.object(ss, "_RUN_MERGE_GAP", 2):
             runs = lin._group_runs([3, 4, 7, 8])
             assert runs == [(3, 6)], runs
