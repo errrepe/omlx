@@ -338,4 +338,38 @@ A mudança só deve ser considerada segura se:
 
 ---
 
+## 12. Resultados de Verificação (execução Fase J)
+
+Estado ao fim da sessão 2026-08-31 (worktree `fork-feature-expert-streaming-61637226`, HEAD `6b020181` → `0a4d3c72`).
+
+### 12.1 As 44 falhas da suíte completa são AMBIENTAIS (não o diff)
+Isolado via `/tmp/iso_test.sh` (varia árvore vs. estilo de invocação em `test_paged_ssd_cache.py`):
+- Árvore COM-mudanças, invocação limpa → **170 passed**.
+- Árvore LIMPA, invocação estilo-com-mudanças → **27 failed, 143 passed**, todas com `PermissionError: EEXIST: file already exists, mkdir '.../ssd_cache/0'` (o broker de `mkdir` do sandbox não é idempotente para `makedirs(exist_ok=True)`).
+- O mesmo gatilho dispara em código não modificado → **0% atribuível ao diff de `read_expert_into`/`RUN_QD`**. Suíte alvo `tests/test_expert_streaming.py` roda verde sob qualquer modo.
+
+### 12.2 RUN_QD — committed em `0a4d3c72`
+`perf: parallelize per-run preadv in read_expert_into (RUN_QD=16)`. 5 arquivos, +533.
+- Pool aninhado `_RUN_IO_POOL` (separado de `_EXPERT_IO_POOL`) evita deadlock; plan-then-execute com scatter-after-barrier → bit-exact por construção.
+- Varredura QD: 1→2.184 tok/s; 8→3.203/3.059; **16→3.324/3.419 (pico + mais estável, stdev 0.046 vs 0.390 em QD=8); 32→3.138 (regride)**. Default 16 = +55% vs profundidade 1, acima do baseline 3.06. `phys` plano ~10.9 GiB; 15 runs token-ID bit-exact.
+- Corrigido gate vazio de teste (`_write_shard` escrevia payload zero → qualquer comparação de bytes passava): `_write_shard_filled` + `assert out1.any()`.
+
+### 12.3 C6 (Etapa B / Layer Barrier) A/B — bit-exact-preserving
+Knob: `OMLX_EXPERT_STREAMING_LAYER_BARRIER` (default ON, `streaming_switch.py:55,1720`). Quando ON, a GLU quantizada monta `_LayerLoadContext` compartilhado (retenção union das projeções); quando OFF, cada projeção carrega independente.
+- **Barrier ON (default): 111 passed.**
+- **Barrier OFF (legacy, +`CTX_ROLLING=0`): 108 passed, 3 failed** — e os 3 failures são EXATAMENTE os testes que ASSERTEM comportamento de barrier-ON: `test_glu_forward_emits_memtrace_events` (espera eventos `ctx.ensure.`), `test_ctx_bank_promote_is_bit_identical_on_default_path` (`assert ss._LAYER_BARRIER_ENV`), `test_ctx_bank_promote_declined_on_partial_demand` (espera gravação do caminho de promoção ctx). Nenhum é teste numérico.
+- Todos os gates numéricos/bit-exact passam em AMBOS os modos (`test_streaming_quantized_glu_matches_reference`, `test_quantized_call_identical_with_and_without_bank_promote` [A1, L3089], `test_ctx_bank_promote_is_bit_identical_on_default_path` [A1b, L3252], `test_backing_read_expert_into_matches_load_expert_slice`). **Conclusão: a barrier é behavior-preserving / bit-exact-safe.**
+- Mecânica A1 vs A1b: **A1 (`_BANK_PROMOTE_ENV`, L1444) é código morto na config default** — só dispara quando `len(missing) == len(plan.uniq_list)` (batch todo miss), quase nunca verdadeiro porque a ctx pré-particiona. **A1b (`_BANK_PROMOTE_CTX_ENV`, L670/695/1561) é o caminho vivo, e só dispara PORQUE a barrier monta `plan.ctx`.** Logo a barrier (C6/Etapa B) é o *habilitador* da promoção, não a A1.
+- Ressalva: esta A/B prova equivalência de CORREÇÃO, NÃO que a barrier entrega o ganho de retenção de memória alegado (G2/G3). Um bench de RSS durante prefill seria necessário para confirmar; não medido nesta sessão.
+
+### 12.4 Etapa E
+OFF por padrão (decisão já registrada em §3 Etapa E + nota de execução). Medição prévia com E ativo divergiu do baseline em token-ID bit-exactness (token 3 de 48) → conflito com critério #1.
+
+### 12.5 A2 (tiling / Etapa A) — estado para a decisão
+- Bit-exact por construção (R1): tileia por experts, `gather_qmm` por tile, concat ascendente → cada elemento de saída é computado identicamente (redução sobre K intocada; grupos de quantização preservados por expert). Risco residual é de *implementação* (índice de bias, offset de `remapped`, drop de tile), não deriva numérica fundamental — coberto por um teste tile-vs-nontile análogo aos de A1/A1b.
+- **A2 NÃO endereça o pico de 34.5 GiB (Metal/IOAccelerator):** esse pico é o pool do allocator MLX (grafo lazy), conforme a própria nota de ganho da Etapa C ("Pool MLX estagna em ~1 camada… em vez de crescer 48×"). A2 limita o working set *host* por projeção (elimina double-buffer do `mx.stack`, metade do footprint de montagem) — ganho secundário. O pico real é Etapa C/D.
+- Decisão pendente do usuário (ver passo 4 do plano): implementar A2 como mudança isolada atrás de flag + teste tile-vs-nontile, adiar, ou pivotar para Etapa C/D para o pico de memória.
+
+---
+
 **Fim do handoff.**
