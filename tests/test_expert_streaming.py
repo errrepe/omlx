@@ -3091,6 +3091,70 @@ def test_quantized_call_identical_with_and_without_bank_promote(monkeypatch, tmp
     assert bool(mx.all(mx.isfinite(out_on)))
 
 
+def test_quantized_call_identical_with_and_without_tiling(monkeypatch, tmp_path):
+    """Etapa A (A2) tiling: the quantized linear output must be bit-identical
+    whether demand-set tiling is enabled or not. This is the gate that makes
+    A2 lossless rather than near-lossless — the same role A1/A1b tests play
+    for bank promotion."""
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    # 12 positions, one per routing entry in `indices` (n_experts=8).
+    # x is 3D (P, 1, in) — the GLU always expands to this layout before
+    # calling the linear, and it is the layout under which gather_qmm does
+    # true per-position routing (so tiling is bit-exact by construction).
+    x = mx.random.normal((12, 1, 128)).astype(mx.float32)
+    indices = mx.array([2, 0, 1, 2, 0, 1, 3, 4, 7, 5, 6, 2], dtype=mx.int32)
+
+    def run(tile):
+        # Fresh linear per arm so neither arm rides the other's LRU hits —
+        # otherwise a vacuous pass (both arms all-cache-hit) proves nothing.
+        monkeypatch.setenv("OMLX_EXPERT_STREAMING_TILE", str(tile))
+        linear = _quant_linear(tmp_path, n_experts=8)
+        out = linear(x, indices)
+        mx.eval(out)
+        return out
+
+    out_off = run(0)
+    out_on = run(3)
+    assert out_off.dtype == out_on.dtype
+    bits_off = np.ascontiguousarray(out_off).view(np.uint32).reshape(-1)
+    bits_on = np.ascontiguousarray(out_on).view(np.uint32).reshape(-1)
+    assert np.array_equal(bits_off, bits_on)
+    # Guard against a vacuous pass: garbage inputs would make every bit 0/NaN.
+    assert bool(mx.all(mx.isfinite(out_off)))
+
+
+def test_glu_tiling_bit_identical_prefill(monkeypatch, tmp_path):
+    """Etapa A (A2) tiling through the full GLU on a prefill-sized, *sorted*
+    routing plan (do_sort path) must be bit-identical to the non-tiled path.
+    The sorted case is the one that actually matters for the prefill working
+    set, so this exercises the contiguous-tile / ascending-scatter path."""
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    rng = np.random.default_rng(7)
+    x = mx.array(rng.standard_normal((1, 200, 128)).astype(np.float32))
+    idx = mx.array(rng.integers(0, 8, size=(1, 200)).astype(np.int32))
+
+    def run(tile):
+        monkeypatch.setenv("OMLX_EXPERT_STREAMING_TILE", str(tile))
+        glu = _quant_glu(tmp_path, n_experts=8)
+        out = glu(x, idx)
+        mx.eval(out)
+        return out
+
+    out_off = run(0)
+    out_on = run(4)
+    assert out_off.shape == out_on.shape
+    bits_off = np.ascontiguousarray(out_off).view(np.uint32).reshape(-1)
+    bits_on = np.ascontiguousarray(out_on).view(np.uint32).reshape(-1)
+    assert np.array_equal(bits_off, bits_on)
+    assert bool(mx.all(mx.isfinite(out_on)))
+
+
 def test_bank_promote_returns_none_without_bank_backing(tmp_path):
     """A dict backing cannot serve contiguous banks, so A1 must decline and
     let the legacy per-expert path run."""

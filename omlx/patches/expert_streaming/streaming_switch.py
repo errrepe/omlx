@@ -75,7 +75,27 @@ _CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "
 _CTX_PREFETCH_AHEAD = max(
     0, int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_AHEAD", "3"))
 )
-# Banks larger than this are never held speculatively; they are read on demand.
+# Etapa A (A2): demand-set tiling of the quantized gather_qmm.
+# Off by default. When set to an integer > 0, every quantized projection's
+# per-call gather_qmm is split into tiles of that many experts, so the
+# per-projection w_bank never materialises more than ``tile`` experts at once
+# (bounds the host/Metal working set during prefill). Output is bit-identical
+# to the non-tiled path: each output position depends only on its own x row and
+# its selected expert's weight row, so tiling + ascending reassembly leaves
+# every value unchanged. See HANDOFF-fase-J-prefill-memory.md §12.5.
+# Read live (not cached at import) so tests can toggle it via monkeypatch.
+_TILE_SIZE_ENV = "OMLX_EXPERT_STREAMING_TILE"
+
+
+def _expert_tile_size() -> int:
+    """Experts per tile for Etapa A, or 0 when tiling is disabled."""
+    raw = os.environ.get(_TILE_SIZE_ENV, "")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
 _CTX_PREFETCH_MAX_BYTES = max(
     0,
     int(
@@ -1400,6 +1420,22 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         cache_result = not (
             getattr(self.cache, "prefill_bypass", False) and plan.positions > 64
         )
+        # Etapa A (A2): optional demand-set tiling. When enabled, the
+        # per-projection gather_qmm is split into expert tiles so the w_bank is
+        # bounded to ``tile`` experts at once (caps the prefill working set).
+        # Output is bit-identical to the path below — each position's value is
+        # unchanged by tiling, and tiles are reassembled in ascending expert
+        # order (see _call_tiled). Skipped when the demand set already fits a
+        # single tile.
+        tile = _expert_tile_size()
+        # Only the 3D production layout (B, *, in) gives per-position routing;
+        # 2D x degenerates to an all-pairs (B,B,out) layout that is not the
+        # production path (the GLU always expands to 3D), so tiling must not
+        # be engaged there — fall back to the non-tiled path instead.
+        if tile and tile < len(plan.uniq_list) and getattr(x, "ndim", 0) >= 3:
+            return self._call_tiled(
+                x, sorted_indices, plan, cache_result, p, built
+            )
         t2 = time.perf_counter()
         # Load bundles: cache/staging resolution on this thread, then one
         # parallel os.pread fetch per missing bundle (QD1 -> QD8). Pool
@@ -1631,6 +1667,140 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             experts=len(plan.uniq_list),
             positions=plan.positions,
         )
+        return out
+
+    # ------------------------------------------------------------------
+    # Etapa A (A2): demand-set tiling of the quantized gather_qmm.
+    # ------------------------------------------------------------------
+    def _build_tile_bank(self, uniq_tile, cache_result):
+        """Build (w_bank, s_bank, b_bank) for one expert tile.
+
+        Mirrors the per-expert promotion + stack branch of :meth:`__call__`
+        exactly, so the assembled bank is bit-identical to the non-tiled path.
+        The only difference is *scope*: only ``uniq_tile`` experts are promoted
+        and stacked at once, bounding the transient w_bank to the tile.
+        """
+        dt = self._slice_dtypes_lazy()
+        bundles: dict[int, tuple] = {}
+        missing: list[int] = []
+        for eid in uniq_tile:
+            b = self._bundle_cached_or_staged(int(eid))
+            if b is not None:
+                bundles[eid] = b
+            else:
+                missing.append(eid)
+        if missing:
+            missing.sort()
+            raws = self._load_expert_bank_np(missing)
+            if raws is None:
+                for eid in missing:
+                    bundles[eid] = self._load_expert_bundle(eid)
+            else:
+                for eid, raw in zip(missing, raws):
+                    if raw is None:
+                        bundles[eid] = self._load_expert_bundle(eid)
+                    else:
+                        bundles[eid] = raw
+                        if cache_result:
+                            self.cache.put(
+                                (self.layer_idx, eid, self.stacked_weight_key), raw
+                            )  # type: ignore[arg-type]
+        mini_w, mini_s, mini_b, has_b = [], [], [], False
+        for eid in uniq_tile:
+            w, s, b = bundles[int(eid)]
+            w = self._promote_np(w)
+            s = self._promote_np(s, dt[0])
+            if b is not None:
+                has_b = True
+                b = self._promote_np(b, dt[1])
+            mini_w.append(w)
+            mini_s.append(s)
+            if b is not None:
+                mini_b.append(b)
+        if len(mini_w) == 1:
+            w_bank = mx.expand_dims(mini_w[0], 0)
+            s_bank = mx.expand_dims(mini_s[0], 0)
+            b_bank = mx.expand_dims(mini_b[0], 0) if (has_b and mini_b) else None
+        else:
+            w_bank = mx.stack(mini_w, axis=0)
+            s_bank = mx.stack(mini_s, axis=0)
+            b_bank = mx.stack(mini_b, axis=0) if (has_b and mini_b) else None
+        return w_bank, s_bank, b_bank
+
+    def _call_tiled(self, x, sorted_indices, plan, cache_result, p, built):
+        """Etapa A (A2): tile-by-expert gather_qmm, bit-identical to __call__.
+
+        Production always routes through the GLU, which expands ``x`` to 3D
+        (P, *, in) and sorts positions by expert, so ``gather_qmm`` performs
+        per-position routing: out[b] = x[b] @ W[remapped[b]]. That makes
+        tiling trivially bit-exact — a position's value depends only on x[b]
+        and the weight row selected by remapped[b], so we can (1) restrict x
+        to the positions whose expert falls in the current tile, (2) run the
+        SAME per-tile bank build + gather_qmm the non-tiled path would run
+        for that subset, (3) eval + drop the tile's w_bank to free it, and
+        (4) reassemble in ascending expert order. The reassembly is a pure
+        permutation (each position belongs to exactly one tile), so no
+        scatter / indexed-assign is needed.
+
+        Only engaged for 3D+ ``x`` (see __call__); 2D x would hit an
+        all-pairs gather_qmm layout that is not the production path, so the
+        non-tiled path handles it instead.
+        """
+        uniq = plan.uniq_list
+        remapped = plan.remapped
+        rem_flat = remapped.reshape(-1)  # (P,)
+        tile = _expert_tile_size()
+        out_list: list[tuple] = []
+        k = 0
+        n = len(uniq)
+        while k < n:
+            start = k
+            end = min(start + tile, n)
+            # MLX has no boolean-array indexing and no argwhere/nonzero, so
+            # resolve the tile's positions to integer indices by argsorting the
+            # negated mask: the 1s (this tile's positions) sort to the front,
+            # in ascending position order.
+            m = (rem_flat >= start) & (rem_flat < end)
+            m_int = m.astype(mx.int32)
+            count = int(mx.sum(m_int))
+            if count == 0:
+                k = end
+                continue
+            idx_pos = mx.argsort(-m_int)[:count]
+            xP = x[idx_pos]  # (count, *inner, in) — keep x's leading dims
+            remP = rem_flat[idx_pos] - start  # (count,)
+            uniq_tile = uniq[start:end]
+            w_bank, s_bank, b_bank = self._build_tile_bank(uniq_tile, cache_result)
+            outP = mx.gather_qmm(
+                xP,
+                w_bank,
+                s_bank,
+                b_bank,
+                rhs_indices=remP,
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+                sorted_indices=sorted_indices,
+            )
+            if self._bias is not None and self._has_bias:
+                b_mini = mx.take(self._bias, mx.array(uniq_tile), axis=0)
+                outP = outP + mx.expand_dims(b_mini[remP], -2)
+            # Materialise the tile so its w_bank graph can be released before
+            # the next tile is built — this is the working-set bound.
+            mx.eval(outP)
+            out_list.append((idx_pos, outP))
+            k = end
+        out_dims = out_list[0][1].shape[-1]
+        idx_pos_all = mx.concatenate([ip for ip, _ in out_list], axis=0)
+        outP_all = mx.concatenate([o for _, o in out_list], axis=0)
+        # ``idx_pos_all`` is a permutation of every position (each position
+        # belongs to exactly one expert tile), so argsorting it recovers the
+        # original position order — no scatter / indexed-assign needed.
+        out_flat = outP_all[mx.argsort(idx_pos_all)]
+        out = out_flat.reshape(x.shape[:-1] + (out_dims,))
+        if p is not None:
+            p.record_observed(self.layer_idx, uniq)
         return out
 
 
