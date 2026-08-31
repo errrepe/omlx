@@ -831,13 +831,13 @@ class _LayerLoadContext:
         return cached, missing
 
     @staticmethod
-    def _pool_for(linear: Any):
-        # Fase K F12: regime by asked demand size (decode ~10, prefill
-        # ~hundreds). Static: the caller passes the context's demand set.
-        override = getattr(linear, "_io_pool_override", None)
-        if override is not None:
-            return override
-        return _EXPERT_IO_POOL
+    def _pool_for(linear: Any, positions: int = 0):
+        # Fase K F12/K4: regime by asked demand size (decode ~10 experts,
+        # prefill ~hundreds). The caller passes the context's demand-set
+        # size — the rolling path MUST route its prefetch submissions
+        # through this delegate, not the fixed singleton (K4: before the
+        # fix the 24-worker prefill pool never saw a single rolling task).
+        return io_pool_for_positions(linear, positions)
 
     @property
     def _inflight_bytes(self) -> int:
@@ -885,7 +885,7 @@ class _LayerLoadContext:
                 if _BANK_PROMOTE_CTX_ENV
                 else nxt._load_expert_bank_np
             )
-            self._futures[nid] = self._pool_for(nxt).submit(reader, missing)
+            self._futures[nid] = self._pool_for(nxt, len(self._expert_ids)).submit(reader, missing)
             self._inflight[nid] = bank_bytes
             submitted += 1
 
@@ -899,7 +899,12 @@ class _LayerLoadContext:
         ids = self._expert_ids
 
         # A prefetch may already be in flight; the split is recomputed because
-        # the cache can change between submit and await.
+        # the cache can change between submit and await. K4: the FIRST
+        # projection of the rolling path resolves synchronously here — its
+        # read depth is bounded by read_expert_into's _RUN_IO_QD run pool,
+        # not by the regime pool; only the FOLLOWING projections (prefetch)
+        # run on the regime pool. Sizing stays safe: the sync read is what
+        # the demand path always paid.
         fut = self._futures.pop(lid, None)
         self._inflight.pop(lid, None)
         cached, missing = self._split(linear, ids)
@@ -982,7 +987,7 @@ class _LayerLoadContext:
                 jobs.append((proj, missing))
         if not jobs:
             return
-        pool = self._pool_for(jobs[0][0])
+        pool = self._pool_for(jobs[0][0], len(expert_ids))
         results = list(pool.map(lambda job: job[0]._load_expert_bank_np(job[1]), jobs))
         for (proj, ids), rows in zip(jobs, results):
             if rows is None or len(rows) != len(ids):

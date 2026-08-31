@@ -2806,6 +2806,59 @@ def test_read_expert_banks_no_bridge_without_split():
         assert len(rows) == 4, f"exactly the demanded rows: {len(rows)}"
         assert segments[0][0] == [3, 4, 7, 8], segments[0][0]
 
+
+
+def test_prefill_pool_used_on_rolling_path():
+    """Fase K K4: the rolling prefetch must route its submissions through
+    the regime pool — prefill-shaped demand sets use the PREFILL_QD pool,
+    decode demand keeps the process-wide singleton."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    class _RecordingPool(ThreadPoolExecutor):
+        def __init__(self, *a, tag, **k):
+            super().__init__(*a, **k)
+            self.tag = tag
+            self.submitted: list = []
+
+        def submit(self, fn, *a, **k):
+            self.submitted.append(fn)
+            return super().submit(fn, *a, **k)
+
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "m").mkdir()
+        lin0 = _quant_linear(Path(td) / "m", n_experts=16)
+        cache = lin0.cache
+        backing = lin0.backing
+        backing.num_experts = 16  # fixture needs for _make_advise_linear
+        lin1 = _make_advise_linear(0, "up_proj", backing, cache)
+        lin1.cache = cache
+        prefill_pool = _RecordingPool(2, tag="prefill")
+        decode_pool = _RecordingPool(2, tag="decode")
+        try:
+            with patch.object(ss, "_PREFILL_IO_POOL", prefill_pool), patch.object(
+                ss, "_EXPERT_IO_POOL", decode_pool
+            ), patch.object(ss, "_PREFILL_REGIME_MIN_POSITIONS", 8):
+                ctx = ss._LayerLoadContext([lin0, lin1], cache)
+                # Prefill-shaped (16 experts > 8): prefetch must go to the
+                # PREFILL_QD pool.
+                ctx.ensure(lin0, list(range(16)))
+                assert ctx.misses[id(lin1)] == 16
+                assert prefill_pool.submitted, "rolling prefetch missed the prefill pool"
+                assert not decode_pool.submitted
+                # Drain the in-flight prefetch before the next scenario.
+                for fut in list(ctx._futures.values()):
+                    fut.result()
+                # Decode-shaped (3 experts <= 8): prefetch keeps the singleton.
+                ctx2 = ss._LayerLoadContext([lin0, lin1], cache)
+                ctx2.ensure(lin0, [1, 2, 3])
+                assert not prefill_pool.submitted[1:], "decode must not touch the prefill pool"
+                assert decode_pool.submitted, "decode prefetch uses the singleton"
+        finally:
+            prefill_pool.shutdown(wait=False, cancel_futures=True)
+            decode_pool.shutdown(wait=False, cancel_futures=True)
+
 def test_memtrace_disabled_by_default_is_noop():
     """With the env var unset the singleton is a null tracer: recording is
     a no-op and enabled is False, so the hot path stays free."""
