@@ -39,6 +39,9 @@ _BANK_MAX_BYTES = max(
     int(os.environ.get("OMLX_EXPERT_STREAMING_BANK_MAX_BYTES", str(256 * 1024**2))),
 )
 _RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
+# Fase K F7: bridge gaps of up to this many experts inside one same-tier
+# coalesced run (gap bytes are read but never promoted/used). 0 disables.
+_RUN_MERGE_GAP = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MERGE_GAP", "2")))
 # Etapa A1: promote an all-miss demand bank with a single mx.array instead of
 # U per-expert mx arrays followed by mx.stack. Bit-identical — gather_qmm
 # receives the same bytes, dtype and shape — but it halves the Metal transient
@@ -185,6 +188,36 @@ _EXPERT_IO_POOL = ThreadPoolExecutor(
     max_workers=max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_QD", "") or 16)),
     thread_name_prefix="omlx-expert-io",
 )
+
+# Fase K F12 (opt-in): a separate pool for PREFILL-SHAPED calls.
+# OMLX_EXPERT_STREAMING_PREFILL_QD=<workers>. The sweep evidence: QD16 is the
+# decode optimum, QD24 measured the better 8k TTFT (85 s). Two bounded regime
+# pools keep both numbers without oversubscribing either phase; 0 (default)
+# keeps the single process-wide pool. Selection happens per layer call from
+# the count of routed positions (> _PREFILL_REGIME_MIN_POSITIONS).
+_PREFILL_QD_ENV = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_PREFILL_QD", "") or 0))
+_PREFILL_REGIME_MIN_POSITIONS = 64
+_PREFILL_IO_POOL: ThreadPoolExecutor | None = (
+    ThreadPoolExecutor(
+        max_workers=_PREFILL_QD_ENV,
+        thread_name_prefix="omlx-expert-io-prefill",
+    )
+    if _PREFILL_QD_ENV > 0
+    else None
+)
+
+
+def io_pool_for_positions(
+    linear: Any, positions: int
+) -> ThreadPoolExecutor:
+    """Regime pool for a layer call: prefill-shaped calls may use the
+    separate bounded pool; decode keeps the process-wide QD16 singleton."""
+    override = getattr(linear, "_io_pool_override", None)
+    if override is not None:
+        return override
+    if _PREFILL_IO_POOL is not None and positions > _PREFILL_REGIME_MIN_POSITIONS:
+        return _PREFILL_IO_POOL
+    return _EXPERT_IO_POOL
 
 # Per-depth executors for models whose per-model settings override the pool
 # depth (autotune). One shared executor per distinct depth value — repeated
@@ -676,7 +709,12 @@ class _LayerLoadContext:
 
     @staticmethod
     def _pool_for(linear: Any):
-        return getattr(linear, "_io_pool_override", None) or _EXPERT_IO_POOL
+        # Fase K F12: regime by asked demand size (decode ~10, prefill
+        # ~hundreds). Static: the caller passes the context's demand set.
+        override = getattr(linear, "_io_pool_override", None)
+        if override is not None:
+            return override
+        return _EXPERT_IO_POOL
 
     @property
     def _inflight_bytes(self) -> int:
@@ -1325,9 +1363,18 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         would come back in the wrong packing. Runs therefore end at the
         first id whose tier differs from the run's first id. The bound comes
         from _RUN_MAX (env OMLX_EXPERT_STREAMING_RUN_MAX).
+
+        Fase K F7: since the caller neither promotes nor uses extra rows
+        (rows outside the requested scatter set are dropped), a run may be
+        stretched to BRIDGE a small gap (_RUN_MERGE_GAP, default 2) of
+        missing ids within the SAME tier — prefill demand under the HOBBIT
+        split fragments into many single-expert runs; bridging turns them
+        into longer sequential reads on the 40 Gbps NVMe at the cost of a
+        few idle bytes. The gap experts are read but never promoted or used.
         """
         tier_of = self._tier_of if self._is_split_active() else None
         max_run = _RUN_MAX if max_run is None else max(1, int(max_run))
+        merge_gap = _RUN_MERGE_GAP
         runs: list[tuple[int, int]] = []
         i = 0
         n = len(sorted_ids)
@@ -1335,6 +1382,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             first = sorted_ids[i]
             first_tier = tier_of(first) if tier_of else 0
             count = 1
+            # contiguous within the tier
             while (
                 count < max_run
                 and i + count < n
@@ -1342,8 +1390,31 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 and (tier_of is None or tier_of(sorted_ids[i + count]) == first_tier)
             ):
                 count += 1
+            # Fase K F7: bridge a small same-tier gap (rows never promoted).
+            if merge_gap > 0:
+                bridged = count
+                k = i + count
+                while k < n and bridged < max_run:
+                    expect = first + bridged
+                    gap = sorted_ids[k] - expect
+                    # gap 0 = contiguous tail; 1..merge_gap = bridgeable
+                    # hole; a tier mismatch (HOBBIT) or negative gap ends it.
+                    if (
+                        gap < 0
+                        or gap > merge_gap
+                        or (tier_of is not None and tier_of(sorted_ids[k]) != first_tier)
+                    ):
+                        break
+                    bridged = min(bridged + gap + 1, max_run)
+                    k += 1
+                if bridged > count:
+                    count = bridged
             runs.append((first, count))
-            i += count
+            # advance past the run's ids (gap experts are consumed by the read)
+            j = i + 1
+            while j < n and sorted_ids[j] < first + count:
+                j += 1
+            i = j
         return runs
 
 
@@ -1715,7 +1786,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                             self.layer_idx, staged=False, dt=dt_per / len(missing)
                         )
             elif hasattr(self.backing, "load_expert_slice"):
-                io_pool = self._io_pool_override or _EXPERT_IO_POOL
+                # Fase K F12: prefill-shaped calls may use the separate pool.
+                io_pool = io_pool_for_positions(self, plan.positions)
                 # Fase K F6 (C2 bank-first path): read all missing experts
                 # into one raw bank per (key, tier) on this thread, then
                 # expose rows as views. Avoids one task/result allocation per

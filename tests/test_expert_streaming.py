@@ -3167,3 +3167,40 @@ def test_ctx_bank_promote_declined_on_partial_demand(monkeypatch, tmp_path):
     assert recorded["up_proj"][1] == [0, 1, 2]
     assert bool(mx.all(mx.isfinite(out)))
 
+
+class TestFaseKRunMerge:
+    def test_group_runs_bridges_small_gap_within_tier(self):
+        """Fase K F7: a run may bridge a <=2 gap of non-demanded ids (the
+        gap bytes are read but never promoted); tier boundaries never merge."""
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        lin = _make_advise_linear(0, "gate_proj", _AdviseRecorderBacking(), ss.ExpertLRUCache(0, 4096))
+        ids = [3, 4, 7, 8]  # contiguous (3,4) then gap 7,8: one run (3,6)
+        with patch.object(ss, "_RUN_MERGE_GAP", 2):
+            runs = lin._group_runs(ids)
+            assert runs == [(3, 6)], runs  # covers 3,4,5,6,7,8
+        # Gap of 3 (ids 3,4 then 8,9) is beyond the bridge budget.
+        with patch.object(ss, "_RUN_MERGE_GAP", 2):
+            runs = lin._group_runs([3, 4, 8, 9])
+            assert runs == [(3, 2), (8, 2)], runs
+        # Bridge disabled.
+        with patch.object(ss, "_RUN_MERGE_GAP", 0):
+            runs = lin._group_runs([3, 4, 7, 8])
+            assert runs == [(3, 2), (7, 2)], runs
+        # max_run still bounds the bridged run (bridge clamps to the cap).
+        with patch.object(ss, "_RUN_MERGE_GAP", 2), patch.object(ss, "_RUN_MAX", 4):
+            runs = lin._group_runs([3, 4, 7, 8])
+            assert runs == [(3, 4), (7, 2)], runs
+
+    def test_group_runs_bridge_never_crosses_tier(self):
+        """Under the HOBBIT split the bridge stays inside the first tier."""
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        backing = _AdviseRecorderBacking()
+        lin = _make_advise_linear(0, "gate_proj", backing, ss.ExpertLRUCache(0, 4096))
+        lin.set_hobbit_split({1, 2, 9}, cold_bits=2, cold_gs=32)  # hot: 1,2,9
+        ids = [1, 2, 4, 5, 9]  # hot(1,2) gap cold(4,5): must NOT bridge to cold
+        with patch.object(ss, "_RUN_MERGE_GAP", 2):
+            runs = lin._group_runs(ids)
+        assert runs[0] == (1, 2), f"hot run must stay intact: {runs}"
+        assert (4, 2) in runs or (4, 1) in runs
