@@ -873,7 +873,7 @@ class _LayerLoadContext:
                 # short-circuits when it asks.
                 self._resolved.add(nid)
                 continue
-            bank_bytes = int(nxt._bank_bytes_for(len(missing)))
+            bank_bytes = int(nxt._tier_bank_bytes_for(missing))
             if bank_bytes > _CTX_PREFETCH_MAX_BYTES:
                 continue
             # Etapa A1b: ask for the raw contiguous banks as well when
@@ -958,7 +958,7 @@ class _LayerLoadContext:
                 proj=getattr(linear, "proj_name", "?"),
                 uniq=len(ids),
                 miss=len(missing),
-                bank_bytes=int(linear._bank_bytes_for(len(missing))),
+                bank_bytes=int(linear._tier_bank_bytes_for(missing)),
                 inflight=len(self._futures),
                 inflight_bytes=self._inflight_bytes,
             )
@@ -995,7 +995,7 @@ class _LayerLoadContext:
                 return
             self.bundles[id(proj)].update(zip(ids, rows))
         if memtrace.enabled:
-            live = sum(proj._bank_bytes_for(len(ids)) for proj, ids in jobs)
+            live = sum(proj._tier_bank_bytes_for(ids) for proj, ids in jobs)
             memtrace.record(
                 "ctx.ensure.exit",
                 layer=layer,
@@ -1310,11 +1310,45 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         """Bytes of raw NumPy bank needed to hold n_experts of this projection.
 
         Used by the layer-context memory bookkeeping and by the demand-set
-        bank reader to size reads under the bank cap.
+        bank reader to size reads under the bank cap. Tier-blind (cold-first):
+        use _tier_bank_bytes_for when the demand set is known — under the
+        HOBBIT split hot experts carry the SOURCE packing width, which this
+        cold-first measurement under-estimates (Fase K K6).
         """
         if n_experts <= 0:
             return 0
         return n_experts * self._per_expert_bytes()
+
+    def _tier_bank_bytes_for(self, ids: list[int]) -> int:
+        """True raw-bank bytes for an id set under the HOBBIT split (K6).
+
+        Sums per tier group with the TIER's own reader width (hot = source
+        packing, cold = tier packing). Without the split it reduces to
+        _bank_bytes_for. Never raises: a resolution failure falls back to
+        the cold-first estimate so the caps stay at least as strict as
+        their pre-K6 behavior for unknown layouts.
+        """
+        if not ids:
+            return 0
+        try:
+            if not self._is_split_active():
+                return len(ids) * self._per_expert_bytes()
+            keys = [self.stacked_weight_key, self.stacked_scales_key]
+            if self.stacked_biases_key:
+                keys.append(self.stacked_biases_key)
+            groups: Dict[int, list[int]] = {}
+            for eid in ids:
+                groups.setdefault(self._tier_of(eid), []).append(eid)
+            total = 0
+            for _t, g in groups.items():
+                per_t = 0
+                for key in keys:
+                    reader = self.backing._reader_for_key(key, g[0])
+                    per_t += int(reader._rp_for(key).expert_bytes)
+                total += len(g) * per_t
+            return total
+        except Exception:
+            return len(ids) * self._per_expert_bytes()
 
     def _slice_view(self, key: str, buf: np.ndarray, expert_id: int) -> np.ndarray:
         """Reshape a raw uint8 expert buffer exactly as expert_slice would.

@@ -2859,6 +2859,45 @@ def test_prefill_pool_used_on_rolling_path():
             prefill_pool.shutdown(wait=False, cancel_futures=True)
             decode_pool.shutdown(wait=False, cancel_futures=True)
 
+
+
+def test_bank_bytes_respect_tier_widths():
+    """Fase K K6: under the HOBBIT split the byte math uses the TIER's
+    own width (hot = source packing). The cold-first estimate under-counts
+    every hot expert, so an oversize bank could slip past the prefetch and
+    bank caps; the tier-aware sum cannot."""
+    from types import SimpleNamespace
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    class _WidthBacking(_AdviseRecorderBacking):
+        def __init__(self):
+            super().__init__(per_expert_bytes=64, num_experts=64)
+            self.hot_w = SimpleNamespace(expert_bytes=2 * 1024 * 1024)
+            self.cold_w = SimpleNamespace(expert_bytes=1 * 1024 * 1024)
+
+        def _reader_for_key(self, key, expert_id=None):
+            width = (
+                self.hot_w
+                if expert_id is not None and expert_id < 8
+                else self.cold_w
+            )
+            return SimpleNamespace(_rp_for=lambda k: width, path="/fake")
+
+    cache = ss.ExpertLRUCache(0, 4096, num_layers=1)
+    backing = _WidthBacking()
+    lin = _make_advise_linear(0, "gate_proj", backing, cache)
+    lin.set_hobbit_split(set(range(8)), cold_bits=2, cold_gs=32)
+    assert lin._is_split_active()
+    ids = list(range(16))  # 8 hot + 8 cold, 2 stacked keys per expert
+    hot = 8 * 2 * 2 * 1024 * 1024
+    cold = 8 * 2 * 1 * 1024 * 1024
+    assert lin._tier_bank_bytes_for(ids) == hot + cold
+    assert lin._tier_bank_bytes_for(ids) > lin._bank_bytes_for(16), "under-counts hot"
+    # No split: the tier-aware sum reduces to the plain estimate.
+    lin2 = _make_advise_linear(0, "gate_proj", _WidthBacking(), cache)
+    assert lin2._tier_bank_bytes_for([0, 1]) == lin2._bank_bytes_for(2)
+
 def test_memtrace_disabled_by_default_is_noop():
     """With the env var unset the singleton is a null tracer: recording is
     a no-op and enabled is False, so the hot path stays free."""
