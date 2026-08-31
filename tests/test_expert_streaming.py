@@ -2553,6 +2553,8 @@ class TestFaseKPriorPath:
             assert t2.load_prior() is True
             assert t2.bytes_per_token == 200.0
             assert t2.samples == 0, "samples must be clamped to 0 on load"
+            assert t2.last_delta_bytes == 0, "prior delta is not measurement (K3)"
+            assert t2.last_n_tokens == 0, "prior token count is not measurement (K3)"
             t2.update(1000, 400_000)
             assert t2.bytes_per_token == 400.0, "first measured chunk replaces prior"
             assert t2.samples == 1

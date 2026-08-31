@@ -4002,7 +4002,9 @@ class Scheduler:
         Metal command-buffer OOM crash at large kv_len. We therefore take the
         MAX of the available signals and apply a safety factor:
           - the most recently MEASURED per-token growth (last_delta / last_n)
-            — anchored on reality at the current kv_len regime,
+            — anchored on reality at the current kv_len regime (used only
+            once the tracker has real samples; a restored prior with
+            samples == 0 is NOT measurement — Fase K K3),
           - the long-run EWMA (model-specific constants the static misses),
           - the kv_len-aware static estimate (SDPA transient + this chunk's
             newly allocated KV), used ONLY as a fallback for the first chunk
@@ -4022,7 +4024,12 @@ class Scheduler:
         effective_static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
-        if tracker is not None:
+        if tracker is not None and tracker.samples > 0:
+            # K3: measured signal exists ONLY after real chunk updates. A
+            # restored prior has samples == 0 (and zeroed deltas), so it
+            # never acts as measurement — the first chunk prices the static
+            # estimate instead of a stale prior that could underestimate
+            # the Metal peak under a changed regime.
             if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
                 measured_signal = max(
                     measured_signal, tracker.last_delta_bytes / tracker.last_n_tokens
@@ -4058,8 +4065,10 @@ class Scheduler:
 
         # Fase K F4 (port of faseJ 061d8b9): reconcile the static estimate
         # with the measured signal.
-        #  - NO measured samples yet (first chunk of a freshly loaded model):
-        #    the static estimate is the conservative fallback.
+        #  - NO measured samples yet (first chunk of a freshly loaded model,
+        #    or a loaded prior whose samples were clamped to 0 — K3: the
+        #    prior is not measurement until the first real chunk): the
+        #    static estimate is the conservative fallback.
         #  - measured samples exist: the static may only RAISE the per-token
         #    prediction up to _PREFILL_STATIC_MAX_OVER_MEASURED x the
         #    measured rate. A static that is modestly higher (legitimate

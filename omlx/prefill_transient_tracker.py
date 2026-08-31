@@ -267,18 +267,22 @@ class PrefillTransientTracker:
             if bpt <= 0 or bpt > 100 * 1024 * 1024:  # sanity: 100 MB/tok max
                 return False
             self._ewma_per_token = bpt
-            # Fase K F10: seed the EWMA but do NOT inherit the prior's sample
-            # count — with the full count a regime change (e.g. cold tier
-            # toggled on/off, which shifts bytes/token by ~2x) would need
-            # dozens of chunks to move the EWMA. Clamping to 0 makes the
-            # first measured chunk of the new session REPLACE the prior
-            # immediately (update() seeds when samples == 0). predict()
-            # returns 0 until then, so the first chunk sizes against the
-            # static estimate — the exact pre-prior fallback.
+            # Fase K F10/K3: seed the EWMA but do NOT inherit the prior's
+            # sample count — a regime change (e.g. cold tier toggled on/off,
+            # which shifts bytes/token by ~2x) must not need dozens of
+            # chunks to move the EWMA. Samples are clamped to 0 so the
+            # first measured chunk of the new session REPLACES the prior
+            # (update() seeds when samples == 0). K3: the restored prior is
+            # NOT measurement — last_delta_bytes/last_n_tokens are zeroed so
+            # the scheduler cannot price the first chunk from a stale prior
+            # (a changed regime would underestimate the first chunk and
+            # risk the Metal peak/OOM the throttle exists to prevent). The
+            # first chunk sizes against the static estimate — the exact
+            # pre-prior fallback — until the first real update().
             self._samples = 0
             self._observed_max_bytes = int(data.get("observed_max_bytes", 0))
-            self._last_delta_bytes = int(data.get("last_delta_bytes", 0))
-            self._last_n_tokens = int(data.get("last_n_tokens", 0))
+            self._last_delta_bytes = 0
+            self._last_n_tokens = 0
             logger.info("PrefillTransientTracker(%s): loaded prior %.1f B/tok from %s", self._model_id, bpt, path)
             return True
         except Exception as e:
