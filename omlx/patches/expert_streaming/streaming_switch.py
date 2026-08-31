@@ -41,6 +41,11 @@ _BANK_MAX_BYTES = max(
 _RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
 # Fase K F7: bridge gaps of up to this many experts inside one same-tier
 # coalesced run (gap bytes are read but never promoted/used). 0 disables.
+# Effective only while the HOBBIT split is active: split prefill demand
+# fragments into many single-expert runs, so bridging buys sequential
+# reads; single-tier demand is already contiguous and bridging only adds
+# idle gap bytes (measured 2k TTFT: 34.0s bridged vs 31.4s unbridged, 3
+# reps, bench/results/fasek/mergeab/).
 _RUN_MERGE_GAP = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MERGE_GAP", "2")))
 # Etapa A1: promote an all-miss demand bank with a single mx.array instead of
 # U per-expert mx arrays followed by mx.stack. Bit-identical — gather_qmm
@@ -1371,10 +1376,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         split fragments into many single-expert runs; bridging turns them
         into longer sequential reads on the 40 Gbps NVMe at the cost of a
         few idle bytes. The gap experts are read but never promoted or used.
+        Bridging applies ONLY while the split is active: single-tier demand
+        is already contiguous, and re-measurement showed bridging costs ~8%
+        of 2k TTFT there (34.0s vs 31.4s, 3 reps, mergeab artifacts).
         """
         tier_of = self._tier_of if self._is_split_active() else None
         max_run = _RUN_MAX if max_run is None else max(1, int(max_run))
-        merge_gap = _RUN_MERGE_GAP
+        merge_gap = _RUN_MERGE_GAP if tier_of is not None else 0
         runs: list[tuple[int, int]] = []
         i = 0
         n = len(sorted_ids)

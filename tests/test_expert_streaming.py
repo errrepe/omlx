@@ -3171,26 +3171,36 @@ def test_ctx_bank_promote_declined_on_partial_demand(monkeypatch, tmp_path):
 class TestFaseKRunMerge:
     def test_group_runs_bridges_small_gap_within_tier(self):
         """Fase K F7: a run may bridge a <=2 gap of non-demanded ids (the
-        gap bytes are read but never promoted); tier boundaries never merge."""
+        gap bytes are read but never promoted); tier boundaries never merge.
+        Bridging is active only while the HOBBIT split is on — single-tier
+        demand is already contiguous, and bridging costs ~8% of 2k TTFT there.
+
+        """
         from omlx.patches.expert_streaming import streaming_switch as ss
 
         lin = _make_advise_linear(0, "gate_proj", _AdviseRecorderBacking(), ss.ExpertLRUCache(0, 4096))
-        ids = [3, 4, 7, 8]  # contiguous (3,4) then gap 7,8: one run (3,6)
+        # No split: bridging must NOT engage regardless of the env value.
         with patch.object(ss, "_RUN_MERGE_GAP", 2):
-            runs = lin._group_runs(ids)
-            assert runs == [(3, 6)], runs  # covers 3,4,5,6,7,8
-        # Gap of 3 (ids 3,4 then 8,9) is beyond the bridge budget.
-        with patch.object(ss, "_RUN_MERGE_GAP", 2):
-            runs = lin._group_runs([3, 4, 8, 9])
-            assert runs == [(3, 2), (8, 2)], runs
-        # Bridge disabled.
-        with patch.object(ss, "_RUN_MERGE_GAP", 0):
             runs = lin._group_runs([3, 4, 7, 8])
             assert runs == [(3, 2), (7, 2)], runs
-        # max_run still bounds the bridged run (bridge clamps to the cap).
-        with patch.object(ss, "_RUN_MERGE_GAP", 2), patch.object(ss, "_RUN_MAX", 4):
+            runs = lin._group_runs([3, 4, 8, 9])
+            assert runs == [(3, 2), (8, 2)], runs
+        # Split active, every demanded id hot: bridge engages (covers 3..8).
+        lin.set_hobbit_split({3, 4, 5, 6, 7, 8, 9}, cold_bits=2, cold_gs=32)
+        with patch.object(ss, "_RUN_MERGE_GAP", 2):
             runs = lin._group_runs([3, 4, 7, 8])
-            assert runs == [(3, 4), (7, 2)], runs
+            assert runs == [(3, 6)], runs
+            # Gap of 3 (ids 3,4 then 8,9) is beyond the bridge budget.
+            runs = lin._group_runs([3, 4, 8, 9])
+            assert runs == [(3, 2), (8, 2)], runs
+            # Bridge disabled by env.
+            with patch.object(ss, "_RUN_MERGE_GAP", 0):
+                runs = lin._group_runs([3, 4, 7, 8])
+                assert runs == [(3, 2), (7, 2)], runs
+            # max_run still bounds the bridged run (bridge clamps to the cap).
+            with patch.object(ss, "_RUN_MAX", 4):
+                runs = lin._group_runs([3, 4, 7, 8])
+                assert runs == [(3, 4), (7, 2)], runs
 
     def test_group_runs_bridge_never_crosses_tier(self):
         """Under the HOBBIT split the bridge stays inside the first tier."""

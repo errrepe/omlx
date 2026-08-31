@@ -843,6 +843,17 @@ threshold shared with the scheduler's chunk-boundary clears (Etapa D).
   break, and the dual-tier gather_qmm assembly consumes the single-promoted
   per-tier banks directly.
 
+### F7 — run-gap bridging (gated on the HOBBIT split)
+
+Bridging stretches a same-tier run across a <=2 gap of non-demanded ids
+so split-fragmented prefill demand becomes longer sequential preadvs.
+Re-measurement at 2k with the split inactive showed the idle gap bytes cost
+~8% of TTFT (34.0 vs 31.4 s, 3 reps, bench/results/fasek/mergeab/) for no
+locality gain: single-tier demand is already contiguous. Bridging is now
+effective ONLY while the split is active; single-tier runs keep the plain
+grouping even when OMLX_EXPERT_STREAMING_RUN_MERGE_GAP > 0 (the env still
+caps the budget; 0 always disables). Token output is unchanged (reads only).
+
 ### F12 — pools per regime (opt-in)
 
 Prefill-shaped calls (positions > 64) can use a separate 24-worker pool while
@@ -869,20 +880,29 @@ Evidence in bench/results/fasek/ (artifacts qwen_*_arm*.json):
   single-promotion, read_expert_into RUN_QD=16), legacy (bank reads and
   promotion off), and extreme scheduling (AHEAD=1 + RUN_QD=1). The Fase 2
   timing changes are Safe on Qwen3.8-Flash-Next-oQ4e-mtp.
-- Re-measure (2026-08-31, 3 reps/arm, 2k prompt, 48 decode tokens, load
-  2.2-3.6, artifacts in bench/results/fasek/rem/): 9/9 runs byte-identical
+- Re-measure window 1 (3 reps/arm, 2k prompt, 48 decode tokens, load
+  2.2-3.6, artifacts bench/results/fasek/rem/): 9/9 runs byte-identical
   (262 chars). Decode tok/s mean ± sigma: legacy 3.157 ± 0.4%, pipeline
-  2.575 ± 7.3% (2.32-2.78), AHEAD=1+RUN_QD=1 1.919 ± 1.2%. The earlier
-  ±25% band was noise — the maximum rep spread is now ±7.3%; the
-  earlier single-run 3.17 for the pipeline arm sat at the top of that
-  band (the 3-rep mean is 2.575). TTFT is arm-equal: legacy 34.6 s,
-  pipeline 34.6 s, extreme 35.8 s.
-- On this box at 2k with a warm page cache (budget 0), the legacy arm is
-  ~22% faster in decode than the pipeline (15.2 s vs 18.8 s per 48
-  tokens). The rolling AHEAD=3 prefetch and run-merge add CPU work that
-  cache-hot reads do not repay at 2k scale. AHEAD=1+RUN_QD=1 stays
-  slowest (25.0 s, 1.90-1.95 tok/s) — the I/O-depth finding reproduces:
-  depth 1 pins the device queue.
+  2.575 ± 7.3%, AHEAD=1+RUN_QD=1 1.919 ± 1.2%. The old ±25% band was
+  noise — the maximum rep spread is now ±7.3%. TTFT arm-equal (34.6/34.6/
+  35.8 s).
+- Attribution window 2 (2 reps/arm + profile, artifacts
+  bench/results/fasek/attrib/): the window-1 'legacy +22%' ordering did
+  NOT replicate — pipeline 3.036 ± 2.0% vs legacy 3.042 ± 0.2%
+  (identical within sigma). AHEAD=0 (no prefetch) 2.576 (−15%), per-
+  expert promote 2.826 (−7%), merge-off 2.872 (−5%). Cross-window drift
+  (~±10%) dominates arm deltas at 2k: treat any single-window ordering
+  under that bound as noise, except the depth-1 arm (AHEAD=1+RUN_QD=1,
+  consistently slowest). Rolling AHEAD=3 STAYS the default.
+- Per-stage profile (OMLX_EXPERT_STREAMING_PROFILE=1): the load stage
+  dominates the attributed CPU — 3.69 ms/call vs gate-eval 1.51 and
+  stack 0.74 per GLU call; 6.84 sync loads per call at 0.31 ms each.
+- F7 re-gate (window 3, 3 reps/arm, artifacts bench/results/fasek/mergeab/):
+  with the HOBBIT split inactive, gap-bridging costs ~8% of 2k TTFT
+  (34.0 s bridged vs 31.4 s unbridged, non-overlapping ranges; decode
+  equal within noise; 12/12 runs byte-identical). Bridging exists for
+  split-activated prefill fragmentation — it now engages only while the
+  split is active (see F7 subsection below).
 - Live logs confirm the F5 boundary installed on Qwen4ExpDecoderLayer and
   the guard's boundary accounting (projections=3, activation=5120 B/token);
   advise stats exported (F1/F2/F3 telemetry: advised=16-22k per run,
