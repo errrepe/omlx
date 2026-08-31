@@ -1519,7 +1519,7 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
-    prefill_step_size: int = 2048
+    prefill_step_size: int = 4096
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
     # reduces TTFT for concurrent requests but adds per-step overhead.
@@ -1965,6 +1965,11 @@ class Scheduler:
         self._prefill_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
+        # B3: seed EWMA from per-model persisted prior (same infra as pin profile)
+        try:
+            self._prefill_transient_tracker.load_prior()
+        except Exception:
+            pass
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
         # and taken after the first prefill chunk's eval.
@@ -3851,7 +3856,7 @@ class Scheduler:
     # headroom without over-predicting mid-size chunks into guard rejection.
     # Env-overridable.
     _STREAMING_BANK_TOKEN_RATIO: float = float(
-        os.environ.get("OMLX_STREAMING_BANK_TOKEN_RATIO", "") or 0.2
+        os.environ.get("OMLX_STREAMING_BANK_TOKEN_RATIO", "") or 0.10
     )
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
@@ -4831,6 +4836,11 @@ class Scheduler:
         self._prefill_transient_tracker.update(
             n_tokens, delta, floor_sample=n_tokens <= min_chunk
         )
+        # B3: persist the updated prior immediately (best-effort)
+        try:
+            self._prefill_transient_tracker.save_prior()
+        except Exception:
+            pass
         logger.debug(
             "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
             loop_label,

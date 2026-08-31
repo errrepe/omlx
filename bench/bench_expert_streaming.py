@@ -4,6 +4,9 @@ Usage:
     .venv/bin/python bench/bench_expert_streaming.py --model qwen --budget 1.0 --decode 96 --out bench/results/qwen_1g.json
     .venv/bin/python bench/bench_expert_streaming.py --model glm --budget 1.0 --decode 16
 
+Protocol (B6): use --single-request and the same --decode for all A/B arms so
+TTFT and tok/s are comparable. Every arm writes tokens + chunk_schedule + metal peaks.
+
 Controls:
     OMLX_EXPERT_STREAMING_PROFILE=1  (integer per-stage profiling per layer)
 """
@@ -12,6 +15,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -128,6 +132,7 @@ async def run(
     specprefill_draft: str | None = None,
     specprefill_keep: float | None = None,
     out_dir: str = "bench/results",
+    single_request: bool = False,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -250,6 +255,14 @@ async def run(
             )
             time.sleep(3.0)  # let the 4-thread warm pool drain
             print(f"warm-control: {jobs} discard-reads fired")
+    # Reference chunk schedule for bit-exactness (B4): fixed per prompt_len
+    # so that divergence from different step sizes is explicit and comparable.
+    _CHUNK_SCHEDULE_REF = {"short": 512, "512": 512, "2k": 1024, "8k": 4096}
+    chunk_schedule = {
+        "prompt_len": prompt_len,
+        "reference_step": _CHUNK_SCHEDULE_REF.get(prompt_len, 512),
+        "single_request": single_request,
+    }
     results = {
         "model": model_key,
         "budget_gib": budget,
@@ -261,6 +274,8 @@ async def run(
         "ane": ane,
         "warm_control_gib": warm_control,
         "prompt_len": prompt_len,
+        "single_request": single_request,
+        "chunk_schedule": chunk_schedule,
         "runtime_est_gib": runtime / 1024**3,
         "load_s": t_load,
         "phys_before_gib": round(phys0, 2),
@@ -278,21 +293,74 @@ async def run(
         mlx_callbacks={
             "mlx_active_gib": mx.get_active_memory,
             "mlx_cache_gib": mx.get_cache_memory,
+            # Fase J: high-water mark per phase to distinguish prefill transient
+            # from decode residency (mlx_peak_gib is process-global, so reset per phase).
+            "mlx_peak_gib": mx.get_peak_memory,
         },
     )
-    sampler.start()
-    t1 = time.perf_counter()
-    sampler.mark("prefill")
-    out1 = await engine.chat(messages, max_tokens=1, temperature=0.0)
-    ttft = time.perf_counter() - t1
-    sampler.mark("decode")
-    print(f"TTFT (1 tok) {ttft:.1f}s prompt {out1.prompt_tokens}")
+    _metal_peak: dict[str, float] = {}
+    _reset_peak = getattr(mx, "reset_peak_memory", None)
 
-    t2 = time.perf_counter()
-    out2 = await engine.chat(messages, max_tokens=decode, temperature=0.0)
-    t_decode = time.perf_counter() - t2
-    n = out2.completion_tokens or decode
-    tokps = n / t_decode
+    def _peak_phase(label: str) -> None:
+        try:
+            _metal_peak[label] = round(mx.get_peak_memory() / 1024**3, 3)
+        except Exception:
+            pass
+        if _reset_peak is not None:
+            try:
+                _reset_peak()
+            except Exception:
+                pass
+
+    if _reset_peak is not None:
+        try:
+            _reset_peak()
+        except Exception:
+            pass
+    sampler.start()
+    sampler.mark("prefill")
+    if single_request:
+        # Single-request avoids the second full prefill; TTFT is first streamed token.
+        t_request = time.perf_counter()
+        first_output_at = None
+        out2 = None
+        async for output in engine.stream_chat(
+            messages, max_tokens=decode, temperature=0.0
+        ):
+            out2 = output
+            if first_output_at is None and (
+                output.completion_tokens > 0 or output.new_text or getattr(output, "tokens", None)
+            ):
+                first_output_at = time.perf_counter()
+                _peak_phase("prefill")
+                sampler.mark("decode")
+        if out2 is None:
+            raise SystemExit("single-request benchmark produced no output")
+        end_request = time.perf_counter()
+        if first_output_at is None:
+            first_output_at = end_request
+            _peak_phase("prefill")
+            sampler.mark("decode")
+        ttft = first_output_at - t_request
+        t_decode = end_request - first_output_at
+        n = int(out2.completion_tokens)
+        prompt_tokens = getattr(out2, "prompt_tokens", None)
+        print(f"TTFT (stream first token) {ttft:.1f}s prompt {prompt_tokens}")
+    else:
+        t1 = time.perf_counter()
+        out1 = await engine.chat(messages, max_tokens=1, temperature=0.0)
+        ttft = time.perf_counter() - t1
+        _peak_phase("prefill")
+        sampler.mark("decode")
+        print(f"TTFT (1 tok) {ttft:.1f}s prompt {out1.prompt_tokens}")
+        t2 = time.perf_counter()
+        out2 = await engine.chat(messages, max_tokens=decode, temperature=0.0)
+        t_decode = time.perf_counter() - t2
+        n = int(out2.completion_tokens)
+    if n <= 0:
+        raise SystemExit("benchmark produced zero completion tokens")
+    tokps = n / max(t_decode, 1e-9)
+    _peak_phase("decode")
     sampler.mark("teardown")
     sampler.stop()
     print(f"decode {n} tok in {t_decode:.1f}s -> {tokps:.3f} tok/s")
@@ -308,14 +376,31 @@ async def run(
         sampler.samples(),
         open(out_dir_p / f"{model_key}_{budget}g_samples.json", "w"),
     )
-    # Generated output for bit-exactness comparison across runs
+    # Generated output for bit-exactness comparison across runs. The VLM path
+    # forwards RequestOutput.output_token_ids when available. Prefer token IDs
+    # for the gate; keep textual fallback. Fail-high when neither exists.
     _text = getattr(out2, "text", None)
-    _ids = getattr(out2, "completion_tokens", None) or getattr(out2, "token_ids", None)
+    _tokens = getattr(out2, "tokens", None)
+    if _tokens is None:
+        _tokens = getattr(out2, "token_ids", None)
+    if isinstance(_tokens, list) and _tokens:
+        _bit_exact = _tokens
+        _bit_exact_kind = "tokens"
+    elif isinstance(_text, str) and _text:
+        _bit_exact = _text
+        _bit_exact_kind = "text"
+    else:
+        raise SystemExit(
+            f"bit-exactness gate FAILED: out2 has neither tokens nor text "
+            f"(tokens={type(_tokens).__name__}, text={type(_text).__name__}); "
+            "cannot compare runs. Aborting."
+        )
     _json.dump(
         {
+            "bit_exact_kind": _bit_exact_kind,
             "text": _text if isinstance(_text, str) else None,
             "completion_tokens": n,
-            "token_ids": _ids if isinstance(_ids, list) else None,
+            "tokens": _tokens if isinstance(_tokens, list) else None,
         },
         open(out_dir_p / f"{model_key}_{budget}g_output.json", "w"),
     )
@@ -352,6 +437,14 @@ async def run(
             print(f"prefetcher {pf_stats}")
 
     phys_end = get_phys_footprint() / 1024**3
+    try:
+        from omlx.utils.proc_memory import get_lifetime_max_phys_footprint
+
+        phys_lifetime_max = round(
+            get_lifetime_max_phys_footprint() / 1024**3, 2
+        )
+    except Exception:
+        phys_lifetime_max = None
     results.update(
         {
             "ttft_s": round(ttft, 2),
@@ -359,11 +452,16 @@ async def run(
             "decode_s": round(t_decode, 2),
             "tok_s": round(tokps, 4),
             "phys_after_decode_gib": round(phys_end, 2),
+            "phys_lifetime_max_gib": phys_lifetime_max,
+            "metal_peak_prefill_gib": _metal_peak.get("prefill"),
+            "metal_peak_decode_gib": _metal_peak.get("decode"),
             "active_after_decode_gib": round(mx.get_active_memory() / 1024**3, 2),
             "cache_stats": stats,
             "profile": profile,
             "prefetcher": pf_stats,
             "resources": res_summary,
+            "tokens": _tokens if isinstance(_tokens, list) else None,
+            "bit_exact_kind": _bit_exact_kind,
         }
     )
 
@@ -425,6 +523,11 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--out-dir", default="bench/results", metavar="DIR",
                     help="directory for the _samples/_output side-effect files (default bench/results)")
+    ap.add_argument(
+        "--single-request",
+        action="store_true",
+        help="measure TTFT and decode from one streaming request (avoids a second prefill; B6)",
+    )
     args = ap.parse_args()
     try:
         import psutil
@@ -458,6 +561,7 @@ def main():
             warm_control=args.warm_control,
             mem_ceiling=args.mem_ceiling_gib,
             out_dir=args.out_dir,
+            single_request=args.single_request,
         )
     )
 

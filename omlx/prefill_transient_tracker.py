@@ -12,9 +12,34 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_PRIOR_DIR = Path(os.environ.get("OMLX_PREFILL_PRIOR_DIR", "") or Path.home() / ".cache" / "omlx")
+
+
+def _prior_path(model_id: str) -> Path | None:
+    if not model_id:
+        return None
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in model_id)[:80]
+    # Prefer per-model .omlx dir if model exists on SSD (like pin profile), else cache dir
+    for base in ["/Volumes/SSD 4TB/AI Models", "/Volumes/SSD 2TB"]:
+        cand = Path(base) / model_id / ".omlx" / "prefill_transient_prior.json"
+        # Also check subdirs that contain model_id as substring (e.g., Qwen alias)
+        if cand.parent.exists():
+            return cand
+        # search one level deep for matching dir
+        try:
+            for p in Path(base).iterdir():
+                if model_id in p.name and (p / ".omlx").exists():
+                    return p / ".omlx" / "prefill_transient_prior.json"
+        except Exception:
+            pass
+    return _PRIOR_DIR / f"prefill_prior_{safe}.json"
 
 
 class PrefillTransientTracker:
@@ -199,3 +224,46 @@ class PrefillTransientTracker:
         self._last_n_tokens = 0
         self._observed_max_bytes = 0
         self._recent_reclaim_bytes = 0
+
+    def save_prior(self) -> None:
+        if not self._model_id or self._samples == 0 or self._ewma_per_token <= 0:
+            return
+        path = _prior_path(self._model_id)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            data = {
+                "model_id": self._model_id,
+                "bytes_per_token": self._ewma_per_token,
+                "samples": self._samples,
+                "observed_max_bytes": self._observed_max_bytes,
+                "last_delta_bytes": self._last_delta_bytes,
+                "last_n_tokens": self._last_n_tokens,
+            }
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(path)
+            logger.info("PrefillTransientTracker(%s): saved prior %.1f B/tok to %s", self._model_id, self._ewma_per_token, path)
+        except Exception as e:
+            logger.debug("save_prior failed %s: %s", path, e)
+
+    def load_prior(self) -> bool:
+        path = _prior_path(self._model_id)
+        if path is None or not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text())
+            bpt = float(data.get("bytes_per_token", 0))
+            if bpt <= 0 or bpt > 100 * 1024 * 1024:  # sanity: 100 MB/tok max
+                return False
+            self._ewma_per_token = bpt
+            self._samples = int(data.get("samples", 1))
+            self._observed_max_bytes = int(data.get("observed_max_bytes", 0))
+            self._last_delta_bytes = int(data.get("last_delta_bytes", 0))
+            self._last_n_tokens = int(data.get("last_n_tokens", 0))
+            logger.info("PrefillTransientTracker(%s): loaded prior %.1f B/tok from %s", self._model_id, bpt, path)
+            return True
+        except Exception as e:
+            logger.debug("load_prior failed %s: %s", path, e)
+            return False

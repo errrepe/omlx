@@ -224,6 +224,10 @@ Why it flipped: the draft/verify cycle runs **3.4 target forwards per generated 
 | 48 GB+, quality flexible | default | optional | 0.85 | on (qwen4_exp with `mtp.*`) |
 | 16 GB-class | default | `PIN=1` | 0.85 (+ `WARM=1` to test) | on (qwen4_exp with `mtp.*`) |
 
+### B5 — LRU at 6 GiB is net-negative (Fase J)
+
+Measured on Qwen 8k prompt with page-cache only vs LRU (budget=6 GiB, per-layer cap ~47 slots): LRU hit 4.95% with 130k evictions and **0.649 tok/s vs 2.86 tok/s page-cache only**; swap write spikes 519 MB/s and `phys_lifetime` ~19 GiB vs 12 GiB. Insert-on-every-miss thrashes when working set >> capacity and rows pin the stacked bank until evicted (F2 contract). Operational default is **budget=0** for this model/box. If a workload needs a cache, enable the scan-resistant admission filter (`OMLX_EXPERT_STREAMING_ADMISSION=1` — only inserts experts seen >=2 times in the last 1024 accesses) and validate with `OMLX_EXPERT_STREAMING_TRACE=1` + `bench/lrc_analysis.py --cache-sizes 142 trace.jsonl` to read SCH(142); if SCH ~10-15% the cache will not pay.
+
 ## Fase E — bottleneck experiments (QD, coalescing, learned pins, MTP tuning, ANE)
 
 All runs cold (28 GB `cache_cool`), Qwen 0G page-cache-only unless noted; run-to-run noise ~±5%.

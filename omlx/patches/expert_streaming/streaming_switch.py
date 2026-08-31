@@ -15,7 +15,7 @@ import logging
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
@@ -34,6 +34,26 @@ _COALESCE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_COALESCE", "") != "0"
 _PREFILL_DIAG_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PREFILL_DIAG", "") == "1"
 # Routes above this count are treated as prefill-sized for the diag sync.
 _PREFILL_DIAG_MIN_ROUTES = 512
+
+# B5 admission filter (scan-resistant). When OMLX_EXPERT_STREAMING_ADMISSION=1,
+# only experts seen >=2 times in the recent window enter the LRU. Disabled by
+# default; operational default for this model/box is budget=0 (see docs).
+_ADMISSION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION", "") == "1"
+_ADMISSION_WINDOW = 1024
+
+# O2 cross-layer speculation (G2 F_RDADVISE + stash). RA is default-on (like G2)
+# and can be disabled with OMLX_EXPERT_STREAMING_RA=0. When enabled, each
+# MoE layer advises (or stashes, if OMLX_EXPERT_STREAMING_STASH=1) the next
+# layer's previous-token experts via F_RDADVISE so the NVMe fetch overlaps
+# compute. The stash is a small per-layer ring (<=256 experts total, ~650 MB
+# worst) that bypasses the LRU and never blocks demand reads.
+_RA_ENV = os.environ.get("OMLX_EXPERT_STREAMING_RA", "") != "0"
+_STASH_ENV = os.environ.get("OMLX_EXPERT_STREAMING_STASH", "") == "1"
+_STASH_MAX_ENTRIES = 256
+_PREV_UNIQ_BY_LAYER: Dict[int, list[int]] = {}
+_SPEC_STASH: Dict[Tuple[int, int, str], Any] = {}
+_SPEC_STASH_ORDER: list[Tuple[int, int, str]] = []
+_ADVISE_STATS = {"advised": 0, "advised_bytes": 0, "stash_hits": 0, "stash_misses": 0}
 
 # Routing trace (Fase I3): when OMLX_EXPERT_STREAMING_TRACE is set, append one
 # JSONL row per MoE layer call ({call, layer, positions, uniq}) so
@@ -64,6 +84,12 @@ def _trace_row(layer_idx: int, uniq_list: list, positions: int) -> None:
 # return raw numpy slices only — MLX promotion happens on the inference
 # thread. QD8 sustains ~1.5 GB/s on the reference NVMe; QD16 plateaus near
 # ~2.5 GB/s (+34% decode) — see E1. OMLX_EXPERT_STREAMING_QD overrides.
+#
+# B1 correction (Fase J): _EXPERT_IO_POOL is a process-wide SINGLETON with
+# 16 workers shared across all concurrent parents. With CTX_AHEAD=3, each
+# parent sees ~5 workers on average, not 16. Device depth is 16 total,
+# not N*16. Do not "fix" this to per-call pools — that oversubscribes and
+# regressed at QD32 (commit 0a4d3c7). The sweep value 16 is process-wide.
 _EXPERT_IO_POOL = ThreadPoolExecutor(
     max_workers=max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_QD", "") or 16)),
     thread_name_prefix="omlx-expert-io",
@@ -329,6 +355,11 @@ class ExpertLRUCache:
         self._layer_counts: Dict[int, int] = {}
         self.stats = CacheStats()
         self.profile = ProfileAccumulator(enabled=_PROFILE_ENV)
+        # B5 admission filter: scan-resistant frequency window (only when env set)
+        self._admission_enabled = bool(_ADMISSION_ENV and self.capacity > 0 and self.capacity < 4096)
+        self._admission_counts: Dict[Tuple[int, int], int] = {}
+        self._admission_order: deque[Tuple[int, int]] = deque()  # type: ignore[type-arg]
+        self.admission_drops = 0
 
     def __contains__(self, key: tuple[int, int, str]) -> bool:
         return key in self._store
@@ -340,12 +371,43 @@ class ExpertLRUCache:
             return -1
 
     def get(self, key: tuple[int, int, str]) -> Any | None:
+        # O2 stash check (decode speculation) - bypasses LRU, never counts as miss
+        if _RA_ENV and _STASH_ENV:
+            sv = _SPEC_STASH.get(key)  # type: ignore[arg-type]
+            if sv is not None:
+                _ADVISE_STATS["stash_hits"] += 1
+                return sv
+            # Count demand-path stash misses only when RA is active
+            # (keeps stats meaningful without extra branching in hot path)
+            # Miss counter incremented below after stash miss.
         if key in self._store:
             self._store.move_to_end(key)
             self.stats.hits += 1
             return self._store[key]
+        if _RA_ENV and _STASH_ENV:
+            _ADVISE_STATS["stash_misses"] += 1
         self.stats.misses += 1
         return None
+
+    def _admission_should_insert(self, key: tuple[int, int, str]) -> bool:
+        if not self._admission_enabled:
+            return True
+        # Frequency >=2 in recent window; count via hashed (layer, expert)
+        lk = (int(key[0]), int(key[1]))
+        c = self._admission_counts.get(lk, 0) + 1
+        self._admission_counts[lk] = c
+        self._admission_order.append(lk)
+        if len(self._admission_order) > _ADMISSION_WINDOW:
+            old = self._admission_order.popleft()
+            oc = self._admission_counts.get(old, 0) - 1
+            if oc <= 0:
+                self._admission_counts.pop(old, None)
+            else:
+                self._admission_counts[old] = oc
+        if c < 2:
+            self.admission_drops += 1
+            return False
+        return True
 
     def put(self, key: tuple[int, int, str], value: Any) -> None:
         if self.capacity <= 0:
@@ -353,6 +415,8 @@ class ExpertLRUCache:
         if key in self._store:
             self._store.move_to_end(key)
             self._store[key] = value
+            return
+        if not self._admission_should_insert(key):
             return
         # per-layer cap enforcement
         layer = self._layer_of(key)
@@ -845,6 +909,38 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 return bundle
         return None
 
+    def _advise_next_layer_prev_token(self) -> None:
+        if not _RA_ENV:
+            return
+        next_layer = self.layer_idx + 1
+        prev = _PREV_UNIQ_BY_LAYER.get(next_layer)
+        if not prev:
+            return
+        try:
+            sorted_prev = sorted(int(e) for e in prev)
+            if not sorted_prev:
+                return
+            # Coalesce into runs for single F_RDADVISE per run
+            s = sorted_prev[0]
+            cnt = 1
+            runs: list[tuple[int, int]] = []
+            for eid in sorted_prev[1:]:
+                if eid == s + cnt:
+                    cnt += 1
+                else:
+                    runs.append((s, cnt))
+                    s, cnt = eid, 1
+            runs.append((s, cnt))
+            for first, count in runs:
+                try:
+                    ok = self.backing.advise_expert_run(self.stacked_weight_key, first, count)
+                    if ok:
+                        _ADVISE_STATS["advised"] += count
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _load_expert_bundle(self, expert_id: int) -> tuple[mx.array, mx.array, mx.array | None]:
         key = self.bundle_key(expert_id)
         # Cache / staging resolution (shared with the parallel demand-set path)
@@ -895,6 +991,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         return bundle
 
     def __call__(self, x, indices, sorted_indices=False, plan: _RemapPlan | None = None):
+        if _RA_ENV and _PREV_UNIQ_BY_LAYER:
+            try:
+                self._advise_next_layer_prev_token()
+            except Exception:
+                pass
         p = self.cache.profile
         if plan is None:
             plan = _RemapPlan()
@@ -937,6 +1038,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 # Coalesce consecutive ids into single-pread runs (dense in
                 # long-prompt prefill; rare in decode, where runs are size 1
                 # and the path degenerates to the per-expert fetch).
+                # B2/O6: map keeps a sliding window of 16 in flight (singleton
+                # pool), so the device queue stays full; batch drain/sawtooth
+                # is avoided without moving promotion off the inference thread.
                 runs = self._group_runs(missing)
                 if coalesce_on and len(runs) < len(missing):
                     results_by_run = list(
@@ -1109,6 +1213,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 experts=len(plan.uniq_list),
                 positions=plan.positions,
             )
+            # O2: remember this layer's routing for next token's speculation
+            _PREV_UNIQ_BY_LAYER[self.layer_idx] = [int(e) for e in plan.uniq_list]
             return out
 
         if len(mini_w) == 1:
@@ -1136,6 +1242,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
+        # O2: remember this layer's routing for next token's speculation
+        _PREV_UNIQ_BY_LAYER[self.layer_idx] = [int(e) for e in plan.uniq_list]
         p.record_observed(self.layer_idx, plan.uniq_list)
         p.add(
             self.layer_idx,
