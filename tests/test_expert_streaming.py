@@ -2898,6 +2898,116 @@ def test_bank_bytes_respect_tier_widths():
     lin2 = _make_advise_linear(0, "gate_proj", _WidthBacking(), cache)
     assert lin2._tier_bank_bytes_for([0, 1]) == lin2._bank_bytes_for(2)
 
+
+
+def _quant_linear_same_store(tmp: Path, backing, cache, n_experts: int = 16):
+    """Second StreamingQuantizedSwitchLinear over the SAME shard store.
+
+    The per-layer load context runs several projections per layer; the
+    piece helpers must share one backing/cache so the read path and the
+    tier resolution stay realistic.
+    """
+    from omlx.patches.expert_streaming.streaming_switch import (
+        StreamingQuantizedSwitchLinear,
+    )
+
+    return StreamingQuantizedSwitchLinear(
+        layer_idx=0,
+        proj_name="gate_proj",
+        stacked_weight_key="model.layers.0.mlp.switch_mlp.gate_proj.weight",
+        stacked_scales_key="model.layers.0.mlp.switch_mlp.gate_proj.scales",
+        stacked_biases_key="model.layers.0.mlp.switch_mlp.gate_proj.biases",
+        num_experts=n_experts,
+        input_dims=128,
+        output_dims=16,
+        backing=backing,
+        cache=cache,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        has_bias=False,
+    )
+
+
+def test_ctx_mode_is_union_for_decode_positions():
+    """Fase 1: <=64 routed rows resolve through union; prefill keeps
+    rolling; max_rows=0 disables the hybrid (rolling everywhere)."""
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    with patch.object(ss, "_DECODE_UNION_MAX_ROWS", 64):
+        for pos in (1, 10, 64):
+            assert ss._layer_ctx_mode(pos, quantized=True, barrier=True) == "union", pos
+        for pos in (65, 512, 4096):
+            assert ss._layer_ctx_mode(pos, quantized=True, barrier=True) == "rolling", pos
+    assert ss._layer_ctx_mode(1, quantized=False, barrier=True) is None
+    assert ss._layer_ctx_mode(1, quantized=True, barrier=False) is None
+    with patch.object(ss, "_DECODE_UNION_MAX_ROWS", 0):
+        assert ss._layer_ctx_mode(1, quantized=True, barrier=True) == "rolling"
+    with patch.object(ss, "_CTX_ROLLING_ENV", False):
+        ctx = ss._LayerLoadContext([], None)  # type: ignore[arg-type]
+        assert ctx.mode == "union", "global kill switch forces union"
+
+
+def test_ctx_hybrid_matches_explicit_union_and_rolling_bundles():
+    """Fase 1: the hybrid union path and the rolling path resolve the same
+    decode demand to byte-identical bundles (the mode switch only changes
+    read scheduling, never the gather bytes)."""
+    import numpy as np
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "m"
+        store.mkdir()
+        lin0 = _quant_linear(store, n_experts=16)
+        backing = lin0.backing
+        backing.num_experts = 16
+        lin1 = _quant_linear_same_store(store, backing, lin0.cache)
+        demand = [1, 3, 5, 8]
+        ctx_r = ss._LayerLoadContext([lin0, lin1], lin0.cache, mode="rolling")
+        ctx_u = ss._LayerLoadContext([lin0, lin1], lin0.cache, mode="union")
+        ctx_r.ensure(lin0, demand)
+        ctx_u.ensure(lin0, demand)
+        assert not ctx_r.failed and not ctx_u.failed
+        b_r = ctx_r.bundles.get(id(lin0), {})
+        b_u = ctx_u.bundles.get(id(lin0), {})
+        assert set(b_r) == set(b_u) == set(demand)
+        for eid in demand:
+            for a, b in zip(b_r[eid], b_u[eid]):
+                assert np.array_equal(a, b), f"bundle {eid} diverged"
+
+
+def test_ctx_hybrid_preserves_hobbit_keys():
+    """Fase 1: with the HOBBIT split on, both modes keep the tier-suffixed
+    bundle_key contract — hot ids never alias cold copies, and the union
+    path resolves the same keys as rolling."""
+    import numpy as np
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "m"
+        store.mkdir()
+        lin0 = _quant_linear(store, n_experts=16)
+        lin0.set_hobbit_split(set(range(8)), cold_bits=2, cold_gs=32)
+        assert lin0._is_split_active()
+        lin1 = _quant_linear_same_store(store, lin0.backing, lin0.cache)
+        lin1.set_hobbit_split(set(range(8)), cold_bits=2, cold_gs=32)
+        demand = [0, 3, 5]  # all hot: resolves on the source packing
+        ctx_r = ss._LayerLoadContext([lin0, lin1], lin0.cache, mode="rolling")
+        ctx_u = ss._LayerLoadContext([lin0, lin1], lin0.cache, mode="union")
+        ctx_r.ensure(lin0, demand)
+        ctx_u.ensure(lin0, demand)
+        assert not ctx_r.failed and not ctx_u.failed
+        for eid in demand:
+            k = lin0.bundle_key(eid)
+            assert k[2] == lin0.stacked_weight_key, f"hot key must stay unsuffixed: {k}"
+        for eid in (8, 12):
+            k = lin0.bundle_key(eid)
+            assert k[2].endswith("#c"), f"cold key must be tier-suffixed: {k}"
+        b_u = ctx_u.bundles.get(id(lin0), {})
+        assert set(b_u) == set(demand)
+
 def test_memtrace_disabled_by_default_is_noop():
     """With the env var unset the singleton is a null tracer: recording is
     a no-op and enabled is False, so the hot path stays free."""
@@ -3387,8 +3497,11 @@ def test_ctx_bank_promote_is_bit_identical_on_default_path(monkeypatch, tmp_path
 
     assert ss._LAYER_BARRIER_ENV  # the default path A1b is scoped to
 
-    x = mx.random.normal((1, 6, 128)).astype(mx.float32)
-    indices = mx.array([2, 0, 1, 2, 0, 1], dtype=mx.int32)
+    # Fase 1 hybrid: A1b engages on the ROLLING mode, which decode-shaped
+    # calls no longer use (positions <= 64 -> union). Use prefill-shaped
+    # positions so this gate keeps exercising the rolling default path.
+    x = mx.random.normal((1, 130, 128)).astype(mx.float32)
+    indices = mx.array([i % 3 for i in range(130)], dtype=mx.int32)
 
     def run(enabled):
         monkeypatch.setattr(ss, "_BANK_PROMOTE_CTX_ENV", enabled)
@@ -3453,8 +3566,10 @@ def test_ctx_bank_promote_declined_on_partial_demand(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ss._LayerLoadContext, "ensure", spy)
 
-    x = mx.random.normal((1, 6, 128)).astype(mx.float32)
-    indices = mx.array([2, 0, 1, 2, 0, 1], dtype=mx.int32)
+    # Fase 1 hybrid: rolling (single-promotion) only engages on
+    # prefill-shaped calls; pin the partial-demand decline there.
+    x = mx.random.normal((1, 130, 128)).astype(mx.float32)
+    indices = mx.array([i % 3 for i in range(130)], dtype=mx.int32)
     out = glu(x, indices)
     mx.eval(out)
 

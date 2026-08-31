@@ -68,6 +68,28 @@ _LAYER_BARRIER_ENV = os.environ.get("OMLX_EXPERT_STREAMING_LAYER_BARRIER", "1") 
 # 0 restores the legacy behaviour (every projection's NumPy bank resident at
 # once) for A/B against the new pipelined path.
 _CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "0"
+# Fase 1 (hybrid decode fast path): routed calls at or below this many
+# positions resolve through the UNION mode (all projections in flight at
+# once — the measured-best decode shape on this box); larger calls keep
+# rolling so prefill never holds all projections resident. 0 disables
+# the hybrid (rolling everywhere), matching the pre-Fase-1 behavior.
+_DECODE_UNION_MAX_ROWS = max(
+    0, int(os.environ.get("OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS", "64"))
+)
+
+
+def _layer_ctx_mode(positions: int, *, quantized: bool, barrier: bool) -> str | None:
+    """Layer-context mode for one GLU call (Fase 1).
+
+    None -> no context (not quantized / barrier off). 'union' for
+    decode-shaped calls when the hybrid is enabled; 'rolling' otherwise.
+    The env kills or forces union via the global switch in the caller.
+    """
+    if not (quantized and barrier):
+        return None
+    if _DECODE_UNION_MAX_ROWS > 0 and int(positions) <= _DECODE_UNION_MAX_ROWS:
+        return "union"
+    return "rolling"
 # How many *following* projections to read in the background while the
 # current one is promoted/computed. 0 disables prefetch entirely.
 #
@@ -792,7 +814,13 @@ class _LayerLoadContext:
     performed on IO-pool workers that never allocate MLX arrays.
     """
 
-    def __init__(self, linears: list[Any], cache: ExpertLRUCache):
+    def __init__(
+        self, linears: list[Any], cache: ExpertLRUCache, mode: str | None = None
+    ):
+        # Fase 1: the GLU picks the mode per call (union for decode-shaped,
+        # rolling for prefill); OMLX_EXPERT_STREAMING_CTX_ROLLING=0 remains
+        # the global kill switch (forces union here).
+        self.mode = mode or ("union" if not _CTX_ROLLING_ENV else "rolling")
         self.linears = linears
         self.cache = cache
         self.bundles: dict[int, dict[int, tuple]] = {}
@@ -957,6 +985,7 @@ class _LayerLoadContext:
                 "ctx.ensure.exit",
                 layer=linear.layer_idx,
                 proj=getattr(linear, "proj_name", "?"),
+                ctx_mode=self.mode,
                 uniq=len(ids),
                 miss=len(missing),
                 bank_bytes=int(linear._tier_bank_bytes_for(missing)),
@@ -1011,10 +1040,10 @@ class _LayerLoadContext:
 
     def ensure(self, linear: Any, expert_ids: list[int]) -> None:
         """Resolve linear's demand set for this layer call."""
-        if _CTX_ROLLING_ENV:
-            self._ensure_rolling(linear, expert_ids)
-        else:
+        if self.mode == "union":
             self._ensure_union(linear, expert_ids)
+        else:
+            self._ensure_rolling(linear, expert_ids)
 
 
 @dataclass
@@ -2367,7 +2396,18 @@ class StreamingSwitchGLU(nn.Module):
                 else [self.up_proj, self.gate_proj, self.down_proj]
             )
             if all(hasattr(proj, '_load_expert_bank_np') for proj in projections):
-                plan.ctx = _LayerLoadContext(projections, self._cache)
+                # Fase 1 hybrid: decode-shaped calls (<64 routed rows)
+                # read all projections at once (union — the measured-best
+                # decode shape); prefill keeps rolling so all banks are
+                # never resident simultaneously.
+                ctx_mode = _layer_ctx_mode(
+                    int(indices.size),
+                    quantized=self.quantized,
+                    barrier=_LAYER_BARRIER_ENV,
+                )
+                plan.ctx = _LayerLoadContext(
+                    projections, self._cache, mode=ctx_mode
+                )
         if memtrace.enabled:
             memtrace.record(
                 'glu.enter', layer=self.layer_idx, positions=int(indices.size)
