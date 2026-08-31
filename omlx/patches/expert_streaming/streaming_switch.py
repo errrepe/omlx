@@ -1821,9 +1821,15 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                         for (first, count), out in results_by_run:
                             if out is not None:
                                 for j in range(count):
-                                    raws[idx_of[first + j]] = out[j]
+                                    eid = first + j
+                                    if eid in idx_of:
+                                        raws[idx_of[eid]] = out[j]
+                                    # else: Fase K F7 bridge gap row — read
+                                    # but never promoted/used, so dropped here
                             else:
-                                leftover.extend(range(first, first + count))
+                                leftover.extend(
+                                    e for e in range(first, first + count) if e in idx_of
+                                )
                         if leftover:
                             for eid, raw in zip(
                                 leftover, io_pool.map(self._load_expert_np, leftover)
