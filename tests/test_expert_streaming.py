@@ -2277,6 +2277,23 @@ def test_ctx_rolling_mode_prefetch_ahead_zero_reads_on_demand():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_ctx_prefetch_ahead_default_keeps_io_depth_above_one():
+    """The rolling path must keep more than one projection's read in flight.
+
+    `read_expert_into` issues its preadv calls one at a time, so the prefetch
+    window is the *only* thing giving the layer call an I/O queue depth above
+    1. At depth 1 the device idles between reads and decode throughput follows
+    it down: measured on qwen4_exp (2k prompt, 48 decode), AHEAD=1 gave
+    41% CPU / 0.46 GiB/s / 1.86 tok/s against the baseline's 85% / 0.92 GiB/s
+    / 3.06 tok/s. AHEAD=3 recovers to 50% / 0.56 GiB/s / 2.22 tok/s with no
+    memory cost. This pins the default so a revert to 1 fails here rather
+    than as an unexplained throughput regression.
+    """
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    assert ss._CTX_PREFETCH_AHEAD >= 2
+
+
 def test_ctx_rolling_mode_matches_union_mode_results():
     """Both modes must produce identical bundles — the rolling path is a
     scheduling change, not a data change. Bit-exactness of the loaded rows is

@@ -59,8 +59,20 @@ _LAYER_BARRIER_ENV = os.environ.get("OMLX_EXPERT_STREAMING_LAYER_BARRIER", "1") 
 _CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "0"
 # How many *following* projections to read in the background while the
 # current one is promoted/computed. 0 disables prefetch entirely.
+#
+# Default 3, up from 1, because this is the only knob that widens the I/O
+# queue depth on the rolling path and depth is what the decode regression
+# turned on. `read_expert_into` issues its preadv calls strictly one at a
+# time, so with AHEAD=1 the whole layer call had a queue depth of 1: the
+# NVMe sat idle between reads and decode throughput tracked that idleness
+# (CPU 41%, 0.46 GiB/s, 1.86 tok/s). Raising it to 3 keeps the following
+# projections in flight: CPU 50%, 0.56 GiB/s, 2.22 tok/s (+19% decode,
+# -9% TTFT) at no measured memory cost (phys_lifetime_max 11.03 GiB vs
+# 11.06). 3 already covers every remaining projection, so higher values
+# buy nothing here — real depth has to come from parallelising the reads
+# inside read_expert_into, which this does not do.
 _CTX_PREFETCH_AHEAD = max(
-    0, int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_AHEAD", "1"))
+    0, int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_AHEAD", "3"))
 )
 # Banks larger than this are never held speculatively; they are read on demand.
 _CTX_PREFETCH_MAX_BYTES = max(
