@@ -153,7 +153,7 @@ _run_io_pool_lock = threading.Lock()
 
 
 def _run_io_pool() -> ThreadPoolExecutor:
-    """Threads for the per-run preadvs of a single read_expert_into call.
+    """Threads for the per-run preadvs of read_expert_into calls.
 
     Deliberately NOT the caller's pool. read_expert_into is dispatched on
     _EXPERT_IO_POOL (16 workers) via the layer-context prefetch and the
@@ -162,12 +162,14 @@ def _run_io_pool() -> ThreadPoolExecutor:
     queued child. This pool is separate and its tasks never submit anywhere,
     so it always drains.
 
-    Bounded at _RUN_IO_QD workers, which caps the reads ONE call can have in
-    flight. It does not cap the process: with N concurrent parents the device
-    can see up to N * _RUN_IO_QD outstanding reads. That is intentional —
-    total depth is what we are buying — and it is why the default is 16 and
-    not higher, since 32 measured slower (oversubscription, not parallelism).
-    The per-call bound is what keeps the transient buffer memory bounded.
+    The SINGLETON is bounded at _RUN_IO_QD workers PROCESS-WIDE: every
+    concurrent parent shares the same 16 run-read workers (K10 — the old
+    docstring claimed one call was capped but N parents stacked N*QD depth;
+    the executor caps the process, which is why QD32 measured slower: 32
+    workers oversubscribe the device's useful queue depth, they do not
+    multiply it). A single call keeps at most _RUN_IO_QD reads in flight
+    because its planning window is sized to the pool (K11); the bound also
+    keeps the transient buffer memory bounded.
     """
     global _RUN_IO_POOL_SINGLETON
     if _RUN_IO_POOL_SINGLETON is None:
@@ -364,11 +366,6 @@ class _ShardReader:
         self._read_into(off, out)
         return np.frombuffer(out, dtype=rp.np_dtype).reshape(rp.per_shape)
 
-    def expert_byte_range(self, key: str, expert_id: int) -> Tuple[int, int]:
-        """Absolute file offsets (start, end) of one expert's slice."""
-        rp = self._rp_for(key)
-        off = rp.tensor_abs_off + expert_id * rp.expert_bytes
-        return off, off + rp.expert_bytes
     def expert_byte_range(self, key: str, expert_id: int) -> Tuple[int, int]:
         """Absolute file offsets (start, end) of one expert's slice."""
         rp = self._rp_for(key)
@@ -891,43 +888,68 @@ class ExpertBackingStore:
             # at _RUN_IO_QD run buffers instead of one per run — a fully
             # fragmented component is one run per expert, which would
             # otherwise double the component's footprint.
-            for bstart in range(0, len(runs), _RUN_IO_QD):
-                batch = runs[bstart : bstart + _RUN_IO_QD]
-                bufs = [
-                    np.empty(count * rp.expert_bytes, dtype=np.uint8)
-                    for _off, _first, count, _js in batch
-                ]
-                if len(batch) == 1:
-                    try:
-                        reader._read_into(batch[0][0], bufs[0])
-                    except Exception:
-                        return False
-                else:
-                    io_exec = _run_io_pool()
-                    futs = [
-                        io_exec.submit(reader._read_into, off, buf)
-                        for (off, _first, _count, _js), buf in zip(batch, bufs)
-                    ]
-                    # Drain every future even after a failure, so no exception
-                    # is left unretrieved and no read keeps writing into a
-                    # buffer the caller has already been told to discard.
-                    ok = True
-                    for fut in futs:
+            def scatter_one(off, first, js, buf) -> None:
+                # The row base for a demanded id is (eid - first) — never
+                # the slice index, which is what would corrupt every id
+                # behind a bridge. Rows are disjoint per descriptor, so the
+                # byte content of out never depends on completion order.
+                for j in js:
+                    base = (eids[j] - first) * rp.expert_bytes
+                    out[j, :] = buf[base : base + rp.expert_bytes]
+
+            if len(runs) == 1:
+                off, first, count, js = runs[0]
+                buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                try:
+                    reader._read_into(off, buf)
+                except Exception:
+                    return False
+                scatter_one(off, first, js, buf)
+            else:
+                # Sliding window (K11): keep up to _RUN_IO_QD reads in
+                # flight continuously. The old drain-all-per-batch loop
+                # emptied the queue at every batch boundary — a sawtooth
+                # that let the device idle even though demand was waiting.
+                # The window pops the OLDEST descriptor (submission order)
+                # so out bytes stay deterministic descriptor by descriptor.
+                io_exec = _run_io_pool()
+                window: list = []  # (off, first, js, buf, future)
+                ok = True
+                for idx, (off, first, count, js) in enumerate(runs):
+                    buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                    window.append(
+                        (off, first, js, buf, io_exec.submit(reader._read_into, off, buf))
+                    )
+                    if len(window) >= _RUN_IO_QD or idx == len(runs) - 1:
+                        wo, wfirst, wjs, wbuf, wfut = window.pop(0)
                         try:
-                            fut.result()
+                            wfut.result()
                         except Exception:
                             ok = False
+                        if ok:
+                            scatter_one(wo, wfirst, wjs, wbuf)
                     if not ok:
+                        # Drain the rest so no exception is left unretrieved
+                        # and no read keeps writing into a buffer the caller
+                        # has already been told to discard.
+                        for _o, _f, _j, _b, fut in window:
+                            try:
+                                fut.result()
+                            except Exception:
+                                pass
                         return False
-                # Scatter only once the whole batch has landed, and in
-                # descriptor order, so the bytes in out never depend on the
-                # order the reads happened to complete in. The row base for
-                # a demanded id is (eid - first) — never the slice index,
-                # which is what would corrupt every id behind a bridge.
-                for (off, first, _count, js), buf in zip(batch, bufs):
-                    for j in js:
-                        base = (eids[j] - first) * rp.expert_bytes
-                        out[j, :] = buf[base : base + rp.expert_bytes]
+                # The window may still hold descriptors submitted on the
+                # final iterations (when the run count is below the window
+                # size); drain them in submission order.
+                for wo, wfirst, wjs, wbuf, wfut in window:
+                    try:
+                        wfut.result()
+                    except Exception:
+                        ok = False
+                    if ok:
+                        scatter_one(wo, wfirst, wjs, wbuf)
+                if not ok:
+                    return False
         return True
 
     def advise_expert_run(self, key: str, first_id: int, count: int) -> bool:

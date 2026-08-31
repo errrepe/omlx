@@ -91,12 +91,26 @@ def _clear_cache_synced() -> None:
     store-cache worker from observing a half-reclaimed pool (#1106), so it is
     preferred whenever it is importable.
     """
+    # K12: the bare clear is ONLY the import-failure fallback. A failure
+    # INSIDE the synced helper (lock, sync, eval) must not fall through to
+    # the unsynchronized clear — that reintroduces the very 'clear with
+    # command buffers in flight' race this helper exists to prevent. The
+    # scheduler's chunk-boundary clear covers the pool in that case.
     try:
         from omlx.utils.metal_sync import _sync_and_clear_cache
-
+    except Exception:
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
+        return
+    try:
         _sync_and_clear_cache()
     except Exception:
-        mx.clear_cache()
+        logger.warning(
+            "_sync_and_clear_cache failed; skipping the per-layer clear (K12)",
+            exc_info=True,
+        )
 
 
 def _wrap_call(orig_call: Any) -> Any:
