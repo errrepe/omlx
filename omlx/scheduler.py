@@ -4024,19 +4024,23 @@ class Scheduler:
         effective_static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
-        if tracker is not None and tracker.samples > 0:
-            # K3: measured signal exists ONLY after real chunk updates. A
-            # restored prior has samples == 0 (and zeroed deltas), so it
-            # never acts as measurement — the first chunk prices the static
-            # estimate instead of a stale prior that could underestimate
-            # the Metal peak under a changed regime.
-            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                measured_signal = max(
-                    measured_signal, tracker.last_delta_bytes / tracker.last_n_tokens
-                )
-            if tracker.bytes_per_token > 0:
-                measured_signal = max(measured_signal, tracker.bytes_per_token)
+        if tracker is not None:
+            # The reclaim ledger is not measurement: it charges whatever
+            # footprint a chunk released until the next chunk confirms
+            # reallocation, so it is priced even before any sample exists.
             recent_reclaim = tracker.recent_reclaim_bytes
+            if tracker.samples > 0:
+                # K3: measured signal exists ONLY after real chunk updates.
+                # A restored prior has samples == 0 (and zeroed deltas), so
+                # it never acts as measurement — the first chunk prices the
+                # static estimate instead of a stale prior that could
+                # underestimate the Metal peak under a changed regime.
+                if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
+                    measured_signal = max(
+                        measured_signal, tracker.last_delta_bytes / tracker.last_n_tokens
+                    )
+                if tracker.bytes_per_token > 0:
+                    measured_signal = max(measured_signal, tracker.bytes_per_token)
 
         # Static SDPA+KV estimate. Model-specific by construction: a generic
         # dense / head-count formula can over-predict a quantized MoE model
