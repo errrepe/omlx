@@ -437,10 +437,10 @@ async def run(
             print(f"prefetcher {pf_stats}")
         # Fase K F3: export the O2 F_RDADVISE/stash speculation counters so
         # the readahead coverage is measurable (advised experts, stash hits).
+        # K1: the counters live on the per-conversion SpeculationState.
         try:
-            from omlx.patches.expert_streaming.streaming_switch import _ADVISE_STATS
-
-            advise_stats = dict(_ADVISE_STATS)
+            _cache_spec = getattr(cache, "spec_state", None)
+            advise_stats = dict(_cache_spec.stats) if _cache_spec is not None else None
             print(f"advise {advise_stats}")
         except Exception:
             advise_stats = None

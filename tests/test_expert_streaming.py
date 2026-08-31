@@ -4,6 +4,7 @@
 import json
 import struct
 import tempfile
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2242,79 +2243,78 @@ def _make_advise_linear(layer_idx: int, proj: str, backing, cache):
     )
 
 
+def _attach_spec(cache):
+    """Fase K K1: attach a fresh per-conversion SpeculationState to a cache.
+
+    Mirrors what convert_model_to_streaming does: one instance per
+    conversion, hung off the cache (and the backing when it is an object).
+    """
+    from omlx.patches.expert_streaming import streaming_switch as ss
+
+    cache.spec_state = ss.SpeculationState()
+    return cache.spec_state
+
+
 class TestFaseKO2Advisor:
     def test_advise_uses_next_layer_key(self):
-        """Fase K F1: the advisor must F_RDADVISE the NEXT layer's banks."""
+        """Fase K F1: the advisor must F_RDADVISE the NEXT layer's banks.
+
+        K1: the whole speculation state is per-conversion — the test
+        attaches its own state and never touches module globals.
+        """
         from omlx.patches.expert_streaming import streaming_switch as ss
 
         cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec = _attach_spec(cache)
         backing = _AdviseRecorderBacking()
         lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
         lin1_up = _make_advise_linear(1, "up_proj", backing, cache)
         lin1_down = _make_advise_linear(1, "down_proj", backing, cache)
-        ss._STREAM_LINEARS_BY_LAYER.clear()
-        ss.register_streaming_linears(1, [lin1_up, lin1_down])
-        ss._PREV_UNIQ_BY_LAYER[1] = [3, 4, 9]
-        ss._SPEC_STASH.clear()
-        ss._SPEC_STASH_ORDER.clear()
-        old_stats = dict(ss._ADVISE_STATS)
-        try:
-            with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", False):
-                plan = ss._RemapPlan()
-                lin0._advise_next_layer_prev_token(plan)
-            keys = {k for k, _, _ in backing.advised}
-            assert keys == {
-                "model.layers.1.mlp.switch_mlp.up_proj.weight",
-                "model.layers.1.mlp.switch_mlp.down_proj.weight",
-            }, f"advised wrong banks: {keys}"
-            # 2 targets x 3 experts (runs (3,2) + (9,1))
-            assert ss._ADVISE_STATS["advised"] - old_stats["advised"] == 6
-        finally:
-            ss._STREAM_LINEARS_BY_LAYER.clear()
-            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
-            ss._SPEC_STASH.clear()
-            ss._SPEC_STASH_ORDER.clear()
+        spec.register_linears(1, [lin1_up, lin1_down])
+        spec.prev_uniq_by_layer[1] = [3, 4, 9]
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", False):
+            plan = ss._RemapPlan()
+            lin0._advise_next_layer_prev_token(plan)
+        keys = {k for k, _, _ in backing.advised}
+        assert keys == {
+            "model.layers.1.mlp.switch_mlp.up_proj.weight",
+            "model.layers.1.mlp.switch_mlp.down_proj.weight",
+        }, f"advised wrong banks: {keys}"
+        # 2 targets x 3 experts (runs (3,2) + (9,1))
+        assert spec.stats["advised"] == 6
 
     def test_advise_guard_skips_prefill_shaped_sets(self):
         """Fase K F2: > _MAX_ADVISE_ROWS experts is prefill-shaped, skip."""
         from omlx.patches.expert_streaming import streaming_switch as ss
 
         cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec = _attach_spec(cache)
         backing = _AdviseRecorderBacking(num_experts=512)
         lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
         lin1 = _make_advise_linear(1, "up_proj", backing, cache)
-        ss._STREAM_LINEARS_BY_LAYER.clear()
-        ss.register_streaming_linears(1, [lin1])
-        ss._PREV_UNIQ_BY_LAYER[1] = list(range(200))
-        try:
-            with patch.object(ss, "_RA_ENV", True):
-                plan = ss._RemapPlan()
-                lin0._advise_next_layer_prev_token(plan)
-            assert backing.advised == [], "prefill-shaped set must not be advised"
-        finally:
-            ss._STREAM_LINEARS_BY_LAYER.clear()
-            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
+        spec.register_linears(1, [lin1])
+        spec.prev_uniq_by_layer[1] = list(range(200))
+        with patch.object(ss, "_RA_ENV", True):
+            plan = ss._RemapPlan()
+            lin0._advise_next_layer_prev_token(plan)
+        assert backing.advised == [], "prefill-shaped set must not be advised"
 
     def test_advise_dedupes_runs_per_layer_call(self):
         """Fase K F2: the 3 projections share one plan -> no double advise."""
         from omlx.patches.expert_streaming import streaming_switch as ss
 
         cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec = _attach_spec(cache)
         backing = _AdviseRecorderBacking()
         lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
         lin1 = _make_advise_linear(1, "up_proj", backing, cache)
-        ss._STREAM_LINEARS_BY_LAYER.clear()
-        ss.register_streaming_linears(1, [lin1])
-        ss._PREV_UNIQ_BY_LAYER[1] = [3, 4]
-        try:
-            with patch.object(ss, "_RA_ENV", True):
-                plan = ss._RemapPlan()
-                lin0._advise_next_layer_prev_token(plan)
-                lin0._advise_next_layer_prev_token(plan)
-            assert len(backing.advised) == 1, f"expected 1 run, got {backing.advised}"
-        finally:
-            ss._STREAM_LINEARS_BY_LAYER.clear()
-            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
+        spec.register_linears(1, [lin1])
+        spec.prev_uniq_by_layer[1] = [3, 4]
+        with patch.object(ss, "_RA_ENV", True):
+            plan = ss._RemapPlan()
+            lin0._advise_next_layer_prev_token(plan)
+            lin0._advise_next_layer_prev_token(plan)
+        assert len(backing.advised) == 1, f"expected 1 run, got {backing.advised}"
 
 
 class TestFaseKO2StashRing:
@@ -2328,70 +2328,186 @@ class TestFaseKO2StashRing:
         from omlx.patches.expert_streaming import streaming_switch as ss
 
         cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec = _attach_spec(cache)
         backing = _AdviseRecorderBacking()
         lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
         lin1 = _make_advise_linear(1, "up_proj", backing, cache)
-        ss._STREAM_LINEARS_BY_LAYER.clear()
-        ss.register_streaming_linears(1, [lin1])
-        ss._PREV_UNIQ_BY_LAYER[1] = [3, 4]
-        ss._SPEC_STASH.clear()
-        ss._SPEC_STASH_ORDER.clear()
-        try:
-            with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-                plan = ss._RemapPlan()
-                lin0._advise_next_layer_prev_token(plan)
-                deadline = time.time() + 5.0
-                while ss._ADVISE_STATS["stash_inserts"] < 2 and time.time() < deadline:
-                    time.sleep(0.02)
-            assert ss._ADVISE_STATS["stash_inserts"] == 2, "stash reads must land"
-            for eid in (3, 4):
-                key = lin1.bundle_key(eid)
-                assert key in ss._SPEC_STASH, f"stash missing {key}"
-                w, s, b = ss._SPEC_STASH[key]
-                assert w.shape == (64,)
-            # A demand get() against the LRU resolution path must hit the ring.
-            with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-                got = lin1._bundle_cached_or_staged(3)
-            assert got is not None and got[0].shape == (64,)
-            # FIFO ring: inserting beyond _STASH_MAX_ENTRIES evicts the oldest.
-            for eid in range(10, 10 + ss._STASH_MAX_ENTRIES):
-                key = (1, eid, lin1.stacked_weight_key)
-                ss._SPEC_STASH[key] = (np.zeros(4, np.uint8), None, None)
-                ss._SPEC_STASH_ORDER.append(key)
-            while len(ss._SPEC_STASH) > ss._STASH_MAX_ENTRIES:
-                old = ss._SPEC_STASH_ORDER.pop(0)
-                ss._SPEC_STASH.pop(old, None)
-            assert len(ss._SPEC_STASH) <= ss._STASH_MAX_ENTRIES
-        finally:
-            ss._STREAM_LINEARS_BY_LAYER.clear()
-            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
-            ss._SPEC_STASH.clear()
-            ss._SPEC_STASH_ORDER.clear()
+        spec.register_linears(1, [lin1])
+        spec.prev_uniq_by_layer[1] = [3, 4]
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+            plan = ss._RemapPlan()
+            lin0._advise_next_layer_prev_token(plan)
+            deadline = time.time() + 5.0
+            while spec.stats["stash_inserts"] < 2 and time.time() < deadline:
+                time.sleep(0.02)
+        assert spec.stats["stash_inserts"] == 2, "stash reads must land"
+        for eid in (3, 4):
+            key = lin1.bundle_key(eid)
+            assert key in spec.stash, f"stash missing {key}"
+            w, s, b = spec.stash[key]
+            assert w.shape == (64,)
+        # A demand get() against the LRU resolution path must hit the ring.
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+            got = lin1._bundle_cached_or_staged(3)
+        assert got is not None and got[0].shape == (64,)
+        # FIFO ring: inserting beyond _STASH_MAX_ENTRIES evicts the oldest.
+        for eid in range(10, 10 + ss._STASH_MAX_ENTRIES):
+            key = (1, eid, lin1.stacked_weight_key)
+            spec.stash_insert(key, (np.zeros(4, np.uint8), None, None))
+        assert len(spec.stash) <= ss._STASH_MAX_ENTRIES
+        # Dedupe: re-inserting an existing key is a no-op that never evicts.
+        existing = list(spec.stash_order)[0]
+        before = len(spec.stash)
+        assert spec.stash_insert(existing, (np.zeros(4, np.uint8), None, None)) is False
+        assert len(spec.stash) == before
 
     def test_stash_off_by_default_no_stash_reads(self):
         """Fase K F3: STASH=0 (default) issues advisory hints only."""
         from omlx.patches.expert_streaming import streaming_switch as ss
 
         cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec = _attach_spec(cache)
         backing = _AdviseRecorderBacking()
         lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
         lin1 = _make_advise_linear(1, "up_proj", backing, cache)
-        ss._STREAM_LINEARS_BY_LAYER.clear()
-        ss.register_streaming_linears(1, [lin1])
-        ss._PREV_UNIQ_BY_LAYER[1] = [3, 4]
-        ss._SPEC_STASH.clear()
-        ss._SPEC_STASH_ORDER.clear()
-        try:
-            with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", False):
-                plan = ss._RemapPlan()
-                lin0._advise_next_layer_prev_token(plan)
-            assert backing.read_runs == [], "stash disabled: no speculative reads"
-            assert len(backing.advised) == 1, "F_RDADVISE still fires"
-        finally:
-            ss._STREAM_LINEARS_BY_LAYER.clear()
-            ss._PREV_UNIQ_BY_LAYER.pop(1, None)
-            ss._SPEC_STASH.clear()
-            ss._SPEC_STASH_ORDER.clear()
+        spec.register_linears(1, [lin1])
+        spec.prev_uniq_by_layer[1] = [3, 4]
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", False):
+            plan = ss._RemapPlan()
+            lin0._advise_next_layer_prev_token(plan)
+        assert backing.read_runs == [], "stash disabled: no speculative reads"
+        assert len(backing.advised) == 1, "F_RDADVISE still fires"
+
+
+class TestFaseKSpecStateLifecycle:
+    """Fase K corrections K1/K7: per-conversion isolation and drain."""
+
+    def test_stash_isolated_per_backing(self):
+        """K1: two conversions with the same keys never share ring bytes."""
+        import time
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        def build() -> tuple:
+            cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+            spec = _attach_spec(cache)
+            backing = _AdviseRecorderBacking()
+            lin = _make_advise_linear(1, "up_proj", backing, cache)
+            spec.register_linears(1, [lin])
+            return cache, backing, spec, lin
+
+        ca, ba, sa, la = build()
+        cb, bb, sb, lb = build()
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+            la._stash_populate([3])
+        deadline = time.time() + 5.0
+        while sa.stats["stash_inserts"] < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert sa.stats["stash_inserts"] == 1, "A's speculation must land"
+        key = la.bundle_key(3)
+        assert key in sa.stash
+        # B's ring never saw A's bytes; its stats are untouched.
+        assert sb.stats["stash_inserts"] == 0
+        assert lb.bundle_key(3) not in sb.stash
+        # Closing A drains and clears the ring; a closed state accepts nothing.
+        sa.close()
+        assert sa.stash == {} and sa.stash_order == []
+        assert sa.is_closed()
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+            assert la._spec_state() is sa
+            la._stash_populate([5])  # closed: silently dropped
+        assert sa.stats["stash_inserts"] == 1, "no inserts after close"
+        # B keeps working independently after A closed.
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+            lb._stash_populate([7])
+        deadline = time.time() + 5.0
+        while sb.stats["stash_inserts"] < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert sb.stats["stash_inserts"] == 1
+
+    def test_stash_close_drains_inflight_reads(self):
+        """K1: close() during in-flight speculation accepts no late writes."""
+        import time
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        class _SlowBacking(_AdviseRecorderBacking):
+            def load_expert_run(self, key, first_id, count):
+                time.sleep(0.05)
+                return super().load_expert_run(key, first_id, count)
+
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec = _attach_spec(cache)
+        backing = _SlowBacking()
+        lin = _make_advise_linear(1, "up_proj", backing, cache)
+        spec.register_linears(1, [lin])
+        stock = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+            lin._stash_populate(stock)
+        deadline = time.time() + 5.0
+        while spec.pending and time.time() < deadline:
+            time.sleep(0.01)
+        assert spec.stats["stash_inserts"] > 0, "reads started before close"
+        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
+            lin._stash_populate([13, 14, 15])
+        before = spec.stats["stash_inserts"]
+        spec.close()
+        deadline = time.time() + 5.0
+        while backing.read_runs and time.time() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.3)  # let any straggler worker finish its disk read
+        assert spec.stash == {}, "close must leave the ring empty"
+        assert spec.stats["stash_inserts"] == before, "no inserts after close"
+        with spec.lock:
+            assert spec.pending == set(), "pending futures dropped on close"
+
+    def test_stash_concurrent_writers_keep_invariants(self):
+        """K7: N threads over overlapping keys keep the ring consistent.
+
+        Invariants: bounded size, FIFO without duplicates, locked stats,
+        bounded pending queue, zero exceptions even under a submit storm.
+        """
+        import time
+
+        import numpy as np
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        spec = ss.SpeculationState()
+        errors: list = []
+
+        def writer(offset: int):
+            try:
+                for i in range(400):
+                    key = (1, (offset + i * 37) % 300, "k")
+                    spec.stash_insert(key, (np.zeros(1, np.uint8), None, None))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(o,)) for o in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        assert not errors, f"writer exceptions: {errors}"
+        assert len(spec.stash) <= ss._STASH_MAX_ENTRIES
+        assert len(spec.stash_order) == len(set(spec.stash_order)), "FIFO has dups"
+        inserts = spec.stats["stash_inserts"]
+        evictions = spec.stats["stash_evictions"]
+        assert inserts == len(spec.stash) + evictions, "stats must reconcile"
+        # Pending cap: a storm of slow reads is dropped, never unbounded.
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec2 = _attach_spec(cache)
+        accepted = 0
+        for _ in range(ss._STASH_MAX_PENDING + 200):
+            if spec2.submit(lambda: time.sleep(0.001)):
+                accepted += 1
+        with spec2.lock:
+            assert len(spec2.pending) <= ss._STASH_MAX_PENDING
+        assert accepted <= ss._STASH_MAX_PENDING + 200
+        spec2.close()
+        with spec2.lock:
+            assert spec2.pending == set()
 
 
 class TestFaseKAdmissionFilter:

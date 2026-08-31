@@ -914,6 +914,19 @@ class ExpertBackingStore:
         return len(self._pinned)
 
     def close(self) -> None:
+        # Fase K K1: drain the speculation workers before the readers die —
+        # a live stash future would read from closed files or, worse, write
+        # stale bytes into a ring past its owning engine's lifetime.
+        spec = getattr(self, "spec_state", None)
+        if spec is not None:
+            try:
+                spec.close()
+            except Exception:
+                pass
+            try:
+                self.spec_state = None  # type: ignore[attr-defined]
+            except Exception:
+                pass
         for readers in (self._readers, self._cold_readers):
             for r in list(readers.values()):
                 try:

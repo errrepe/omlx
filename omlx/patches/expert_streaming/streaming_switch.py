@@ -114,11 +114,14 @@ _ADMISSION_WINDOW = 1024
 # NumPy bundles into the ring, so a later demand gets them without disk I/O.
 #
 # Fase K F1: the advisor targets the NEXT layer's banks (ids come from
-# _PREV_UNIQ_BY_LAYER[next_layer]); the F_RDADVISE key must be the next
-# layer's stacking key, resolved through the converted-linears registry
-# (_STREAM_LINEARS_BY_LAYER), never __self__'s key — the old port advised
-# the CURRENT layer's byte range for the NEXT layer's ids (warmed the wrong
-# bytes, and under the HOBBIT split applied the wrong hot-set routing).
+# spec_state.prev_uniq_by_layer[next_layer]); the F_RDADVISE key must be
+# the next layer's stacking key, resolved through the converted-linears
+# registry (spec_state.linears_by_layer), never __self__'s key — the old
+# port advised the CURRENT layer's byte range for the NEXT layer's ids
+# (warmed the wrong bytes, and under the HOBBIT split applied the wrong
+# hot-set routing). K1: the whole speculation state (ring, history,
+# registry, stats, pending futures) is PER CONVERSION — it hangs off the
+# cache/backing and dies with them, so two engines never share bytes.
 # Fase K F2: the advisory is guarded like the warmer G2 (_MAX_ADVISE_ROWS)
 # and deduped per layer call (_RemapPlan.advised_runs) so the 3 projections
 # of one layer issue each next-layer run at most once.
@@ -128,29 +131,143 @@ _STASH_MAX_ENTRIES = 256
 # Fase K F2: hard cap on the advisory row set, matching the warmer G2's
 # _MAX_WARM_ROWS (rows > 64 are prefill-shaped, not decode speculation).
 _MAX_ADVISE_ROWS = 64
-_PREV_UNIQ_BY_LAYER: Dict[int, list[int]] = {}
-_SPEC_STASH: Dict[Tuple[int, int, str], Any] = {}
-_SPEC_STASH_ORDER: list[Tuple[int, int, str]] = []
-_ADVISE_STATS = {
-    "advised": 0,
-    "advised_bytes": 0,
-    "stash_hits": 0,
-    "stash_misses": 0,
-    "stash_inserts": 0,
-    "stash_evictions": 0,
-}
-
-# Fase K F1: converted quantized streaming linears per layer, registered by
-# the converter (_convert_switch_mlp_module) for main layers only. The O2
-# advisor resolves the next layer's real stacking keys and tier routing
-# through these objects, so F_RDADVISE and the stash target the right banks.
-_STREAM_LINEARS_BY_LAYER: Dict[int, list[Any]] = {}
+# Fase K correction K1/K7: the O2 advisor's speculation state is PER
+# CONVERSION (one instance per backing/cache pair), never module-global.
+# Two engines (different checkpoints, same tensor keys) can never share
+# ring bytes, routing history or linears registries: the state dies with
+# the owning store, and close() drains the speculation workers the same
+# way ExpertBackingStore.close drains its readers.
+_STASH_MAX_PENDING = 2 * _STASH_MAX_ENTRIES
 
 
-def register_streaming_linears(layer_idx: int, linears: list[Any]) -> None:
-    """Record the converted quantized linears of one MoE layer (convert-time)."""
-    if linears:
-        _STREAM_LINEARS_BY_LAYER[int(layer_idx)] = [l for l in linears if l is not None]
+class SpeculationState:
+    """Per-conversion O2 speculation state (Fase K K1/K7).
+
+    Owns the stash ring (FIFO, bounded), the routing history used by the
+    next-layer advisor, the converted-linears registry, the advise stats,
+    and the in-flight speculation futures. Hangs off ``cache.spec_state``
+    (and off ``backing.spec_state`` when the backing is an object) so the
+    demand path, the advisor, and backing.close() all share one instance.
+    All mutations are lock-guarded: workers read the disk OUTSIDE the lock
+    and apply insert/evict/stats INSIDE it. Speculation never blocks
+    demand: a full pending queue or a closed state drops submissions.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.closed = False
+        self.prev_uniq_by_layer: Dict[int, list[int]] = {}
+        self.linears_by_layer: Dict[int, list[Any]] = {}
+        self.stash: Dict[Tuple[int, int, str], Any] = {}
+        self.stash_order: list[Tuple[int, int, str]] = []
+        self.stats = {
+            "advised": 0,
+            "advised_bytes": 0,
+            "stash_hits": 0,
+            "stash_misses": 0,
+            "stash_inserts": 0,
+            "stash_evictions": 0,
+        }
+        self.pending: set[Any] = set()
+
+    # -- registry / history ----------------------------------------------
+
+    def register_linears(self, layer_idx: int, linears: list[Any]) -> None:
+        """Record one MoE layer's converted quantized linears (convert-time)."""
+        kept = [l for l in linears if l is not None]
+        if not kept:
+            return
+        with self.lock:
+            self.linears_by_layer[int(layer_idx)] = kept
+
+    def record_prev(self, layer_idx: int, ids: list[int]) -> None:
+        """Remember this layer's routing for the next token's speculation."""
+        with self.lock:
+            self.prev_uniq_by_layer[int(layer_idx)] = [int(e) for e in ids]
+
+    # -- stash ring (K7: all mutations under one lock) --------------------
+
+    def stash_get(self, key: Tuple[int, int, str]) -> Any:
+        """Demand-path lookup; counts a hit when present (lock-guarded)."""
+        with self.lock:
+            sv = self.stash.get(key)
+            if sv is not None:
+                self.stats["stash_hits"] += 1
+            return sv
+
+    def stash_count_miss(self) -> None:
+        with self.lock:
+            self.stats["stash_misses"] += 1
+
+    def stash_insert(self, key: Tuple[int, int, str], value: Any) -> bool:
+        """Insert one entry under the lock; FIFO evict beyond the bound."""
+        with self.lock:
+            if self.closed or key in self.stash:
+                return False
+            self.stash[key] = value
+            self.stash_order.append(key)
+            self.stats["stash_inserts"] += 1
+            while len(self.stash) > _STASH_MAX_ENTRIES:
+                old = self.stash_order.pop(0)
+                if self.stash.pop(old, None) is not None:
+                    self.stats["stash_evictions"] += 1
+            return True
+
+    def bump(self, key: str, amount: int = 1) -> None:
+        with self.lock:
+            self.stats[key] = self.stats.get(key, 0) + amount
+
+    # -- futures (K7: bounded pending, close drains) ----------------------
+
+    def submit(self, fn: Any) -> bool:
+        """Queue one speculation read; drop silently when full or closed."""
+        with self.lock:
+            if self.closed or len(self.pending) >= _STASH_MAX_PENDING:
+                return False
+        fut = _EXPERT_IO_POOL.submit(fn)
+        with self.lock:
+            if self.closed:
+                fut.cancel()
+                return False
+            self.pending.add(fut)
+        fut.add_done_callback(self._drop_pending)
+        return True
+
+    def _drop_pending(self, fut: Any) -> None:
+        with self.lock:
+            self.pending.discard(fut)
+
+    def is_closed(self) -> bool:
+        with self.lock:
+            return self.closed
+
+    def close(self) -> None:
+        """Stop speculation: cancel unscheduled work, drain running reads.
+
+        Idempotent. The stash, routing history and registry are cleared so a
+        closed state can never serve stale bytes to another conversion.
+        """
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            futs = list(self.pending)
+            self.pending.clear()
+        if futs:
+            for fut in futs:
+                if not fut.running():
+                    fut.cancel()
+            try:
+                from concurrent.futures import wait
+
+                wait(futs, timeout=3.0)
+            except Exception:
+                pass
+        with self.lock:
+            self.stash.clear()
+            self.stash_order.clear()
+            self.prev_uniq_by_layer.clear()
+            self.linears_by_layer.clear()
 
 # Routing trace (Fase I3): when OMLX_EXPERT_STREAMING_TRACE is set, append one
 # JSONL row per MoE layer call ({call, layer, positions, uniq}) so
@@ -484,6 +601,8 @@ class ExpertLRUCache:
         self._layer_counts: Dict[int, int] = {}
         self.stats = CacheStats()
         self.profile = ProfileAccumulator(enabled=_PROFILE_ENV)
+        # Fase K K1: per-conversion speculation state (set by the converter).
+        self.spec_state: SpeculationState | None = None
         # B5 admission filter: scan-resistant frequency window (only when env set).
         # Fase K F9: the old capacity < 4096 cap meant the filter never engaged
         # at the 6 GiB budgets measured net-negative (capacity ~6847): a
@@ -504,20 +623,18 @@ class ExpertLRUCache:
 
     def get(self, key: tuple[int, int, str]) -> Any | None:
         # O2 stash check (decode speculation) - bypasses LRU, never counts as miss
-        if _RA_ENV and _STASH_ENV:
-            sv = _SPEC_STASH.get(key)  # type: ignore[arg-type]
+        spec = self.spec_state if _STASH_ENV else None
+        if _RA_ENV and spec is not None:
+            sv = spec.stash_get(key)
             if sv is not None:
-                _ADVISE_STATS["stash_hits"] += 1
                 return sv
-            # Count demand-path stash misses only when RA is active
-            # (keeps stats meaningful without extra branching in hot path)
-            # Miss counter incremented below after stash miss.
+            # Miss counter incremented below after the store miss.
         if key in self._store:
             self._store.move_to_end(key)
             self.stats.hits += 1
             return self._store[key]
-        if _RA_ENV and _STASH_ENV:
-            _ADVISE_STATS["stash_misses"] += 1
+        if _RA_ENV and spec is not None:
+            spec.stash_count_miss()
         self.stats.misses += 1
         return None
 
@@ -1534,14 +1651,27 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 return bundle
         return None
 
+    def _spec_state(self) -> SpeculationState | None:
+        """Per-conversion speculation state (Fase K K1).
+
+        The converter hangs one instance on the cache and (when the
+        backing is an object) on the backing; it dies with them, so two
+        engines can never share ring bytes or routing history.
+        """
+        state = getattr(self.backing, "spec_state", None)
+        if state is None:
+            state = getattr(self.cache, "spec_state", None)
+        return state
+
     def _advise_next_layer_prev_token(self, plan: _RemapPlan | None = None) -> None:
         """Speculate the NEXT layer's previous-token experts (Fase K F1/F2).
 
-        _PREV_UNIQ_BY_LAYER holds layer N+1's expert ids; the advisory must
-        therefore hit layer N+1's banks. The converted-linears registry
-        resolves the next layer's real stacking keys (and its HOBBIT tier
-        routing — backing.advise_expert_run segments runs per resolved
-        reader, so hot/cold boundaries are respected automatically).
+        spec_state.prev_uniq_by_layer holds layer N+1's expert ids; the
+        advisory must therefore hit layer N+1's banks. The converted-
+        linears registry resolves the next layer's real stacking keys (and
+        its HOBBIT tier routing — backing.advise_expert_run segments runs
+        per resolved reader, so hot/cold boundaries are respected
+        automatically).
 
         F2 guards: the advisory is capped at _MAX_ADVISE_ROWS experts
         (prefill-shaped sets are skipped: they are dense demand, not decode
@@ -1551,11 +1681,14 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         """
         if not _RA_ENV:
             return
+        state = self._spec_state()
+        if state is None or state.is_closed():
+            return
         next_layer = self.layer_idx + 1
-        prev = _PREV_UNIQ_BY_LAYER.get(next_layer)
+        prev = state.prev_uniq_by_layer.get(next_layer)
         if not prev or len(prev) > _MAX_ADVISE_ROWS:
             return
-        targets = _STREAM_LINEARS_BY_LAYER.get(next_layer)
+        targets = state.linears_by_layer.get(next_layer)
         if not targets:
             return
         advised_runs = plan.advised_runs if plan is not None else None
@@ -1590,7 +1723,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                             target.stacked_weight_key, first, count
                         )
                         if ok:
-                            _ADVISE_STATS["advised"] += count
+                            state.bump("advised", count)
                     except Exception:
                         pass
         except Exception:
@@ -1605,6 +1738,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         path looks up, so a stash hit returns without disk I/O. Never blocks
         the caller: reads run on the IO pool.
         """
+        state = self._spec_state()
+        if state is None or state.is_closed():
+            return
         if not hasattr(self.backing, "load_expert_run"):
             return
         try:
@@ -1630,12 +1766,22 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             return
         for first, count in jobs:
             try:
-                _EXPERT_IO_POOL.submit(self._stash_read_run, first, count)  # noqa: SIM115
+                # K7: bounded pending queue; a full or closed state drops
+                # the submission silently (speculation never blocks demand).
+                state.submit(lambda f=first, c=count: self._stash_read_run(f, c))
             except Exception:
                 pass
 
     def _stash_read_run(self, first_id: int, count: int) -> None:
-        """IO-pool worker: read one run into the stash ring (FIFO, bounded)."""
+        """IO-pool worker: read one run into the stash ring (FIFO, bounded).
+
+        K1/K7: reads the DISK outside the state lock; insert/evict/stats
+        happen inside it. A closed state is checked before and after the
+        reads so a drained engine never receives speculative bytes.
+        """
+        state = self._spec_state()
+        if state is None or state.is_closed():
+            return
         try:
             ws = self.backing.load_expert_run(self.stacked_weight_key, first_id, count)
             ss = self.backing.load_expert_run(self.stacked_scales_key, first_id, count)
@@ -1648,21 +1794,18 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 except Exception:
                     bs = None
             for i in range(count):
+                if state.is_closed():
+                    return
                 eid = first_id + i
                 key = self.bundle_key(eid)
-                if key in _SPEC_STASH:
-                    continue
-                _SPEC_STASH[key] = (
-                    ws[i],
-                    ss[i],
-                    bs[i] if bs is not None and i < len(bs) else None,
+                state.stash_insert(
+                    key,
+                    (
+                        ws[i],
+                        ss[i],
+                        bs[i] if bs is not None and i < len(bs) else None,
+                    ),
                 )
-                _SPEC_STASH_ORDER.append(key)
-                _ADVISE_STATS["stash_inserts"] += 1
-            while len(_SPEC_STASH) > _STASH_MAX_ENTRIES:
-                old = _SPEC_STASH_ORDER.pop(0)
-                if _SPEC_STASH.pop(old, None) is not None:
-                    _ADVISE_STATS["stash_evictions"] += 1
         except Exception:
             pass
 
@@ -1721,7 +1864,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             plan = _RemapPlan()
         # Fase K F1/F2: speculation for layer+1, deduped per layer call
         # through plan.advised_runs (the GLU shares one plan).
-        if _RA_ENV and _PREV_UNIQ_BY_LAYER:
+        _spec_state = self._spec_state()
+        if _RA_ENV and _spec_state is not None and _spec_state.prev_uniq_by_layer:
             try:
                 self._advise_next_layer_prev_token(plan)
             except Exception:
@@ -2070,7 +2214,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 positions=plan.positions,
             )
             # O2: remember this layer's routing for next token's speculation
-            _PREV_UNIQ_BY_LAYER[self.layer_idx] = [int(e) for e in plan.uniq_list]
+            if _spec_state is not None:
+                _spec_state.record_prev(self.layer_idx, plan.uniq_list)
             return out
 
         if 0 in tier_single:
@@ -2102,7 +2247,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             out = out + mx.expand_dims(b_mini[remapped], -2)
         t4 = time.perf_counter()
         # O2: remember this layer's routing for next token's speculation
-        _PREV_UNIQ_BY_LAYER[self.layer_idx] = [int(e) for e in plan.uniq_list]
+        if _spec_state is not None:
+            _spec_state.record_prev(self.layer_idx, plan.uniq_list)
         p.record_observed(self.layer_idx, plan.uniq_list)
         p.add(
             self.layer_idx,

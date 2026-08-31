@@ -561,16 +561,19 @@ def _convert_switch_mlp_module(
     # O2 next-layer advisor (main layers only — MTP stages have their own
     # layer-id space and never feed the streaming decode chain).
     if needle.startswith("layers."):
-        from .streaming_switch import register_streaming_linears
-
-        register_streaming_linears(
-            layer_idx,
-            [
-                getattr(streaming_glu, a, None)
-                for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
-                if isinstance(getattr(streaming_glu, a, None), StreamingQuantizedSwitchLinear)
-            ],
-        )
+        # Fase K K1: register on the per-conversion speculation state — the
+        # global registry would let one engine's advisor target another
+        # engine's linears.
+        _spec_state = getattr(cache, "spec_state", None)
+        if _spec_state is not None:
+            _spec_state.register_linears(
+                layer_idx,
+                [
+                    getattr(streaming_glu, a, None)
+                    for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+                    if isinstance(getattr(streaming_glu, a, None), StreamingQuantizedSwitchLinear)
+                ],
+            )
 
     # Fase J Etapa E: the per-layer load context's projection list (2 fused
     # gate_up+down, 3 split) — consumed by the scheduler's guard accounting
@@ -800,6 +803,16 @@ def convert_model_to_streaming(
         ram_dict = {}
         backing = ram_dict  # type: ignore[assignment]
         backing_kind = "ram-dict"
+
+    # Fase K K1: one speculation state per conversion. It hangs off the
+    # cache (always) and off the backing store (file backing) so close()
+    # drains the speculation workers with the readers.
+    from .streaming_switch import SpeculationState
+
+    _spec_state = SpeculationState()
+    cache.spec_state = _spec_state  # type: ignore[attr-defined]
+    if not isinstance(backing, dict):
+        backing.spec_state = _spec_state  # type: ignore[attr-defined]
 
     converted = 0
     # Walk model.layers — handle LLM (model.model.layers) and VLM wrappers
