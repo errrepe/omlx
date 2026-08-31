@@ -1137,5 +1137,15 @@
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
   "modal.model_settings.expert_streaming_budget_hint": "Опциональный LRU для экспертов. Пусто или 0 — только страничный кэш ОС (по умолчанию; замерено быстрее и с меньшим расходом RAM). >0 — фиксированный кэш экспертов в ГиБ.",
   "modal.model_settings.expert_streaming_topk": "Порог массы top-k",
-  "modal.model_settings.expert_streaming_topk_hint": "Опциональный приблизительный роутинг: сохраняет наименьший префикс top-k (по убыванию score), набирающий эту долю массы. 1.0 или пусто — точный (бит-в-бит). ~0.85 — измеренный порог ускорения (~1.8x, 7/10 токенов совпадают при 0.70)."
+  "modal.model_settings.expert_streaming_topk_hint": "Опциональный приблизительный роутинг: сохраняет наименьший префикс top-k (по убыванию score), набирающий эту долю массы. 1.0 или пусто — точный (бит-в-бит). ~0.85 — измеренный порог ускорения (~1.8x, 7/10 токенов совпадают при 0.70).",
+  "modal.model_settings.expert_streaming_eval": "Послойная синхронизация при предзаполнении (Qwen)",
+  "modal.model_settings.expert_streaming_eval_hint": "Вычисляет каждый слой декодера при потоковом предзаполнении и подрезает кэш аллокатора. Побитово точно; ограничивает пики памяти на длинных промптах, чтобы кэш страниц выживал. Отключайте только для A/B-тестов.",
+  "modal.model_settings.expert_streaming_pins": "Закрепление экспертов (mlock)",
+  "modal.model_settings.expert_streaming_pins_hint": "Закрепляет самые горячие эксперты слоя в RAM (блокировка страниц без копирования) и обучает сохраняемый при выгрузке профиль пинов на модель — горячий набор прогрет с первого токена при следующей загрузке. Выход не меняется.",
+  "modal.model_settings.expert_streaming_pin_gib": "Бюджет закрепления (GiB)",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "Потолок проводной памяти для закреплённых экспертов. Пусто = по умолчанию 1,25 GiB.",
+  "modal.model_settings.expert_streaming_cold_tier": "Холодный ярус экспертов (биты)",
+  "modal.model_settings.expert_streaming_cold_tier_hint": "Требуется tools/requant_cold_tier.py (есть expert_cold/). Потоковые эксперты читаются из яруса низкой точности — меньше байт на токен по нижней границе I/O. Приближённо: проверяйте замером перплексии. Пусто = выключено.",
+  "modal.model_settings.expert_streaming_hot_fraction": "Доля горячих экспертов (сплит HOBBIT)",
+  "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1. При холодном ярусе и выученном профиле пинов эта доля самых используемых экспертов слоя сохраняет исходные 4 бита; остальные читают холодный ярус. Пусто/0 = единый ярус."
 }

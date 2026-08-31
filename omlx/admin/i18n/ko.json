@@ -1137,5 +1137,15 @@
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
   "modal.model_settings.expert_streaming_budget_hint": "선택적 전문가 LRU. 비우거나 0 = OS 페이지 캐시만 사용(기본값; 측정상 더 빠르고 RAM 적게 사용). >0이면 고정 GiB 캐시 유지.",
   "modal.model_settings.expert_streaming_topk": "Top-k 질량 임계값",
-  "modal.model_settings.expert_streaming_topk_hint": "옵트인 근사 라우팅: 점수 내림차순 top-k 접두사 중 이 질량 비율에 도달하는 최소치를 유지. 1.0 또는 비움 = 정확(비트 동일). ~0.85은 측정된 속도 절벽(약 1.8배, 0.70에서 10토큰 중 7개 일치)."
+  "modal.model_settings.expert_streaming_topk_hint": "옵트인 근사 라우팅: 점수 내림차순 top-k 접두사 중 이 질량 비율에 도달하는 최소치를 유지. 1.0 또는 비움 = 정확(비트 동일). ~0.85은 측정된 속도 절벽(약 1.8배, 0.70에서 10토큰 중 7개 일치).",
+  "modal.model_settings.expert_streaming_eval": "프리필 시 레이어별 동기화 (Qwen)",
+  "modal.model_settings.expert_streaming_eval_hint": "스트리밍 프리필 중 디코더의 각 레이어를 평가하고 할당자 캐시를 정리합니다. 비트 정확; 긴 프롬프트의 메모리 피크를 억제해 페이지 캐시를 보존합니다. A/B 테스트 때만 끄세요.",
+  "modal.model_settings.expert_streaming_pins": "전문가 고정 (mlock)",
+  "modal.model_settings.expert_streaming_pins_hint": "레이어별 가장 핫한 전문가를 RAM에 제로카피로 잠그고 언로드 시 저장되는 모델별 pin 프로파일을 학습합니다 — 다음 로드에서 첫 토큰부터 핫셋이 준비됩니다. 출력 변화 없음.",
+  "modal.model_settings.expert_streaming_pin_gib": "고정 예산 (GiB)",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "고정 전문가의 실메모리 상한. 비움 = 기본 1.25 GiB.",
+  "modal.model_settings.expert_streaming_cold_tier": "콜드 전문가 티어 (비트)",
+  "modal.model_settings.expert_streaming_cold_tier_hint": "tools/requant_cold_tier.py 필요 (expert_cold/ 존재). 스트리밍 전문가를 저정밀 티어에서 읽습니다 — I/O 하한에서 토큰당 바이트가 줄어듭니다. 근사 계산: 퍼플렉시티 벤치로 검증하세요. 비움 = 끔.",
+  "modal.model_settings.expert_streaming_hot_fraction": "핫 전문가 비율 (HOBBIT 분할)",
+  "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1. 콜드 티어와 학습된 pin 프로파일이 있으면 레이어별 최다 사용 전문가의 이 비율은 원본 4-bit을 유지하고 나머지는 콜드 티어에서 읽습니다. 비움/0 = 균일 티어."
 }

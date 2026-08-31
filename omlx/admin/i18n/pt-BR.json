@@ -1137,5 +1137,15 @@
   "modal.model_settings.expert_streaming_budget": "Orçamento do cache (GiB)",
   "modal.model_settings.expert_streaming_budget_hint": "LRU de experts opcional. Vazio ou 0 = page cache do OS (padrão; medimos mais rápido com menos RAM). >0 fixa um cache de experts em GiB.",
   "modal.model_settings.expert_streaming_topk": "Limiar de massa do top-k",
-  "modal.model_settings.expert_streaming_topk_hint": "Roteamento aproximado opcional: mantém o menor prefixo do top-k (ordem decrescente de score) que atinge esta fração de massa. 1.0 ou vazio = exato (bit-idêntico). ~0.85 é o ponto de aceleração medido (~1.8x, 7/10 tokens idênticos a 0.70)."
+  "modal.model_settings.expert_streaming_topk_hint": "Roteamento aproximado opcional: mantém o menor prefixo do top-k (ordem decrescente de score) que atinge esta fração de massa. 1.0 ou vazio = exato (bit-idêntico). ~0.85 é o ponto de aceleração medido (~1.8x, 7/10 tokens idênticos a 0.70).",
+  "modal.model_settings.expert_streaming_eval": "Sincronização por camada no prefill (Qwen)",
+  "modal.model_settings.expert_streaming_eval_hint": "Avalia cada camada do decodificador durante o prefill em streaming e apara o cache do alocador. Bit-exato; limita picos de memória em prompts longos para que o cache de páginas sobreviva. Desative apenas para testes A/B.",
+  "modal.model_settings.expert_streaming_pins": "Fixação de especialistas (mlock)",
+  "modal.model_settings.expert_streaming_pins_hint": "Fixa na RAM (lock de páginas sem cópia) os especialistas mais quentes por camada e aprende um perfil de pins por modelo salvo no descarregamento — o conjunto quente parte morno do primeiro token no próximo carregamento. Sem mudança na saída.",
+  "modal.model_settings.expert_streaming_pin_gib": "Orçamento de fixação (GiB)",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "Teto de memória cabeada para especialistas fixados. Vazio = padrão 1,25 GiB.",
+  "modal.model_settings.expert_streaming_cold_tier": "Camada fria de especialistas (bits)",
+  "modal.model_settings.expert_streaming_cold_tier_hint": "Requer tools/requant_cold_tier.py (expert_cold/ presente). Lê os especialistas em streaming da camada de baixa precisão — menos bytes por token no piso de I/O. Aproximado: valide com o harness de perplexidade. Vazio = desativado.",
+  "modal.model_settings.expert_streaming_hot_fraction": "Fração de especialistas quentes (split HOBBIT)",
+  "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1. Com uma camada fria e um perfil de pins aprendido, esta fração dos especialistas mais usados por camada mantém o 4-bit original; o resto lê a camada fria. Vazio/0 = camada uniforme."
 }

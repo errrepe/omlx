@@ -1137,5 +1137,15 @@
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
   "modal.model_settings.expert_streaming_budget_hint": "オプションのエキスパートLRU。空または0 = OSのページキャッシュのみ（デフォルト。実測で高速かつ省RAM）。>0で固定サイズ（GiB）のキャッシュを確保。",
   "modal.model_settings.expert_streaming_topk": "Top-k 質量しきい値",
-  "modal.model_settings.expert_streaming_topk_hint": "オプトインの近似ルーティング：スコア降順の top-k プレフィックスのうち、この質量比率に達する最小のものを保持。1.0 または空 = 厳密（ビット同一）。約0.85が速度の変曲点（約1.8倍、0.70で10トークン中7個一致）。"
+  "modal.model_settings.expert_streaming_topk_hint": "オプトインの近似ルーティング：スコア降順の top-k プレフィックスのうち、この質量比率に達する最小のものを保持。1.0 または空 = 厳密（ビット同一）。約0.85が速度の変曲点（約1.8倍、0.70で10トークン中7個一致）。",
+  "modal.model_settings.expert_streaming_eval": "プリフィル時のレイヤー別同期（Qwen）",
+  "modal.model_settings.expert_streaming_eval_hint": "ストリーミングプリフィル中にデコーダの各レイヤーを評価し、アロケータキャッシュを整理します。ビット一致。長いプロンプトでのメモリピークを抑え、ページキャッシュを守ります。A/B テスト時のみ無効化してください。",
+  "modal.model_settings.expert_streaming_pins": "エキスパートのピン留め（mlock）",
+  "modal.model_settings.expert_streaming_pins_hint": "各レイヤーの最ホットなエキスパートを RAM にゼロコピーでロックし、アンロード時に保存されるモデル別 pin プロファイルを学習します——次回ロード時は最初のトークンからホットセットが温まっています。出力は変わりません。",
+  "modal.model_settings.expert_streaming_pin_gib": "ピン留め予算（GiB）",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "ピン留めエキスパートのワイヤードメモリ上限。空 = デフォルト 1.25 GiB。",
+  "modal.model_settings.expert_streaming_cold_tier": "コールドエキスパート層（ビット）",
+  "modal.model_settings.expert_streaming_cold_tier_hint": "tools/requant_cold_tier.py が必要（expert_cold/ が存在）。ストリーミングエキスパートを低精度層から読み込みます——I/O 下限でのトークンあたりバイト数を削減。近似計算：パープレキシティ計測で検証してください。空 = オフ。",
+  "modal.model_settings.expert_streaming_hot_fraction": "ホットエキスパート割合（HOBBIT スプリット）",
+  "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1。コールド層と学習済み pin プロファイルがある場合、各レイヤーの使用頻度が高いこの割合のエキスパートは元の 4-bit を維持し、残りはコールド層から読み込みます。空/0 = 均一層。"
 }
