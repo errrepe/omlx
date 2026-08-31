@@ -402,12 +402,47 @@ all-miss, C/D ON):
 - 8.33 GiB = "low single-digit GiB", que é exatamente o alvo do critério #3
   ("~29 GiB → low single-digit GiB"). O 34.5 GiB era a medição PRÉ-C/D.
 
+#### 13.1 Confirmação em 8k (worst-case all-miss) — PASSOU
+Bench real `bench/results/faseJ/real_faseJ_8k.json`, qwen 8k, `budget_gib=0`
+(all-miss, re-leitura do banco de experts = pior caso), `--single-request`,
+C/D ON (`OMLX_EXPERT_STREAMING_PER_LAYER_EVAL=1`, `OMLX_EXPERT_STREAMING_CACHE_THRESH=2`),
+rodado em 2026-08-31. Comparação direta com o 2k (mesmas condições):
+
+| metric | 2k | 8k | veredito |
+|---|---|---|---|
+| `metal_peak_prefill_gib` (crit #3) | 8.33 | **6.95** | ✅ limitado, ainda menor em 8k |
+| `phys_lifetime_max_gib` | 11.28 | 11.64 | ✅ plano, ≪ teto de 28 GiB |
+| TTFT | 35.27 s | 253.84 s | ⚠️ degradado (latência, não memória) |
+| cache | — | 0 hits / 1.108.182 misses | ✅ caminho all-miss exercido |
+
+- O `metal_peak_prefill_gib` em 8k (6.95 GiB) ficou **abaixo** do de 2k (8.33) —
+  o boundary de eval por camada + limpeza de pool threshold-gated (2 GiB)
+  mantém o pool retido em ~1 working set de camada **independentemente do
+  comprimento do prompt**. O pico não escala com o prompt.
+- `phys_lifetime_max_gib` plano (11.64 vs 11.28) — bem abaixo do teto.
+- A única regressão é **TTFT** (253.84 s, ~7.2× o de 2k). Causas observadas no log:
+  (a) **amplificação de leitura** do all-miss (1.99 GB/s de disco no prefill,
+  `mlx_cache_gib_max=2.13` disparando os clears); e (b) **throttle do scheduler
+  super-conservador**: o log mostra predição de 67.46 GB mas o pico real foi
+  11.64 GiB, então o scheduler encolheu o chunk de prefill `2048 → 512`
+  (`adaptive_prefill_throttle`, `predicted=67.46GB` vs `target=23.94GB`). Isso
+  estrangulou a latência desnecessariamente — é um ajuste de *scheduler tuning*
+  separado, **não** um estouro de memória. Os critérios de aceitação de pico
+  foram atingidos.
+- `get_cache_memory()` existe neste build de MLX (caso contrário o clear
+  rodaria toda camada incondicionalmente — comportamento idêntico entre 2k e 8k
+  porque é o mesmo binário, então a comparação é válida).
+
 **Conclusão:** o item "pivotar para Etapa C/D para o pico de 34.5 GiB" do
-resumo de still-open está essencialmente FECHADO pela implementação existente.
-Resta, se desejado: (a) confirmar robustez em prompt maior (8k) — o docs
-avisa que 8k pode re-ler o banco 8× se o pool subir; (b) gateá-los os ~20 sites
-restantes do scheduler (refinamento, com risco de subir o pico se feito mal —
-NÃO fazer sem medir); (c) nada de código se o alvo de pico já está atingido.
+resumo de still-open está FECHADO pela implementação existente **e confirmado
+em 8k** (§13.1). O alvo de pico do critério #3 está atingido em 2k e 8k.
+Resta, se desejado (nenhum é bloqueador do critério de pico):
+(a) ~FEITO — robustez em 8k confirmada; (b) gateá-los os ~20 sites restantes
+do scheduler com `should_clear_cache` (refinamento de cadência, com risco de
+subir o pico se feito mal — NÃO fazer sem medir); (c) investigar o
+`adaptive_prefill_throttle` que superestima o uso de memória em ~6× (67.46 GB
+previsto vs 11.64 GiB real) e encolhe o chunk sem necessidade — isso é o que
+infla o TTFT em 8k, não a memória. Nada de código de pico pendente.
 
 ---
 
