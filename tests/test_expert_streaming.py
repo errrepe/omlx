@@ -4198,6 +4198,41 @@ class TestFaseM2M4StageAndPoolTelemetry:
             assert np.array_equal(results[0], results[1]), "wrapper changed bytes"
 
 
+
+class TestFaseM6MemtraceContext:
+    """Fase M6: ambient phase/request context and per-(layer, proj) event
+    sequence on memtrace rows."""
+
+    def test_context_fields_land_on_every_row(self):
+        from omlx.patches.expert_streaming.memtrace import MemTracer
+
+        tr = MemTracer(path=None, sample_every=1)
+        tr.set_context(phase="prefill", request_id="r1", engine_id="e1")
+        tr.record("dual_tier.enter", layer=0, proj="gate_proj")
+        tr.set_context(phase="decode", request_id="r1", engine_id="e1")
+        tr.record("dual_tier.enter", layer=1, proj="up_proj")
+        tr.clear_context()
+        tr.record("ctx.ensure.exit", layer=2, proj="down_proj")
+        rows = tr.rows()
+        assert rows[0]["phase"] == "prefill" and rows[0]["request_id"] == "r1"
+        assert rows[1]["phase"] == "decode"
+        assert "phase" not in rows[2], "cleared context must vanish"
+
+    def test_event_seq_monotone_per_layer_proj(self):
+        from omlx.patches.expert_streaming.memtrace import MemTracer
+
+        tr = MemTracer(path=None, sample_every=1)
+        tr.record("dual_tier.enter", layer=0, proj="gate_proj")
+        tr.record("dual_tier.hot.bank_ready", layer=0, proj="gate_proj")
+        tr.record("dual_tier.enter", layer=0, proj="up_proj")
+        tr.record("dual_tier.layer_exit", layer=0, proj="gate_proj")
+        rows = tr.rows()
+        seq_g = [r["event_seq"] for r in rows if r.get("proj") == "gate_proj"]
+        seq_u = [r["event_seq"] for r in rows if r.get("proj") == "up_proj"]
+        assert seq_g == [1, 2, 3], seq_g
+        assert seq_u == [1], seq_u
+
+
 class TestFaseM1PinWiring:
     """Fase M1: pins reach the PinController as explicit configuration
     before the first request — settings win over env, the bench wires them

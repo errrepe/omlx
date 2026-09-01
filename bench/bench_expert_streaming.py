@@ -436,6 +436,13 @@ async def run(
     # prefill vs decode without cross-contamination.
     _tel = getattr(_bk, "read_telemetry", None) if _bk is not None else None
     _pool_before = None
+    # Fase M6: tag every memtrace row with the current phase/request.
+    try:
+        from omlx.patches.expert_streaming.memtrace import memtrace as _mt6
+
+        _mt6.set_context(phase="prefill", request_id="bench-1", engine_id=entry_name)
+    except Exception:
+        pass
     if _tel is not None and _tel.enabled:
         _tel.begin_phase("prefill", request_id="bench-1", engine_id=entry_name)
         # Fase M4: observed run-pool concurrency around the request — the
@@ -465,6 +472,10 @@ async def run(
                 if _tel is not None and _tel.enabled:
                     _tel.end_phase()
                     _tel.begin_phase("decode", request_id="bench-1", engine_id=entry_name)
+                try:
+                    _mt6.set_context(phase="decode", request_id="bench-1", engine_id=entry_name)
+                except Exception:
+                    pass
                 sampler.mark("decode")
         if out2 is None:
             raise SystemExit("single-request benchmark produced no output")
@@ -499,6 +510,10 @@ async def run(
         n = int(out2.completion_tokens)
         if _tel is not None and _tel.enabled:
             _tel.end_phase()
+    try:
+        _mt6.set_context(phase="teardown", request_id="bench-1", engine_id=entry_name)
+    except Exception:
+        pass
     _pool_after = None
     if _pool_before is not None:
         try:

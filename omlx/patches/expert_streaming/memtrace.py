@@ -142,6 +142,12 @@ class _NullTracer:
     def record(self, event: str, **fields: Any) -> None:
         return None
 
+    def set_context(self, **ctx: Any) -> None:
+        return None
+
+    def clear_context(self) -> None:
+        return None
+
     @contextmanager
     def scope(self, event: str, **fields: Any) -> Iterator[None]:
         yield None
@@ -171,6 +177,11 @@ class MemTracer:
         self.path = path
         self.sample_every = max(1, int(sample_every))
         self._lock = threading.Lock()
+        # Fase M6: ambient context (phase, request_id, engine_id) attached
+        # to every row, and a per-(layer, proj) event sequence counter so
+        # ordering can be reconstructed without timestamp resolution.
+        self._context: dict[str, Any] = {}
+        self._event_seq: dict[tuple, int] = {}
         self._file = None
         self._seq = 0
         self._rows: list[dict[str, Any]] = []
@@ -211,7 +222,14 @@ class MemTracer:
                 "t": round(time.perf_counter() - self._t0, 6),
                 "event": event,
             }
+            if self._context:
+                row.update(self._context)
             row.update(fields)
+            # Fase M6: monotone per-(layer, proj) event sequence.
+            if "layer" in fields and "proj" in fields:
+                k = (fields.get("layer"), fields.get("proj"))
+                self._event_seq[k] = self._event_seq.get(k, 0) + 1
+                row["event_seq"] = self._event_seq[k]
             row.update(self._sample())
             for key, val in fields.items():
                 if key in _TRACKED_NUMERIC and isinstance(val, (int, float)) and not isinstance(val, bool):
@@ -231,6 +249,16 @@ class MemTracer:
                 self._file.write(json.dumps(row, default=str) + "\n")
             elif len(self._rows) < self._max_rows:
                 self._rows.append(row)
+
+    def set_context(self, **ctx: Any) -> None:
+        """Fase M6: ambient fields (phase, request_id...) appended to every
+        subsequent row until clear_context()."""
+        with self._lock:
+            self._context.update(ctx)
+
+    def clear_context(self) -> None:
+        with self._lock:
+            self._context.clear()
 
     @contextmanager
     def scope(self, event: str, **fields: Any) -> Iterator[None]:
