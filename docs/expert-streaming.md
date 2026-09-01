@@ -1156,6 +1156,108 @@ only on a backend with measurable idle time.
   multi-batch components; the FIRST_COMPLETED variant remains the only
   acceptable re-open, gated on >=2-3% potential.
 
+
+## Fase M — reliable I/O instrumentation, pin wiring, critical-path attribution (branch feature/expert-streaming)
+
+Base `312fe4ba`. Safe class only: no weights, remap, gather_qmm, chunk
+schedule or I/O defaults changed. The phase makes the NEXT optimization
+choosable by measured critical-path share instead of expectation.
+
+### M1 — explicit pin wiring (settings, not late env)
+
+- Pin sync/regime travel as ModelSettings: `expert_streaming_pin_sync`
+  and `expert_streaming_pin_regime` go through `_io_overrides` into the
+  PinController constructor BEFORE get_engine. The env constants remain
+  fallbacks for unset models (server compatibility). The bench no longer
+  mutates os.environ after engine load; `_bench_settings()` builds the
+  ModelSettings explicitly and is unit-testable.
+- The bench JSON pin block proves EFFECTIVE state: requested, pin_sync_
+  requested/effective, pin_regime requested/effective, pin_profile_
+  loaded_at_engine_load, pin_applied_before_first_request, fingerprint
+  match, load time. A `--pins --pin-regime prefill` arm records
+  profile_regime=prefill and pin_sync_effective=true.
+
+### M3 — per-backing, phase-scoped, bounded telemetry
+
+- Every ExpertBackingStore owns a ReadTelemetry (default enabled from
+  OMLX_EXPERT_STREAMING_PROFILE). begin_phase(phase, request_id,
+  engine_id, fingerprint)/end_phase() split prefill vs decode; summary()
+  reports per-phase merges, per-request entries, lifetime totals,
+  dropped_samples, sample_capacity and profiling_enabled. Modules keep
+  no global read state.
+- Memory is bounded: percentiles use capacity-capped reservoirs (default
+  2048) with count/sum/min/max always kept; run sizes bucket in a capped
+  dict (1..512+). dropped_samples flags approximate percentiles. Workers
+  never take the telemetry lock — the read path inserts one aggregate
+  record per component.
+- `ctx_fallback_to_legacy` counters moved onto ExpertLRUCache (per
+  engine), module globals removed.
+- Concurrency fix found by the new tests: reader lazy-open could hand out
+  two reader objects for one key; resolution returns the canonical
+  instance now (tier contract safe under concurrent first access).
+
+### M2 — stage-split read timers
+
+Each read_expert_into component records host-only stage buckets (only
+when profiling): component_e2e_us, reader_resolve_us, plan_us,
+buffer_alloc_us, queue_wait_us, preadv_us, future_tail_us, scatter_us,
+fallback_us (failed components). Workers measure queue-wait and preadv
+with host timestamps; the caller merges under the per-call lock. The hot
+path pays no timers when profiling is off. `lat_us` is renamed
+component_e2e_us. A profile answers: SSD service (preadv), pool
+congestion (queue_wait), planner/alloc/scatter host cost, and multi-run
+tail — no knob gets re-optimized without one of these pointing at it.
+
+### M4 — observed pool concurrency
+
+RunPoolTelemetry rides the run-pool singleton: submitted/queued/started/
+completed/failed/active(+peak), queue delay and active duration;
+snapshot()/delta() attribute a phase. The bench exports run_pool
+deltas, so requested_inflight_peak (the window) is never mistaken for
+effective depth: a request can ask 10 and observe the shared pool at 16
+workers, or 4 and see active_peak 1 when the pool is busy elsewhere.
+
+### M5 — comparability discipline
+
+- Every result carries an immutable `effective_config` block: git sha,
+  model fingerprint, single_request/decode_tokens, chunk schedule,
+  budget/cold tier/HOBBIT fraction, ctx policy, QDs, merge gap, RA/stash,
+  pins + sync/regime effective, profile/memtrace state, sampling mode,
+  cache-cool protocol, and the declared `--knob` experiment fields.
+- `bench/compare_results.py` refuses any comparison where a critical
+  field mismatches (including nested chunk_schedule and bit_exact_kind),
+  honors knobs declared by BOTH sides only, requires the block on both
+  results, and reports metric deltas only for fair pairs.
+
+### M6 — memtrace context and sequencing
+
+- MemTracer.set_context(phase, request_id, engine_id) tags every row; the
+  bench marks prefill/decode/teardown. Per-(layer, proj) monotone
+  event_seq reconstructs order without timestamp resolution.
+- memtrace_summary.event_aggregates summarize SAMPLES per event; they are
+  not durations and not time-weighted means. Use memtrace for lifetime/
+  memory questions; use read_stats stage buckets for host I/O. Never
+  compare TTFT between MEMTRACE=0/1 or PROFILE=0/1 runs (deliberate
+  profiling overhead); the effective_config block makes such A/B
+  fails loud.
+
+### Repeated L2 pins (M1+M5 fixed wiring) and the attribution verdict
+
+bench/results/fasel/m_pins/: interleaved A (no pins) vs C (decode
+profile, 512 MiB, sync) x3 with PROFILE=1. The shared box degraded
+mid-window (6-13 GB free, other users), so m_a3/a4 and m_c3 rode a
+degraded window; clean same-window pairs (a1/c1, a2/c2) show decode
+delta -1.4% / -0.5% — no >=5% gate met. The stage attribution is the
+new deliverable: decode demand preadv p50 72-77 us (page cache),
+component e2e ~740 us dominated by the multi-run window overhead
+(queue p95 ~390-1280 us, tail ~700 us), pool balanced (241,362
+submissions -> 241,362 completions, queue_delay max 23 ms). Decision
+tree row applies: demand served from the page cache -> pins add wired
+memory without moving latency -> residency stays closed (pins remain
+opt-in, LRU closed). Tokens 48/48 identical to the K8 reference; M1
+flags proven (sync effective, regime decode, 19.5 ms load-time apply).
+
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.
