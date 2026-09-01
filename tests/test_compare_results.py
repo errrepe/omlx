@@ -37,6 +37,7 @@ def _cfg(**over):
         "read_sampling_mode": "off",
         "cache_cool_protocol": "warm-page-cache",
         "experiment_knobs": [],
+        "active_engines": 1,
     }
     base.update(over)
     return base
@@ -95,10 +96,12 @@ def test_result_contains_effective_config(tmp_path):
         "memtrace_enabled",
         "read_sampling_mode",
         "cache_cool_protocol",
+        "active_engines",
     ):
         assert key in cfg, key
     assert cfg["experiment_knobs"] == ["pins_enabled"]
     assert cfg["decode_tokens"] == 48
+    assert cfg["active_engines"] == 1
 
 
 def test_result_records_profile_and_memtrace_state():
@@ -166,4 +169,45 @@ def test_comparator_rejects_missing_declared_knob_side():
     )
     issues = collect_mismatches(a, b)
     assert any("pins_enabled" in i for i in issues), issues
+
+
+def test_comparator_rejects_empty_tokens_or_text_kind():
+    """Fase A2: an EMPTY token list is a broken gate by construction, and
+    a text "gate" proves nothing about token identity — both are refused
+    even when both sides share the flaw."""
+    a = _result("a", _cfg(), tokens=[])
+    b = _result("b", _cfg())
+    issues = collect_mismatches(a, b)
+    assert any("empty" in i and "tokens" in i for i in issues), issues
+    a2 = _result("a2", _cfg(), bit_exact_kind="text")
+    b2 = _result("b2", _cfg(), bit_exact_kind="text")
+    issues2 = collect_mismatches(a2, b2)
+    assert any("text" in i for i in issues2), issues2
+
+
+def test_comparator_rejects_mixed_stage_vocabulary():
+    """Fase A3: read_stats built with a different stage-key vocabulary
+    (e.g. the pre-A3 names) cannot be compared stage-wise — refused."""
+    a = _result("a", _cfg())
+    b = _result("b", _cfg())
+    a["read_stats"] = {
+        "lifetime": {"stages_us": {"component_e2e_us": {}, "read_duration_us": {}}}
+    }
+    b["read_stats"] = {
+        "lifetime": {"stages_us": {"component_e2e_us": {}, "preadv_us": {}}}
+    }
+    issues = collect_mismatches(a, b)
+    assert any("stage keys" in i for i in issues), issues
+    # One-sided stage data never blocks the comparison.
+    c = _result("c", _cfg())
+    assert collect_mismatches(a, c) == []
+
+
+def test_comparator_rejects_active_engines_mismatch():
+    """Fase A4: comparing a run with a second engine in-process against a
+    single-engine run compares different pool worlds — refused."""
+    a = _result("a", _cfg())
+    b = _result("b", _cfg(active_engines=2))
+    issues = collect_mismatches(a, b)
+    assert any("active_engines" in i for i in issues), issues
 

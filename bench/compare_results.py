@@ -43,6 +43,9 @@ CRITICAL_FIELDS = (
     "memtrace_enabled",
     "read_sampling_mode",
     "cache_cool_protocol",
+    # Fase A4: an A/B where one side ran with a second engine in-process
+    # and the other did not compares different pool worlds — refused.
+    "active_engines",
 )
 
 METRIC_FIELDS = ("ttft_s", "tok_s", "metal_peak_prefill_gib", "metal_peak_decode_gib")
@@ -83,6 +86,31 @@ def collect_mismatches(a: dict, b: dict, allow: set[str] | None = None) -> list[
     ka, kb = a.get("bit_exact_kind"), b.get("bit_exact_kind")
     if ka is not None and kb is not None and ka != kb:
         issues.append(f"bit_exact_kind: {ka!r} vs {kb!r}")
+    # Fase A2 fail-high: a text-only "gate" proves nothing about token
+    # identity, and an EMPTY token list is a broken gate by construction —
+    # neither may enter a comparison, even when both sides share the flaw.
+    for side, d in (("a", a), ("b", b)):
+        toks = d.get("tokens")
+        if isinstance(toks, list) and len(toks) == 0:
+            issues.append(f"{side}: tokens list is empty — token gate cannot pass")
+        if d.get("bit_exact_kind") == "text":
+            issues.append(
+                f"{side}: bit_exact_kind == 'text' cannot prove token identity"
+            )
+    # Fase A3: the stage-bucket VOCABULARY must match. read_stats with
+    # different stage keys (e.g. the pre-A3 metric names) cannot be
+    # compared stage-wise, so the comparison is refused.
+    def _stage_keys(d: dict) -> set:
+        rs = d.get("read_stats") or {}
+        acc = rs.get("lifetime") or {}
+        st = acc.get("stages_us") or {}
+        return set(st)
+
+    _ka3, _kb3 = _stage_keys(a), _stage_keys(b)
+    if _ka3 and _kb3 and _ka3 != _kb3:
+        issues.append(
+            "read_stats stage keys: %s vs %s" % (sorted(_ka3), sorted(_kb3))
+        )
     return issues
 
 
