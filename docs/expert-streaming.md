@@ -1208,6 +1208,10 @@ component_e2e_us. A profile answers: SSD service (preadv), pool
 congestion (queue_wait), planner/alloc/scatter host cost, and multi-run
 tail — no knob gets re-optimized without one of these pointing at it.
 
+DEPRECATED by Fase A3: queue_wait_us, preadv_us and future_tail_us are
+renamed (worker_start_delay_us, read_duration_us, last_future_wait_us)
+plus the new window_wait_us — see the Fase A section.
+
 ### M4 — observed pool concurrency
 
 RunPoolTelemetry rides the run-pool singleton: submitted/queued/started/
@@ -1256,6 +1260,128 @@ tree row applies: demand served from the page cache -> pins add wired
 memory without moving latency -> residency stays closed (pins remain
 opt-in, LRU closed). Tokens 48/48 identical to the K8 reference; M1
 flags proven (sync effective, regime decode, 19.5 ms load-time apply).
+
+
+## Fase A — evidence hygiene and telemetry review fixes (post-M review)
+
+The M-series review found four telemetry defects and one gap. A1-A5 are
+Safe code + tests, written without executing anything; the gates (unit
+suite, token gates, evidence regeneration, overhead A/B) run later when
+the machine frees up (Fase B protocol below). No weights, remap,
+gather_qmm, chunk schedule or I/O defaults changed.
+
+### A1 — legacy-path phase attribution (bench)
+
+The legacy path (single_request=False) closed "prefill" and opened
+"decode" BEFORE the first engine.chat() — but that chat RUNS the prefill,
+so the legacy decode bucket included prefill reads. Recent results use
+--single-request (correct), so the main series is unaffected; the legacy
+mode was misleading. The bench now opens the prefill scope immediately
+before the call that runs it (stream_chat iteration or first chat) and
+switches to decode ONLY after the first chat returns / first token
+arrives; memtrace set_context switches at the SAME boundary. The three
+helpers (open_phase / switch_phase / close_phase in
+bench_expert_streaming.py) are unit-tested with fake telemetry: the first
+legacy chat observes prefill, the second observes decode.
+
+### A2 — effective_config: null artifacts and comparability gates
+
+The M5 shadowing fix landed after the m_pins arms ran: those artifacts
+carry "effective_config": null and the comparator refuses them — the
+current evidence is un-comparable by construction. The code now fails
+HIGH: assert_effective_config_complete() aborts under --gate-tokens when
+the block is null or a critical field is missing (never a silent
+artifact); outside gate mode it warns loudly. compare_results.py
+additionally refuses empty token lists and bit_exact_kind == "text":
+neither can prove token identity.
+
+### A3 — window metric vocabulary (read_stats)
+
+The M2 names inflated the saturation read: queue_wait_us measured
+submit -> worker start (not queueing per resource) and future_tail_us
+measured first submit -> last finish (the whole burst, reads included).
+The names were cut directly (every pre-A artifact is archived as
+un-comparable); the canonical stage set is now:
+
+| Metric | Measures | Answers |
+|---|---|---|
+| worker_start_delay_us | submit -> worker start | Was a worker free? |
+| read_duration_us | inside _read_into | SSD/kernel real time |
+| window_wait_us | caller's blocks on window futures | How long the caller stood still |
+| last_future_wait_us | caller's wait for the FINAL run | True tail of the burst |
+| component_e2e_us | entry -> exit (unchanged) | Latency the model feels |
+
+compare_results.py refuses comparisons whose read_stats stage-key
+vocabularies differ; tests/ snapshots the canonical key set, so a rename
+outside a reviewed transition is caught. The old names (queue_wait_us,
+preadv_us, future_tail_us) are gone; the single-run path reports
+worker_start_delay_us = 0 by construction.
+
+### A4 — run-pool ownership
+
+The pool is process-wide; RunPoolTelemetry could not tell which backing
+submitted a task. Tasks now carry an optional owner tag (id(backing)),
+accumulated per owner (submitted_A + submitted_B == submitted_total)
+under the same lock, and only on the PROFILE path (zero off-profile
+cost). snapshot()/delta() filter by owner; the bench exports the delta
+of its OWN backing. effective_config gains active_engines (default 1;
+set OMLX_EXPERT_STREAMING_ACTIVE_ENGINES when another engine shares the
+process; single-engine run_pool results remain process-wide by design),
+and the comparator refuses A/B across different values — comparing a run
+with a second engine in-process against a single-engine run compares
+different pool worlds.
+
+### A5 — instrumentation overhead
+
+PROFILE=1 changes the workload (timers, locks, aggregation) and no
+reference number existed for the cost. Every result now carries
+instrumentation_overhead (null until the A/B runs). bench/overhead_probe.py
+measures record_call, summary, stage-dict build and the pool wrap pair
+synthetically (no model, no SSD) and can run even on a busy machine; the
+PROFILE=0 vs PROFILE=1 gate pair fills the field when the machine frees.
+
+### A6 — tests written (execution deferred)
+
+tests/test_expert_streaming.py:
+test_legacy_path_attributes_prefill_to_prefill,
+test_single_request_switches_phase_at_first_token,
+test_disabled_telemetry_does_not_disturb_the_flow,
+test_bench_gate_tokens_fails_without_effective_config,
+test_result_contains_effective_config_fails_when_incomplete_in_gate_mode,
+test_non_gate_mode_warns_but_continues,
+test_worker_start_delay_vs_read_duration_split,
+test_last_future_wait_isolates_tail,
+test_read_stats_stage_keys_frozen,
+test_pool_telemetry_per_owner,
+test_read_expert_into_attributes_pool_tasks_to_owner,
+test_probe_reports_sane_per_call_costs.
+tests/test_compare_results.py:
+test_comparator_rejects_empty_tokens_or_text_kind,
+test_comparator_rejects_mixed_stage_vocabulary,
+test_comparator_rejects_active_engines_mismatch.
+The M2/M3 stage tests were migrated to the A3 vocabulary.
+
+### Fase B — execution deferred to a free machine
+
+Fixed order, one window at a time, machine idle:
+
+1. Unit suite at HEAD (tests/test_expert_streaming.py,
+   tests/test_scheduler_chunked_prefill.py,
+   tests/test_prefill_oom_graceful.py,
+   tests/test_prefill_transient_tracker.py, tests/test_cold_tier.py,
+   tests/test_compare_results.py).
+2. Token gates 2k and 8k (--single-request --gate-tokens): 48/48 IDs
+   identical to the K8 reference; effective_config non-null;
+   bit_exact_kind == "tokens".
+3. Regenerate the doc-cited m_pins arms with the effective block; move
+   the current m_a1..m_a4, m_c1..m_c3 into
+   bench/results/fasel/m_pins/_pre_effective_config/ so nobody compares
+   them by mistake.
+4. PROFILE=0 vs PROFILE=1 A/B (--gate-tokens) filling
+   instrumentation_overhead; cross-check with bench/overhead_probe.py.
+5. Merge decision only after 1-4 green: suite green at HEAD, gates green,
+   comparator rejects the known invalid pairs (negative proof), docs cite
+   only artifacts with a valid effective_config.
 
 
 ## References

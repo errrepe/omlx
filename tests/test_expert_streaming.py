@@ -3919,7 +3919,7 @@ thread-safe; ctx fallback counters are per-cache."""
         for _ in range(20000):
             tel.record_call(
                 runs=1, bytes_=16, requested_inflight=1,
-                timings={"component_e2e_us": [1234], "preadv_us": [100]},
+                timings={"component_e2e_us": [1234], "read_duration_us": [100]},
             )
         snap = tel.summary()
         assert snap["sample_capacity"] == 128
@@ -3991,12 +3991,12 @@ class TestFaseM2M4StageAndPoolTelemetry:
         backing.read_telemetry.enabled = enabled
         return backing, key, per
 
-    def test_read_telemetry_splits_plan_queue_preadv_scatter(self, tmp_path):
-        """A fake reader with known sleeps: each stage lands in ITS bucket,
-        with the counts and magnitudes the fixture implies."""
+    def test_read_telemetry_splits_stages_with_a3_vocabulary(self, tmp_path):
+        """Fase A3: the honest window vocabulary — read_duration and
+        worker_start_delay are SEPARATE per-run buckets; window_wait
+        covers the caller's blocks; last_future_wait isolates the final
+        run's tail; the old ambiguous names are gone."""
         import time
-
-        from omlx.patches.expert_streaming import shard_bank as sb_mod
 
         with tempfile.TemporaryDirectory() as td:
             backing, key, per = self._backing(Path(td))
@@ -4012,15 +4012,19 @@ class TestFaseM2M4StageAndPoolTelemetry:
             assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
             snap = backing.read_telemetry.summary()
             st = snap["lifetime"]["stages_us"]
-            assert st["preadv_us"]["count"] == 2, st
-            assert st["preadv_us"]["p50"] >= 1900, st  # ~2 ms per run
-            assert st["queue_wait_us"]["count"] == 2
+            assert st["read_duration_us"]["count"] == 2, st
+            assert st["read_duration_us"]["p50"] >= 1900, st  # ~2 ms per run
+            assert st["worker_start_delay_us"]["count"] == 2
             assert st["plan_us"]["count"] == 1
             assert st["reader_resolve_us"]["count"] == 1
             assert st["scatter_us"]["count"] == 2, st
             assert st["component_e2e_us"]["count"] == 1
-            tail = st["future_tail_us"]
+            ww = st["window_wait_us"]
+            assert ww["count"] == 2, ww  # one pop in the main loop + one drain
+            tail = st["last_future_wait_us"]
             assert tail["count"] == 1 and tail["p50"] is not None, tail
+            for gone in ("queue_wait_us", "preadv_us", "future_tail_us"):
+                assert gone not in st, gone
 
     def test_component_e2e_covers_all_stages(self, tmp_path):
         """e2e >= the sequential host stages (resolve+plan+scatter+reads)"""
@@ -4041,7 +4045,7 @@ class TestFaseM2M4StageAndPoolTelemetry:
             st = backing.read_telemetry.summary()["lifetime"]["stages_us"]
             e2e = st["component_e2e_us"]["p50"] or 0
             host = 0
-            for m in ("reader_resolve_us", "plan_us", "preadv_us", "scatter_us"):
+            for m in ("reader_resolve_us", "plan_us", "read_duration_us", "scatter_us"):
                 host += st[m]["sum"]
             assert e2e >= host, (e2e, host)
 
@@ -4785,4 +4789,353 @@ class TestFaseL2RegimePins:
         p.write_text(json.dumps({"freq": {"0": [[9, 9]]}}))
         hot3 = load_hot_set_from_profile(str(p), 1.0, num_experts=4)
         assert hot3["layer_0"] == {9}, hot3
+
+
+# ---------------------------------------------------------------------------
+# Fase A — hygiene post-review: phase attribution, fail-high gates, honest
+# window vocabulary, pool owners, overhead probe. Tests are WRITTEN here;
+# execution happens in Fase B when the machine frees up.
+# ---------------------------------------------------------------------------
+
+
+class TestFaseA1LegacyPhaseAttribution:
+    """Fase A1: the bench's phase helpers must attribute the FIRST chat of
+    the legacy path to prefill and only the second chat to decode, with
+    memtrace agreeing at the same boundary."""
+
+    def test_legacy_path_attributes_prefill_to_prefill(self):
+        """The legacy flow is EXACTLY the bench's else-branch sequence:
+        open prefill, first chat, switch to decode, second chat, close.
+        The first chat must observe prefill; the second, decode."""
+        from bench.bench_expert_streaming import (
+            close_phase,
+            open_phase,
+            switch_phase,
+        )
+
+        tel = _FakeRelayTel()
+        mt6 = _FakeRelayMt6()
+        phase_during_chat = []
+
+        def first_chat():
+            phase_during_chat.append(tel.active_phase)
+
+        def second_chat():
+            phase_during_chat.append(tel.active_phase)
+
+        open_phase(tel, mt6, "prefill", "bench-entry")
+        first_chat()
+        switch_phase(tel, mt6, "decode", "bench-entry")
+        second_chat()
+        close_phase(tel)
+
+        assert phase_during_chat == ["prefill", "decode"], phase_during_chat
+        assert tel.events == [
+            ("begin", "prefill"),
+            ("end", "prefill"),
+            ("begin", "decode"),
+            ("end", "decode"),
+        ], tel.events
+        assert mt6.contexts == ["prefill", "decode"], mt6.contexts
+
+    def test_single_request_switches_phase_at_first_token(self):
+        from bench.bench_expert_streaming import (
+            close_phase,
+            open_phase,
+            switch_phase,
+        )
+
+        tel = _FakeRelayTel()
+        mt6 = _FakeRelayMt6()
+        open_phase(tel, mt6, "prefill", "bench-entry")
+        assert tel.active_phase == "prefill"
+        switch_phase(tel, mt6, "decode", "bench-entry")
+        assert tel.active_phase == "decode"
+        assert mt6.last_context == "decode"
+        close_phase(tel)
+        assert tel.active_phase is None
+
+    def test_disabled_telemetry_does_not_disturb_the_flow(self):
+        from bench.bench_expert_streaming import close_phase, open_phase
+
+        tel = _FakeRelayTel()
+        tel.enabled = False
+        open_phase(tel, None, "prefill", "e")
+        close_phase(tel)
+        assert tel.active_phase is None and tel.events == []
+
+
+class _FakeRelayTel:
+    """Fake read telemetry that records the active phase + event order."""
+
+    enabled = True
+
+    def __init__(self):
+        self.active_phase = None
+        self.events = []
+
+    def begin_phase(self, phase, request_id=None, engine_id=None):
+        self.active_phase = phase
+        self.events.append(("begin", phase))
+
+    def end_phase(self):
+        self.events.append(("end", self.active_phase))
+        self.active_phase = None
+        return {}
+
+
+class _FakeRelayMt6:
+    """Fake memtracer recording every set_context call."""
+
+    def __init__(self):
+        self.contexts = []
+        self.last_context = None
+
+    def set_context(self, phase, request_id=None, engine_id=None):
+        self.contexts.append(phase)
+        self.last_context = phase
+
+
+class TestFaseA2EffectiveConfigGate:
+    """Fase A2: fail-high — a null or incomplete effective_config aborts
+    under --gate-tokens BEFORE an artifact is written; outside gate mode
+    it warns loudly instead."""
+
+    @staticmethod
+    def _complete_cfg():
+        return {
+            "git_sha": "abc123",
+            "single_request": True,
+            "decode_tokens": 48,
+            "chunk_schedule": {"reference_step": 1024},
+            "budget_gib": 0.0,
+            "ctx_mode_policy": "hybrid",
+            "decode_union_rows": 64,
+            "ctx_ahead": 3,
+            "expert_qd": 16,
+            "run_qd": 16,
+            "prefill_qd": 0,
+            "run_merge_gap": 0,
+            "ra_enabled": True,
+            "stash_enabled": False,
+            "pins_enabled": False,
+            "profile_enabled": False,
+            "memtrace_enabled": False,
+            "read_sampling_mode": "off",
+            "cache_cool_protocol": "warm-page-cache",
+            "active_engines": 1,
+        }
+
+    def test_bench_gate_tokens_fails_without_effective_config(self):
+        from bench.bench_expert_streaming import assert_effective_config_complete
+
+        with pytest.raises(SystemExit):
+            assert_effective_config_complete(None, gate=True)
+        with pytest.raises(SystemExit):
+            assert_effective_config_complete({"git_sha": "x"}, gate=True)
+
+    def test_result_contains_effective_config_fails_when_incomplete_in_gate_mode(
+        self,
+    ):
+        """A6.7: gated results must carry the COMPLETE block — dropping one
+        critical field is as fatal as a null block."""
+        from bench.bench_expert_streaming import assert_effective_config_complete
+
+        cfg = self._complete_cfg()
+        assert_effective_config_complete(cfg, gate=True)  # must not raise
+        del cfg["chunk_schedule"]
+        with pytest.raises(SystemExit):
+            assert_effective_config_complete(cfg, gate=True)
+
+    def test_non_gate_mode_warns_but_continues(self, capsys):
+        from bench.bench_expert_streaming import assert_effective_config_complete
+
+        assert_effective_config_complete(None, gate=False)  # must not raise
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.out
+
+
+class TestFaseA3WindowMetricSplit:
+    """Fase A3: the renamed vocabulary decomposes the window honestly —
+    worker_start_delay and read_duration split each run; window_wait
+    covers the caller's blocks; last_future_wait isolates the tail."""
+
+    @staticmethod
+    def _backing(tmp: Path):
+        from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        per = 4 * 4 * 2
+        _write_shard_filled(tmp / "model.safetensors", {key: ((16, 4, 4), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        backing.read_telemetry.enabled = True
+        return backing, key, per
+
+    def test_worker_start_delay_vs_read_duration_split(self, tmp_path):
+        """A fake reader with a known sleep: the sleep lands in
+        read_duration_us (SSD/kernel time) while worker_start_delay_us
+        stays small — the two never merge."""
+        import time
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            reader = backing._reader_for_key(key)
+            orig = reader._read_into
+
+            def slow(off, buf):
+                time.sleep(0.02)
+                return orig(off, buf)
+
+            reader._read_into = slow
+            out = np.empty((4, per), dtype=np.uint8)
+            assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+            st = backing.read_telemetry.summary()["lifetime"]["stages_us"]
+            rd = st["read_duration_us"]
+            ws = st["worker_start_delay_us"]
+            assert rd["count"] == 2 and rd["p50"] >= 18000, rd  # ~20 ms per run
+            assert ws["count"] == 2, ws
+            assert ws["p50"] is None or ws["p50"] < rd["p50"], (ws, rd)
+
+    def test_last_future_wait_isolates_tail(self, tmp_path):
+        """A slow FIRST run inflates window_wait_us but NOT the tail: the
+        final run's wait is the true tail of the burst, not the span."""
+        import time
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            reader = backing._reader_for_key(key)
+            orig = reader._read_into
+            state = {"n": 0}
+
+            def slow_first(off, buf):
+                state["n"] += 1
+                if state["n"] == 1:
+                    time.sleep(0.05)
+                return orig(off, buf)
+
+            reader._read_into = slow_first
+            out = np.empty((8, per), dtype=np.uint8)
+            eids = [0, 1, 100, 101, 200, 201, 300, 301]  # 4 separate runs
+            assert backing.read_expert_into([(key, eids)], [out])
+            st = backing.read_telemetry.summary()["lifetime"]["stages_us"]
+            tail = st["last_future_wait_us"]
+            ww = st["window_wait_us"]
+            assert tail["count"] == 1 and tail["p50"] is not None, tail
+            assert tail["p50"] < 40000, tail  # the FINAL run is fast
+            assert ww["count"] >= 1 and ww["sum"] >= 40000, ww  # the slow run
+            assert tail["sum"] < ww["sum"], (tail, ww)
+
+    def test_read_stats_stage_keys_frozen(self):
+        """A6: the canonical stage-key set of read_stats is a snapshot —
+        accidental renames outside a reviewed transition are caught here
+        (the comparator refuses mixed vocabularies)."""
+        from omlx.patches.expert_streaming.shard_bank import _READ_METRICS
+
+        assert tuple(_READ_METRICS) == (
+            "component_e2e_us",
+            "reader_resolve_us",
+            "plan_us",
+            "buffer_alloc_us",
+            "worker_start_delay_us",
+            "read_duration_us",
+            "window_wait_us",
+            "last_future_wait_us",
+            "scatter_us",
+            "fallback_us",
+        )
+
+
+class TestFaseA4PoolOwnerAttribution:
+    """Fase A4: the process-wide pool telemetry can attribute activity to
+    one owner; per-owner counters reconcile with the process totals."""
+
+    def test_pool_telemetry_per_owner(self):
+        import time
+
+        from omlx.patches.expert_streaming.shard_bank import RunPoolTelemetry
+
+        ptel = RunPoolTelemetry()
+        ts = time.perf_counter_ns()
+        for owner in ("A", "B"):
+            fn = ptel.wrap(ts, lambda: 1, owner=owner)
+            ptel.submit_notice(owner=owner)
+            assert fn() == 1
+        bad = ptel.wrap(ts, lambda: 1 / 0, owner="A")
+        ptel.submit_notice(owner="A")
+        with pytest.raises(ZeroDivisionError):
+            bad()
+
+        snap = ptel.snapshot()
+        snap_a = ptel.snapshot(owner="A")
+        snap_b = ptel.snapshot(owner="B")
+        assert snap["submitted"] == 3 and snap["completed"] == 2, snap
+        assert snap_a["submitted"] == 2 and snap_a["completed"] == 1
+        assert snap_a["failed"] == 1
+        assert snap_b["submitted"] == 1 and snap_b["completed"] == 1
+        # Reconciliation invariant: per-owner counters sum to the pool.
+        assert snap_a["submitted"] + snap_b["submitted"] == snap["submitted"]
+        assert snap_a["completed"] + snap_b["completed"] == snap["completed"]
+        assert snap_a["failed"] + snap_b["failed"] == snap["failed"]
+
+        # Deltas filter by owner.
+        before_a = snap_a
+        fn = ptel.wrap(ts, lambda: 2, owner="A")
+        ptel.submit_notice(owner="A")
+        assert fn() == 2
+        d_a = ptel.delta(before_a, owner="A")
+        assert d_a["submitted"] == 1 and d_a["completed"] == 1 and d_a["failed"] == 0
+        d_all = ptel.delta(
+            {"submitted": 3, "started": 3, "completed": 2, "failed": 1},
+            owner=None,
+        )
+        assert d_all["submitted"] == 1 and d_all["failed"] == 0
+        assert d_all["completed"] == 1
+
+    def test_read_expert_into_attributes_pool_tasks_to_owner(self, tmp_path):
+        """End-to-end: read_expert_into tags its runs with id(backing), so
+        the owner-filtered snapshot reflects ONLY this backing."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from omlx.patches.expert_streaming import shard_bank as sb_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = TestFaseA3WindowMetricSplit._backing(Path(td))
+            old = sb_mod._RUN_IO_POOL_SINGLETON
+            pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="a4-owner")
+            pool.telemetry = sb_mod.RunPoolTelemetry()
+            try:
+                sb_mod._RUN_IO_POOL_SINGLETON = pool
+                out = np.empty((4, per), dtype=np.uint8)
+                assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+            finally:
+                sb_mod._RUN_IO_POOL_SINGLETON = old
+                pool.shutdown(wait=True, cancel_futures=True)
+            snap_all = pool.telemetry.snapshot()
+            snap_owner = pool.telemetry.snapshot(owner=id(backing))
+            assert snap_all["submitted"] == 2 and snap_all["completed"] == 2
+            assert snap_owner["submitted"] == 2, snap_owner
+            assert snap_owner["completed"] == 2
+
+
+class TestFaseA5OverheadProbe:
+    """Fase A5: the synthetic probe bounds the per-call instrumentation
+    cost without a model; the PROFILE A/B later fills the result field."""
+
+    def test_probe_reports_sane_per_call_costs(self):
+        from bench.overhead_probe import _measure
+
+        rep = _measure(300)
+        assert rep["calls"] == 300
+        assert rep["stage_metrics"] >= 8
+        for key in (
+            "record_call_us_per_call",
+            "summary_us_per_snapshot",
+            "stages_dict_build_us_per_call",
+            "pool_wrap_pair_us_per_run",
+            "estimated_read_path_overhead_us_per_component",
+        ):
+            assert rep[key] > 0.0, key
 
