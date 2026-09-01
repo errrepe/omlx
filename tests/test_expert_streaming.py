@@ -2039,9 +2039,11 @@ def test_pin_controller_counts_per_token_usage():
     pc = warmer.PinController({0: []}, None, num_experts=8)
     pc.on_layer_plan(0, [1, 4], int(flat.size), np.bincount(flat, minlength=8))
     assert pc.freq[0] == Counter({1: 5, 4: 1})
-    # Position-weighted prefill-sized calls accumulate too (never pin).
+    # Fase L: prefill-sized calls accumulate under the PREFILL regime only
+    # (they never pin) — the decode regime stays untouched.
     pc.on_layer_plan(0, [1, 4], 4096, np.bincount(flat, minlength=8))
-    assert pc.freq[0] == Counter({1: 10, 4: 2})
+    assert pc.freq[0] == Counter({1: 5, 4: 1})
+    assert pc.regimes["prefill"][0] == Counter({1: 5, 4: 1})
     assert pc.pinned is False
 
     # dict and list payloads coerce identically; oversized lists clamp to
@@ -2070,7 +2072,10 @@ def test_pin_controller_three_arg_fallback_compat():
     pc.on_layer_plan(0, [3], 8)
     assert pc.freq[0] == Counter({3: 2, 7: 1})
     pc.on_layer_plan(0, [3, 7], 4096)  # prefill-sized: presence, no pin
-    assert pc.freq[0] == Counter({3: 3, 7: 2})
+    # Fase L: the prefill row lands in the prefill regime, not the decode
+    # freq — regimes never overwrite each other.
+    assert pc.freq[0] == Counter({3: 2, 7: 1})
+    assert pc.regimes["prefill"][0] == Counter({3: 1, 7: 1})
     assert pc.pinned is False
 
 
@@ -2549,6 +2554,53 @@ class TestFaseKSpecStateLifecycle:
         with spec2.lock:
             assert spec2.pending == set()
             assert spec2._pending_reserved == 0
+    def test_pending_converges_after_worker_and_pool_failure(self):
+        """Fase L6A: reservations and pending converge after a raising
+        worker and after an executor that rejects the submission itself."""
+        import time
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        class _DeadPool:
+            def submit(self, fn):
+                raise RuntimeError("pool dead")
+
+        # Worker exception: the future completes exceptionally, the done
+        # callback discards it; pending and reservations converge without
+        # close().
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec = _attach_spec(cache)
+
+        def _boom():
+            raise RuntimeError("spec worker failed")
+
+        for _ in range(4):
+            assert spec.submit(_boom)
+        deadline = time.time() + 5.0
+        while spec.pending and time.time() < deadline:
+            time.sleep(0.01)
+        with spec.lock:
+            assert spec.pending == set(), "worker failure must drain pending"
+            assert spec._pending_reserved == 0
+        spec.close()
+        with spec.lock:
+            assert spec.pending == set() and spec._pending_reserved == 0
+
+        # Executor hand-off failure: submit() itself raises, the atomic
+        # reservation must be released on that path.
+        cache2 = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        spec2 = _attach_spec(cache2)
+        old_pool = ss._EXPERT_IO_POOL
+        try:
+            ss._EXPERT_IO_POOL = _DeadPool()
+            assert spec2.submit(lambda: None) is False
+            with spec2.lock:
+                assert spec2._pending_reserved == 0, "executor failure leaked a slot"
+                assert spec2.pending == set()
+        finally:
+            ss._EXPERT_IO_POOL = old_pool
+        spec2.close()
+
 
 
 class TestFaseKAdmissionFilter:
@@ -3757,3 +3809,413 @@ class TestFaseKRunMerge:
             runs = lin._group_runs(ids)
         assert runs[0] == (1, 2), f"hot run must stay intact: {runs}"
         assert (4, 2) in runs or (4, 1) in runs
+
+
+class TestFaseL1CtxObservability:
+    """Fase L1: the hybrid decode fast path is observable — explicit ctx
+    memtrace fields, per-reason fallback counters, and bit-exactness when
+    the fast path degrades to the legacy resolution."""
+
+    def test_ctx_fallback_stats_api(self):
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        ss._reset_ctx_fallback_stats()
+        assert ss.ctx_fallback_stats() == {}
+        ss._count_ctx_fallback("read_failure")
+        ss._count_ctx_fallback("read_failure")
+        ss._count_ctx_fallback("bank_too_large")
+        assert ss.ctx_fallback_stats() == {
+            "read_failure": 2,
+            "bank_too_large": 1,
+        }
+        ss._reset_ctx_fallback_stats()
+        assert ss.ctx_fallback_stats() == {}
+
+    def test_ctx_fallback_read_failure_counted_on_rolling(self, monkeypatch, tmp_path):
+        """A ctx read that returns nothing usable must bump read_failure and
+        fall back to the legacy per-expert resolution; output stays finite."""
+        import mlx.core as mx
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        ss._reset_ctx_fallback_stats()
+        monkeypatch.setattr(
+            ss.StreamingQuantizedSwitchLinear,
+            "_load_expert_bank_np",
+            lambda self, ids: None,
+        )
+        monkeypatch.setattr(
+            ss.StreamingQuantizedSwitchLinear,
+            "_load_expert_bank_np_full",
+            lambda self, ids: None,
+        )
+        glu = _quant_glu(tmp_path, n_experts=3)
+        x = mx.random.normal((1, 130, 128)).astype(mx.float32)
+        indices = mx.array([i % 3 for i in range(130)], dtype=mx.int32)
+        out = glu(x, indices)
+        mx.eval(out)
+        stats = ss.ctx_fallback_stats()
+        assert stats.get("read_failure", 0) >= 1, stats
+        assert bool(mx.all(mx.isfinite(out)))
+
+    def test_ctx_fallback_union_declines_bank_too_large(self, monkeypatch, tmp_path):
+        """Union declines a decode call whose bank set exceeds the cap; the
+        linears fall back per expert and count bank_too_large."""
+        import mlx.core as mx
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        ss._reset_ctx_fallback_stats()
+        monkeypatch.setattr(ss, "_CTX_UNION_MAX_BYTES", 1)
+        glu = _quant_glu(tmp_path, n_experts=3)
+        x = mx.random.normal((1, 8, 128)).astype(mx.float32)
+        indices = mx.array([0, 1, 2, 0, 1, 2, 0, 1], dtype=mx.int32)
+        out = glu(x, indices)
+        mx.eval(out)
+        stats = ss.ctx_fallback_stats()
+        assert stats.get("bank_too_large", 0) >= 3, stats
+        assert bool(mx.all(mx.isfinite(out)))
+
+    def test_ctx_fallback_dict_backing_counted(self, monkeypatch, tmp_path):
+        """A projection without a bank reader means no context is built;
+        that degradation is counted once per GLU call."""
+        import mlx.core as mx
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        ss._reset_ctx_fallback_stats()
+        # Remove the bank reader from the CLASS: hasattr() reads True for a
+        # None value, so a real removal is what the GLU check observes.
+        monkeypatch.delattr(
+            ss.StreamingQuantizedSwitchLinear, "_load_expert_bank_np"
+        )
+        glu = _quant_glu(tmp_path, n_experts=3)
+        x = mx.random.normal((1, 8, 128)).astype(mx.float32)
+        indices = mx.array([0, 1, 2, 0, 1, 2, 0, 1], dtype=mx.int32)
+        out = glu(x, indices)
+        mx.eval(out)
+        stats = ss.ctx_fallback_stats()
+        assert stats.get("dict_backing", 0) == 1, stats
+        assert bool(mx.all(mx.isfinite(out)))
+
+    def test_ctx_fallback_preserves_bit_exactness(self, monkeypatch, tmp_path):
+        """Fase L1 gate: a forced ctx read failure must fall back to the
+        legacy resolution with byte-identical output — the token-ID gate
+        survives even when the fast path cannot serve."""
+        import mlx.core as mx
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        x = mx.random.normal((1, 130, 128)).astype(mx.float32)
+        indices = mx.array([i % 3 for i in range(130)], dtype=mx.int32)
+
+        def run():
+            glu = _quant_glu(tmp_path, n_experts=3)
+            out = glu(x, indices)
+            mx.eval(out)
+            return out
+
+        out_ok = run()
+        bits_ok = np.ascontiguousarray(out_ok).view(np.uint32).reshape(-1)
+        with monkeypatch.context() as m:
+            m.setattr(
+                ss.StreamingQuantizedSwitchLinear,
+                "_load_expert_bank_np",
+                lambda self, ids: None,
+            )
+            m.setattr(
+                ss.StreamingQuantizedSwitchLinear,
+                "_load_expert_bank_np_full",
+                lambda self, ids: None,
+            )
+            out_fb = run()
+        bits_fb = np.ascontiguousarray(out_fb).view(np.uint32).reshape(-1)
+        assert np.array_equal(bits_ok, bits_fb), "fallback changed output bits"
+
+    def test_ctx_memtrace_records_explicit_fields(self, monkeypatch, tmp_path):
+        """Both ctx modes record the Fase L1 explicit frame: ctx_mode,
+        positions, ctx_bank_bytes, ctx_inflight_bytes, ctx_prefetch_count."""
+        import mlx.core as mx
+
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        class _FakeTrace:
+            enabled = True
+
+            def __init__(self):
+                self.rows = []
+
+            def record(self, event, **fields):
+                self.rows.append((event, fields))
+
+        fake = _FakeTrace()
+        monkeypatch.setattr(ss, "memtrace", fake)
+        glu = _quant_glu(tmp_path, n_experts=3)
+
+        def call(n_positions, cycled):
+            x = mx.random.normal((1, n_positions, 128)).astype(mx.float32)
+            if cycled:
+                indices = mx.array([i % 3 for i in range(n_positions)], dtype=mx.int32)
+            else:
+                indices = mx.array([i % 3 for i in range(n_positions)], dtype=mx.int32)
+            out = glu(x, indices)
+            mx.eval(out)
+
+        call(130, True)  # rolling
+        call(8, False)  # union
+        modes_seen = set()
+        for event, fields in fake.rows:
+            if event != "ctx.ensure.exit":
+                continue
+            for key in (
+                "ctx_mode",
+                "positions",
+                "ctx_bank_bytes",
+                "ctx_inflight_bytes",
+                "ctx_prefetch_count",
+            ):
+                assert key in fields, (event, key, fields)
+            modes_seen.add(fields["ctx_mode"])
+        assert modes_seen == {"rolling", "union"}, modes_seen
+
+    def test_memtrace_event_aggregates(self):
+        """MemTracer aggregates tracked numeric fields per event, so a run
+        reports mean/max positions, bank bytes and prefetch counts without
+        JSONL post-processing."""
+        from omlx.patches.expert_streaming.memtrace import MemTracer
+
+        tr = MemTracer(path=None, sample_every=1)
+        tr.record(
+            "ctx.ensure.exit",
+            layer=0,
+            positions=8,
+            ctx_bank_bytes=1000,
+            ctx_prefetch_count=2,
+            ctx_inflight_bytes=700,
+        )
+        tr.record(
+            "ctx.ensure.exit",
+            layer=0,
+            positions=64,
+            ctx_bank_bytes=5000,
+            ctx_prefetch_count=0,
+            ctx_inflight_bytes=0,
+        )
+        s = tr.summary()
+        agg = s["event_aggregates"]["ctx.ensure.exit"]
+        assert agg["positions"]["mean"] == 36.0, agg
+        assert agg["positions"]["max"] == 64.0, agg
+        assert agg["ctx_prefetch_count"]["max"] == 2.0, agg
+        assert agg["ctx_bank_bytes"]["mean"] == 3000.0, agg
+
+class TestFaseL2RegimePins:
+    """Fase L2: regime-split pin profiles, fingerprint gating, proportional
+    per-layer budgets with page dedupe, and tier-aware pin resolution."""
+
+    @staticmethod
+    def _pin_backing(per_expert: int = 1024):
+        """Fake backing with reader identity per expert and pin recording."""
+        class _Reader:
+            def __init__(self, name, width):
+                self.path = f"stub-{name}"
+                self.width = width
+
+            def expert_byte_range(self, key, eid):
+                return int(eid) * self.width, (int(eid) + 1) * self.width
+
+        class _B:
+            def __init__(self):
+                self.hot = _Reader("hot", per_expert)
+                self.cold = _Reader("cold", per_expert)
+                self.pinned_calls: list[tuple] = []
+                self.pinned_bytes = 0
+                self._pinned: set = set()
+
+            def _reader_for_key(self, key, expert_id=None):
+                return self.hot if (expert_id or 0) < 8 else self.cold
+
+            def pin_expert(self, key, expert_id):
+                r = self._reader_for_key(key, expert_id)
+                self.pinned_calls.append((r.path, key, int(expert_id)))
+                self._pinned.add((r.path, key, int(expert_id)))
+                self.pinned_bytes += r.width
+                return r.width
+
+            @property
+            def pinned_count(self):
+                return len(self._pinned)
+
+        return _B()
+
+    @staticmethod
+    def _lin(layer: int, proj: str):
+        from types import SimpleNamespace
+
+        base = f"model.layers.{layer}.mlp.switch_mlp.{proj}"
+        return SimpleNamespace(
+            stacked_weight_key=f"{base}.weight",
+            stacked_scales_key=f"{base}.scales",
+            stacked_biases_key=None,
+            backing=None,
+        )
+
+    def test_pin_profile_v2_fingerprint_gating(self, tmp_path):
+        """A v2 profile applies only when the model fingerprint matches;
+        mismatch logs and ignores the profile (never a silent apply)."""
+        from collections import Counter
+
+        from omlx.patches.expert_streaming import warmer as warmer_mod
+
+        profile = str(tmp_path / "expert_pin_profile.json")
+        linears = {0: [self._lin(0, "gate_proj"), self._lin(0, "down_proj")]}
+        backing = self._pin_backing()
+        ctl = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, profile_path=profile,
+            model_fingerprint={"model": "A", "profile_format": 2},
+            packing="oQ4e4 b-gs64",
+        )
+        ctl.freq = {0: Counter({3: 9, 5: 2})}
+        ctl.save_profile()
+        import json
+
+        data = json.loads(open(profile).read())
+        assert data["version"] == 2
+        assert data["regimes"]["decode"]["freq"]["0"] == [[3, 9], [5, 2]]
+        assert data["regimes"]["prefill"] == {"freq": {}}
+
+        # Matching fingerprint: loads and latches the pin pass.
+        ok = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, profile_path=profile,
+            model_fingerprint={"model": "A", "profile_format": 2},
+        )
+        assert ok.freq[0] == Counter({3: 9, 5: 2})
+        assert ok.fingerprint_match is True
+        assert ok.pinned is True
+
+        # Mismatched fingerprint: profile ignored, no pin, no freq.
+        bad = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, profile_path=profile,
+            model_fingerprint={"model": "B", "profile_format": 2},
+        )
+        assert bad.freq == {}
+        assert bad.fingerprint_match is False
+        assert bad.pinned is False
+
+    def test_pin_regime_selects_prefill_hot_set(self, tmp_path):
+        """Arm E: the PREfill regime drives the pin selection — the pinner
+        wires the prefill-learned experts, not the decode ones."""
+        from collections import Counter
+
+        from omlx.patches.expert_streaming import warmer as warmer_mod
+
+        linears = {0: [self._lin(0, "gate_proj"), self._lin(0, "down_proj")]}
+        backing = self._pin_backing()
+        ctl = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, profile_path=None,
+            pin_regime="prefill",
+        )
+        ctl.on_layer_plan(0, [2, 3], 4096)  # prefill rows only
+        ctl.on_layer_plan(0, [6], 8)  # decode row: expert 6 hot in decode
+        ctl._pin_all(sync=True)
+        pinned = {e for _r, _k, e in backing.pinned_calls}
+        assert pinned == {2, 3}, pinned  # prefill hot set, not decode 6
+
+    def test_pin_budget_respected_after_page_dedupe(self):
+        """The unique page set of the chosen experts must fit the budget —
+        page-aligned neighbors share pages and never double-charge."""
+        from collections import Counter
+
+        from omlx.patches.expert_streaming import warmer as warmer_mod
+        from omlx.patches.expert_streaming.shard_bank import _PAGE_SIZE
+
+        linears = {0: [self._lin(0, "gate_proj"), self._lin(0, "down_proj")]}
+        backing = self._pin_backing(per_expert=1024)
+        budget = 2 * _PAGE_SIZE  # 32 KiB on 16 KiB pages
+        ctl = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, budget_bytes=budget,
+        )
+        # 30 hot experts per layer -> selection far above the budget; the
+        # trim pass must drop the least-hot until the unique pages fit.
+        ctl.freq = {
+            0: Counter({e: 1000 - e for e in range(30)}),
+        }
+        ctl._pin_all(sync=True)
+        assert ctl.pinned_pages_estimate * _PAGE_SIZE <= budget, (
+            ctl.pinned_pages_estimate,
+            budget,
+        )
+        assert backing.pinned_bytes <= budget, backing.pinned_bytes
+        assert ctl.pin_jobs > 0
+        assert ctl.pin_load_time_ms >= 0.0
+
+    def test_pin_expert_tier_aware_reader(self):
+        """Cold experts pin through the COLD reader; hot experts through the
+        source reader — the HOBBIT split never crosses files inside one pin."""
+        from collections import Counter
+
+        from omlx.patches.expert_streaming import warmer as warmer_mod
+
+        linears = {0: [self._lin(0, "gate_proj")]}
+        backing = self._pin_backing()
+        ctl = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024,
+        )
+        ctl.freq = {0: Counter({3: 9, 9: 9})}  # 3 hot (source), 9 cold (tier)
+        ctl._pin_all(sync=True)
+        by_eid = {e: r for r, _k, e in backing.pinned_calls}
+        assert by_eid[3] == "stub-hot", by_eid
+        assert by_eid[9] == "stub-cold", by_eid
+
+    def test_pin_sync_applies_before_first_decode(self, tmp_path, monkeypatch):
+        """PIN_SYNC=1: the mlock pass completes inside engine load — after
+        construction the backing already reports the wired set."""
+        from collections import Counter
+
+        from omlx.patches.expert_streaming import warmer as warmer_mod
+
+        profile = str(tmp_path / "expert_pin_profile.json")
+        linears = {0: [self._lin(0, "gate_proj")]}
+        backing = self._pin_backing()
+        ctl = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, profile_path=profile,
+        )
+        ctl.freq = {0: Counter({3: 9})}
+        ctl.save_profile()
+        monkeypatch.setattr(warmer_mod, "PIN_SYNC_ENABLED", True)
+        ctl2 = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, profile_path=profile,
+        )
+        assert ctl2.pinned is True
+        assert backing.pinned_count > 0
+        assert ctl2.pin_load_time_ms > 0.0
+
+    def test_hot_set_loader_reads_v2_decode_regime(self, tmp_path):
+        """HOBBIT reads the DECODE regime of a v2 profile; v1 legacy freq
+        keeps working, and a decode-less v2 profile yields no hot set."""
+        import json
+
+        from omlx.patches.expert_streaming.shard_bank import load_hot_set_from_profile
+
+        p = tmp_path / "expert_pin_profile.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "regimes": {
+                        "decode": {"freq": {"0": [[5, 9], [2, 4]]}},
+                        "prefill": {"freq": {"0": [[7, 9]]}},
+                    },
+                    "freq": {"0": [[5, 9], [2, 4]]},
+                }
+            )
+        )
+        hot = load_hot_set_from_profile(str(p), 0.5, num_experts=4)
+        assert hot["layer_0"] == {5, 2}, hot  # decode regime: 2 of 4 experts
+        hot2 = load_hot_set_from_profile(str(p), 0.5)
+        # Legacy 2-arg: denominator is the record count (2) -> 1 hot expert.
+        assert hot2["layer_0"] == {5}
+        # v1 fallback: legacy top-level freq.
+        p.write_text(json.dumps({"freq": {"0": [[9, 9]]}}))
+        hot3 = load_hot_set_from_profile(str(p), 1.0, num_experts=4)
+        assert hot3["layer_0"] == {9}, hot3
+

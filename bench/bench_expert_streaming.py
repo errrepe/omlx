@@ -134,6 +134,8 @@ async def run(
     out_dir: str = "bench/results",
     single_request: bool = False,
     gate_tokens: bool = False,
+    pin_gib: float | None = None,
+    pin_regime: str = "decode",
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -167,7 +169,7 @@ async def run(
         # experts and LEARN the pin profile this run persists on unload —
         # the decode-dominant hot set for the prefill×decode overlap study.
         expert_streaming_pins=pins or None,
-        expert_streaming_pin_gib=1.25 if pins else None,
+        expert_streaming_pin_gib=(pin_gib if pin_gib is not None else 0.25) if pins else None,
         qwen4_ple_ssd_offload=True,
         vlm_mtp_enabled=mtp,
         vlm_mtp_draft_block_size=mtp_block,
@@ -209,6 +211,11 @@ async def run(
             )
     except Exception as e:
         print(f"scheduler limit setup skipped: {e}")
+
+    # Fase L: bench arms need the mlock pass finished before the first
+    # request and a chosen pin regime (arm E: prefill profile on decode).
+    os.environ["OMLX_EXPERT_STREAMING_PIN_SYNC"] = "1" if pins else ""
+    os.environ["OMLX_EXPERT_STREAMING_PIN_REGIME"] = pin_regime
 
     vlm_model = getattr(engine, "_vlm_model", None)
     cache = find_streaming_cache(vlm_model)
@@ -461,6 +468,58 @@ async def run(
             _read_stats_out = _rs()
         except Exception:
             _read_stats_out = None
+        # Fase L1: per-frame ctx observability — memtrace aggregates
+        # (ctx_mode/positions/bank/inflight/prefetch per ctx.ensure event)
+        # and the fallback-to-legacy counter by reason.
+        try:
+            from omlx.patches.expert_streaming.memtrace import memtrace as _mt
+
+            _memtrace_summary = _mt.summary() if _mt.enabled else None
+        except Exception:
+            _memtrace_summary = None
+        try:
+            from omlx.patches.expert_streaming import streaming_switch as _ss
+
+            _ctx_fb = _ss.ctx_fallback_stats()
+        except Exception:
+            _ctx_fb = None
+
+        # Fase L: pin accounting (only when --pins armed a PinController).
+        _pin_out = {
+            "pin_budget_gib": round((pin_gib if pin_gib is not None else 0.25), 3)
+            if pins
+            else 0.0,
+            "pinned_bytes": 0,
+            "pinned_experts": 0,
+            "pinned_pages_estimate": 0,
+            "profile_regime": pin_regime if pins else None,
+            "profile_fingerprint_match": None,
+            "pin_load_time_ms": 0.0,
+        }
+        _pinner = None
+        for holder in (
+            engine,
+            getattr(engine, "_model", None),
+            getattr(engine, "_vlm_model", None),
+        ):
+            if holder is None:
+                continue
+            _bk = getattr(holder, "_expert_streaming_backing", None)
+            _pinner = getattr(_bk, "_pin_controller", None)
+            if _pinner is not None:
+                break
+        if _pinner is not None:
+            _pin_out.update(
+                {
+                    "pin_budget_gib": round(_pinner.budget_bytes / 1024**3, 3),
+                    "pinned_bytes": getattr(_bk, "pinned_bytes", 0),
+                    "pinned_experts": getattr(_bk, "pinned_count", 0),
+                    "pinned_pages_estimate": _pinner.pinned_pages_estimate,
+                    "profile_regime": _pinner.profile_regime,
+                    "profile_fingerprint_match": _pinner.fingerprint_match,
+                    "pin_load_time_ms": round(_pinner.pin_load_time_ms, 1),
+                }
+            )
 
     phys_end = get_phys_footprint() / 1024**3
     try:
@@ -487,6 +546,9 @@ async def run(
             "prefetcher": pf_stats,
             "advise_stats": advise_stats,
             "read_stats": _read_stats_out,
+            "memtrace_summary": _memtrace_summary,
+            "ctx_fallback_to_legacy": _ctx_fb,
+            "pin": _pin_out,
             "resources": res_summary,
             "tokens": _tokens if isinstance(_tokens, list) else None,
             "bit_exact_kind": _bit_exact_kind,
@@ -532,8 +594,8 @@ def main():
                          "profile, this fraction of each layer's most-used experts keeps the "
                          "original packing; the rest read the cold tier")
     ap.add_argument("--pins", action="store_true",
-                    help="mlock-pin observed hot experts (1.25 GiB) and persist the learned "
-                         "pin profile on unload (parity with the ppl harness)")
+                    help="mlock-pin observed hot experts (default 0.25 GiB) and persist the "
+                         "learned pin profile on unload (parity with the ppl harness)")
     ap.add_argument("--prompt-len", choices=["short", "512", "2k", "8k"], default="short")
     ap.add_argument("--mtp-block", type=int, default=None, help="vlm_mtp_draft_block_size (MTP tokens per round)")
     ap.add_argument("--ane", action="store_true", help="enable qwen35 ANE prefill")
@@ -542,6 +604,10 @@ def main():
     ap.add_argument("--specprefill-keep", type=float, default=None, metavar="PCT",
                     help="keep rate for SpecPrefill (default 0.2)")
     ap.add_argument("--warm-control", type=float, default=0.0, metavar="GIB", help="post-load deterministic warmup budget")
+    ap.add_argument("--pin-gib", type=float, default=None, metavar="GIB",
+                    help="pin budget for --pins arms (default 0.25) — L2 matrix: 0.25/0.5/1.25")
+    ap.add_argument("--pin-regime", choices=["decode", "prefill"], default="decode",
+                    help="regime whose learned profile drives the pin selection (arm E: prefill)")
     ap.add_argument("--min-free-gb", type=float, default=22.0, metavar="GB",
                     help="abort when available memory is below this (memory-starved runs fragment prefill "
                          "into many chunks, re-stream experts, and thrash the page cache)")
@@ -593,6 +659,8 @@ def main():
             out_dir=args.out_dir,
             single_request=args.single_request,
             gate_tokens=args.gate_tokens,
+            pin_gib=args.pin_gib,
+            pin_regime=args.pin_regime,
         )
     )
 

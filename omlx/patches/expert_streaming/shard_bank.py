@@ -508,7 +508,17 @@ def load_hot_set_from_profile(
     experts it never observed)."""
     try:
         data = json.loads(Path(profile_path).read_text())
-        freq = data.get("freq") or {}
+        # Fase L profile v2: the HOBBIT hot set is the DECODE regime (the
+        # split targets decode-hot experts); v1 profiles keep the legacy
+        # top-level freq.
+        regimes = data.get("regimes")
+        freq = None
+        if isinstance(regimes, dict):
+            decode_regime = regimes.get("decode")
+            if isinstance(decode_regime, dict):
+                freq = decode_regime.get("freq") or {}
+        if not freq:
+            freq = data.get("freq") or {}
         if not freq or hot_fraction <= 0.0:
             return {}
         hot: dict[str, set] = {}
@@ -1113,7 +1123,18 @@ class ExpertBackingStore:
         locked = reader.pin_expert(key, expert_id)
         if locked > 0:
             self._pinned.add(pkey)
-            self.pinned_bytes += locked
+            # Fase L: count only NEWLY locked pages — adjacent experts share
+            # the boundary page and must not double-charge the budget.
+            try:
+                off, end = reader.expert_byte_range(key, expert_id)
+                sp = off // _PAGE_SIZE
+                ep = (end + _PAGE_SIZE - 1) // _PAGE_SIZE
+                pages = self._pinned_pages.setdefault(str(reader.path), set())
+                new_pages = set(range(sp, ep)) - pages
+                pages |= new_pages
+                self.pinned_bytes += len(new_pages) * _PAGE_SIZE
+            except Exception:
+                self.pinned_bytes += locked
         return locked
 
     @property
@@ -1121,6 +1142,9 @@ class ExpertBackingStore:
         return len(self._pinned)
 
     def close(self) -> None:
+        # Fase L: unique locked page accounting per reader file, so
+        # pinned_bytes reports the true wired bytes after page dedupe.
+        self._pinned_pages: dict[str, set[int]] = {}
         # Fase K K1: drain the speculation workers before the readers die —
         # a live stash future would read from closed files or, worse, write
         # stale bytes into a ring past its owning engine's lifetime.

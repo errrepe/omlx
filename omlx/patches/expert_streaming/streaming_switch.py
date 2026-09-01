@@ -76,6 +76,14 @@ _CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "
 _DECODE_UNION_MAX_ROWS = max(
     0, int(os.environ.get("OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS", "64"))
 )
+# Fase L1: the union fast path declines (falls back to the legacy per-expert
+# resolution) when one layer call's bank set would exceed this many bytes.
+# Decode-shaped calls never approach it; the cap only fences a misrouted
+# prefill-shaped call out of union residency.
+_CTX_UNION_MAX_BYTES = max(
+    0,
+    int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_UNION_MAX_BYTES", str(1024**3))),
+)
 
 
 def _layer_ctx_mode(positions: int, *, quantized: bool, barrier: bool) -> str | None:
@@ -314,6 +322,29 @@ class SpeculationState:
             self.stash_order.clear()
             self.prev_uniq_by_layer.clear()
             self.linears_by_layer.clear()
+
+# Fase L1: count every layer-context fallback to the legacy per-expert
+# resolution, per reason, so a bench run can prove the fast path engaged.
+# Reasons: read_failure (ctx read produced nothing usable), bank_too_large
+# (union declined over _CTX_UNION_MAX_BYTES), tier_mismatch (bundles did
+# not cover the demand set), dict_backing (projections without a bank
+# reader, so no context was built at all).
+_CTX_FALLBACKS: dict[str, int] = {}
+
+
+def ctx_fallback_stats() -> dict[str, int]:
+    return dict(_CTX_FALLBACKS)
+
+
+def _reset_ctx_fallback_stats() -> None:
+    _CTX_FALLBACKS.clear()
+
+
+def _count_ctx_fallback(reason: str) -> None:
+    _CTX_FALLBACKS[reason] = _CTX_FALLBACKS.get(reason, 0) + 1
+    if memtrace.enabled:
+        memtrace.record("ctx.fallback", reason=reason)
+
 
 # Routing trace (Fase I3): when OMLX_EXPERT_STREAMING_TRACE is set, append one
 # JSONL row per MoE layer call ({call, layer, positions, uniq}) so
@@ -865,6 +896,9 @@ class _LayerLoadContext:
         self._expert_ids: list[int] = []
         # legacy union latch
         self._loaded = False
+        # Fase L1: union declined a demand set over _CTX_UNION_MAX_BYTES; the
+        # linears fall back to the legacy per-expert resolution.
+        self.declined = False
 
     # -- helpers ------------------------------------------------------------
 
@@ -1008,11 +1042,15 @@ class _LayerLoadContext:
                 layer=linear.layer_idx,
                 proj=getattr(linear, "proj_name", "?"),
                 ctx_mode=self.mode,
+                positions=len(ids),
                 uniq=len(ids),
                 miss=len(missing),
+                ctx_bank_bytes=int(linear._tier_bank_bytes_for(missing)),
                 bank_bytes=int(linear._tier_bank_bytes_for(missing)),
-                inflight=len(self._futures),
+                ctx_inflight_bytes=self._inflight_bytes,
                 inflight_bytes=self._inflight_bytes,
+                ctx_prefetch_count=len(self._futures),
+                inflight=len(self._futures),
             )
 
     # -- legacy union path --------------------------------------------------
@@ -1040,6 +1078,14 @@ class _LayerLoadContext:
         if not jobs:
             return
         pool = self._pool_for(jobs[0][0], len(expert_ids))
+        live = sum(proj._tier_bank_bytes_for(ids) for proj, ids in jobs)
+        # Fase L1: a demand set too large for union residency declines so the
+        # linears fall back per expert instead of holding the whole layer at
+        # once (prefill-shaped calls never reach union, but a misrouted call
+        # must not force union residency).
+        if _CTX_UNION_MAX_BYTES > 0 and live > _CTX_UNION_MAX_BYTES:
+            self.declined = True
+            return
         results = list(pool.map(lambda job: job[0]._load_expert_bank_np(job[1]), jobs))
         for (proj, ids), rows in zip(jobs, results):
             if rows is None or len(rows) != len(ids):
@@ -1047,15 +1093,19 @@ class _LayerLoadContext:
                 return
             self.bundles[id(proj)].update(zip(ids, rows))
         if memtrace.enabled:
-            live = sum(proj._tier_bank_bytes_for(ids) for proj, ids in jobs)
             memtrace.record(
                 "ctx.ensure.exit",
                 layer=layer,
+                ctx_mode=self.mode,
                 n_proj=len(self.linears),
+                positions=len(expert_ids),
                 uniq=len(expert_ids),
                 n_loaded=len(jobs),
                 miss_per_proj=[len(ids) for _, ids in jobs],
+                ctx_bank_bytes=live,
                 bank_bytes=live,
+                ctx_inflight_bytes=0,
+                ctx_prefetch_count=0,
             )
 
     # -- public API ---------------------------------------------------------
@@ -1968,7 +2018,15 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # layer context; the context prefetches the next one in the
             # background so banks are not all resident at once.
             plan.ctx.ensure(self, plan.uniq_list)
-            if not plan.ctx.failed:
+            # Fase L1: count every fallback to the legacy per-expert
+            # resolution so runs can prove the fast path engaged.
+            if plan.ctx.failed:
+                context_bundles = None
+                _count_ctx_fallback("read_failure")
+            elif getattr(plan.ctx, "declined", False):
+                context_bundles = None
+                _count_ctx_fallback("bank_too_large")
+            else:
                 context_bundles = plan.ctx.bundles.get(id(self))
                 hits = plan.ctx.hits.get(id(self), 0)
                 misses = plan.ctx.misses.get(id(self), 0)
@@ -1976,6 +2034,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     bundles.update(context_bundles)
                 else:
                     context_bundles = None
+                    _count_ctx_fallback("tier_mismatch")
         if context_bundles is None:
             for eid in plan.uniq_list:
                 eid = int(eid)
@@ -2236,6 +2295,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 bits_ = self.bits if t == 0 else self._cold_bits
                 gs_ = self.group_size if t == 0 else self._cold_gs
                 if memtrace.enabled:
+                    # Fase L4A: one bank_ready event per tier, so the trace
+                    # can attribute the peak to hot or cold residency.
                     memtrace.record(
                         "dual_tier.bank_promoted",
                         layer=self.layer_idx,
@@ -2485,6 +2546,10 @@ class StreamingSwitchGLU(nn.Module):
                 plan.ctx = _LayerLoadContext(
                     projections, self._cache, mode=ctx_mode
                 )
+            else:
+                # Fase L1: no bank reader on every projection (dict-backed
+                # test doubles / bf16 mixes) — no context to resolve through.
+                _count_ctx_fallback("dict_backing")
         if memtrace.enabled:
             memtrace.record(
                 'glu.enter', layer=self.layer_idx, positions=int(indices.size)

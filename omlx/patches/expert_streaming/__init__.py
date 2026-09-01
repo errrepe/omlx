@@ -96,6 +96,66 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
     return raw
 
 
+def _expert_pin_fingerprint(
+    model_path: str | Path,
+    linears_by_layer: dict[int, list],
+    backing: Any,
+    cold_root: Any,
+    hot_fraction: float | None,
+) -> dict:
+    """Fase L: profile-identity fields for a loaded model.
+
+    A v2 pin profile applies only when these fields match the model: a
+    mismatch logs and ignores the profile (never a silent apply). The
+    fingerprint covers the checkpoint (config hash), the source/cold
+    packing, the HOBBIT hot fraction and the profile format version.
+    """
+    import hashlib
+
+    fp: dict = {
+        "model": Path(model_path).name,
+        "profile_format": 2,  # keep in sync with warmer.PROFILE_VERSION
+    }
+    cfg = Path(model_path) / "config.json"
+    try:
+        fp["config_sha"] = hashlib.sha256(cfg.read_bytes()).hexdigest()[:16]
+    except Exception:
+        fp["config_sha"] = None
+    packing = None
+    probe = next(
+        (
+            l
+            for ls in linears_by_layer.values()
+            for l in ls
+            if getattr(l, "stacked_weight_key", None)
+        ),
+        None,
+    )
+    if probe is not None:
+        src = "oQ4e%d b-gs%d" % (
+            int(getattr(probe, "bits", 4)),
+            int(getattr(probe, "group_size", 64)),
+        )
+        fp["source_packing"] = src
+        packing = src
+        if cold_root is not None and hasattr(backing, "cold_quant_params"):
+            try:
+                cb, cg = backing.cold_quant_params(probe.stacked_weight_key)
+                cold = "cold%d b-gs%d" % (int(cb), int(cg))
+                fp["cold_packing"] = cold
+                packing = src + "+" + cold
+            except Exception:
+                fp["cold_packing"] = None
+                packing = src + "+cold?"
+    else:
+        fp["source_packing"] = None
+    fp["hot_fraction"] = (
+        round(float(hot_fraction), 4) if hot_fraction is not None else None
+    )
+    fp["packing"] = packing
+    return fp
+
+
 def _wire_streaming_io_overrides(
     layers: Any,
     mtp_stages: Any,
@@ -1112,6 +1172,26 @@ def convert_model_to_streaming(
                     pin_profile_path = _warmer_mod.PIN_PROFILE_PATH or str(
                         Path(model_path) / ".omlx" / "expert_pin_profile.json"
                     )
+                    # Fase L: the pin profile applies only when the loaded
+                    # model's fingerprint matches the one it was learned from.
+                    # hot_fraction resolves inside the cold-tier branch above;
+                    # resolve it again here so the fingerprint is stable even
+                    # when no cold tier is active.
+                    _hf_setting = io_ov.get("expert_streaming_hot_fraction")
+                    if _hf_setting is None:
+                        _hf_setting = _shard_mod.HOT_FRACTION_ENV or None
+                    _hf = (
+                        max(0.0, min(1.0, float(_hf_setting)))
+                        if _hf_setting is not None
+                        else None
+                    )
+                    _pin_fp = _expert_pin_fingerprint(
+                        model_path,
+                        linears_by_layer,
+                        backing,
+                        cold_root,
+                        _hf,
+                    )
                     pinner = _warmer_mod.PinController(
                         linears_by_layer,
                         backing,
@@ -1122,6 +1202,8 @@ def convert_model_to_streaming(
                         # I6: expert width — sizes the per-token bincount
                         # payloads from on_layer_plan and validates them.
                         num_experts=estimate.experts_per_layer,
+                        model_fingerprint=_pin_fp,
+                        packing=_pin_fp.get("packing"),
                     )
                     # Save-on-unload hook: engines call save_expert_pin_profile()
                     # in stop() while the backing is still reachable.
