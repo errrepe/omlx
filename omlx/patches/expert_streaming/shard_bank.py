@@ -17,6 +17,7 @@ import math
 import logging
 import mmap
 import os
+import random
 import re
 import struct
 import sys
@@ -154,36 +155,296 @@ _RUN_WINDOW_COMPLETION = (
     os.environ.get("OMLX_EXPERT_STREAMING_RUN_WINDOW", "") == "completion"
 )
 
-# Fase 2: demand-read telemetry, collected ONLY under the profiling env
-# (the bench sets OMLX_EXPERT_STREAMING_PROFILE=1). Zero cost otherwise:
-# one module-global guard read per read_expert_into call.
+# Fase 2/M3: demand-read telemetry. The env gates the DEFAULT enabled
+# state of every backing's telemetry (the bench sets PROFILE=1); each
+# ExpertBackingStore owns a ReadTelemetry instance, so engines never mix
+# sessions. Zero instrumentation cost when a backing's telemetry is off:
+# one attribute guard per read_expert_into call.
 _PROFILE_READS = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
-_READ_STATS: dict = {}
+
+# Fase M2 stage buckets (recorded per component except the per-run ones).
+_READ_METRICS = (
+    "component_e2e_us",
+    "reader_resolve_us",
+    "plan_us",
+    "buffer_alloc_us",
+    "queue_wait_us",
+    "preadv_us",
+    "future_tail_us",
+    "scatter_us",
+    "fallback_us",
+)
+# Run sizes beyond this count collapse into one capped bucket.
+_RUN_SIZE_CAP = 512
 
 
-def read_stats() -> dict | None:
-    """Fase 2 demand-read telemetry snapshot (None when unarmed)."""
-    if not _PROFILE_READS:
+def read_stats(backing: Any = None) -> dict | None:
+    """Fase M3: demand-read telemetry snapshot of one backing (None when
+    unarmed or no backing given — telemetry is per-backing now)."""
+    if backing is None:
         return None
-    lat = sorted(_READ_STATS.get("lat_us", []))
-    sizes = sorted(_READ_STATS.get("run_sizes", []))
+    tel = getattr(backing, "read_telemetry", None)
+    if tel is None or not tel.enabled:
+        return None
+    return tel.summary()
 
-    def pct(vals: list, p: float) -> int | None:
-        if not vals:
+
+class _Percentile:
+    """Bounded reservoir percentile with always-on count/sum/min/max.
+
+    One metric of one accumulator. The reservoir keeps at most `capacity`
+    samples (uniform reservoir sampling); dropped_samples = count - kept,
+    reported at the summary level so an analysis knows the percentiles are
+    approximate on long runs. No lock: insertion happens under the owning
+    ReadTelemetry lock (one per read call, never per run).
+    """
+
+    __slots__ = ("capacity", "count", "sum_us", "min_us", "max_us", "_res")
+
+    def __init__(self, capacity: int):
+        self.capacity = max(8, int(capacity))
+        self.count = 0
+        self.sum_us = 0
+        self.min_us: int | None = None
+        self.max_us = 0
+        self._res: list[int] = []
+
+    def add(self, us: int) -> None:
+        if us < 0:
+            return
+        self.count += 1
+        self.sum_us += us
+        if self.min_us is None or us < self.min_us:
+            self.min_us = us
+        if us > self.max_us:
+            self.max_us = us
+        if len(self._res) < self.capacity:
+            self._res.append(us)
+        elif random.random() < self.capacity / self.count:
+            self._res[random.randrange(self.capacity)] = us
+
+    def pct(self, p: float) -> int | None:
+        if not self._res:
             return None
+        vals = sorted(self._res)
         return int(vals[min(len(vals) - 1, int(len(vals) * p))])
 
-    run_mean = int(sum(sizes) / len(sizes)) if sizes else None
-    return {
-        "calls": _READ_STATS.get("calls", 0),
-        "runs": _READ_STATS.get("runs", 0),
-        "bytes": _READ_STATS.get("bytes", 0),
-        "lat_us_p50": pct(lat, 0.5),
-        "lat_us_p95": pct(lat, 0.95),
-        "run_size_mean": run_mean,
-        "run_size_max": max(sizes) if sizes else None,
-        "peak_inflight": _READ_STATS.get("peak_inflight", 0),
-    }
+    def report(self) -> dict:
+        return {
+            "count": self.count,
+            "p50": self.pct(0.5),
+            "p95": self.pct(0.95),
+            "max": self.max_us,
+            "sum": self.sum_us,
+        }
+
+    def merge(self, other: "_Percentile") -> None:
+        """Merge for phase-summary aggregation (approximate percentiles:
+        the reservoirs concatenate up to 2x capacity)."""
+        self.count += other.count
+        self.sum_us += other.sum_us
+        if other.min_us is not None:
+            if self.min_us is None or other.min_us < self.min_us:
+                self.min_us = other.min_us
+        if other.max_us > self.max_us:
+            self.max_us = other.max_us
+        self._res.extend(other._res[: max(0, self.capacity - len(self._res))])
+
+
+class _ReadAccum:
+    """One scope's counters + bounded histograms (lifetime or one phase)."""
+
+    __slots__ = (
+        "metrics",
+        "calls",
+        "runs",
+        "bytes",
+        "run_sizes",
+        "requested_inflight_peak",
+        "failed_calls",
+    )
+
+    def __init__(self, capacity: int):
+        self.metrics: dict[str, _Percentile] = {
+            m: _Percentile(capacity) for m in _READ_METRICS
+        }
+        self.calls = 0
+        self.runs = 0
+        self.bytes = 0
+        self.run_sizes: dict[int, int] = {}
+        self.requested_inflight_peak = 0
+        self.failed_calls = 0
+
+    def add_timings(self, timings: dict[str, list[int]]) -> None:
+        for name, us_list in timings.items():
+            p = self.metrics.get(name)
+            if p is None:
+                continue
+            for us in us_list:
+                p.add(us)
+
+    def run_size(self, size: int) -> None:
+        capped = min(int(size), _RUN_SIZE_CAP)
+        self.run_sizes[capped] = self.run_sizes.get(capped, 0) + 1
+
+
+class ReadTelemetry:
+    """Fase M3: per-backing, phase-scoped, memory-bounded read telemetry.
+
+    Ownership: ONE instance per ExpertBackingStore — two engines never
+    share counters. Scopes: begin_phase(phase, request_id, engine_id,
+    fingerprint) opens a per-request accumulator; end_phase() freezes it
+    under "requests"; summary() merges per phase name (prefill/decode) and
+    keeps the lifetime totals. The worker threads never take the lock: the
+    read path collects local timings and inserts ONE aggregated record per
+    call under the lock.
+    """
+
+    def __init__(self, enabled: bool = True, sample_capacity: int = 2048):
+        self.enabled = bool(enabled)
+        self.sample_capacity = max(64, int(sample_capacity))
+        self._lock = threading.Lock()
+        self._lifetime = _ReadAccum(self.sample_capacity)
+        self._phase_acc: _ReadAccum | None = None
+        self._phase_meta: dict = {}
+        self._finished: dict[str, _ReadAccum] = {}
+
+    def begin_phase(
+        self,
+        phase: str,
+        request_id: str | None = None,
+        engine_id: str | None = None,
+        fingerprint: str | None = None,
+    ) -> None:
+        with self._lock:
+            if self._phase_acc is not None:
+                # Robustness: never lose a scope's counts to an unbalanced
+                # begin; close it under its own key first.
+                self._close_phase_locked()
+            self._phase_meta = {
+                "phase": phase,
+                "request_id": request_id,
+                "engine_id": engine_id,
+                "fingerprint": fingerprint,
+            }
+            self._phase_acc = _ReadAccum(self.sample_capacity)
+
+    def _close_phase_locked(self) -> None:
+        if self._phase_acc is None:
+            return
+        meta = self._phase_meta
+        key = (meta.get("request_id") or "anon") + "/" + (meta.get("phase") or "phase")
+        self._finished[key] = self._phase_acc
+        self._phase_acc = None
+        self._phase_meta = {}
+
+    def end_phase(self) -> dict | None:
+        with self._lock:
+            if self._phase_acc is None:
+                return None
+            out = self._report_readonly(self._phase_acc)
+            self._close_phase_locked()
+            return out
+
+    def record_call(
+        self,
+        *,
+        runs: int = 0,
+        bytes_: int = 0,
+        run_sizes: list[int] | None = None,
+        requested_inflight: int = 0,
+        failed: bool = False,
+        timings: dict[str, list[int]] | None = None,
+    ) -> None:
+        """ONE lock per call: the caller aggregates run-level samples first."""
+        if not self.enabled:
+            return
+        with self._lock:
+            for acc in (self._lifetime, self._phase_acc):
+                if acc is None:
+                    continue
+                acc.calls += 1
+                acc.runs += runs
+                acc.bytes += bytes_
+                if acc.requested_inflight_peak < requested_inflight:
+                    acc.requested_inflight_peak = requested_inflight
+                if failed:
+                    acc.failed_calls += 1
+                for size in run_sizes or []:
+                    acc.run_size(size)
+                if timings:
+                    acc.add_timings(timings)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._lifetime = _ReadAccum(self.sample_capacity)
+            self._phase_acc = None
+            self._phase_meta = {}
+            self._finished = {}
+
+    @staticmethod
+    def _report_readonly(acc: _ReadAccum) -> dict:
+        avg = (acc.bytes / acc.calls) if acc.calls else 0
+        return {
+            "calls": acc.calls,
+            "runs": acc.runs,
+            "bytes": acc.bytes,
+            "bytes_per_call": int(avg),
+            "run_sizes_buckets": dict(sorted(acc.run_sizes.items())),
+            "run_size_max": max(acc.run_sizes) if acc.run_sizes else None,
+            "requested_inflight_peak": acc.requested_inflight_peak,
+            "failed_calls": acc.failed_calls,
+            "stages_us": {m: acc.metrics[m].report() for m in _READ_METRICS},
+        }
+
+    def summary(self) -> dict:
+        with self._lock:
+            merged: dict[str, _ReadAccum] = {}
+
+            def _merge_into(target: _ReadAccum, src: _ReadAccum) -> None:
+                target.calls += src.calls
+                target.runs += src.runs
+                target.bytes += src.bytes
+                target.failed_calls += src.failed_calls
+                if target.requested_inflight_peak < src.requested_inflight_peak:
+                    target.requested_inflight_peak = src.requested_inflight_peak
+                for size, cnt in src.run_sizes.items():
+                    target.run_sizes[size] = target.run_sizes.get(size, 0) + cnt
+                for m in _READ_METRICS:
+                    target.metrics[m].merge(src.metrics[m])
+
+            for key, acc in self._finished.items():
+                phase = key.split("/", 1)[-1]
+                if phase not in merged:
+                    merged[phase] = _ReadAccum(self.sample_capacity)
+                _merge_into(merged[phase], acc)
+            if self._phase_acc is not None:
+                phase = (self._phase_meta.get("phase") or "phase")
+                if phase not in merged:
+                    merged[phase] = _ReadAccum(self.sample_capacity)
+                _merge_into(merged[phase], self._phase_acc)
+            out: dict = {
+                "profiling_enabled": self.enabled,
+                "dropped_samples": 0,
+                "sample_capacity": self.sample_capacity,
+                "lifetime": self._report_readonly(self._lifetime),
+                "requests": {
+                    key: self._report_readonly(acc)
+                    for key, acc in sorted(self._finished.items())
+                },
+            }
+            for phase, acc in merged.items():
+                out[phase] = self._report_readonly(acc)
+            dropped = 0
+            for acc in [self._lifetime, self._phase_acc] + list(
+                self._finished.values()
+            ):
+                if acc is None:
+                    continue
+                for m in acc.metrics.values():
+                    dropped += max(0, m.count - len(m._res))
+            out["dropped_samples"] = dropped
+            return out
 
 # NOTE: the singleton and the accessor must not share a name — a module-level
 # def _run_io_pool would rebind the very global the accessor is meant to
@@ -620,6 +881,12 @@ class ExpertBackingStore:
         # mlock pin tracking (expert_streaming pin mode)
         self._pinned: set = set()
         self.pinned_bytes = 0
+        # Fase L: unique locked page accounting per reader file, so
+        # pinned_bytes reports the true wired bytes after page dedupe.
+        self._pinned_pages: dict[str, set[int]] = {}
+        # Fase M3: per-backing read telemetry (phase-scoped, bounded). The
+        # env gates the default enabled state; callers may arm it explicitly.
+        self.read_telemetry = ReadTelemetry(enabled=_PROFILE_READS)
 
     def _roots(self) -> list[Path]:
         return [self.model_path, *self._extra_roots]
@@ -720,8 +987,8 @@ class ExpertBackingStore:
             self._cold_readers[str(cold_path)] = reader
         if key not in reader.header:
             return None
-        self._cold_key_to_reader[key] = reader
-        return reader
+        self._cold_key_to_reader.setdefault(key, reader)
+        return self._cold_key_to_reader[key]
 
     def _reader_for_key(self, key: str, expert_id: int | None = None) -> _ShardReader:
         # expert_id routes the HOBBIT split (I6): a hot expert resolves the
@@ -731,15 +998,17 @@ class ExpertBackingStore:
         # hot, or a hot expert would land on the cold packing.
         if expert_id is not None:
             k2 = (key, int(expert_id))
-            if k2 in self._key_to_reader:
-                return self._key_to_reader[k2]
+            cached = self._key_to_reader.get(k2)
+            if cached is not None:
+                return cached
             cold = self._cold_reader_for_key(key, int(expert_id))
-            if cold is not None:
-                self._key_to_reader[k2] = cold
-                return cold
-            reader = self._reader_for_key_source(key)
-            self._key_to_reader[k2] = reader
-            return reader
+            reader = cold if cold is not None else self._reader_for_key_source(key)
+            # Fase M3: concurrent lazy opens must return ONE canonical
+            # instance — two threads resolving the same key simultaneously
+            # could otherwise hand out different reader objects and the
+            # tier contract (all ids -> the same reader) would reject the
+            # component with a False.
+            return self._key_to_reader.setdefault(k2, reader)
         if key in self._key_to_reader:
             return self._key_to_reader[key]
         cold = self._cold_reader_for_key(key)
@@ -771,7 +1040,10 @@ class ExpertBackingStore:
         reader = self._readers.get(str(fpath))
         if reader is None:
             reader = _ShardReader(fpath)
-            self._readers[str(fpath)] = reader
+            # Fase M3: canonical instance under concurrency (see
+            # _reader_for_key).
+            self._readers.setdefault(str(fpath), reader)
+            reader = self._readers[str(fpath)]
         self._key_to_reader[("src", key)] = reader
         return reader
 
@@ -874,7 +1146,8 @@ class ExpertBackingStore:
         (caller must fall back to load_expert_slice). Bytes are written in
         expert-id order so outs[i][j] is expert eids[j].
         """
-        _read_t0 = time.perf_counter_ns() if _PROFILE_READS else None
+        _tel_on = self.read_telemetry is not None and self.read_telemetry.enabled
+        _read_t0 = time.perf_counter_ns() if _tel_on else None
         if len(components) != len(outs):
             return False
         for (key, eids), out in zip(components, outs):
@@ -1047,22 +1320,19 @@ class ExpertBackingStore:
                             scatter_one(wo, wfirst, wjs, wbuf)
                     if not ok:
                         return False
-            if _PROFILE_READS:
-                # Fase 2 demand-read telemetry (bench-only cost).
-                _READ_STATS["calls"] = _READ_STATS.get("calls", 0) + 1
-                _READ_STATS["runs"] = _READ_STATS.get("runs", 0) + len(runs)
-                _READ_STATS["bytes"] = _READ_STATS.get("bytes", 0) + sum(
-                    cnt * rp.expert_bytes for (_o, _f, cnt, _js) in runs
-                )
-                _READ_STATS.setdefault("run_sizes", []).extend(
-                    cnt for (_o, _f, cnt, _js) in runs
-                )
-                _READ_STATS.setdefault("lat_us", []).append(
-                    (time.perf_counter_ns() - _read_t0) // 1000
-                )
-                _READ_STATS["peak_inflight"] = max(
-                    _READ_STATS.get("peak_inflight", 0),
-                    min(_RUN_IO_QD, len(runs)),
+            # Fase M3: one aggregated record per component — the worker
+            # threads never take the telemetry lock. _read_t0 wraps the
+            # whole component (reader resolve + plan + runs + scatter), so
+            # component_e2e_us is the service latency the caller observes.
+            if _tel_on:
+                self.read_telemetry.record_call(
+                    runs=len(runs),
+                    bytes_=sum(cnt * rp.expert_bytes for (_o, _f, cnt, _js) in runs),
+                    run_sizes=[cnt for (_o, _f, cnt, _js) in runs],
+                    requested_inflight=min(_RUN_IO_QD, len(runs)),
+                    timings={
+                        "component_e2e_us": [(time.perf_counter_ns() - _read_t0) // 1000]
+                    },
                 )
         return True
 
@@ -1142,9 +1412,6 @@ class ExpertBackingStore:
         return len(self._pinned)
 
     def close(self) -> None:
-        # Fase L: unique locked page accounting per reader file, so
-        # pinned_bytes reports the true wired bytes after page dedupe.
-        self._pinned_pages: dict[str, set[int]] = {}
         # Fase K K1: drain the speculation workers before the readers die —
         # a live stash future would read from closed files or, worse, write
         # stale bytes into a ring past its owning engine's lifetime.

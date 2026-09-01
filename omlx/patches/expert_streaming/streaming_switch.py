@@ -333,25 +333,13 @@ class SpeculationState:
 
 # Fase L1: count every layer-context fallback to the legacy per-expert
 # resolution, per reason, so a bench run can prove the fast path engaged.
-# Reasons: read_failure (ctx read produced nothing usable), bank_too_large
-# (union declined over _CTX_UNION_MAX_BYTES), tier_mismatch (bundles did
-# not cover the demand set), dict_backing (projections without a bank
-# reader, so no context was built at all).
-_CTX_FALLBACKS: dict[str, int] = {}
-
-
-def ctx_fallback_stats() -> dict[str, int]:
-    return dict(_CTX_FALLBACKS)
-
-
-def _reset_ctx_fallback_stats() -> None:
-    _CTX_FALLBACKS.clear()
-
-
-def _count_ctx_fallback(reason: str) -> None:
-    _CTX_FALLBACKS[reason] = _CTX_FALLBACKS.get(reason, 0) + 1
-    if memtrace.enabled:
-        memtrace.record("ctx.fallback", reason=reason)
+# Fase M3: ctx fallback counters moved onto ExpertLRUCache (per-engine/
+# per-conversion) — module-global counters would mix sessions in a
+# persistent server. Reasons: read_failure (ctx read produced nothing
+# usable), bank_too_large (union declined over _CTX_UNION_MAX_BYTES or the
+# rolling loader's bank cap), tier_mismatch (bundles did not cover the
+# demand set), dict_backing (projections without a bank reader, so no
+# context was built at all).
 
 
 # Routing trace (Fase I3): when OMLX_EXPERT_STREAMING_TRACE is set, append one
@@ -696,6 +684,19 @@ class ExpertLRUCache:
         self._admission_counts: Dict[Tuple[int, int], int] = {}
         self._admission_order: deque[Tuple[int, int]] = deque()  # type: ignore[type-arg]
         self.admission_drops = 0
+        # Fase M3: per-engine ctx fallback-to-legacy counters (per reason).
+        self._ctx_fallbacks: dict[str, int] = {}
+
+    def _count_ctx_fallback(self, reason: str) -> None:
+        self._ctx_fallbacks[reason] = self._ctx_fallbacks.get(reason, 0) + 1
+        if memtrace.enabled:
+            memtrace.record("ctx.fallback", reason=reason)
+
+    def ctx_fallback_stats(self) -> dict[str, int]:
+        return dict(self._ctx_fallbacks)
+
+    def _reset_ctx_fallback_stats(self) -> None:
+        self._ctx_fallbacks.clear()
 
     def __contains__(self, key: tuple[int, int, str]) -> bool:
         return key in self._store
@@ -2047,12 +2048,12 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # records WHICH reason when the read came back unusable.
             if plan.ctx.failed:
                 context_bundles = None
-                _count_ctx_fallback(
+                self.cache._count_ctx_fallback(
                     getattr(plan.ctx, "fallback_reason", None) or "read_failure"
                 )
             elif getattr(plan.ctx, "declined", False):
                 context_bundles = None
-                _count_ctx_fallback("bank_too_large")
+                self.cache._count_ctx_fallback("bank_too_large")
             else:
                 context_bundles = plan.ctx.bundles.get(id(self))
                 hits = plan.ctx.hits.get(id(self), 0)
@@ -2061,7 +2062,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     bundles.update(context_bundles)
                 else:
                     context_bundles = None
-                    _count_ctx_fallback("tier_mismatch")
+                    self.cache._count_ctx_fallback("tier_mismatch")
         if context_bundles is None:
             for eid in plan.uniq_list:
                 eid = int(eid)
@@ -2592,7 +2593,7 @@ class StreamingSwitchGLU(nn.Module):
             else:
                 # Fase L1: no bank reader on every projection (dict-backed
                 # test doubles / bf16 mixes) — no context to resolve through.
-                _count_ctx_fallback("dict_backing")
+                self._cache._count_ctx_fallback("dict_backing")
         if memtrace.enabled:
             memtrace.record(
                 'glu.enter', layer=self.layer_idx, positions=int(indices.size)

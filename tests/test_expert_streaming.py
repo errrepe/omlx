@@ -1007,10 +1007,14 @@ def test_adaptive_topk_qwen_block_patch():
 
 
 def test_shard_bank_pin_expert_mlock():
-    """pin_expert locks the page-aligned file range and dedupes repeats."""
+    """pin_expert locks the page-aligned file range and dedupes repeats AND
+    shared pages (Fase L: pinned_bytes counts UNIQUE locked pages)."""
     import mlx.core as mx  # noqa: F401
 
-    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+    from omlx.patches.expert_streaming.shard_bank import (
+        ExpertBackingStore,
+        _PAGE_SIZE,
+    )
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1025,11 +1029,20 @@ def test_shard_bank_pin_expert_mlock():
         key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
         locked = backing.pin_expert(key, 0)
         assert locked > 0
-        assert backing.pinned_bytes == locked
+        # Unique-page accounting: at least one full page wired, never below
+        # the slice bytes.
+        assert backing.pinned_bytes >= locked
+        assert backing.pinned_bytes % _PAGE_SIZE == 0
         assert backing.pinned_count == 1
         # duplicate pin skipped
         assert backing.pin_expert(key, 0) == 0
         assert backing.pinned_count == 1
+        # Fase L dedupe: expert 1 shares expert 0's page — the unique-page
+        # tally must NOT grow (both live inside the first page).
+        first = backing.pinned_bytes
+        assert backing.pin_expert(key, 1) > 0
+        assert backing.pinned_count == 2
+        assert backing.pinned_bytes == first, "shared page must not double-charge"
         # range math sanity: page-rounded >= slice bytes
         off, end = backing._reader_for_key(key).expert_byte_range(key, 1)
         assert end - off == 8 * 16 * 2
@@ -3107,9 +3120,9 @@ def test_advisor_stats_count_bytes_per_tier_segment():
 
 
 def test_read_stats_collected_under_profile():
-    """Fase 2: with the profile env armed, read_expert_into accumulates
-    demand-read telemetry (calls/runs/bytes/latency); without it the
-    collector stays inert (None snapshot)."""
+    """Fase M3: read_expert_into accumulates PER-BACKING telemetry (calls/
+    runs/bytes/component_e2e); a disabled backing stays inert and module-
+    level read_stats() without a backing returns None (no global state)."""
     import numpy as np
 
     from omlx.patches.expert_streaming import shard_bank as sb_mod
@@ -3125,20 +3138,23 @@ def test_read_stats_collected_under_profile():
         )
         backing = ExpertBackingStore(tmp)
         out = np.empty((4, per), dtype=np.uint8)
-        assert sb_mod.read_stats() is None, "unarmed: no snapshot"
-        sb_mod._READ_STATS.clear()
-        try:
-            with patch.object(sb_mod, "_PROFILE_READS", True):
-                assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
-                snap = sb_mod.read_stats()
-            assert snap is not None
-            assert snap["calls"] >= 1
-            assert snap["runs"] == 2, snap
-            assert snap["bytes"] == 4 * per, snap
-            assert snap["lat_us_p95"] is not None
-            assert snap["peak_inflight"] >= 1
-        finally:
-            sb_mod._READ_STATS.clear()
+        assert sb_mod.read_stats() is None, "no backing: no global state"
+        backing.read_telemetry.enabled = False
+        assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+        assert sb_mod.read_stats(backing) is None, "disabled: inert"
+        backing.read_telemetry.enabled = True
+        assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+        snap = sb_mod.read_stats(backing)
+        assert snap is not None
+        assert snap["lifetime"]["calls"] >= 1
+        assert snap["lifetime"]["runs"] == 2, snap
+        assert snap["lifetime"]["bytes"] == 4 * per, snap
+        e2e = snap["lifetime"]["stages_us"]["component_e2e_us"]
+        assert e2e["count"] >= 1 and e2e["p95"] is not None, e2e
+        assert snap["lifetime"]["requested_inflight_peak"] >= 1
+        assert snap["profiling_enabled"] is True
+        assert snap["sample_capacity"] >= 64
+        assert "prefill" not in snap or snap["prefill"]["calls"] >= 1, snap
 
 
 
@@ -3814,6 +3830,146 @@ class TestFaseKRunMerge:
 
 
 
+
+class TestFaseM3ReadTelemetry:
+    """Fase M3: telemetry is per-backing, phase-scoped, bounded and
+thread-safe; ctx fallback counters are per-cache."""
+
+    @staticmethod
+    def _backing(tmp: Path, enabled: bool = True):
+        import numpy as np
+
+        from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        per = 4 * 4 * 2
+        _write_shard_filled(tmp / "model.safetensors", {key: ((16, 4, 4), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        backing.read_telemetry.enabled = enabled
+        return backing, key, per
+
+    def test_read_telemetry_isolated_per_backing(self, tmp_path):
+        """Two backings never share counters; disabling one leaves it
+        inert while the other keeps counting."""
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td), enabled=True)
+            (Path(td) / "b2").mkdir()
+            backing2, key2, _per2 = self._backing(Path(td) / "b2", enabled=False)
+            out = np.empty((4, per), dtype=np.uint8)
+            out2 = np.empty((4, per), dtype=np.uint8)
+            assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+            assert backing2.read_expert_into([(key2, [3, 4, 7, 8])], [out2])
+            s1 = backing.read_telemetry.summary()
+            s2 = backing2.read_telemetry.summary()
+            assert s1["lifetime"]["calls"] == 1, s1
+            assert s2["lifetime"]["calls"] == 0, "disabled backing stays inert"
+
+    def test_prefill_and_decode_summaries_do_not_mix(self, tmp_path):
+        """begin/end scopes split one request: prefill metrics land ONLY
+        under prefill, decode under decode."""
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            tel = backing.read_telemetry
+            out = np.empty((4, per), dtype=np.uint8)
+            tel.begin_phase("prefill", request_id="req-1", engine_id="e1")
+            assert backing.read_expert_into([(key, [0, 1, 2, 3])], [out])
+            tel.end_phase()
+            tel.begin_phase("decode", request_id="req-1", engine_id="e1")
+            assert backing.read_expert_into([(key, [4, 5, 6, 7])], [out])
+            tel.end_phase()
+            snap = tel.summary()
+            assert snap["prefill"]["calls"] == 1
+            assert snap["decode"]["calls"] == 1
+            assert snap["lifetime"]["calls"] == 2
+            assert "req-1/prefill" in snap["requests"]
+            p_pre = snap["prefill"]["stages_us"]["component_e2e_us"]["count"]
+            p_dec = snap["decode"]["stages_us"]["component_e2e_us"]["count"]
+            assert p_pre == 1 and p_dec == 1
+
+    def test_two_requests_do_not_merge_phase_stats(self, tmp_path):
+        """Per-request keys stay distinct; the merged prefill/decode views
+        are the ANALYTIC merge of both requests, never a mix across
+        phases."""
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            tel = backing.read_telemetry
+            out = np.empty((4, per), dtype=np.uint8)
+            for rid in ("r1", "r2"):
+                tel.begin_phase("prefill", request_id=rid)
+                backing.read_expert_into([(key, [0, 1, 2, 3])], [out])
+                tel.end_phase()
+                tel.begin_phase("decode", request_id=rid)
+                backing.read_expert_into([(key, [4, 5, 6, 7])], [out])
+                tel.end_phase()
+            snap = tel.summary()
+            assert set(snap["requests"]) == {"r1/prefill", "r1/decode", "r2/prefill", "r2/decode"}
+            assert snap["prefill"]["calls"] == 2
+            assert snap["decode"]["calls"] == 2
+            assert snap["lifetime"]["calls"] == 4
+
+    def test_reservoir_or_histogram_is_bounded(self):
+        """Percentile reservoirs cap at sample_capacity and report the
+        drop count — long runs cannot grow memory linearly."""
+        from omlx.patches.expert_streaming.shard_bank import ReadTelemetry
+
+        tel = ReadTelemetry(enabled=True, sample_capacity=128)
+        for _ in range(20000):
+            tel.record_call(
+                runs=1, bytes_=16, requested_inflight=1,
+                timings={"component_e2e_us": [1234], "preadv_us": [100]},
+            )
+        snap = tel.summary()
+        assert snap["sample_capacity"] == 128
+        e2e = snap["lifetime"]["stages_us"]["component_e2e_us"]
+        assert e2e["count"] == 20000
+        assert snap["dropped_samples"] >= 20000 - 128, snap
+        assert e2e["p50"] == 1234 and e2e["max"] == 1234
+
+    def test_concurrent_read_telemetry_reconciles_counts(self, tmp_path):
+        """Threads hammering one backing: the per-call lock must reconcile
+        calls/runs exactly (worker threads never take the lock)."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            out = np.empty((4, per), dtype=np.uint8)
+            errors = []
+
+            def worker():
+                try:
+                    for _ in range(25):
+                        if not backing.read_expert_into([(key, [3, 4, 7, 8])], [out]):
+                            errors.append("read failed")
+                except Exception as e:
+                    errors.append(repr(e))
+
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            assert not errors, errors
+            snap = backing.read_telemetry.summary()
+            assert snap["lifetime"]["calls"] == 100, snap
+            assert snap["lifetime"]["runs"] == 200, snap
+
+    def test_ctx_fallback_stats_reset_on_engine_unload(self):
+        """The cache-owned counter resets cleanly (engine unload path);
+        a fresh cache starts zeroed — nothing survives in module state."""
+        from omlx.patches.expert_streaming import streaming_switch as ss
+
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        cache._count_ctx_fallback("read_failure")
+        cache._count_ctx_fallback("bank_too_large")
+        assert cache.ctx_fallback_stats() == {"read_failure": 1, "bank_too_large": 1}
+        cache._reset_ctx_fallback_stats()
+        assert cache.ctx_fallback_stats() == {}
+        assert ss.ExpertLRUCache(0, 4096).ctx_fallback_stats() == {}
+
+
 class TestFaseM1PinWiring:
     """Fase M1: pins reach the PinController as explicit configuration
     before the first request — settings win over env, the bench wires them
@@ -3961,19 +4117,23 @@ class TestFaseL1CtxObservability:
     the fast path degrades to the legacy resolution."""
 
     def test_ctx_fallback_stats_api(self):
+        """Fase M3: fallback counters live per CACHE (per engine), not in
+        module globals — two caches never mix reasons."""
         from omlx.patches.expert_streaming import streaming_switch as ss
 
-        ss._reset_ctx_fallback_stats()
-        assert ss.ctx_fallback_stats() == {}
-        ss._count_ctx_fallback("read_failure")
-        ss._count_ctx_fallback("read_failure")
-        ss._count_ctx_fallback("bank_too_large")
-        assert ss.ctx_fallback_stats() == {
+        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        assert cache.ctx_fallback_stats() == {}
+        cache._count_ctx_fallback("read_failure")
+        cache._count_ctx_fallback("read_failure")
+        cache._count_ctx_fallback("bank_too_large")
+        assert cache.ctx_fallback_stats() == {
             "read_failure": 2,
             "bank_too_large": 1,
         }
-        ss._reset_ctx_fallback_stats()
-        assert ss.ctx_fallback_stats() == {}
+        other = ss.ExpertLRUCache(0, 4096, num_layers=2)
+        assert other.ctx_fallback_stats() == {}, "independent per engine"
+        cache._reset_ctx_fallback_stats()
+        assert cache.ctx_fallback_stats() == {}
 
     def test_ctx_fallback_read_failure_counted_on_rolling(self, monkeypatch, tmp_path):
         """A ctx read that returns nothing usable must bump read_failure and
@@ -3982,7 +4142,8 @@ class TestFaseL1CtxObservability:
 
         from omlx.patches.expert_streaming import streaming_switch as ss
 
-        ss._reset_ctx_fallback_stats()
+        glu = _quant_glu(tmp_path, n_experts=3)
+        glu._cache._reset_ctx_fallback_stats()
         monkeypatch.setattr(
             ss.StreamingQuantizedSwitchLinear,
             "_load_expert_bank_np",
@@ -3993,12 +4154,11 @@ class TestFaseL1CtxObservability:
             "_load_expert_bank_np_full",
             lambda self, ids: None,
         )
-        glu = _quant_glu(tmp_path, n_experts=3)
         x = mx.random.normal((1, 130, 128)).astype(mx.float32)
         indices = mx.array([i % 3 for i in range(130)], dtype=mx.int32)
         out = glu(x, indices)
         mx.eval(out)
-        stats = ss.ctx_fallback_stats()
+        stats = glu._cache.ctx_fallback_stats()
         assert stats.get("read_failure", 0) >= 1, stats
         assert bool(mx.all(mx.isfinite(out)))
 
@@ -4009,14 +4169,14 @@ class TestFaseL1CtxObservability:
 
         from omlx.patches.expert_streaming import streaming_switch as ss
 
-        ss._reset_ctx_fallback_stats()
-        monkeypatch.setattr(ss, "_CTX_UNION_MAX_BYTES", 1)
         glu = _quant_glu(tmp_path, n_experts=3)
+        glu._cache._reset_ctx_fallback_stats()
+        monkeypatch.setattr(ss, "_CTX_UNION_MAX_BYTES", 1)
         x = mx.random.normal((1, 8, 128)).astype(mx.float32)
         indices = mx.array([0, 1, 2, 0, 1, 2, 0, 1], dtype=mx.int32)
         out = glu(x, indices)
         mx.eval(out)
-        stats = ss.ctx_fallback_stats()
+        stats = glu._cache.ctx_fallback_stats()
         assert stats.get("bank_too_large", 0) >= 3, stats
         assert bool(mx.all(mx.isfinite(out)))
 
@@ -4027,18 +4187,18 @@ class TestFaseL1CtxObservability:
 
         from omlx.patches.expert_streaming import streaming_switch as ss
 
-        ss._reset_ctx_fallback_stats()
         # Remove the bank reader from the CLASS: hasattr() reads True for a
         # None value, so a real removal is what the GLU check observes.
         monkeypatch.delattr(
             ss.StreamingQuantizedSwitchLinear, "_load_expert_bank_np"
         )
         glu = _quant_glu(tmp_path, n_experts=3)
+        glu._cache._reset_ctx_fallback_stats()
         x = mx.random.normal((1, 8, 128)).astype(mx.float32)
         indices = mx.array([0, 1, 2, 0, 1, 2, 0, 1], dtype=mx.int32)
         out = glu(x, indices)
         mx.eval(out)
-        stats = ss.ctx_fallback_stats()
+        stats = glu._cache.ctx_fallback_stats()
         assert stats.get("dict_backing", 0) == 1, stats
         assert bool(mx.all(mx.isfinite(out)))
 

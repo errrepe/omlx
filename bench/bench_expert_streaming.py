@@ -359,6 +359,11 @@ async def run(
             pass
     sampler.start()
     sampler.mark("prefill")
+    # Fase M3: phase-scope the backing telemetry so read_stats splits
+    # prefill vs decode without cross-contamination.
+    _tel = getattr(_bk, "read_telemetry", None) if _bk is not None else None
+    if _tel is not None and _tel.enabled:
+        _tel.begin_phase("prefill", request_id="bench-1", engine_id=entry_name)
     if single_request:
         # Single-request avoids the second full prefill; TTFT is first streamed token.
         t_request = time.perf_counter()
@@ -373,9 +378,17 @@ async def run(
             ):
                 first_output_at = time.perf_counter()
                 _peak_phase("prefill")
+                if _tel is not None and _tel.enabled:
+                    _tel.end_phase()
+                    _tel.begin_phase("decode", request_id="bench-1", engine_id=entry_name)
                 sampler.mark("decode")
         if out2 is None:
             raise SystemExit("single-request benchmark produced no output")
+        if _tel is not None and _tel.enabled and first_output_at is None:
+            _tel.end_phase()
+            _tel.begin_phase("decode", request_id="bench-1", engine_id=entry_name)
+        if _tel is not None and _tel.enabled:
+            _tel.end_phase()
         end_request = time.perf_counter()
         if first_output_at is None:
             first_output_at = end_request
@@ -387,6 +400,9 @@ async def run(
         prompt_tokens = getattr(out2, "prompt_tokens", None)
         print(f"TTFT (stream first token) {ttft:.1f}s prompt {prompt_tokens}")
     else:
+        if _tel is not None and _tel.enabled:
+            _tel.end_phase()
+            _tel.begin_phase("decode", request_id="bench-1", engine_id=entry_name)
         t1 = time.perf_counter()
         out1 = await engine.chat(messages, max_tokens=1, temperature=0.0)
         ttft = time.perf_counter() - t1
@@ -397,6 +413,8 @@ async def run(
         out2 = await engine.chat(messages, max_tokens=decode, temperature=0.0)
         t_decode = time.perf_counter() - t2
         n = int(out2.completion_tokens)
+        if _tel is not None and _tel.enabled:
+            _tel.end_phase()
     if n <= 0:
         raise SystemExit("benchmark produced zero completion tokens")
     tokps = n / max(t_decode, 1e-9)
@@ -457,6 +475,23 @@ async def run(
     stats = None
     profile = None
     pf_stats = None
+    # Fase M3: the streaming backing is resolved ONCE (walked from the
+    # engine holders) and feeds the read telemetry + ctx fallback + pin
+    # exports below — one source of truth.
+    _bk = None
+    _pinner = None
+    for holder in (
+        engine,
+        getattr(engine, "_model", None),
+        getattr(engine, "_vlm_model", None),
+    ):
+        if holder is None:
+            continue
+        _cand = getattr(holder, "_expert_streaming_backing", None)
+        if _cand is not None:
+            _bk = _cand
+            _pinner = getattr(_bk, "_pin_controller", None)
+            break
     if cache is not None:
         stats = {
             "hits": cache.stats.hits,
@@ -497,7 +532,7 @@ async def run(
         try:
             from omlx.patches.expert_streaming.shard_bank import read_stats as _rs
 
-            _read_stats_out = _rs()
+            _read_stats_out = _rs(_bk)
         except Exception:
             _read_stats_out = None
         # Fase L1: per-frame ctx observability — memtrace aggregates
@@ -510,9 +545,7 @@ async def run(
         except Exception:
             _memtrace_summary = None
         try:
-            from omlx.patches.expert_streaming import streaming_switch as _ss
-
-            _ctx_fb = _ss.ctx_fallback_stats()
+            _ctx_fb = cache.ctx_fallback_stats()
         except Exception:
             _ctx_fb = None
 
@@ -535,18 +568,6 @@ async def run(
             "profile_fingerprint_match": None,
             "pin_load_time_ms": 0.0,
         }
-        _pinner = None
-        for holder in (
-            engine,
-            getattr(engine, "_model", None),
-            getattr(engine, "_vlm_model", None),
-        ):
-            if holder is None:
-                continue
-            _bk = getattr(holder, "_expert_streaming_backing", None)
-            _pinner = getattr(_bk, "_pin_controller", None)
-            if _pinner is not None:
-                break
         if _pinner is not None:
             _pin_out.update(
                 {
