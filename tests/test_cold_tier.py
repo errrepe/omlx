@@ -39,6 +39,112 @@ def _write_quantized_checkpoint(tmp: Path, bits: int = 4, gs: int = 64):
     return key_w
 
 
+
+def test_hobbit_small_first_tier_order_bit_identical(tmp_path):
+    """Fase L4B B3: submitting the smaller tier FIRST must be
+    byte-identical to the hot-first order — the masked add is elementwise
+    commutative in IEEE fp. The order env only reshuffles residency; it
+    never changes the output."""
+    from requant_cold_tier import requant_shard
+
+    from omlx.patches.expert_streaming import streaming_switch as ss
+    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingSwitchGLU,
+        StreamingQuantizedSwitchLinear,
+    )
+
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    # Full split GLU checkpoint: gate/up (E,O=64,I=128) and down (E,O=128,
+    # I=64), all 4-bit gs64 — every axis divisible by the group size.
+    shard = ckpt / "model-00001-of-00001.safetensors"
+    tensors = {}
+    for proj, o, i in (("gate_proj", 64, 128), ("up_proj", 64, 128), ("down_proj", 128, 64)):
+        dense = mx.random.normal((8, o, i))
+        w, s, b = mx.quantize(dense, group_size=64, bits=4)
+        base = f"model.layers.0.mlp.switch_mlp.{proj}"
+        tensors[f"{base}.weight"] = w
+        tensors[f"{base}.scales"] = s.astype(mx.bfloat16)
+        tensors[f"{base}.biases"] = b.astype(mx.bfloat16)
+    mx.save_safetensors(str(shard), tensors)
+    (ckpt / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: shard.name for k in tensors}})
+    )
+    (ckpt / "config.json").write_text(
+        json.dumps({"quantization": {"group_size": 64, "bits": 4, "mode": "affine"}})
+    )
+    quant_cfg = json.loads((ckpt / "config.json").read_text())["quantization"]
+    requant_shard(shard, ckpt / "expert_cold", quant_cfg, bits=3)
+    backing = ExpertBackingStore(ckpt, cold_root=ckpt / "expert_cold")
+    cache = ExpertLRUCache(64 * 1024, 1024, num_layers=1)
+    glu = StreamingSwitchGLU(
+        input_dims=128,
+        hidden_dims=32,
+        num_experts=8,
+        layer_idx=0,
+        backing=backing,
+        cache=cache,
+        fused_gate_up=False,
+        inverse_scatter=False,
+        quantized=True,
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+    spec = (
+        ("gate_proj", 64, 128),
+        ("up_proj", 64, 128),
+        ("down_proj", 128, 64),
+    )
+    for proj, o, i in spec:
+        base = f"model.layers.0.mlp.switch_mlp.{proj}"
+        setattr(
+            glu,
+            proj,
+            StreamingQuantizedSwitchLinear(
+                layer_idx=0,
+                proj_name=proj,
+                stacked_weight_key=f"{base}.weight",
+                stacked_scales_key=f"{base}.scales",
+                stacked_biases_key=f"{base}.biases",
+                num_experts=8,
+                input_dims=i,
+                output_dims=o,
+                backing=backing,
+                cache=cache,
+                group_size=64,
+                bits=4,
+                mode="affine",
+                has_bias=False,
+            ),
+        )
+    hot = {0, 1, 2, 3}
+    for proj, _o, _i in spec:
+        getattr(glu, proj).set_hobbit_split(hot, cold_bits=3, cold_gs=64)
+    # The backing's tier routing is independent of the linears' split: both
+    # must agree on the hot set for cold ids to resolve expert_cold/.
+    backing.set_hot_experts({"layer_0": hot})
+
+    x = mx.random.normal((1, 6, 128)).astype(mx.float32)
+    indices = mx.array([0, 1, 4, 5, 6, 0], dtype=mx.int32)
+
+    def run(order):
+        from unittest.mock import patch
+
+        with patch.object(ss, "_DUAL_TIER_ORDER", order):
+            out = glu(x, indices)
+            mx.eval(out)
+        return out
+
+    out_hot = run("")
+    out_small = run("small-first")
+    b_hot = np.ascontiguousarray(out_hot).view(np.uint32).reshape(-1)
+    b_small = np.ascontiguousarray(out_small).view(np.uint32).reshape(-1)
+    assert np.array_equal(b_hot, b_small), "tier order changed output bits"
+    assert bool(mx.all(mx.isfinite(out_small)))
+
 def test_requant_tool_round_trip(tmp_path):
     from requant_cold_tier import META_BITS, META_GS, requant_shard
 

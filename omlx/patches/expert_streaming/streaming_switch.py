@@ -76,6 +76,14 @@ _CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "
 _DECODE_UNION_MAX_ROWS = max(
     0, int(os.environ.get("OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS", "64"))
 )
+# Fase L4B B3: dual-tier execution order. Default "" runs hot first
+# (historical); "small-first" submits the tier with the FEWER positions
+# first. The masked add is elementwise and commutative in IEEE fp, so the
+# order is bit-exact; measured as a residency experiment (no gain on this
+# box — kept as a diagnostic knob).
+_DUAL_TIER_ORDER = os.environ.get(
+    "OMLX_EXPERT_STREAMING_DUAL_TIER_ORDER", ""
+)
 # Fase L1: the union fast path declines (falls back to the legacy per-expert
 # resolution) when one layer call's bank set would exceed this many bytes.
 # Decode-shaped calls never approach it; the cap only fences a misrouted
@@ -2311,7 +2319,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         if split:
             flat_np = np.asarray(plan.flat_np).reshape(-1)
             out = None
-            for t, idxs in ((0, hot_idx), (1, cold_idx)):
+            tier_order = [(0, hot_idx), (1, cold_idx)]
+            if _DUAL_TIER_ORDER == "small-first":
+                # Fase L4B B3: smaller tier first — reduces the coexistence
+                # of the two banks in the lazy graph before the larger
+                # tier's build; bit-exact (elementwise commutative add).
+                tier_order.sort(key=lambda tv: len(tv[1]))
+            for t, idxs in tier_order:
                 if not idxs:
                     continue
                 if t in tier_single:
