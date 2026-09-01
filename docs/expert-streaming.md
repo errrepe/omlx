@@ -1027,6 +1027,135 @@ workers (head-of-line). max(0.5/2.8, 0.5/1.0) ~= 1.4x + occupancy ~= 1.85x.
 Stripe only across disks of comparable speed; the EXTRA_ROOTS mechanism stays
 for that case.
 
+
+## Fase L — expert residency, decode observability, dual-tier memory (branch feature/expert-streaming)
+
+Branch `fase-k/io-concurrency`, base `51ca54aa`. All benches: single-request
+protocol, budget 0, --gate-tokens, shared 48 GiB box with loadavg 2-5 and
+~+/-9% window drift on arm A alone; decisions only on interleaved A/B with
+median deltas outside that band.
+
+### L1 — hybrid decode fast path is now observable (Safe, kept)
+
+- Kill-switch semantics (unchanged): OMLX_EXPERT_STREAMING_CTX_ROLLING=0
+  forces union in ALL regimes; =1 (default) selects hybrid by
+  OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS (default 64). No new knob.
+- ctx.ensure memtrace frames carry ctx_mode, positions, ctx_bank_bytes,
+  ctx_inflight_bytes, ctx_prefetch_count in both modes; MemTracer now
+  aggregates tracked numeric fields per event into summary(), so a bench
+  run exports mean/max per frame without JSONL post-processing.
+- Fallback counter `ctx_fallback_to_legacy` per reason: bank_too_large
+  (union cap OMLX_EXPERT_STREAMING_CTX_UNION_MAX_BYTES, default 1 GiB, and
+  the rolling loader's _BANK_MAX_BYTES decline — prefill 2k arms report
+  198, all expected), read_failure, tier_mismatch, dict_backing. Decode
+  (union) measures zero fallbacks; the fast path demonstrably engages.
+- Bench exports memtrace_summary + ctx_fallback_to_legacy alongside the
+  token gate, so every arm self-verifies the fast path.
+- Tests: 24 ctx/fallback/memtrace cases incl. forced-failure bit-exactness
+  (a dead ctx read falls back to per-expert loads with identical output).
+
+### L2 — regime-split learned pins: measured, closed (Safe, default OFF)
+
+Pin profiles are now v2: version, model_fingerprint (config sha, source/
+cold packing, hot_fraction, profile_format), packing, and separate
+regimes.decode/prefill frequency tables (plan format
+regimes.<regime>.freq.<layer>). The fingerprint gates every load: a
+mismatch logs and ignores the profile, never applies silently. v1
+profiles migrate to the decode regime; HOBBIT reads the decode regime.
+Budget accounting: per-layer budget proportional to usage mass (min 1
+expert per valid layer), unique page ranges deduped before the budget is
+enforced; backing.pinned_bytes now counts truly unique locked pages.
+
+Matrix (2k decode-48, budget 0, 3+3 interleaved A/C and A/C/E):
+
+| arm | pins | budget | tok/s | p95 demand us |
+|-----|------|--------|-------|---------------|
+| A   | off  | 0      | 3.084 | 5391          |
+| B   | dec  | 256 MiB| 3.292 | (1 run)       |
+| C   | dec  | 512 MiB| 3.066 | 5921          |
+| D   | dec  | 1.25 GiB|3.103 | (1 run)       |
+| E   | pref | 512 MiB| 2.978 | n/a           |
+
+Both acceptance gates fail: decode >=5% not met (all arms inside window
+drift) and demand p95 did not drop 10% (it rose ~10% under pins). The
+decode working set is already page-cache resident (~2 ms p50 demand
+reads); mlock adds wired memory without moving the latency. Per the plan
+('if 256-512 MiB does not pay, close for this model/SSD'), pins stay
+opt-in per model with the default OFF. The v2 profile machinery is kept
+as the HOBBIT/diagnostic path. Evidence: bench/results/fasel/l2/ (L2.md).
+
+### L3 — LRU admission: closed (Safe, no code landed)
+
+Routing trace + lrc_analysis (bench/results/fasel/l3/): SCH (Belady oracle
+hit rate) is 20.6/27.8/34.8/42.5/51.4/61.7% at S=8/16/32/64/128/256
+expert slots; SRP demand coverage 20.5/31.1/44.8% at G=16/32/64. At the
+pin-equivalent budget (~27 experts/layer) the oracle bound is ~33% — the
+top-freq set L2 already pins, and L2 measured that approximation does
+not improve decode. The plan's precondition 'pins already capture the
+gain' holds; LRU admission stays closed for this model/SSD.
+
+### L4A — HOBBIT 8k peak: per-tier diagnosis (Safe, measured)
+
+Per-tier events implemented (dual_tier.{hot,cold}.bank_ready,
+{hot,cold}.qmm_submitted, mask_ready, add_submitted, layer_exit) with
+hot/cold positions and byte attribution on every record. Two 8k HOBBIT
+runs (hf 0.25 and 0.10) answer the plan's four questions
+(bench/results/fasel/l4a/L4A.md):
+
+1. No dual-tier event creates the peak: the 14.232 GiB allocator high-
+   water precedes the first traced ctx.ensure and is equal at every event
+   — the plateau is the chunk-wide lazy graph (held until the chunk-end
+   eval), and ACTIVE grows 5.09 -> 11.9 GiB inside a layer build.
+2. Ratio-blind, position-driven: hf 0.25 -> 0.10 leaves the peak
+   byte-identical; correlations with hot/cold/total positions are
+   statistically the same (~0.44); only the per-tier bank split moves
+   (per-layer banks average 21 MiB, max 339 MiB — ~0.2% of the graph).
+3. The layer boundary retains 99.8-99.9% of ACTIVE memory: nothing is
+   released per layer; the drop happens at the chunk-end eval.
+4. gate/up/down profiles are identical.
+
+### L4B — lifetime-reduction variants (Re-baseline class)
+
+- B1 (eval between tiers) and B2 (mask-free reassembly): closed by the
+  L4A numbers without implementation — they target tensors one to two
+  orders of magnitude below the plateau driver.
+- B3 (small-tier-first order): implemented (OMLX_EXPERT_STREAMING_DUAL_
+  TIER_ORDER=small-first, default hot-first), bit-exact by construction
+  (elementwise commutative masked add) with a real dual-tier GLU
+  bit-identity test. Measured: peak 14.162 vs 14.232 GiB (jitter, not a
+  reduction), tokens 48/48 identical, TTFT inside drift. Kept as a
+  diagnostic knob, default unchanged.
+- B4 (phase policy: uniform tier for long prefill): documented product
+  option gated by the PPL harness at release time (as F4B noted).
+- L4 acceptance: the <=10 GiB target is NOT reached by tier-lifetime
+  variants; the only decomposer is the chunk-end eval boundary (Fase I1
+  machinery) or a chunk-schedule change — both Re-baseline. HOBBIT 8k
+  stays within the 28 GiB ceiling on this box (the guard throttles 8k
+  chunks to 1024 rows; peak 14.23 GiB, phys lifetime max 20.7 GiB, no
+  swap) and stays the default; the formal 'non-default on 48 GiB
+  machines' restriction is a product decision, documented here and not
+  imposed silently.
+
+### L5 — idle-only speculation: stays closed (no new backend evidence)
+
+Precondition not met: Fase 2 measured F_RDADVISE below the 5% threshold
+and STASH lost decode on this NVMe (no idle time worth speculating
+into). The idle-only design (max 1-2 pending reads, empty demand queue,
+cancel-on-demand, one next-layer projection) stays documented; it opens
+only on a backend with measurable idle time.
+
+### L6 — robustness and hygiene
+
+- L6A: atomic pending reservations already land (Fase 5); new test proves
+  convergence after a raising worker, after an executor that rejects the
+  submission, and after close() (reservations and pending both zero).
+- L6B: completion-order run window stays OFF (measured -6.8% decode) and
+  the knob remains diagnostic-only; submission order is the default.
+- L6C: read_expert_into is not re-optimized — the sliding window already
+  removed the drain sawtooth and no profile shows sustained QD gaps or
+  multi-batch components; the FIRST_COMPLETED variant remains the only
+  acceptable re-open, gated on >=2-3% potential.
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.
