@@ -162,15 +162,24 @@ _RUN_WINDOW_COMPLETION = (
 # one attribute guard per read_expert_into call.
 _PROFILE_READS = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
 
-# Fase M2 stage buckets (recorded per component except the per-run ones).
+# Fase M2/A3 stage buckets (recorded per component except the per-run
+# ones). A3 renamed the ambiguous window metrics and cut the old names
+# directly (every pre-A artifact is archived as un-comparable):
+#   queue_wait_us  -> worker_start_delay_us (submit -> worker start)
+#   preadv_us      -> read_duration_us (inside _read_into: SSD/kernel)
+#   future_tail_us -> last_future_wait_us (caller wait for the FINAL run)
+# plus NEW window_wait_us (all caller blocks on window futures together).
+# compare_results.py refuses comparisons whose stage-key vocabularies
+# differ; tests/ snapshot this canonical set (Fase A6).
 _READ_METRICS = (
     "component_e2e_us",
     "reader_resolve_us",
     "plan_us",
     "buffer_alloc_us",
-    "queue_wait_us",
-    "preadv_us",
-    "future_tail_us",
+    "worker_start_delay_us",
+    "read_duration_us",
+    "window_wait_us",
+    "last_future_wait_us",
     "scatter_us",
     "fallback_us",
 )
@@ -454,14 +463,33 @@ _run_io_pool_lock = threading.Lock()
 
 
 class RunPoolTelemetry:
-    """Fase M4: OBSERVED concurrency of the process-wide run pool.
+    """Fase M4/A4: OBSERVED concurrency of the process-wide run pool.
 
     requested_inflight (the caller's window size) is not the effective
     depth: the pool is shared process-wide, so queued tasks may wait for
     workers busy elsewhere. Counters are cumulative; snapshot()/delta()
     attribute a phase from before/after samples. The worker wrapper takes
     two tiny locks (start/finish) and never covers the preadv itself.
+
+    Fase A4 OWNERS: every task may carry an owner tag (e.g. id(backing)).
+    The per-owner counters mirror the global ones and reconcile with them
+    (submitted_A + submitted_B == submitted_total), so a multi-engine
+    process can attribute pool activity to ONE engine. Callers pass an
+    owner ONLY on the profiled path (PROFILE=1 gates wrap/submit_notice),
+    so the off-profile cost stays zero.
     """
+
+    _OWNER_KEYS = (
+        "submitted",
+        "queued",
+        "started",
+        "completed",
+        "failed",
+        "active",
+        "active_peak",
+        "queue_delay_us_max",
+        "active_us_max",
+    )
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -476,17 +504,31 @@ class RunPoolTelemetry:
         self.queue_delay_us_max = 0
         self.active_us_sum = 0
         self.active_us_max = 0
+        self._by_owner: dict[Any, dict] = {}
 
-    def submit_notice(self) -> None:
+    def _owner_state(self, owner: Any) -> dict:
+        st = self._by_owner.get(owner)
+        if st is None:
+            st = {k: 0 for k in self._OWNER_KEYS}
+            self._by_owner[owner] = st
+        return st
+
+    def submit_notice(self, owner: Any = None) -> None:
         """Called on the submitting thread BEFORE executor.submit."""
         with self._lock:
             self.submitted += 1
             self.queued += 1
+            if owner is not None:
+                ost = self._owner_state(owner)
+                ost["submitted"] += 1
+                ost["queued"] += 1
 
-    def wrap(self, submit_ts: int, fn) -> Any:
+    def wrap(self, submit_ts: int, fn, owner: Any = None) -> Any:
         """Wrap one run task. Runs INSIDE the worker: measures queue delay
         (submit -> start) and active duration (start -> finish). Never
-        touches MLX."""
+        touches MLX. With an owner, the same counters accumulate per owner
+        under the SAME lock — never an extra lock or an extra wall-clock
+        read."""
 
         def _w(*a, **k):
             t0 = time.perf_counter_ns()
@@ -500,12 +542,24 @@ class RunPoolTelemetry:
                 self.queue_delay_us_sum += qd
                 if qd > self.queue_delay_us_max:
                     self.queue_delay_us_max = qd
+                ost = self._owner_state(owner) if owner is not None else None
+                if ost is not None:
+                    ost["queued"] = max(0, ost["queued"] - 1)
+                    ost["started"] += 1
+                    ost["active"] += 1
+                    if ost["active"] > ost["active_peak"]:
+                        ost["active_peak"] = ost["active"]
+                    if qd > ost["queue_delay_us_max"]:
+                        ost["queue_delay_us_max"] = qd
             try:
                 result = fn(*a, **k)
             except BaseException:
                 with self._lock:
                     self.active -= 1
                     self.failed += 1
+                    if ost is not None:
+                        ost["active"] -= 1
+                        ost["failed"] += 1
                 raise
             else:
                 t1 = time.perf_counter_ns()
@@ -516,12 +570,22 @@ class RunPoolTelemetry:
                     self.active_us_sum += us
                     if us > self.active_us_max:
                         self.active_us_max = us
+                    if ost is not None:
+                        ost["active"] -= 1
+                        ost["completed"] += 1
+                        if us > ost["active_us_max"]:
+                            ost["active_us_max"] = us
                 return result
 
         return _w
 
-    def snapshot(self) -> dict:
+    def snapshot(self, owner: Any = None) -> dict:
+        """Cumulative counters of one owner, or of the whole process pool
+        when owner is None (the pre-A4 behavior)."""
         with self._lock:
+            if owner is not None:
+                ost = self._owner_state(owner)
+                return {k: ost[k] for k in self._OWNER_KEYS}
             return {
                 "submitted": self.submitted,
                 "queued": self.queued,
@@ -534,12 +598,27 @@ class RunPoolTelemetry:
                 "active_us_max": self.active_us_max,
             }
 
-    def delta(self, before: dict) -> dict:
+    def delta(self, before: dict, owner: Any = None) -> dict:
         """Phase attribution: cumulative counter differences plus the
         conservative observed-peak delta (the pool's all-time peak may
         predate the phase, so peak_delta only grows when the phase raised
-        it)."""
+        it). With an owner, only that owner's tasks are attributed —
+        foreign engines' pool traffic never skews the owner's phase."""
         with self._lock:
+            if owner is not None:
+                ost = self._owner_state(owner)
+                return {
+                    "submitted": ost["submitted"] - before.get("submitted", 0),
+                    "started": ost["started"] - before.get("started", 0),
+                    "completed": ost["completed"] - before.get("completed", 0),
+                    "failed": ost["failed"] - before.get("failed", 0),
+                    "active": ost["active"],
+                    "active_peak_delta": max(
+                        0, ost["active_peak"] - before.get("active_peak", 0)
+                    ),
+                    "queue_delay_us_max": ost["queue_delay_us_max"],
+                    "active_us_max": ost["active_us_max"],
+                }
             return {
                 "submitted": self.submitted - before.get("submitted", 0),
                 "started": self.started - before.get("started", 0),
@@ -1261,17 +1340,16 @@ class ExpertBackingStore:
             # workers never touch MLX). Collected locally, inserted as ONE
             # aggregate record under the telemetry lock (M3).
             comp_t0 = time.perf_counter_ns() if _tel_on else 0
-            first_submit: int | None = None
-            last_finish: int | None = None
             stages: dict[str, list[int]] | None = (
                 {
                     "component_e2e_us": [],
                     "reader_resolve_us": [],
                     "plan_us": [],
                     "buffer_alloc_us": [],
-                    "queue_wait_us": [],
-                    "preadv_us": [],
-                    "future_tail_us": [],
+                    "worker_start_delay_us": [],
+                    "read_duration_us": [],
+                    "window_wait_us": [],
+                    "last_future_wait_us": [],
                     "scatter_us": [],
                     "fallback_us": [],
                 }
@@ -1279,6 +1357,9 @@ class ExpertBackingStore:
                 else None
             )
             run_times: list[tuple[int, int]] | None = [] if _tel_on else None
+            # Fase A4: the owner tag attributes this backing's tasks in the
+            # process-wide pool telemetry (id(self) is stable per call).
+            _owner_tag = id(self) if _tel_on else None
 
             def _record_failed() -> bool:
                 if _tel_on and stages is not None:
@@ -1384,16 +1465,19 @@ class ExpertBackingStore:
                     stages["buffer_alloc_us"].append(
                         (time.perf_counter_ns() - _t_a) // 1000
                     )
+                # A3: the single-run path reads inline on the CALLER thread,
+                # so the worker start delay is 0 by construction and the
+                # read lands in read_duration_us (SSD/kernel time).
                 _t_rd = time.perf_counter_ns() if _tel_on else 0
                 try:
                     reader._read_into(off, buf)
                 except Exception:
                     return _record_failed()
                 if _tel_on and stages is not None:
-                    stages["preadv_us"].append(
+                    stages["read_duration_us"].append(
                         (time.perf_counter_ns() - _t_rd) // 1000
                     )
-                    stages["queue_wait_us"].append(0)
+                    stages["worker_start_delay_us"].append(0)
                 scatter_one(off, first, js, buf)
             else:
                 # Sliding window (K11 + Fase 5b): keep up to _RUN_IO_QD
@@ -1408,16 +1492,16 @@ class ExpertBackingStore:
                 # own disjoint rows.
                 io_exec = _run_io_pool()
                 ptel = getattr(io_exec, "telemetry", None)
-                first_submit: int | None = None
-                last_finish: int | None = None
-                if _tel_on:
-                    first_submit = time.perf_counter_ns()
                 if _RUN_WINDOW_COMPLETION:
                     from concurrent.futures import wait
 
                     window: dict = {}  # future -> (off, first, js, buf)
                     pending_runs = iter(runs)
                     ok = True
+                    # Fase A3: caller-side block on the window futures. The
+                    # wait that begins with only the FINAL run left is the
+                    # true burst tail (last_future_wait_us).
+                    last_wait_t0: int | None = None
 
                     def submit_next():
                         run = next(pending_runs, None)
@@ -1441,6 +1525,7 @@ class ExpertBackingStore:
                                 reader._read_into(off, buf)
                             finally:
                                 if _tel_on and run_times is not None:
+                                    # (worker_start_delay, read_duration)
                                     run_times.append(
                                         (
                                             (t0 - submit_ts) // 1000,
@@ -1450,8 +1535,8 @@ class ExpertBackingStore:
 
                         fn = _timed_run
                         if _tel_on and ptel is not None:
-                            fn = ptel.wrap(submit_ts, fn)
-                            ptel.submit_notice()
+                            fn = ptel.wrap(submit_ts, fn, owner=_owner_tag)
+                            ptel.submit_notice(owner=_owner_tag)
                         fut = io_exec.submit(fn, off, buf, submit_ts, rp.expert_bytes)
                         window[fut] = (off, first, js, buf)
                         return fut
@@ -1463,9 +1548,21 @@ class ExpertBackingStore:
                         if submit_next() is None:
                             break
                     while window:
+                        _t_ww = time.perf_counter_ns() if _tel_on else 0
+                        if _tel_on and len(window) == 1:
+                            last_wait_t0 = _t_ww
                         done, _ = wait(
                             list(window), return_when="FIRST_COMPLETED"
                         )
+                        if _tel_on and stages is not None:
+                            stages["window_wait_us"].append(
+                                (time.perf_counter_ns() - _t_ww) // 1000
+                            )
+                            if last_wait_t0 is not None:
+                                stages["last_future_wait_us"].append(
+                                    (time.perf_counter_ns() - last_wait_t0) // 1000
+                                )
+                                last_wait_t0 = None
                         for fut in done:
                             off, first, js, buf = window.pop(fut)
                             try:
@@ -1474,8 +1571,6 @@ class ExpertBackingStore:
                                 ok = False
                             else:
                                 scatter_one(off, first, js, buf)
-                            if _tel_on:
-                                last_finish = time.perf_counter_ns()
                             submit_next()
                         if not ok:
                             for fut in list(window):
@@ -1488,6 +1583,22 @@ class ExpertBackingStore:
                 else:
                     window: list = []  # (off, first, js, buf, future)
                     ok = True
+
+                    def _wait_future(wfut) -> bool:
+                        # Fase A3: caller-side block on one window future;
+                        # the block duration lands in window_wait_us.
+                        _t_ww = time.perf_counter_ns() if _tel_on else 0
+                        try:
+                            wfut.result()
+                            _okw = True
+                        except BaseException:
+                            _okw = False
+                        if _tel_on and stages is not None:
+                            stages["window_wait_us"].append(
+                                (time.perf_counter_ns() - _t_ww) // 1000
+                            )
+                        return _okw
+
                     for idx, (off, first, count, js) in enumerate(runs):
                         _t_a = time.perf_counter_ns() if _tel_on else 0
                         buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
@@ -1503,6 +1614,7 @@ class ExpertBackingStore:
                                 reader._read_into(off, buf)
                             finally:
                                 if _tel_on and run_times is not None:
+                                    # (worker_start_delay, read_duration)
                                     run_times.append(
                                         (
                                             (t0 - submit_ts) // 1000,
@@ -1512,8 +1624,8 @@ class ExpertBackingStore:
 
                         fn = _timed_run
                         if _tel_on and ptel is not None:
-                            fn = ptel.wrap(submit_ts, fn)
-                            ptel.submit_notice()
+                            fn = ptel.wrap(submit_ts, fn, owner=_owner_tag)
+                            ptel.submit_notice(owner=_owner_tag)
                         window.append(
                             (
                                 off, first, js, buf,
@@ -1522,12 +1634,8 @@ class ExpertBackingStore:
                         )
                         if len(window) >= _RUN_IO_QD or idx == len(runs) - 1:
                             wo, wfirst, wjs, wbuf, wfut = window.pop(0)
-                            try:
-                                wfut.result()
-                            except Exception:
+                            if not _wait_future(wfut):
                                 ok = False
-                            if _tel_on:
-                                last_finish = time.perf_counter_ns()
                             if ok:
                                 scatter_one(wo, wfirst, wjs, wbuf)
                         if not ok:
@@ -1537,31 +1645,41 @@ class ExpertBackingStore:
                                 except Exception:
                                     pass
                             return _record_failed()
-                    for wo, wfirst, wjs, wbuf, wfut in window:
-                        try:
-                            wfut.result()
-                        except Exception:
+                    # Drain: the FINAL element is the last run of the burst;
+                    # its block — measured from when only it remained — is
+                    # the true tail (A3), distinct from the full span.
+                    last_wait_t0: int | None = None
+                    for wi, (wo, wfirst, wjs, wbuf, wfut) in enumerate(window):
+                        if _tel_on and wi == len(window) - 1:
+                            last_wait_t0 = time.perf_counter_ns()
+                        if not _wait_future(wfut):
                             ok = False
-                        if _tel_on:
-                            last_finish = time.perf_counter_ns()
+                        if (
+                            _tel_on
+                            and stages is not None
+                            and wi == len(window) - 1
+                            and last_wait_t0 is not None
+                        ):
+                            stages["last_future_wait_us"].append(
+                                (time.perf_counter_ns() - last_wait_t0) // 1000
+                            )
                         if ok:
                             scatter_one(wo, wfirst, wjs, wbuf)
                     if not ok:
                         return _record_failed()
-            # Fase M2/M3: one aggregate record per component. The worker
-            # threads never take the telemetry lock; their (queue_wait,
-            # preadv) samples merge here under the single per-call lock.
+            # Fase M2/M3/A3: one aggregate record per component. The worker
+            # threads never take the telemetry lock; their per-run
+            # (worker_start_delay, read_duration) samples merge here under
+            # the single per-call lock. window_wait_us and
+            # last_future_wait_us were appended by the window loops above.
             if _tel_on and stages is not None:
-                if (
-                    first_submit is not None
-                    and last_finish is not None
-                ):
-                    stages["future_tail_us"].append(
-                        (last_finish - first_submit) // 1000
-                    )
                 if run_times:
-                    stages["queue_wait_us"].extend(us for us, _pv in run_times)
-                    stages["preadv_us"].extend(_pv for _qw, _pv in run_times)
+                    stages["worker_start_delay_us"].extend(
+                        us for us, _rd in run_times
+                    )
+                    stages["read_duration_us"].extend(
+                        _rd for _ws, _rd in run_times
+                    )
                 stages["component_e2e_us"].append(
                     (time.perf_counter_ns() - comp_t0) // 1000
                 )
