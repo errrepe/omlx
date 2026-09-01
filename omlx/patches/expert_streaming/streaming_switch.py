@@ -899,6 +899,9 @@ class _LayerLoadContext:
         # Fase L1: union declined a demand set over _CTX_UNION_MAX_BYTES; the
         # linears fall back to the legacy per-expert resolution.
         self.declined = False
+        # Fase L1: why the last resolve failed, when it did (read_failure vs
+        # bank_too_large) so the fallback counter reports the true reason.
+        self.fallback_reason: str | None = None
 
     # -- helpers ------------------------------------------------------------
 
@@ -996,6 +999,7 @@ class _LayerLoadContext:
         self.bundles[lid] = cached
         self.hits[lid] = len(cached)
         self.misses[lid] = len(missing)
+        bank_bytes = int(linear._tier_bank_bytes_for(missing))
 
         if missing:
             if fut is not None:
@@ -1017,6 +1021,9 @@ class _LayerLoadContext:
             rows = None if got is None else got[1]
             if rows is None or len(rows) != len(missing):
                 self.failed = True
+                self.fallback_reason = (
+                    "bank_too_large" if bank_bytes > _BANK_MAX_BYTES else "read_failure"
+                )
                 if memtrace.enabled:
                     memtrace.record(
                         "ctx.ensure.fail",
@@ -1024,6 +1031,7 @@ class _LayerLoadContext:
                         proj=getattr(linear, "proj_name", "?"),
                         uniq=len(ids),
                         miss=len(missing),
+                        reason=self.fallback_reason,
                     )
                 return
             self.bundles[lid].update(zip(missing, rows))
@@ -1090,6 +1098,14 @@ class _LayerLoadContext:
         for (proj, ids), rows in zip(jobs, results):
             if rows is None or len(rows) != len(ids):
                 self.failed = True
+                self.fallback_reason = (
+                    "bank_too_large"
+                    if any(
+                        p._tier_bank_bytes_for(ids_) > _BANK_MAX_BYTES
+                        for p, ids_ in jobs
+                    )
+                    else "read_failure"
+                )
                 return
             self.bundles[id(proj)].update(zip(ids, rows))
         if memtrace.enabled:
@@ -2019,10 +2035,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # background so banks are not all resident at once.
             plan.ctx.ensure(self, plan.uniq_list)
             # Fase L1: count every fallback to the legacy per-expert
-            # resolution so runs can prove the fast path engaged.
+            # resolution so runs can prove the fast path engaged. The ctx
+            # records WHICH reason when the read came back unusable.
             if plan.ctx.failed:
                 context_bundles = None
-                _count_ctx_fallback("read_failure")
+                _count_ctx_fallback(
+                    getattr(plan.ctx, "fallback_reason", None) or "read_failure"
+                )
             elif getattr(plan.ctx, "declined", False):
                 context_bundles = None
                 _count_ctx_fallback("bank_too_large")
