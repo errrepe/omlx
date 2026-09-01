@@ -430,6 +430,23 @@ async def run(
             _reset_peak()
         except Exception:
             pass
+    # Fase M3: the streaming backing is resolved ONCE (walked from the
+    # engine holders) and feeds the read telemetry + ctx fallback + pin
+    # exports below — one source of truth, available before the request.
+    _bk = None
+    _pinner = None
+    for holder in (
+        engine,
+        getattr(engine, "_model", None),
+        getattr(engine, "_vlm_model", None),
+    ):
+        if holder is None:
+            continue
+        _cand = getattr(holder, "_expert_streaming_backing", None)
+        if _cand is not None:
+            _bk = _cand
+            _pinner = getattr(_bk, "_pin_controller", None)
+            break
     sampler.start()
     sampler.mark("prefill")
     # Fase M3: phase-scope the backing telemetry so read_stats splits
@@ -584,23 +601,6 @@ async def run(
     stats = None
     profile = None
     pf_stats = None
-    # Fase M3: the streaming backing is resolved ONCE (walked from the
-    # engine holders) and feeds the read telemetry + ctx fallback + pin
-    # exports below — one source of truth.
-    _bk = None
-    _pinner = None
-    for holder in (
-        engine,
-        getattr(engine, "_model", None),
-        getattr(engine, "_vlm_model", None),
-    ):
-        if holder is None:
-            continue
-        _cand = getattr(holder, "_expert_streaming_backing", None)
-        if _cand is not None:
-            _bk = _cand
-            _pinner = getattr(_bk, "_pin_controller", None)
-            break
     if cache is not None:
         stats = {
             "hits": cache.stats.hits,
@@ -706,7 +706,7 @@ async def run(
         from omlx.patches.expert_streaming import warmer as _warmer_cfg
 
         _expert_qd = getattr(_ss_cfg._EXPERT_IO_POOL, "_max_workers", None)
-        _effective_config = _effective_config(
+        _effective_config_out = _effective_config(
             git_sha=_GIT_SHA,
             single_request=single_request,
             decode_tokens=decode,
@@ -728,7 +728,8 @@ async def run(
         )
         from omlx.patches.expert_streaming.shard_bank import _RUN_IO_QD as _rqd_cfg
 
-        _effective_config["run_qd"] = int(_rqd_cfg)
+        _effective_config_out["run_qd"] = int(_rqd_cfg)
+        _effective_config = _effective_config_out
     except Exception:
         _effective_config = None
     phys_end = get_phys_footprint() / 1024**3
