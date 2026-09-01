@@ -2237,6 +2237,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             cold_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 1]
             tier_demand[0] = [uniq[i] for i in hot_idx]
             tier_demand[1] = [uniq[i] for i in cold_idx]
+            # Fase L4A: per-tier byte attribution for the whole layer call.
+            hot_req = [uniq[i] for i in hot_idx]
+            cold_req = [uniq[i] for i in cold_idx]
+            hot_bank_bytes = self._tier_bank_bytes_for(hot_req) if hot_req else 0
+            cold_bank_bytes = self._tier_bank_bytes_for(cold_req) if cold_req else 0
             if memtrace.enabled:
                 memtrace.record(
                     "dual_tier.enter",
@@ -2245,6 +2250,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     positions=len(plan.uniq_list),
                     hot_positions=len(hot_idx),
                     cold_positions=len(cold_idx),
+                    hot_bank_bytes=hot_bank_bytes,
+                    cold_bank_bytes=cold_bank_bytes,
                 )
             for i, eid in enumerate(uniq):
                 t = 0 if i in set(hot_idx) else 1  # hot_rank lookup
@@ -2317,7 +2324,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     # Fase L4A: one bank_ready event per tier, so the trace
                     # can attribute the peak to hot or cold residency.
                     memtrace.record(
-                        "dual_tier.bank_promoted",
+                        "dual_tier.%s.bank_ready" % ("hot" if t == 0 else "cold"),
                         layer=self.layer_idx,
                         proj=self.proj_name,
                         tier=t,
@@ -2332,11 +2339,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 tier_remapped_np = tier_map[flat_np].reshape(plan.indices_shape)
                 if memtrace.enabled:
                     memtrace.record(
-                        "dual_tier.qmm_submitted",
+                        "dual_tier.%s.qmm_submitted" % ("hot" if t == 0 else "cold"),
                         layer=self.layer_idx,
                         proj=self.proj_name,
                         tier=t,
-                        positions=(tier_remapped_np >= 0).sum(),
+                        positions=int((tier_remapped_np >= 0).sum()),
                     )
                 # gather_qmm takes UNSIGNED row indices — -1 wraps to a huge
                 # OOB index (garbage/nan) that the keep mask cannot undo
@@ -2366,7 +2373,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 keep = mx.array(keep_np).reshape(keep_shape)
                 if memtrace.enabled:
                     memtrace.record(
-                        "dual_tier.mask_created",
+                        "dual_tier.mask_ready",
                         layer=self.layer_idx,
                         proj=self.proj_name,
                         tier=t,
@@ -2374,7 +2381,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 tier_out = tier_out * keep
                 if memtrace.enabled:
                     memtrace.record(
-                        "dual_tier.outputs_added",
+                        "dual_tier.add_submitted",
                         layer=self.layer_idx,
                         proj=self.proj_name,
                         tier=t,
@@ -2383,11 +2390,14 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 out = tier_out if out is None else out + tier_out
             if memtrace.enabled:
                 memtrace.record(
-                    "dual_tier.exit",
+                    "dual_tier.layer_exit",
                     layer=self.layer_idx,
                     proj=self.proj_name,
+                    positions=len(plan.uniq_list),
                     hot_positions=len(hot_idx),
                     cold_positions=len(cold_idx),
+                    hot_bank_bytes=hot_bank_bytes,
+                    cold_bank_bytes=cold_bank_bytes,
                 )
             if out is None:
                 # Degenerate: every unique expert hot (hot bank == full uniq
