@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -134,6 +135,67 @@ def _bench_settings(
     )
 
 
+def _effective_config(
+    *,
+    git_sha: str | None,
+    single_request: bool,
+    decode_tokens: int,
+    chunk_schedule: dict,
+    budget_gib: float,
+    cold_tier: str | None,
+    hot_fraction: float | None,
+    pins: bool,
+    pinner: Any,
+    model_fingerprint: Any,
+    run_qd: int,
+    expert_qd: int,
+    prefill_qd: int,
+    knobs: list[str] | None = None,
+) -> dict:
+    """Fase M5: the immutable effective-config block of one bench run.
+
+    Every result carries the EFFECTIVE state (module constants read here,
+    not the CLI intent), so compare_results.py can refuse A/B comparisons
+    across incompatible instrumentation, schedules or cache protocols.
+    """
+    from omlx.patches.expert_streaming import streaming_switch as _ss
+    from omlx.patches.expert_streaming import warmer as _warmer_mod
+    from omlx.patches.expert_streaming.memtrace import memtrace as _mt
+    from omlx.patches.expert_streaming.shard_bank import _PROFILE_READS as _prof
+
+    return {
+        "git_sha": git_sha,
+        "model_fingerprint": model_fingerprint,
+        "single_request": bool(single_request),
+        "decode_tokens": int(decode_tokens),
+        "chunk_schedule": dict(chunk_schedule),
+        "budget_gib": float(budget_gib),
+        "cold_tier": cold_tier,
+        "hot_fraction": hot_fraction,
+        "ctx_mode_policy": "hybrid" if _ss._CTX_ROLLING_ENV else "union",
+        "decode_union_rows": int(_ss._DECODE_UNION_MAX_ROWS),
+        "ctx_ahead": int(_ss._CTX_PREFETCH_AHEAD),
+        "expert_qd": int(expert_qd),
+        "run_qd": int(run_qd),
+        "prefill_qd": int(prefill_qd),
+        "run_merge_gap": int(_ss._RUN_MERGE_GAP),
+        "ra_enabled": bool(_warmer_mod.RA_ENABLED),
+        "stash_enabled": bool(_ss._STASH_ENV),
+        "pins_enabled": bool(pins),
+        "pin_sync_effective": bool(
+            getattr(pinner, "pin_sync", False) if pinner is not None else False
+        ),
+        "pin_regime_effective": (
+            getattr(pinner, "pin_regime", None) if pinner is not None else None
+        ),
+        "profile_enabled": bool(_prof),
+        "memtrace_enabled": bool(_mt.enabled),
+        "read_sampling_mode": "profile" if _prof else "off",
+        "cache_cool_protocol": "warm-page-cache",
+        "experiment_knobs": list(knobs or []),
+    }
+
+
 def find_streaming_cache(vlm_model):
     layers = None
     for path in [
@@ -191,6 +253,7 @@ async def run(
     gate_tokens: bool = False,
     pin_gib: float | None = None,
     pin_regime: str = "decode",
+    knobs: list[str] | None = None,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -200,6 +263,16 @@ async def run(
 
     model_path = MODEL_PATHS[model_key]
     entry_name = DEFAULT_ENTRIES[model_key]
+    # Fase M5: record the exact code revision of the run.
+    _GIT_SHA = None
+    try:
+        import subprocess
+
+        _GIT_SHA = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], text=True
+        ).strip()
+    except Exception:
+        _GIT_SHA = None
 
     print(f"=== {model_key} budget {budget}G decode {decode} mtp {mtp} block {mtp_block} ane {ane} prompt {prompt_len} ===")
     pool = EnginePool(scheduler_config=SchedulerConfig(hot_cache_max_size=0))
@@ -611,6 +684,38 @@ async def run(
                 }
             )
 
+    # Fase M5: the effective-config block — everything a fair comparison
+    # must hold constant, read from the EFFECTIVE state.
+    try:
+        from omlx.patches.expert_streaming import streaming_switch as _ss_cfg
+        from omlx.patches.expert_streaming import warmer as _warmer_cfg
+
+        _expert_qd = getattr(_ss_cfg._EXPERT_IO_POOL, "_max_workers", None)
+        _effective_config = _effective_config(
+            git_sha=_GIT_SHA,
+            single_request=single_request,
+            decode_tokens=decode,
+            chunk_schedule=chunk_schedule,
+            budget_gib=budget,
+            cold_tier=cold_tier,
+            hot_fraction=hot_fraction,
+            pins=pins,
+            pinner=_pinner,
+            model_fingerprint=(
+                getattr(_pinner, "model_fingerprint", None)
+                if _pinner is not None
+                else None
+            ),
+            run_qd=0,
+            expert_qd=_expert_qd or 0,
+            prefill_qd=_ss_cfg._PREFILL_QD_ENV,
+            knobs=knobs,
+        )
+        from omlx.patches.expert_streaming.shard_bank import _RUN_IO_QD as _rqd_cfg
+
+        _effective_config["run_qd"] = int(_rqd_cfg)
+    except Exception:
+        _effective_config = None
     phys_end = get_phys_footprint() / 1024**3
     try:
         from omlx.utils.proc_memory import get_lifetime_max_phys_footprint
@@ -640,6 +745,7 @@ async def run(
             "memtrace_summary": _memtrace_summary,
             "ctx_fallback_to_legacy": _ctx_fb,
             "pin": _pin_out,
+            "effective_config": _effective_config,
             "resources": res_summary,
             "tokens": _tokens if isinstance(_tokens, list) else None,
             "bit_exact_kind": _bit_exact_kind,
@@ -697,6 +803,9 @@ def main():
     ap.add_argument("--warm-control", type=float, default=0.0, metavar="GIB", help="post-load deterministic warmup budget")
     ap.add_argument("--pin-gib", type=float, default=None, metavar="GIB",
                     help="pin budget for --pins arms (default 0.25) — L2 matrix: 0.25/0.5/1.25")
+    ap.add_argument("--knob", action="append", default=None, metavar="KNOB",
+                    help="declare an experiment knob (e.g. pins_enabled) that A/B"
+                         "comparison may differ on (Fase M5)")
     ap.add_argument("--pin-regime", choices=["decode", "prefill"], default="decode",
                     help="regime whose learned profile drives the pin selection (arm E: prefill)")
     ap.add_argument("--min-free-gb", type=float, default=22.0, metavar="GB",
@@ -752,6 +861,7 @@ def main():
             gate_tokens=args.gate_tokens,
             pin_gib=args.pin_gib,
             pin_regime=args.pin_regime,
+            knobs=args.knob,
         )
     )
 
