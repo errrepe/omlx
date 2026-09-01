@@ -264,7 +264,16 @@ class ModelSettings:
         # load so the hot set is wired from token 1. Zero output change.
     )
     expert_streaming_pin_gib: Optional[float] = (
-        None  # Pin budget in GiB (default env OMLX_EXPERT_STREAMING_PIN_GIB or 1.25)
+        None  # Pin budget in GiB (default env OMLX_EXPERT_STREAMING_PIN_GIB or 0.25)
+    )
+    expert_streaming_pin_sync: Optional[bool] = (
+        None  # Fase M1: apply the learned pins synchronously at engine load
+        # (default env OMLX_EXPERT_STREAMING_PIN_SYNC or off). Bench arms set
+        # it so the mlock pass provably completes before the first request.
+    )
+    expert_streaming_pin_regime: Optional[str] = (
+        None  # Fase M1: profile regime that drives the pin selection —
+        # "decode" or "prefill" (default env OMLX_EXPERT_STREAMING_PIN_REGIME).
     )
     expert_streaming_cold_tier: Optional[str] = (
         None  # Cold precision tier for streamed experts: "2"/"3" reads expert

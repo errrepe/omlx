@@ -79,6 +79,8 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
         "expert_streaming_pins": None,
         "expert_streaming_hot_fraction": None,
         "expert_streaming_pin_gib": None,
+        "expert_streaming_pin_sync": None,
+        "expert_streaming_pin_regime": None,
     }
     if model_settings is None:
         return raw
@@ -1172,6 +1174,15 @@ def convert_model_to_streaming(
                     pin_profile_path = _warmer_mod.PIN_PROFILE_PATH or str(
                         Path(model_path) / ".omlx" / "expert_pin_profile.json"
                     )
+                    # Fase M1: effective pin sync/regime — the model setting
+                    # wins when set; env constants remain the fallback for
+                    # unset models (server compatibility).
+                    _pin_regime_eff = io_ov["expert_streaming_pin_regime"]
+                    if _pin_regime_eff is None:
+                        _pin_regime_eff = _warmer_mod.PIN_REGIME
+                    _pin_sync_eff = io_ov["expert_streaming_pin_sync"]
+                    if _pin_sync_eff is None:
+                        _pin_sync_eff = _warmer_mod.PIN_SYNC_ENABLED
                     # Fase L: the pin profile applies only when the loaded
                     # model's fingerprint matches the one it was learned from.
                     # hot_fraction resolves inside the cold-tier branch above;
@@ -1204,6 +1215,8 @@ def convert_model_to_streaming(
                         num_experts=estimate.experts_per_layer,
                         model_fingerprint=_pin_fp,
                         packing=_pin_fp.get("packing"),
+                        pin_regime=_pin_regime_eff,
+                        pin_sync=_pin_sync_eff,
                     )
                     # Save-on-unload hook: engines call save_expert_pin_profile()
                     # in stop() while the backing is still reachable.

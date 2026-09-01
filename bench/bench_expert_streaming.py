@@ -79,6 +79,61 @@ class FakeEnforcer:
         pass
 
 
+def _bench_settings(
+    pins: bool,
+    pin_gib: float | None,
+    pin_regime: str,
+    budget: float,
+    topk: float | None,
+    cold_tier: str | None,
+    hot_fraction: float | None,
+    mtp: bool,
+    mtp_block: int | None,
+    ane: bool,
+    specprefill_draft: str | None,
+    specprefill_keep: float | None,
+):
+    """Fase M1: the bench's ModelSettings, wired EXPLICITLY.
+
+    Pins arrive as model settings (pin regime + sync), never as a late
+    os.environ mutation after engine load — the PinController is built
+    inside get_engine, so env written later cannot be relied on.
+    """
+    from omlx.model_settings import ModelSettings
+
+    return ModelSettings(
+        expert_streaming_enabled=True,
+        expert_streaming_budget_gib=budget,
+        expert_streaming_topk_threshold=topk,
+        expert_streaming_cold_tier=cold_tier,
+        # Fase I6 HOBBIT split: top fraction of experts per layer (by
+        # learned pin-profile frequency) keeps the ORIGINAL packing while
+        # the rest read the cold tier. Requires --cold-tier + a profile.
+        expert_streaming_hot_fraction=hot_fraction,
+        # --pins (parity with the ppl harness): mlock the observed hot
+        # experts and LEARN the pin profile this run persists on unload —
+        # the decode-dominant hot set for the prefill x decode overlap study.
+        expert_streaming_pins=pins or None,
+        expert_streaming_pin_gib=(pin_gib if pin_gib is not None else 0.25)
+        if pins
+        else None,
+        # Fase M1: explicit wiring — the controller receives these BEFORE
+        # the first request; no reliance on late env mutation.
+        expert_streaming_pin_regime=pin_regime if pins else None,
+        expert_streaming_pin_sync=True if pins else None,
+        qwen4_ple_ssd_offload=True,
+        vlm_mtp_enabled=mtp,
+        vlm_mtp_draft_block_size=mtp_block,
+        qwen35_ane_prefill_enabled=ane,
+        specprefill_enabled=bool(specprefill_draft),
+        specprefill_draft_model=specprefill_draft,
+        specprefill_keep_pct=specprefill_keep,
+        # The bench prompt is 7440 tokens; the product default threshold
+        # (8192) would never trigger. Score any long-prompt run.
+        specprefill_threshold=2048,
+    )
+
+
 def find_streaming_cache(vlm_model):
     layers = None
     for path in [
@@ -156,30 +211,9 @@ async def run(
         return
     pool._process_memory_enforcer = None  # keep _propagate no-op path quiet
 
-    settings = ModelSettings(
-        expert_streaming_enabled=True,
-        expert_streaming_budget_gib=budget,
-        expert_streaming_topk_threshold=topk,
-        expert_streaming_cold_tier=cold_tier,
-        # Fase I6 HOBBIT split: top fraction of experts per layer (by
-        # learned pin-profile frequency) keeps the ORIGINAL packing while
-        # the rest read the cold tier. Requires --cold-tier + a profile.
-        expert_streaming_hot_fraction=hot_fraction,
-        # --pins (parity with the ppl harness): mlock the observed hot
-        # experts and LEARN the pin profile this run persists on unload —
-        # the decode-dominant hot set for the prefill×decode overlap study.
-        expert_streaming_pins=pins or None,
-        expert_streaming_pin_gib=(pin_gib if pin_gib is not None else 0.25) if pins else None,
-        qwen4_ple_ssd_offload=True,
-        vlm_mtp_enabled=mtp,
-        vlm_mtp_draft_block_size=mtp_block,
-        qwen35_ane_prefill_enabled=ane,
-        specprefill_enabled=bool(specprefill_draft),
-        specprefill_draft_model=specprefill_draft,
-        specprefill_keep_pct=specprefill_keep,
-        # The bench prompt is 7440 tokens; the product default threshold
-        # (8192) would never trigger. Score any long-prompt run.
-        specprefill_threshold=2048,
+    settings = _bench_settings(
+        pins, pin_gib, pin_regime, budget, topk, cold_tier, hot_fraction,
+        mtp, mtp_block, ane, specprefill_draft, specprefill_keep,
     )
     runtime = pool._entry_runtime_resident_size(entry, settings)
     print(f"runtime est {runtime / 1024**3:.2f}G")
@@ -212,10 +246,8 @@ async def run(
     except Exception as e:
         print(f"scheduler limit setup skipped: {e}")
 
-    # Fase L: bench arms need the mlock pass finished before the first
-    # request and a chosen pin regime (arm E: prefill profile on decode).
-    os.environ["OMLX_EXPERT_STREAMING_PIN_SYNC"] = "1" if pins else ""
-    os.environ["OMLX_EXPERT_STREAMING_PIN_REGIME"] = pin_regime
+    # Fase M1: pin sync/regime are wired through ModelSettings BEFORE
+    # get_engine (see _bench_settings) — no late os.environ mutation here.
 
     vlm_model = getattr(engine, "_vlm_model", None)
     cache = find_streaming_cache(vlm_model)
@@ -486,6 +518,7 @@ async def run(
 
         # Fase L: pin accounting (only when --pins armed a PinController).
         _pin_out = {
+            "requested": pins,
             "pin_budget_gib": round((pin_gib if pin_gib is not None else 0.25), 3)
             if pins
             else 0.0,
@@ -493,6 +526,12 @@ async def run(
             "pinned_experts": 0,
             "pinned_pages_estimate": 0,
             "profile_regime": pin_regime if pins else None,
+            "pin_sync_requested": pins,
+            "pin_sync_effective": False,
+            "pin_regime_requested": pin_regime if pins else None,
+            "pin_regime_effective": None,
+            "pin_profile_loaded_at_engine_load": False,
+            "pin_applied_before_first_request": False,
             "profile_fingerprint_match": None,
             "pin_load_time_ms": 0.0,
         }
@@ -516,6 +555,15 @@ async def run(
                     "pinned_experts": getattr(_bk, "pinned_count", 0),
                     "pinned_pages_estimate": _pinner.pinned_pages_estimate,
                     "profile_regime": _pinner.profile_regime,
+                    "pin_sync_effective": getattr(_pinner, "pin_sync", False),
+                    "pin_regime_effective": _pinner.pin_regime,
+                    "pin_profile_loaded_at_engine_load": getattr(
+                        _pinner, "pins_applied_at_load", False
+                    ),
+                    "pin_applied_before_first_request": (
+                        getattr(_pinner, "pins_applied_at_load", False)
+                        and bool(getattr(_pinner, "pin_sync", False))
+                    ),
                     "profile_fingerprint_match": _pinner.fingerprint_match,
                     "pin_load_time_ms": round(_pinner.pin_load_time_ms, 1),
                 }

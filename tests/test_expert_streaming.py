@@ -1495,6 +1495,8 @@ def test_io_overrides_resolution_and_clamping():
         "expert_streaming_pins": None,
         "expert_streaming_hot_fraction": None,
         "expert_streaming_pin_gib": None,
+        "expert_streaming_pin_sync": None,
+        "expert_streaming_pin_regime": None,
     }
 
     # Depth clamping and boolean pass-through
@@ -3809,6 +3811,148 @@ class TestFaseKRunMerge:
             runs = lin._group_runs(ids)
         assert runs[0] == (1, 2), f"hot run must stay intact: {runs}"
         assert (4, 2) in runs or (4, 1) in runs
+
+
+
+class TestFaseM1PinWiring:
+    """Fase M1: pins reach the PinController as explicit configuration
+    before the first request — settings win over env, the bench wires them
+    ahead of engine load, and the JSON proves the effective values."""
+
+    def _regime_settings(self, regime: str = "prefill"):
+        from bench.bench_expert_streaming import _bench_settings
+
+        return _bench_settings(
+            pins=True,
+            pin_gib=0.5,
+            pin_regime=regime,
+            budget=0.0,
+            topk=None,
+            cold_tier=None,
+            hot_fraction=None,
+            mtp=False,
+            mtp_block=None,
+            ane=False,
+            specprefill_draft=None,
+            specprefill_keep=None,
+        )
+
+    def test_bench_settings_wire_regime_and_sync(self):
+        """The bench builds ModelSettings with the pin knobs explicitly,
+        so the controller inside get_engine sees them from token 1."""
+        s = self._regime_settings("prefill")
+        assert s.expert_streaming_pins is True
+        assert s.expert_streaming_pin_regime == "prefill"
+        assert s.expert_streaming_pin_sync is True
+        assert s.expert_streaming_pin_gib == 0.5
+        s_off = self._regime_settings()
+        s_off.expert_streaming_pins = None
+        s_off.expert_streaming_pin_regime = None
+        s_off.expert_streaming_pin_sync = None
+        s_off.expert_streaming_pin_gib = None
+
+    def test_pin_settings_override_env_defaults(self, tmp_path, monkeypatch):
+        """Explicit constructor args win over the env constants; when None,
+        the env fallbacks still apply (server compatibility)."""
+        from collections import Counter
+
+        from omlx.patches.expert_streaming import warmer as warmer_mod
+
+        monkeypatch.setattr(warmer_mod, "PIN_REGIME", "decode")
+        monkeypatch.setattr(warmer_mod, "PIN_SYNC_ENABLED", False)
+        linears = {0: [self._stub_lin()]}
+        backing = self._pin_backing()
+        # Explicit: prefill regime + sync on.
+        ctl = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024,
+            pin_regime="prefill", pin_sync=True,
+        )
+        assert ctl.pin_regime == "prefill"
+        assert ctl.profile_regime == "prefill"
+        assert ctl.pin_sync is True
+        # Unset: env fallback constants apply.
+        ctl2 = warmer_mod.PinController(linears, backing, per_expert_bytes=1024)
+        assert ctl2.pin_regime == "decode"
+        assert ctl2.pin_sync is False
+
+    def test_pin_regime_invalid_falls_back_to_decode(self):
+        from omlx.patches.expert_streaming import warmer as warmer_mod
+
+        linears = {0: [self._stub_lin()]}
+        backing = self._pin_backing()
+        ctl = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, pin_regime="bogus",
+        )
+        assert ctl.pin_regime == "decode"
+
+    def _stub_lin(self):
+        from types import SimpleNamespace
+
+        base = "model.layers.0.mlp.switch_mlp.gate_proj"
+        return SimpleNamespace(
+            stacked_weight_key=f"{base}.weight",
+            stacked_scales_key=f"{base}.scales",
+            stacked_biases_key=None,
+            backing=None,
+        )
+
+    def _pin_backing(self, per_expert: int = 1024):
+        class _Reader:
+            def __init__(self, name, width):
+                self.path = f"stub-{name}"
+                self.width = width
+
+            def expert_byte_range(self, key, eid):
+                return int(eid) * self.width, (int(eid) + 1) * self.width
+
+        class _B:
+            def __init__(self):
+                self.path = "stub"
+                self.pinned_calls: list = []
+                self.pinned_bytes = 0
+                self._pinned: set = set()
+
+            def _reader_for_key(self, key, expert_id=None):
+                return _Reader("hot", per_expert)
+
+            def pin_expert(self, key, expert_id):
+                self.pinned_calls.append((key, int(expert_id)))
+                self._pinned.add((key, int(expert_id)))
+                self.pinned_bytes += per_expert
+                return per_expert
+
+            @property
+            def pinned_count(self):
+                return len(self._pinned)
+
+        return _B()
+
+    def test_sync_pin_completes_before_first_request(self, tmp_path):
+        """pin_sync=True with a learned profile: the mlock pass finishes
+        inside the controller construction — proven by pins_applied_at_load
+        and the backing's wired bytes."""
+        import json
+
+        from collections import Counter
+
+        from omlx.patches.expert_streaming import warmer as warmer_mod
+
+        profile = str(tmp_path / "expert_pin_profile.json")
+        linears = {0: [self._stub_lin()]}
+        backing = self._pin_backing()
+        ctl = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, profile_path=profile,
+        )
+        ctl.freq = {0: Counter({3: 9})}
+        ctl.save_profile()
+        ctl2 = warmer_mod.PinController(
+            linears, backing, per_expert_bytes=1024, profile_path=profile,
+            pin_sync=True,
+        )
+        assert ctl2.pins_applied_at_load is True
+        assert ctl2.pin_sync is True
+        assert backing.pinned_count > 0
+        assert ctl2.pin_load_time_ms > 0.0
 
 
 class TestFaseL1CtxObservability:

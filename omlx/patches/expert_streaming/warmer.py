@@ -228,7 +228,8 @@ class PinController:
         num_experts: int = 0,
         model_fingerprint: Dict[str, Any] | None = None,
         packing: str | None = None,
-        pin_regime: str = PIN_REGIME,
+        pin_regime: str | None = None,
+        pin_sync: bool | None = None,
     ):
         self.linears_by_layer = linears_by_layer
         self.backing = backing
@@ -243,7 +244,14 @@ class PinController:
         # Fase L: per-regime learned frequencies. decode = routing calls at
         # or below _MAX_WARM_ROWS positions; prefill = larger calls.
         self.regimes: Dict[str, Dict[int, Counter]] = {"decode": {}, "prefill": {}}
+        # Fase M1: explicit wiring wins; the env constant is the fallback
+        # when the caller passes None (server defaults, tests).
+        if pin_regime is None:
+            pin_regime = PIN_REGIME
+        if pin_sync is None:
+            pin_sync = PIN_SYNC_ENABLED
         self.pin_regime = pin_regime if pin_regime in ("decode", "prefill") else "decode"
+        self.pin_sync = bool(pin_sync)
         self.model_fingerprint = (dict(model_fingerprint) if model_fingerprint else None)
         self.packing = packing
         # None = no fingerprint to verify; True/False after a v2 load.
@@ -259,9 +267,13 @@ class PinController:
         self.profile_path = PIN_PROFILE_PATH or profile_path
         if self.profile_path and self._load_profile():
             # Learned hot set available: pin immediately, no observation.
-            # Sync only when the bench/developer opt-in says so — the server
+            # Sync only when the effective wiring says so — the server
             # default keeps pins off the request path.
-            self._pin_all(sync=PIN_SYNC_ENABLED)
+            self._pin_all(sync=self.pin_sync)
+        # Fase M1: truthful load-time flags for the bench JSON — a profile
+        # was loaded at engine load, and the wired pins were applied before
+        # the first request when the effective sync is on.
+        self.pins_applied_at_load = self.pinned
 
     @property
     def freq(self) -> Dict[int, Counter]:
