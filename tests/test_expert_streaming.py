@@ -3970,6 +3970,234 @@ thread-safe; ctx fallback counters are per-cache."""
         assert ss.ExpertLRUCache(0, 4096).ctx_fallback_stats() == {}
 
 
+
+class TestFaseM2M4StageAndPoolTelemetry:
+    """Fase M2/M4: stage-split read timers (pool/SSD/planner/scatter) and
+    observed run-pool concurrency — requested QD is not effective depth."""
+
+    @staticmethod
+    def _backing(tmp: Path, enabled: bool = True):
+        import numpy as np
+
+        from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
+
+        key = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        per = 4 * 4 * 2
+        _write_shard_filled(tmp / "model.safetensors", {key: ((16, 4, 4), "BF16")})
+        (tmp / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "model.safetensors"}})
+        )
+        backing = ExpertBackingStore(tmp)
+        backing.read_telemetry.enabled = enabled
+        return backing, key, per
+
+    def test_read_telemetry_splits_plan_queue_preadv_scatter(self, tmp_path):
+        """A fake reader with known sleeps: each stage lands in ITS bucket,
+        with the counts and magnitudes the fixture implies."""
+        import time
+
+        from omlx.patches.expert_streaming import shard_bank as sb_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            reader = backing._reader_for_key(key)
+            orig = reader._read_into
+
+            def slow(off, buf):
+                time.sleep(0.002)
+                return orig(off, buf)
+
+            reader._read_into = slow
+            out = np.empty((4, per), dtype=np.uint8)
+            assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+            snap = backing.read_telemetry.summary()
+            st = snap["lifetime"]["stages_us"]
+            assert st["preadv_us"]["count"] == 2, st
+            assert st["preadv_us"]["p50"] >= 1900, st  # ~2 ms per run
+            assert st["queue_wait_us"]["count"] == 2
+            assert st["plan_us"]["count"] == 1
+            assert st["reader_resolve_us"]["count"] == 1
+            assert st["scatter_us"]["count"] == 2, st
+            assert st["component_e2e_us"]["count"] == 1
+            tail = st["future_tail_us"]
+            assert tail["count"] == 1 and tail["p50"] is not None, tail
+
+    def test_component_e2e_covers_all_stages(self, tmp_path):
+        """e2e >= the sequential host stages (resolve+plan+scatter+reads)"""
+        import time
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            reader = backing._reader_for_key(key)
+            orig = reader._read_into
+
+            def slow(off, buf):
+                time.sleep(0.001)
+                return orig(off, buf)
+
+            reader._read_into = slow
+            out = np.empty((4, per), dtype=np.uint8)
+            assert backing.read_expert_into([(key, [0, 1, 2, 3])], [out])
+            st = backing.read_telemetry.summary()["lifetime"]["stages_us"]
+            e2e = st["component_e2e_us"]["p50"] or 0
+            host = 0
+            for m in ("reader_resolve_us", "plan_us", "preadv_us", "scatter_us"):
+                host += st[m]["sum"]
+            assert e2e >= host, (e2e, host)
+
+    def test_run_timing_recorded_when_worker_raises(self, tmp_path):
+        """A failing worker records the component as failed with a
+        fallback_us duration — the caller's legacy fallback is visible."""
+        from omlx.patches.expert_streaming import shard_bank as sb_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            reader = backing._reader_for_key(key)
+            orig = reader._read_into
+
+            def boom(off, buf):
+                raise OSError("disk gone")
+
+            reader._read_into = boom
+            out = np.empty((4, per), dtype=np.uint8)
+            assert not backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+            st = backing.read_telemetry.summary()["lifetime"]["stages_us"]
+            assert st["fallback_us"]["count"] >= 1, st
+            assert st["component_e2e_us"]["count"] >= 1
+            assert backing.read_telemetry.summary()["lifetime"]["failed_calls"] >= 1
+
+    def test_telemetry_does_not_touch_mlx_in_worker(self, tmp_path):
+        """The profiled worker path (submit wrapper) must never create MLX
+        arrays — patch mx.array to raise and run a profiled multi-run read."""
+        from unittest.mock import patch
+
+        from omlx.patches.expert_streaming import shard_bank as sb_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            out = np.empty((4, per), dtype=np.uint8)
+            with patch.object(sb_mod.mx, "array", side_effect=AssertionError("MLX in worker")):
+                assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+            assert backing.read_telemetry.summary()["lifetime"]["calls"] == 1
+
+    def test_run_pool_active_peak_less_than_requested_when_workers_busy(
+        self, tmp_path, monkeypatch
+    ):
+        """Fase M4: with ONE worker, four runs request in-flight=4 but the
+        observed pool active peak is 1 — requested QD is a window, not
+        effective depth."""
+        import threading
+        import time
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        from omlx.patches.expert_streaming import shard_bank as sb_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            reader = backing._reader_for_key(key)
+            orig = reader._read_into
+
+            def slow(off, buf):
+                time.sleep(0.002)
+                return orig(off, buf)
+
+            reader._read_into = slow
+            out = np.empty((4, per), dtype=np.uint8)
+            old_singleton = sb_mod._RUN_IO_POOL_SINGLETON
+            old_qd = sb_mod._RUN_IO_QD
+            one = ThreadPoolExecutor(max_workers=1, thread_name_prefix="one-run")
+            one.telemetry = sb_mod.RunPoolTelemetry()
+            try:
+                sb_mod._RUN_IO_POOL_SINGLETON = one
+                monkeypatch.setattr(sb_mod, "_RUN_IO_QD", 4)
+                assert backing.read_expert_into([(key, [0, 2, 4, 6])], [out])
+            finally:
+                sb_mod._RUN_IO_POOL_SINGLETON = old_singleton
+                one.shutdown(wait=True, cancel_futures=True)
+            snap = one.telemetry.snapshot()
+            assert snap["submitted"] == 4
+            assert snap["started"] == 4 and snap["completed"] == 4
+            assert snap["active_peak"] == 1, snap
+            assert snap["queue_delay_us_max"] > 0, "later runs queued"
+            req = backing.read_telemetry.summary()["lifetime"]["requested_inflight_peak"]
+            assert req == 4 and snap["active_peak"] == 1 < req
+
+    def test_pool_telemetry_balances_after_success_failure_cancel(self):
+        """submitted == started + queued holds across success, failure and
+        cancellation (cancelled tasks never start, so they stay queued)."""
+        import time
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        from omlx.patches.expert_streaming import shard_bank as sb_mod
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        tel = sb_mod.RunPoolTelemetry()
+        try:
+            slow_ts = time.perf_counter_ns()
+            slow = tel.wrap(slow_ts, lambda: time.sleep(0.05))
+            tel.submit_notice()
+            f_slow = pool.submit(slow)
+            for _ in range(3):
+                ts = time.perf_counter_ns()
+                fn = tel.wrap(ts, lambda: 1)
+                tel.submit_notice()
+                pool.submit(fn)
+            # Two more wrapped jobs: one success, one failure.
+            okt = time.perf_counter_ns()
+            okf = tel.wrap(okt, lambda: 2)
+            tel.submit_notice()
+            assert pool.submit(okf).result() == 2
+            bad = tel.wrap(time.perf_counter_ns(), lambda: 1 / 0)
+            tel.submit_notice()
+            try:
+                pool.submit(bad).result()
+                assert False, "must raise"
+            except ZeroDivisionError:
+                pass
+            f_slow.result()
+            snap = tel.snapshot()
+            assert snap["completed"] == 5 and snap["failed"] == 1, snap
+            assert snap["started"] == snap["completed"] + snap["failed"]
+            # Balance invariant: every submission is either started or still
+            # queued; cancelled tasks never start, so they stay queued.
+            assert snap["submitted"] == snap["started"] + snap["queued"], snap
+            assert snap["active"] == 0
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def test_run_pool_telemetry_does_not_change_read_bytes(self, tmp_path):
+        """Pool wrapping is measurement-only: outputs stay byte-identical.
+        """
+        import time
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        from omlx.patches.expert_streaming import shard_bank as sb_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            backing, key, per = self._backing(Path(td))
+            old = sb_mod._RUN_IO_POOL_SINGLETON
+            pools = []
+            results = []
+            try:
+                for on in (False, True):
+                    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="p2")
+                    pool.telemetry = sb_mod.RunPoolTelemetry() if on else None
+                    pools.append(pool)
+                    monkeypatch_pool = pool
+                    sb_mod._RUN_IO_POOL_SINGLETON = pool
+                    out = np.empty((4, per), dtype=np.uint8)
+                    assert backing.read_expert_into([(key, [3, 4, 7, 8])], [out])
+                    results.append(np.copy(out))
+            finally:
+                sb_mod._RUN_IO_POOL_SINGLETON = old
+                for p in pools:
+                    p.shutdown(wait=True, cancel_futures=True)
+            assert np.array_equal(results[0], results[1]), "wrapper changed bytes"
+
+
 class TestFaseM1PinWiring:
     """Fase M1: pins reach the PinController as explicit configuration
     before the first request — settings win over env, the bench wires them

@@ -453,6 +453,107 @@ _RUN_IO_POOL_SINGLETON: ThreadPoolExecutor | None = None
 _run_io_pool_lock = threading.Lock()
 
 
+class RunPoolTelemetry:
+    """Fase M4: OBSERVED concurrency of the process-wide run pool.
+
+    requested_inflight (the caller's window size) is not the effective
+    depth: the pool is shared process-wide, so queued tasks may wait for
+    workers busy elsewhere. Counters are cumulative; snapshot()/delta()
+    attribute a phase from before/after samples. The worker wrapper takes
+    two tiny locks (start/finish) and never covers the preadv itself.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.submitted = 0
+        self.queued = 0
+        self.started = 0
+        self.completed = 0
+        self.failed = 0
+        self.active = 0
+        self.active_peak = 0
+        self.queue_delay_us_sum = 0
+        self.queue_delay_us_max = 0
+        self.active_us_sum = 0
+        self.active_us_max = 0
+
+    def submit_notice(self) -> None:
+        """Called on the submitting thread BEFORE executor.submit."""
+        with self._lock:
+            self.submitted += 1
+            self.queued += 1
+
+    def wrap(self, submit_ts: int, fn) -> Any:
+        """Wrap one run task. Runs INSIDE the worker: measures queue delay
+        (submit -> start) and active duration (start -> finish). Never
+        touches MLX."""
+
+        def _w(*a, **k):
+            t0 = time.perf_counter_ns()
+            with self._lock:
+                self.queued = max(0, self.queued - 1)
+                self.started += 1
+                self.active += 1
+                if self.active > self.active_peak:
+                    self.active_peak = self.active
+                qd = max(0, t0 - submit_ts) // 1000
+                self.queue_delay_us_sum += qd
+                if qd > self.queue_delay_us_max:
+                    self.queue_delay_us_max = qd
+            try:
+                result = fn(*a, **k)
+            except BaseException:
+                with self._lock:
+                    self.active -= 1
+                    self.failed += 1
+                raise
+            else:
+                t1 = time.perf_counter_ns()
+                with self._lock:
+                    self.active -= 1
+                    self.completed += 1
+                    us = (t1 - t0) // 1000
+                    self.active_us_sum += us
+                    if us > self.active_us_max:
+                        self.active_us_max = us
+                return result
+
+        return _w
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "submitted": self.submitted,
+                "queued": self.queued,
+                "started": self.started,
+                "completed": self.completed,
+                "failed": self.failed,
+                "active": self.active,
+                "active_peak": self.active_peak,
+                "queue_delay_us_max": self.queue_delay_us_max,
+                "active_us_max": self.active_us_max,
+            }
+
+    def delta(self, before: dict) -> dict:
+        """Phase attribution: cumulative counter differences plus the
+        conservative observed-peak delta (the pool's all-time peak may
+        predate the phase, so peak_delta only grows when the phase raised
+        it)."""
+        with self._lock:
+            return {
+                "submitted": self.submitted - before.get("submitted", 0),
+                "started": self.started - before.get("started", 0),
+                "completed": self.completed - before.get("completed", 0),
+                "failed": self.failed - before.get("failed", 0),
+                "active": self.active,
+                "active_peak_delta": max(
+                    0, self.active_peak - before.get("active_peak", 0)
+                ),
+                "queue_delay_us_max": self.queue_delay_us_max,
+                "active_us_max": self.active_us_max,
+            }
+
+
 def _run_io_pool() -> ThreadPoolExecutor:
     """Threads for the per-run preadvs of read_expert_into calls.
 
@@ -480,6 +581,9 @@ def _run_io_pool() -> ThreadPoolExecutor:
                     max_workers=_RUN_IO_QD,
                     thread_name_prefix="omlx-expert-run",
                 )
+                # Fase M4: observed-concurrency telemetry of the pooled
+                # workers (active/queued/delays), used by PROFILE arms.
+                _RUN_IO_POOL_SINGLETON.telemetry = RunPoolTelemetry()
     return _RUN_IO_POOL_SINGLETON
 
 
@@ -1147,33 +1251,77 @@ class ExpertBackingStore:
         expert-id order so outs[i][j] is expert eids[j].
         """
         _tel_on = self.read_telemetry is not None and self.read_telemetry.enabled
-        _read_t0 = time.perf_counter_ns() if _tel_on else None
         if len(components) != len(outs):
             return False
         for (key, eids), out in zip(components, outs):
             if out.dtype != np.uint8 or out.ndim != 2:
                 return False
             n = len(eids)
+            # Fase M2: per-component stage timings (host timestamps only —
+            # workers never touch MLX). Collected locally, inserted as ONE
+            # aggregate record under the telemetry lock (M3).
+            comp_t0 = time.perf_counter_ns() if _tel_on else 0
+            first_submit: int | None = None
+            last_finish: int | None = None
+            stages: dict[str, list[int]] | None = (
+                {
+                    "component_e2e_us": [],
+                    "reader_resolve_us": [],
+                    "plan_us": [],
+                    "buffer_alloc_us": [],
+                    "queue_wait_us": [],
+                    "preadv_us": [],
+                    "future_tail_us": [],
+                    "scatter_us": [],
+                    "fallback_us": [],
+                }
+                if _tel_on
+                else None
+            )
+            run_times: list[tuple[int, int]] | None = [] if _tel_on else None
+
+            def _record_failed() -> bool:
+                if _tel_on and stages is not None:
+                    elapsed = [(time.perf_counter_ns() - comp_t0) // 1000]
+                    stages["component_e2e_us"] = elapsed
+                    stages["fallback_us"] = elapsed
+                    self.read_telemetry.record_call(
+                        runs=0,
+                        bytes_=0,
+                        run_sizes=[],
+                        requested_inflight=0,
+                        failed=True,
+                        timings=stages,
+                    )
+                return False
+
             # Fase K: resolve the reader per expert (tier-aware) and require
             # ONE reader for the component — mixed tiers cannot share the
             # uniform output layout.
+            if _tel_on and stages is not None:
+                _t_rs = time.perf_counter_ns()
             try:
                 readers = [self._reader_for_key(key, int(e)) for e in eids]
             except Exception:
-                return False
+                return _record_failed()
             if n == 0:
                 continue
             reader = readers[0]
             if any(r is not reader for r in readers[1:]):
-                return False
+                return _record_failed()
             try:
                 rp = reader._rp_for(key)
             except Exception:
-                return False
+                return _record_failed()
             if out.shape[0] != n or out.shape[1] != rp.expert_bytes:
-                return False
+                return _record_failed()
             if any(eid < 0 or eid >= rp.num_experts for eid in eids):
-                return False
+                return _record_failed()
+            if _tel_on and stages is not None:
+                stages["reader_resolve_us"].append(
+                    (time.perf_counter_ns() - _t_rs) // 1000
+                )
+                _t_pl = time.perf_counter_ns()
             # Read contiguous runs separately. This keeps sparse demand from
             # over-reading the gap between the first and last expert. Fase K
             # K5: with merge_gap > 0 a run may BRIDGE holes of up to
@@ -1197,6 +1345,8 @@ class ExpertBackingStore:
                 hi = bisect.bisect_left(sorted_ids, first + count)
                 off = rp.tensor_abs_off + first * rp.expert_bytes
                 runs.append((off, first, count, order[lo:hi]))
+            if _tel_on and stages is not None:
+                stages["plan_us"].append((time.perf_counter_ns() - _t_pl) // 1000)
 
             # Issue each batch's preadvs concurrently. One at a time they are
             # a chain of blocking syscalls, which pins the device's I/O queue
@@ -1217,17 +1367,33 @@ class ExpertBackingStore:
                 # the slice index, which is what would corrupt every id
                 # behind a bridge. Rows are disjoint per descriptor, so the
                 # byte content of out never depends on completion order.
+                _t_sc = time.perf_counter_ns() if _tel_on else 0
                 for j in js:
                     base = (eids[j] - first) * rp.expert_bytes
                     out[j, :] = buf[base : base + rp.expert_bytes]
+                if _tel_on and stages is not None:
+                    stages["scatter_us"].append(
+                        (time.perf_counter_ns() - _t_sc) // 1000
+                    )
 
             if len(runs) == 1:
                 off, first, count, js = runs[0]
+                _t_a = time.perf_counter_ns() if _tel_on else 0
                 buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                if _tel_on and stages is not None:
+                    stages["buffer_alloc_us"].append(
+                        (time.perf_counter_ns() - _t_a) // 1000
+                    )
+                _t_rd = time.perf_counter_ns() if _tel_on else 0
                 try:
                     reader._read_into(off, buf)
                 except Exception:
-                    return False
+                    return _record_failed()
+                if _tel_on and stages is not None:
+                    stages["preadv_us"].append(
+                        (time.perf_counter_ns() - _t_rd) // 1000
+                    )
+                    stages["queue_wait_us"].append(0)
                 scatter_one(off, first, js, buf)
             else:
                 # Sliding window (K11 + Fase 5b): keep up to _RUN_IO_QD
@@ -1241,6 +1407,11 @@ class ExpertBackingStore:
                 # bytes stay deterministic: each descriptor scatters its
                 # own disjoint rows.
                 io_exec = _run_io_pool()
+                ptel = getattr(io_exec, "telemetry", None)
+                first_submit: int | None = None
+                last_finish: int | None = None
+                if _tel_on:
+                    first_submit = time.perf_counter_ns()
                 if _RUN_WINDOW_COMPLETION:
                     from concurrent.futures import wait
 
@@ -1253,8 +1424,35 @@ class ExpertBackingStore:
                         if run is None:
                             return None
                         (off, first, cnt, js) = run
+                        # Fase M2/M4: buffer alloc + queue/wait + preadv are
+                        # measured around the worker; the pool wrapper adds
+                        # observed-concurrency counters when profiling.
+                        _t_a = time.perf_counter_ns() if _tel_on else 0
                         buf = np.empty(cnt * rp.expert_bytes, dtype=np.uint8)
-                        fut = io_exec.submit(reader._read_into, off, buf)
+                        if _tel_on and stages is not None:
+                            stages["buffer_alloc_us"].append(
+                                (time.perf_counter_ns() - _t_a) // 1000
+                            )
+                        submit_ts = time.perf_counter_ns() if _tel_on else 0
+
+                        def _timed_run(off, buf, submit_ts, rp_bytes):
+                            t0 = time.perf_counter_ns() if _tel_on else 0
+                            try:
+                                reader._read_into(off, buf)
+                            finally:
+                                if _tel_on and run_times is not None:
+                                    run_times.append(
+                                        (
+                                            (t0 - submit_ts) // 1000,
+                                            (time.perf_counter_ns() - t0) // 1000,
+                                        )
+                                    )
+
+                        fn = _timed_run
+                        if _tel_on and ptel is not None:
+                            fn = ptel.wrap(submit_ts, fn)
+                            ptel.submit_notice()
+                        fut = io_exec.submit(fn, off, buf, submit_ts, rp.expert_bytes)
                         window[fut] = (off, first, js, buf)
                         return fut
 
@@ -1276,6 +1474,8 @@ class ExpertBackingStore:
                                 ok = False
                             else:
                                 scatter_one(off, first, js, buf)
+                            if _tel_on:
+                                last_finish = time.perf_counter_ns()
                             submit_next()
                         if not ok:
                             for fut in list(window):
@@ -1284,16 +1484,40 @@ class ExpertBackingStore:
                                 except Exception:
                                     pass
                                 window.pop(fut, None)
-                            return False
+                            return _record_failed()
                 else:
                     window: list = []  # (off, first, js, buf, future)
                     ok = True
                     for idx, (off, first, count, js) in enumerate(runs):
+                        _t_a = time.perf_counter_ns() if _tel_on else 0
                         buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                        if _tel_on and stages is not None:
+                            stages["buffer_alloc_us"].append(
+                                (time.perf_counter_ns() - _t_a) // 1000
+                            )
+                        submit_ts = time.perf_counter_ns() if _tel_on else 0
+
+                        def _timed_run(off, buf, submit_ts, rp_bytes):
+                            t0 = time.perf_counter_ns() if _tel_on else 0
+                            try:
+                                reader._read_into(off, buf)
+                            finally:
+                                if _tel_on and run_times is not None:
+                                    run_times.append(
+                                        (
+                                            (t0 - submit_ts) // 1000,
+                                            (time.perf_counter_ns() - t0) // 1000,
+                                        )
+                                    )
+
+                        fn = _timed_run
+                        if _tel_on and ptel is not None:
+                            fn = ptel.wrap(submit_ts, fn)
+                            ptel.submit_notice()
                         window.append(
                             (
                                 off, first, js, buf,
-                                io_exec.submit(reader._read_into, off, buf),
+                                io_exec.submit(fn, off, buf, submit_ts, rp.expert_bytes),
                             )
                         )
                         if len(window) >= _RUN_IO_QD or idx == len(runs) - 1:
@@ -1302,6 +1526,8 @@ class ExpertBackingStore:
                                 wfut.result()
                             except Exception:
                                 ok = False
+                            if _tel_on:
+                                last_finish = time.perf_counter_ns()
                             if ok:
                                 scatter_one(wo, wfirst, wjs, wbuf)
                         if not ok:
@@ -1310,29 +1536,41 @@ class ExpertBackingStore:
                                     fut.result()
                                 except Exception:
                                     pass
-                            return False
+                            return _record_failed()
                     for wo, wfirst, wjs, wbuf, wfut in window:
                         try:
                             wfut.result()
                         except Exception:
                             ok = False
+                        if _tel_on:
+                            last_finish = time.perf_counter_ns()
                         if ok:
                             scatter_one(wo, wfirst, wjs, wbuf)
                     if not ok:
-                        return False
-            # Fase M3: one aggregated record per component — the worker
-            # threads never take the telemetry lock. _read_t0 wraps the
-            # whole component (reader resolve + plan + runs + scatter), so
-            # component_e2e_us is the service latency the caller observes.
-            if _tel_on:
+                        return _record_failed()
+            # Fase M2/M3: one aggregate record per component. The worker
+            # threads never take the telemetry lock; their (queue_wait,
+            # preadv) samples merge here under the single per-call lock.
+            if _tel_on and stages is not None:
+                if (
+                    first_submit is not None
+                    and last_finish is not None
+                ):
+                    stages["future_tail_us"].append(
+                        (last_finish - first_submit) // 1000
+                    )
+                if run_times:
+                    stages["queue_wait_us"].extend(us for us, _pv in run_times)
+                    stages["preadv_us"].extend(_pv for _qw, _pv in run_times)
+                stages["component_e2e_us"].append(
+                    (time.perf_counter_ns() - comp_t0) // 1000
+                )
                 self.read_telemetry.record_call(
                     runs=len(runs),
                     bytes_=sum(cnt * rp.expert_bytes for (_o, _f, cnt, _js) in runs),
                     run_sizes=[cnt for (_o, _f, cnt, _js) in runs],
                     requested_inflight=min(_RUN_IO_QD, len(runs)),
-                    timings={
-                        "component_e2e_us": [(time.perf_counter_ns() - _read_t0) // 1000]
-                    },
+                    timings=stages,
                 )
         return True
 

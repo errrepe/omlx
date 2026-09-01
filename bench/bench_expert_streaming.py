@@ -362,8 +362,19 @@ async def run(
     # Fase M3: phase-scope the backing telemetry so read_stats splits
     # prefill vs decode without cross-contamination.
     _tel = getattr(_bk, "read_telemetry", None) if _bk is not None else None
+    _pool_before = None
     if _tel is not None and _tel.enabled:
         _tel.begin_phase("prefill", request_id="bench-1", engine_id=entry_name)
+        # Fase M4: observed run-pool concurrency around the request — the
+        # delta attributes the pool-wide activity (shared process pool).
+        try:
+            from omlx.patches.expert_streaming.shard_bank import _run_io_pool as _rip
+
+            _ptel = getattr(_rip(), "telemetry", None)
+            if _ptel is not None:
+                _pool_before = _ptel.snapshot()
+        except Exception:
+            _pool_before = None
     if single_request:
         # Single-request avoids the second full prefill; TTFT is first streamed token.
         t_request = time.perf_counter()
@@ -415,6 +426,16 @@ async def run(
         n = int(out2.completion_tokens)
         if _tel is not None and _tel.enabled:
             _tel.end_phase()
+    _pool_after = None
+    if _pool_before is not None:
+        try:
+            from omlx.patches.expert_streaming.shard_bank import _run_io_pool as _rip
+
+            _ptel2 = getattr(_rip(), "telemetry", None)
+            if _ptel2 is not None:
+                _pool_after = _ptel2.delta(_pool_before)
+        except Exception:
+            _pool_after = None
     if n <= 0:
         raise SystemExit("benchmark produced zero completion tokens")
     tokps = n / max(t_decode, 1e-9)
@@ -615,6 +636,7 @@ async def run(
             "prefetcher": pf_stats,
             "advise_stats": advise_stats,
             "read_stats": _read_stats_out,
+            "run_pool": _pool_after,
             "memtrace_summary": _memtrace_summary,
             "ctx_fallback_to_legacy": _ctx_fb,
             "pin": _pin_out,
