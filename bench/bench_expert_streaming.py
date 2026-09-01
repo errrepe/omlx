@@ -193,7 +193,94 @@ def _effective_config(
         "read_sampling_mode": "profile" if _prof else "off",
         "cache_cool_protocol": "warm-page-cache",
         "experiment_knobs": list(knobs or []),
+        "active_engines": int(
+            os.environ.get("OMLX_EXPERT_STREAMING_ACTIVE_ENGINES", "1")
+        ),
     }
+
+
+# Fase A1: phase switches shared by BOTH bench paths. The legacy path must
+# never close "prefill" before the first engine.chat() — that chat RUNS the
+# prefill — and the read_stats + memtrace telemetries must switch in the
+# SAME order so the two agree on the boundary. All three helpers are
+# unit-tested (Fase A6): the legacy flow is exactly open/switch/close
+# around the two chats.
+def open_phase(tel, mt6, phase: str, engine_id: str) -> None:
+    """Open a phase in read telemetry and memtrace together."""
+    if tel is not None and tel.enabled:
+        tel.begin_phase(phase, request_id="bench-1", engine_id=engine_id)
+    if mt6 is not None:
+        try:
+            mt6.set_context(phase=phase, request_id="bench-1", engine_id=engine_id)
+        except Exception:
+            pass
+
+
+def switch_phase(tel, mt6, phase: str, engine_id: str) -> None:
+    """Close the open read-stats scope, open a phase, then move memtrace —
+    one boundary, both telemetries (Fase A1)."""
+    if tel is not None and tel.enabled:
+        tel.end_phase()
+        tel.begin_phase(phase, request_id="bench-1", engine_id=engine_id)
+    if mt6 is not None:
+        try:
+            mt6.set_context(phase=phase, request_id="bench-1", engine_id=engine_id)
+        except Exception:
+            pass
+
+
+def close_phase(tel) -> None:
+    """Close the open read-stats scope (memtrace keeps its teardown ctx)."""
+    if tel is not None and tel.enabled:
+        tel.end_phase()
+
+
+# Fase A2: fields that must be present and non-empty in EVERY effective
+# config — a result without them is un-comparable by construction. The
+# nullable reporter fields (cold_tier, hot_fraction, model_fingerprint,
+# pin_*) stay out by design: they are legitimately absent without pins.
+_REQUIRED_EFFECTIVE_CONFIG_FIELDS = (
+    "git_sha",
+    "single_request",
+    "decode_tokens",
+    "chunk_schedule",
+    "budget_gib",
+    "ctx_mode_policy",
+    "decode_union_rows",
+    "ctx_ahead",
+    "expert_qd",
+    "run_qd",
+    "prefill_qd",
+    "run_merge_gap",
+    "ra_enabled",
+    "stash_enabled",
+    "pins_enabled",
+    "profile_enabled",
+    "memtrace_enabled",
+    "read_sampling_mode",
+    "cache_cool_protocol",
+    "active_engines",
+)
+
+
+def assert_effective_config_complete(cfg, *, gate: bool) -> None:
+    """Fase A2 fail-high: a null or incomplete effective_config must never
+    land in a gated artifact. Under --gate-tokens this aborts BEFORE any
+    result is written; outside gate mode it warns loudly."""
+    missing = [
+        f
+        for f in _REQUIRED_EFFECTIVE_CONFIG_FIELDS
+        if cfg is None or cfg.get(f) in (None, "")
+    ]
+    if not missing:
+        return
+    _msg = (
+        "effective_config incomplete (missing %s); a silent artifact "
+        "would be un-comparable by construction" % ", ".join(missing)
+    )
+    if gate:
+        raise SystemExit("bench aborted: " + _msg)
+    print("WARNING: " + _msg)
 
 
 def find_streaming_cache(vlm_model):
@@ -453,30 +540,34 @@ async def run(
     # prefill vs decode without cross-contamination.
     _tel = getattr(_bk, "read_telemetry", None) if _bk is not None else None
     _pool_before = None
-    # Fase M6: tag every memtrace row with the current phase/request.
+    # Fase A1: one memtrace handle for both paths (inert when unavailable).
     try:
         from omlx.patches.expert_streaming.memtrace import memtrace as _mt6
-
-        _mt6.set_context(phase="prefill", request_id="bench-1", engine_id=entry_name)
     except Exception:
-        pass
-    if _tel is not None and _tel.enabled:
-        _tel.begin_phase("prefill", request_id="bench-1", engine_id=entry_name)
-        # Fase M4: observed run-pool concurrency around the request — the
-        # delta attributes the pool-wide activity (shared process pool).
-        try:
-            from omlx.patches.expert_streaming.shard_bank import _run_io_pool as _rip
+        _mt6 = None
+    # Fase M4/A4: the POOL snapshot brackets the whole request (prefill +
+    # decode). Its delta is owner-filtered to THIS backing, so a second
+    # engine's pool traffic can never skew the bench's run_pool block
+    # (without a backing or telemetry, owner=None gives the process-wide
+    # view by design).
+    _owner_tag = id(_bk) if _bk is not None else None
+    _owner_filter = _owner_tag if _tel is not None and _tel.enabled else None
+    try:
+        from omlx.patches.expert_streaming.shard_bank import _run_io_pool as _rip
 
-            _ptel = getattr(_rip(), "telemetry", None)
-            if _ptel is not None:
-                _pool_before = _ptel.snapshot()
-        except Exception:
-            _pool_before = None
+        _ptel = getattr(_rip(), "telemetry", None)
+        if _ptel is not None:
+            _pool_before = _ptel.snapshot(owner=_owner_filter)
+    except Exception:
+        _pool_before = None
     if single_request:
         # Single-request avoids the second full prefill; TTFT is first streamed token.
         t_request = time.perf_counter()
         first_output_at = None
         out2 = None
+        # Fase A1: the prefill scope opens immediately before the call that
+        # RUNS it (the first stream iteration) — never earlier.
+        open_phase(_tel, _mt6, "prefill", entry_name)
         async for output in engine.stream_chat(
             messages, max_tokens=decode, temperature=0.0
         ):
@@ -486,21 +577,15 @@ async def run(
             ):
                 first_output_at = time.perf_counter()
                 _peak_phase("prefill")
-                if _tel is not None and _tel.enabled:
-                    _tel.end_phase()
-                    _tel.begin_phase("decode", request_id="bench-1", engine_id=entry_name)
-                try:
-                    _mt6.set_context(phase="decode", request_id="bench-1", engine_id=entry_name)
-                except Exception:
-                    pass
+                # Fase A1: first streamed token == prefill done; both
+                # telemetries switch to decode at the SAME boundary.
+                switch_phase(_tel, _mt6, "decode", entry_name)
                 sampler.mark("decode")
         if out2 is None:
             raise SystemExit("single-request benchmark produced no output")
         if _tel is not None and _tel.enabled and first_output_at is None:
-            _tel.end_phase()
-            _tel.begin_phase("decode", request_id="bench-1", engine_id=entry_name)
-        if _tel is not None and _tel.enabled:
-            _tel.end_phase()
+            switch_phase(_tel, _mt6, "decode", entry_name)
+        close_phase(_tel)
         end_request = time.perf_counter()
         if first_output_at is None:
             first_output_at = end_request
@@ -512,21 +597,22 @@ async def run(
         prompt_tokens = getattr(out2, "prompt_tokens", None)
         print(f"TTFT (stream first token) {ttft:.1f}s prompt {prompt_tokens}")
     else:
-        if _tel is not None and _tel.enabled:
-            _tel.end_phase()
-            _tel.begin_phase("decode", request_id="bench-1", engine_id=entry_name)
+        # Fase A1: the prefill scope opens right before the FIRST chat —
+        # that chat RUNS the prefill. It closes ONLY after the chat
+        # returns; the decode chat runs under the decode scope.
+        open_phase(_tel, _mt6, "prefill", entry_name)
         t1 = time.perf_counter()
         out1 = await engine.chat(messages, max_tokens=1, temperature=0.0)
         ttft = time.perf_counter() - t1
         _peak_phase("prefill")
         sampler.mark("decode")
         print(f"TTFT (1 tok) {ttft:.1f}s prompt {out1.prompt_tokens}")
+        switch_phase(_tel, _mt6, "decode", entry_name)
         t2 = time.perf_counter()
         out2 = await engine.chat(messages, max_tokens=decode, temperature=0.0)
         t_decode = time.perf_counter() - t2
         n = int(out2.completion_tokens)
-        if _tel is not None and _tel.enabled:
-            _tel.end_phase()
+        close_phase(_tel)
     try:
         _mt6.set_context(phase="teardown", request_id="bench-1", engine_id=entry_name)
     except Exception:
@@ -538,7 +624,9 @@ async def run(
 
             _ptel2 = getattr(_rip(), "telemetry", None)
             if _ptel2 is not None:
-                _pool_after = _ptel2.delta(_pool_before)
+                # Fase A4: attribute ONLY this bench's backing to run_pool;
+                # foreign engines' traffic is excluded by the owner filter.
+                _pool_after = _ptel2.delta(_pool_before, owner=_owner_filter)
         except Exception:
             _pool_after = None
     if n <= 0:
@@ -732,6 +820,9 @@ async def run(
         _effective_config = _effective_config_out
     except Exception:
         _effective_config = None
+    # Fase A2 fail-high: under --gate-tokens a null/incomplete block
+    # ABORTS here, before any artifact is written; otherwise it warns.
+    assert_effective_config_complete(_effective_config, gate=gate_tokens)
     phys_end = get_phys_footprint() / 1024**3
     try:
         from omlx.utils.proc_memory import get_lifetime_max_phys_footprint
@@ -762,6 +853,10 @@ async def run(
             "ctx_fallback_to_legacy": _ctx_fb,
             "pin": _pin_out,
             "effective_config": _effective_config,
+            # Fase A5: left null by the bench; the PROFILE=0 vs PROFILE=1
+            # gate pair (bench/overhead_probe.py) fills it with the
+            # per-call instrumentation cost when the machine frees up.
+            "instrumentation_overhead": None,
             "resources": res_summary,
             "tokens": _tokens if isinstance(_tokens, list) else None,
             "bit_exact_kind": _bit_exact_kind,
