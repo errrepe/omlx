@@ -25,16 +25,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 MODEL_PATHS = {
     "qwen": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-oQ4e-mtp",
+    "qwen-jang": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4S",
     "glm": "/Volumes/SSD 4TB/AI Models/GLM-5.3-Flash-oQ4e",
     "dsv4": "/Volumes/SSD 4TB/AI Models/DeepSeek-V4-Flash-0731-oQ4e-mtp",
 }
 DEFAULT_ENTRIES = {
     "qwen": "Qwen3.8-Flash-Next-oQ4e-mtp",
+    "qwen-jang": "Qwen3.8-Flash-Next-JANG_4S",
     "glm": "GLM-5.3-Flash-oQ4e",
     "dsv4": "DeepSeek-V4-Flash-0731-oQ4e-mtp",
 }
 PROMPTS = {
     "qwen": [{"role": "user", "content": "Hello, how are you?"}],
+    "qwen-jang": [{"role": "user", "content": "Hello, how are you?"}],
     "glm": [{"role": "user", "content": "Hello, how are you?"}],
     "dsv4": [{"role": "user", "content": "Hello, how are you?"}],
 }
@@ -817,12 +820,11 @@ async def run(
         from omlx.patches.expert_streaming.shard_bank import _RUN_IO_QD as _rqd_cfg
 
         _effective_config_out["run_qd"] = int(_rqd_cfg)
-        _effective_config = _effective_config_out
     except Exception:
-        _effective_config = None
+        _effective_config_out = None
     # Fase A2 fail-high: under --gate-tokens a null/incomplete block
     # ABORTS here, before any artifact is written; otherwise it warns.
-    assert_effective_config_complete(_effective_config, gate=gate_tokens)
+    assert_effective_config_complete(_effective_config_out, gate=gate_tokens)
     phys_end = get_phys_footprint() / 1024**3
     try:
         from omlx.utils.proc_memory import get_lifetime_max_phys_footprint
@@ -852,7 +854,7 @@ async def run(
             "memtrace_summary": _memtrace_summary,
             "ctx_fallback_to_legacy": _ctx_fb,
             "pin": _pin_out,
-            "effective_config": _effective_config,
+            "effective_config": _effective_config_out,
             # Fase A5: left null by the bench; the PROFILE=0 vs PROFILE=1
             # gate pair (bench/overhead_probe.py) fills it with the
             # per-call instrumentation cost when the machine frees up.

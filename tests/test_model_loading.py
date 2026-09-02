@@ -770,6 +770,7 @@ class TestExpandPerLayerQuantKeys:
         assert cfg["quantization"]["language_model.lm_head"] == {
             "bits": 8,
             "group_size": 64,
+            "mode": "affine",
         }
 
     def test_adds_swapped_prefix_variant_for_model_language_model_key(self):
@@ -807,14 +808,16 @@ class TestExpandPerLayerQuantKeys:
 
         model_loading.expand_per_layer_quant_keys(cfg)
 
-        assert (
-            cfg["quantization"]["model.layers.1.mlp.gate.proj"]
-            == {"bits": 8, "group_size": 64}
-        )
-        assert (
-            cfg["quantization"]["model.layers.2.mlp.gate.proj"]
-            == {"bits": 8, "group_size": 64}
-        )
+        assert cfg["quantization"]["model.layers.1.mlp.gate.proj"] == {
+            "bits": 8,
+            "group_size": 64,
+            "mode": "affine",
+        }
+        assert cfg["quantization"]["model.layers.2.mlp.gate.proj"] == {
+            "bits": 8,
+            "group_size": 64,
+            "mode": "affine",
+        }
         # The original key is preserved (other code paths may still use it)
         assert "model.layers.1.mlp.gate" in cfg["quantization"]
 
@@ -834,6 +837,59 @@ class TestExpandPerLayerQuantKeys:
         model_loading.expand_per_layer_quant_keys(cfg)
 
         assert cfg["quantization"][f"inner.{gate}"] == spec
+
+    def test_adds_runtime_variant_for_jangq_shallow_key(self):
+        """JANGQ publisher specs nest text keys one level shallower.
+
+        ``language_model.layers.N.*`` lives at
+        ``language_model.model.layers.N.*`` at runtime; without the deep
+        variant nn.quantize falls back to the global bits and strict
+        loading fails on shape mismatch.
+        """
+        key = "language_model.layers.0.mlp.switch_mlp.gate_proj"
+        cfg = {
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                key: {"bits": 3, "group_size": 64},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        deep = "language_model.model.layers.0.mlp.switch_mlp.gate_proj"
+        assert cfg["quantization"][deep] == {
+            "bits": 3,
+            "group_size": 64,
+            "mode": "affine",
+        }
+
+    def test_skips_runtime_variant_for_ple_keys(self):
+        """PLE shards are mmap-served, never quantized modules."""
+        key = "language_model.layers.0.ple.ngram_embedding.weight"
+        cfg = {
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                key: {"bits": 2, "group_size": 32},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert "language_model.model.layers.0.ple.ngram_embedding.weight" not in cfg[
+            "quantization"
+        ]
+
+    def test_leaves_runtime_keys_without_variant(self):
+        key = "language_model.model.layers.0.q_proj"
+        spec = {"bits": 4, "group_size": 64, "mode": "affine"}
+        cfg = {"quantization": {"bits": 4, "group_size": 64, key: spec}}
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert cfg["quantization"][key] == spec
+        assert len(cfg["quantization"]) == 3
 
 
 class TestMaterializeLazyState:

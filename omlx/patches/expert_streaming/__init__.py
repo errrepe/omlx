@@ -252,6 +252,20 @@ def _resolve_stacked_key(
     return candidates[0]
 
 
+def _source_packing(src: Any, group_size: int, bits: int, mode: str) -> tuple[int, int, str]:
+    """Packing for one streaming projection from its source module.
+
+    JANGQ checkpoints mix precisions inside one layer (e.g. a 2-bit gate
+    with 3-bit up/down). Each streaming linear keeps its own source
+    projection's packing; the layer-level values stay as fallback only.
+    """
+    return (
+        int(getattr(src, "group_size", group_size)),
+        int(getattr(src, "bits", bits)),
+        str(getattr(src, "mode", mode)),
+    )
+
+
 def _model_config_candidates(model: Any) -> list[Any]:
     """Collect potential config objects for dim resolution (LLM + VLM wrappers)."""
     candidates = []
@@ -377,6 +391,9 @@ def _convert_switch_mlp_module(
                 mode = getattr(proj, "mode", "affine")
                 break
 
+    def _proj_packing(src):
+        return _source_packing(src, group_size, bits, mode)
+
     # Cold precision tier (I5): when the backing serves this layer's banks
     # from expert_cold/, every projection of the layer computes at the
     # tier's packing — override the source bits/group size once, here, so
@@ -474,6 +491,7 @@ def _convert_switch_mlp_module(
             stacked_b_key = _resolve_stacked_key(
                 candidates_for("gate_up_proj", "biases"), "gate_up_proj", "biases", backing, needle
             )
+            _gu_gs, _gu_bits, _gu_mode = _proj_packing(src)
             proj_stream = StreamingQuantizedSwitchLinear(
                 layer_idx=layer_idx,
                 proj_name="gate_up_proj",
@@ -485,9 +503,9 @@ def _convert_switch_mlp_module(
                 output_dims=moe_hidden * 2,
                 backing=backing,
                 cache=cache,
-                group_size=group_size,
-                bits=bits,
-                mode=mode,
+                group_size=_gu_gs,
+                bits=_gu_bits,
+                mode=_gu_mode,
                 has_bias=hasattr(src, "bias"),
             )
             if hasattr(src, "bias"):
@@ -519,6 +537,7 @@ def _convert_switch_mlp_module(
             stacked_b_key = _resolve_stacked_key(
                 candidates_for("down_proj", "biases"), "down_proj", "biases", backing, needle
             )
+            _down_gs, _down_bits, _down_mode = _proj_packing(src_down)
             down_stream = StreamingQuantizedSwitchLinear(
                 layer_idx=layer_idx,
                 proj_name="down_proj",
@@ -530,9 +549,9 @@ def _convert_switch_mlp_module(
                 output_dims=hidden,
                 backing=backing,
                 cache=cache,
-                group_size=group_size,
-                bits=bits,
-                mode=mode,
+                group_size=_down_gs,
+                bits=_down_bits,
+                mode=_down_mode,
                 has_bias=hasattr(src_down, "bias"),
             )
             if hasattr(src_down, "bias"):
@@ -571,6 +590,7 @@ def _convert_switch_mlp_module(
                 stacked_b_key = _resolve_stacked_key(
                     candidates_for(proj_name, "biases"), proj_name, "biases", backing, needle
                 )
+                _p_gs, _p_bits, _p_mode = _proj_packing(src)
                 proj_stream = StreamingQuantizedSwitchLinear(
                     layer_idx=layer_idx,
                     proj_name=proj_name,
@@ -582,9 +602,9 @@ def _convert_switch_mlp_module(
                     output_dims=out_dim,
                     backing=backing,
                     cache=cache,
-                    group_size=group_size,
-                    bits=bits,
-                    mode=mode,
+                    group_size=_p_gs,
+                    bits=_p_bits,
+                    mode=_p_mode,
                     has_bias=hasattr(src, "bias"),
                 )
                 if hasattr(src, "bias"):

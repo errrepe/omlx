@@ -157,17 +157,10 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
         for key, val in quant.items():
             if not isinstance(val, dict):
                 continue
-            if key.startswith(_CKPT_TEXT_PREFIX):
-                # model.language_model.X -> language_model.model.X
-                variant = _RUNTIME_TEXT_PREFIX + key[len(_CKPT_TEXT_PREFIX) :]
-            elif key.startswith(_VLM_TEXT_PREFIX):
-                # language_model.X -> X
-                variant = key[len(_VLM_TEXT_PREFIX) :]
-            else:
-                # X -> language_model.X
-                variant = _VLM_TEXT_PREFIX + key
-            if variant not in quant and variant not in extras:
-                extras[variant] = val
+            if "mode" not in val:
+                # JANGQ publisher specs omit the mode; the triples carry
+                # scales+biases, so affine is the only valid reading.
+                val["mode"] = "affine"
             # Laguna router overrides: published checkpoints key the
             # per-layer quantization spec by ``mlp.gate``, but the model's
             # actual module-tree path is ``mlp.gate.proj`` (the router is
@@ -179,6 +172,35 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 proj_variant = key + ".proj"
                 if proj_variant not in quant and proj_variant not in extras:
                     extras[proj_variant] = val
+            if ".ple." in key:
+                # PLE ngram shards are served from SSD by the mmap table,
+                # never by a quantizable module: no runtime variant, or
+                # nn.quantize would target the sharded embedding.
+                continue
+            if key.startswith(_CKPT_TEXT_PREFIX):
+                # model.language_model.X -> language_model.model.X
+                variant = _RUNTIME_TEXT_PREFIX + key[len(_CKPT_TEXT_PREFIX) :]
+            elif key.startswith(_RUNTIME_TEXT_PREFIX):
+                # Already a runtime path: nothing to add.
+                continue
+            elif key.startswith(_VLM_TEXT_PREFIX):
+                rest = key[len(_VLM_TEXT_PREFIX) :]
+                # language_model.X -> X
+                variant = rest
+                if variant not in quant and variant not in extras:
+                    extras[variant] = val
+                if not rest.startswith("model."):
+                    # JANGQ shallow convention: language_model.layers.N.*
+                    # lives at language_model.model.layers.N.* at runtime.
+                    deep_variant = _RUNTIME_TEXT_PREFIX + rest
+                    if deep_variant not in quant and deep_variant not in extras:
+                        extras[deep_variant] = val
+                continue
+            else:
+                # X -> language_model.X
+                variant = _VLM_TEXT_PREFIX + key
+            if variant not in quant and variant not in extras:
+                extras[variant] = val
         if extras:
             quant.update(extras)
         if str(cfg.get("model_type", "")).startswith("minimax_m3"):
