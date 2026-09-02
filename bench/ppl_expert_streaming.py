@@ -340,6 +340,15 @@ def run_streaming(model_path: str, text: str, args) -> dict:
         await pool._unload_engine(entry_name)
 
         mean_nll = total_nll / total_terms
+        # Fase 0 deliverable: per-token disk-read census (precondition for
+        # ADR-0001 D6 Fase 3). ru_inblock counts 512-byte blocks actually
+        # read from disk by THIS process (page-cache hits do not count).
+        import resource as _res
+
+        _ru = _res.getrusage(_res.RUSAGE_SELF)
+        io_gb = _ru.ru_inblock * 512 / 1e9
+        io_per_tok = io_gb * 1e9 / max(total_terms, 1)
+        io_per_win = io_gb / max(len(windows), 1)
         return {
             "model": model_path,
             "corpus": str(args.corpus),
@@ -353,6 +362,9 @@ def run_streaming(model_path: str, text: str, args) -> dict:
             "hot_fraction": args.hot_fraction,
             "budget_gib": args.budget,
             "load_s": round(t_load, 1),
+            "disk_read_gb": round(io_gb, 3),
+            "disk_read_mb_per_window": round(io_per_win * 1024, 1),
+            "disk_read_bytes_per_term": round(io_per_tok, 1),
         }
 
     return asyncio.run(_run())
