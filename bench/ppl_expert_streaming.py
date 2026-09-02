@@ -193,6 +193,74 @@ def run_streaming(model_path: str, text: str, args) -> dict:
             flush=True,
         )
 
+        # Fase 0: instrument the MoE router. mlx nn.Module resolves
+        # __call__ on the class only (instance attribute assignment does not
+        # shadow it), so we compose a class-level wrapper over the current
+        # (engine-patched) __call__ — exactly how the oMLX patches chain.
+        # Per call we recompute the gate GEMM (hidden x num_experts, tiny)
+        # to capture pre-softmax logits plus argpartition top-k/scores.
+        capture_states = []
+        if args.capture_routing:
+            import mlx_vlm.models.qwen3_5_moe.language as moe_mod
+
+            moe_cls = moe_mod.Qwen3_5MoeSparseMoeBlock
+            if getattr(moe_cls, "_omlx_routing_capture", False):
+                raise SystemExit("routing capture already installed")
+            capture_state_by_id: dict[int, dict] = {}
+            _capture_orig_call = moe_cls.__call__
+
+            def _capture_patched(self, x, *a, **kw):
+                out = _capture_orig_call(self, x, *a, **kw)
+                st = capture_state_by_id.get(id(self))
+                if st is not None:
+                    g = self.gate(x)
+                    gs = mx.softmax(g, axis=-1, precise=True)
+                    k = st["k"]
+                    inds = mx.argpartition(gs, kth=-k, axis=-1)[..., -k:]
+                    sc = mx.take_along_axis(gs, inds, axis=-1)
+                    st["logits"].append(g)
+                    st["inds"].append(inds)
+                    st["scores"].append(sc)
+                return out
+
+            moe_cls.__call__ = _capture_patched
+            moe_cls._omlx_routing_capture = True
+
+            layers = None
+            for path in [
+                ("language_model", "model", "layers"),
+                ("language_model", "layers"),
+                ("model", "layers"),
+                ("layers",),
+            ]:
+                cur = vlm_model
+                ok = True
+                for a in path:
+                    if not hasattr(cur, a):
+                        ok = False
+                        break
+                    cur = getattr(cur, a)
+                if ok and cur is not None and len(cur) > 0:
+                    layers = cur
+                    break
+            for li, layer in enumerate(layers or []):
+                moe = getattr(layer, "mlp", None)
+                if moe is None or not hasattr(moe, "gate") or not hasattr(moe, "top_k"):
+                    continue
+                capture_state_by_id[id(moe)] = {
+                    "layers": li,
+                    "k": int(moe.top_k),
+                    "logits": [],
+                    "inds": [],
+                    "scores": [],
+                }
+            capture_states = list(capture_state_by_id.values())
+            print(
+                f"routing capture: {len(capture_states)} MoE layers instrumented "
+                f"(class {moe_cls.__name__})",
+                flush=True,
+            )
+
         total_nll = 0.0
         total_terms = 0
         for i, (_, window) in enumerate(windows):
@@ -226,6 +294,48 @@ def run_streaming(model_path: str, text: str, args) -> dict:
         from omlx.patches.expert_streaming import save_expert_pin_profile
 
         save_expert_pin_profile(engine)
+
+        if capture_states:
+            outdir = Path(args.capture_routing)
+            outdir.mkdir(parents=True, exist_ok=True)
+            saved = 0
+            first_tokens = None
+            first_k = None
+            for state in capture_states:
+                if not state["logits"]:
+                    continue
+                lg = mx.concatenate(state["logits"], axis=0).astype(mx.float16)
+                ids = mx.concatenate(state["inds"], axis=0).astype(mx.int16)
+                sc = mx.concatenate(state["scores"], axis=0).astype(mx.float16)
+                mx.eval(lg, ids, sc)
+                if first_tokens is None:
+                    first_tokens = lg.shape[0]
+                    first_k = state["k"]
+                np.savez(
+                    outdir / f"layer_{state['layers']:04d}.npz",
+                    logits=np.array(lg),
+                    topk=np.array(ids),
+                    scores=np.array(sc),
+                    k=np.array(state["k"], dtype=np.int8),
+                )
+                saved += 1
+            (outdir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "model": model_path,
+                        "corpus": str(args.corpus),
+                        "ctx": args.ctx,
+                        "windows": len(windows),
+                        "tokens": first_tokens,
+                        "n_layers": saved,
+                        "k": first_k,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            print(f"wrote routing captures ({saved} layers) to {outdir}", flush=True)
+
         await pool.release_engine(entry_name)
         await pool._unload_engine(entry_name)
 
@@ -298,6 +408,13 @@ def main() -> None:
         default=14.0,
         metavar="GIB",
         help="scheduler memory ceiling for the streaming load",
+    )
+    ap.add_argument(
+        "--capture-routing",
+        default=None,
+        metavar="DIR",
+        help="write per-layer MoE router captures (logits/topk/scores) to DIR "
+        "(Fase 0: routing fidelity baselines)",
     )
     ap.add_argument(
         "--min-free-gb",
