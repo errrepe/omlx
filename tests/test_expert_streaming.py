@@ -4999,34 +4999,57 @@ class TestFaseA3WindowMetricSplit:
             assert ws["count"] == 2, ws
             assert ws["p50"] is None or ws["p50"] < rd["p50"], (ws, rd)
 
-    def test_last_future_wait_isolates_tail(self, tmp_path):
+    def test_last_future_wait_isolates_tail(self, tmp_path, monkeypatch):
         """A slow FIRST run inflates window_wait_us but NOT the tail: the
-        final run's wait is the true tail of the burst, not the span."""
+        final run's wait is the true tail of the burst, not the span.
+
+        The read pool is pinned to a single worker deliberately. This asserts
+        ATTRIBUTION (which stage a caller-side block is charged to), not
+        concurrency. On the process-wide 16-worker singleton all four runs
+        execute in parallel, so the slow run is the one still in flight when
+        the window shrinks to one — at which point last_future_wait_us
+        legitimately absorbs it. The assertion then passed or failed depending
+        on how warm the singleton happened to be: green alone, red inside a
+        full-suite run. Serializing the reads makes the documented scenario
+        real — the first run blocks, the last one is fast.
+        """
         import time
+        from concurrent.futures import ThreadPoolExecutor
 
-        with tempfile.TemporaryDirectory() as td:
-            backing, key, per = self._backing(Path(td))
-            reader = backing._reader_for_key(key)
-            orig = reader._read_into
-            state = {"n": 0}
+        from omlx.patches.expert_streaming import shard_bank
 
-            def slow_first(off, buf):
-                state["n"] += 1
-                if state["n"] == 1:
-                    time.sleep(0.05)
-                return orig(off, buf)
+        serial = ThreadPoolExecutor(max_workers=1)
+        monkeypatch.setattr(shard_bank, "_run_io_pool", lambda: serial)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                backing, key, per = self._backing(Path(td))
+                reader = backing._reader_for_key(key)
+                orig = reader._read_into
+                state = {"n": 0}
 
-            reader._read_into = slow_first
-            out = np.empty((8, per), dtype=np.uint8)
-            eids = [0, 1, 100, 101, 200, 201, 300, 301]  # 4 separate runs
-            assert backing.read_expert_into([(key, eids)], [out])
-            st = backing.read_telemetry.summary()["lifetime"]["stages_us"]
-            tail = st["last_future_wait_us"]
-            ww = st["window_wait_us"]
-            assert tail["count"] == 1 and tail["p50"] is not None, tail
-            assert tail["p50"] < 40000, tail  # the FINAL run is fast
-            assert ww["count"] >= 1 and ww["sum"] >= 40000, ww  # the slow run
-            assert tail["sum"] < ww["sum"], (tail, ww)
+                def slow_first(off, buf):
+                    state["n"] += 1
+                    if state["n"] == 1:
+                        time.sleep(0.05)
+                    return orig(off, buf)
+
+                reader._read_into = slow_first
+                out = np.empty((8, per), dtype=np.uint8)
+                # 4 separate runs. Ids must stay inside the fixture's
+                # 16-expert bank — read_expert_into rejects out-of-range ids
+                # outright (shard_bank bounds check), which would mask the
+                # tail/window split this test is actually about.
+                eids = [0, 1, 4, 5, 8, 9, 12, 13]
+                assert backing.read_expert_into([(key, eids)], [out])
+                st = backing.read_telemetry.summary()["lifetime"]["stages_us"]
+                tail = st["last_future_wait_us"]
+                ww = st["window_wait_us"]
+                assert tail["count"] == 1 and tail["p50"] is not None, tail
+                assert tail["p50"] < 40000, tail  # the FINAL run is fast
+                assert ww["count"] >= 1 and ww["sum"] >= 40000, ww  # the slow run
+                assert tail["sum"] < ww["sum"], (tail, ww)
+        finally:
+            serial.shutdown(wait=False)
 
     def test_read_stats_stage_keys_frozen(self):
         """A6: the canonical stage-key set of read_stats is a snapshot —

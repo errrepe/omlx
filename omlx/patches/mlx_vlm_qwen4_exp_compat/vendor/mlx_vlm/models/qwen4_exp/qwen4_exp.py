@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)(?=\.)")
 _NGRAM_STORAGE_RE = re.compile(
-    r"\.ple\.ple_embedding\.ngram_embedding\."
+    r"\.ple\.(?:ple_embedding\.)?ngram_embedding\."
     r"(?:shard_\d+|shards\.\d+)\.(?:weight|scales|biases)$"
 )
 _MTP_PREFIXES = (
@@ -128,6 +128,43 @@ def _normalize_ones_centered_rmsnorm_weights(model, weights):
     )
 
 
+def _normalize_checkpoint_key(key: str) -> str:
+    """Map JANGQ checkpoint spellings onto the runtime key layout.
+
+    JANGQ checkpoints use two spellings the oQ layout does not: visual.*
+    for the vision tower (runtime: vision_tower.*) and language_model.*
+    without the .model level (runtime: language_model.model.*). PLE
+    triples are popped in mmap mode before this runs; outside it they
+    map onto the runtime PLE spelling. Historical keys pass through
+    unchanged.
+    """
+    if key.startswith("visual."):
+        key = "vision_tower." + key[len("visual.") :]
+    if ".ple.ngram_embedding." in key and ".ple.ple_embedding." not in key:
+        key = key.replace(
+            ".ple.ngram_embedding.",
+            ".ple.ple_embedding.ngram_embedding.",
+        )
+    # JANGQ stores PLE metadata flat under ple.* (conv1d_weight,
+    # layer_multipliers, ngram_heads_offsets, ngram_heads_vocab_sizes);
+    # the runtime keeps them under ple.conv1d / ple.ple_embedding.
+    if ".ple.conv1d_weight" in key:
+        key = key.replace(".ple.conv1d_weight", ".ple.conv1d.weight")
+    for flat in (
+        "layer_multipliers",
+        "ngram_heads_offsets",
+        "ngram_heads_vocab_sizes",
+    ):
+        marker = f".ple.{flat}"
+        if marker in key and f".ple.ple_embedding.{flat}" not in key:
+            key = key.replace(marker, f".ple.ple_embedding.{flat}")
+    if key.startswith("language_model.") and not key.startswith(
+        ("language_model.model.", "language_model.mtp.")
+    ):
+        key = "language_model.model." + key[len("language_model.") :]
+    return key
+
+
 class Model(Qwen3_5Model):
     def __init__(self, config: ModelConfig):
         nn.Module.__init__(self)
@@ -167,6 +204,7 @@ class Model(Qwen3_5Model):
 
         normalized = {}
         for key, value in weights.items():
+            key = _normalize_checkpoint_key(key)
             mtp_key = next(
                 (prefix for prefix in _MTP_PREFIXES if key.startswith(prefix)),
                 None,
@@ -250,7 +288,11 @@ class Model(Qwen3_5Model):
             key = sanitize_key(key)
             key = _NGRAM_SHARD_RE.sub(r".ngram_embedding.shards.\1", key)
             if "conv1d.weight" in key and value.shape[-1] != 1:
-                value = value.moveaxis(2, 1)
+                if value.ndim == 2:
+                    # JANGQ stores the depthwise kernel squeezed ([out, k]).
+                    value = value[..., None]
+                else:
+                    value = value.moveaxis(2, 1)
             sanitized[key] = value
         _normalize_ones_centered_rmsnorm_weights(self, sanitized)
         return sanitized

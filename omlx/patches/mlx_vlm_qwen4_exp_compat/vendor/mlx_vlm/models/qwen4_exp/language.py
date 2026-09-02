@@ -960,6 +960,15 @@ class _SafeTensorMMap:
     def tensor_dtype(self, key: str) -> str:
         return str(self._header[key]["dtype"])
 
+    def has_tensor(self, key: str) -> bool:
+        """Check header membership without reading tensor data.
+
+        JANGQ checkpoints carry phantom PLE keys in the index whose
+        tensors were never written; base selection must verify the
+        header instead of trusting the index alone.
+        """
+        return key in self._header
+
     def rows(self, key: str, rows: list[int]) -> mx.array:
         entry = self._header[key]
         shape = tuple(entry["shape"])
@@ -1044,23 +1053,52 @@ class DiskBackedShardedEmbedding(nn.Module):
             self._tensor_readers[key] = reader
             return reader
 
+        spellings = [prefix]
         runtime_prefix = prefix
         if runtime_prefix.startswith("model.language_model."):
             runtime_prefix = (
                 "language_model.model." + runtime_prefix[len("model.language_model.") :]
             )
+        if runtime_prefix not in spellings:
+            spellings.append(runtime_prefix)
+        # JANGQ checkpoints nest the ngram table one level shallower
+        # (ple.ngram_embedding, no ple_embedding level) and may drop the
+        # model. prefix. Their index also retains the historical
+        # spellings as phantom keys with no tensor behind them, so every
+        # candidate below is verified against the file header. The
+        # historical spellings stay first: existing checkpoints resolve
+        # exactly as before.
+        for stem in list(spellings):
+            jang = stem.replace(".ple.ple_embedding.", ".ple.")
+            if jang != stem and jang not in spellings:
+                spellings.append(jang)
+        for stem in list(spellings):
+            if stem.startswith("model.language_model."):
+                bare = stem[len("model.") :]
+                if bare not in spellings:
+                    spellings.append(bare)
+
+        def header_backed(key: str) -> bool:
+            filename = weight_map.get(key)
+            if filename is None:
+                return False
+            reader = self._readers.get(filename)
+            if reader is None:
+                reader = _SafeTensorMMap(model_path / filename)
+                self._readers[filename] = reader
+            return reader.has_tensor(key)
+
         for shard_index, shard_size in enumerate(self.shard_sizes):
-            bases = (
-                f"{prefix}.shard_{shard_index}",
-                f"{prefix}.shards.{shard_index}",
-                f"{runtime_prefix}.shard_{shard_index}",
-                f"{runtime_prefix}.shards.{shard_index}",
-            )
+            bases = [
+                f"{stem}.{form}"
+                for stem in spellings
+                for form in (f"shard_{shard_index}", f"shards.{shard_index}")
+            ]
             base = next(
                 (
                     candidate
                     for candidate in bases
-                    if f"{candidate}.weight" in weight_map
+                    if header_backed(f"{candidate}.weight")
                 ),
                 None,
             )
