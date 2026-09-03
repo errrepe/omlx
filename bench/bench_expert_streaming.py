@@ -383,6 +383,32 @@ async def run(
     )
     runtime = pool._entry_runtime_resident_size(entry, settings)
     print(f"runtime est {runtime / 1024**3:.2f}G")
+    # Structural estimate block: what the tuner sized against (layer geometry
+    # + resident/streaming GiB), plus the header-scan cost itself in ms.
+    _estimate_out = None
+    try:
+        import time as _time
+
+        from omlx.patches.expert_streaming.residency import (
+            expert_streaming_estimate as _estimate,
+        )
+
+        _t0 = _time.perf_counter()
+        _est = _estimate(model_path)
+        _scan_ms = (_time.perf_counter() - _t0) * 1000.0
+        _estimate_out = {
+            "model_type": _est.model_type,
+            "supported": _est.supported,
+            "num_moe_layers": _est.num_moe_layers,
+            "experts_per_layer": _est.experts_per_layer,
+            "per_expert_mb": round(_est.per_expert_bytes / 1024**2, 2),
+            "resident_gib": round(_est.resident_bytes / 1024**3, 2),
+            "streaming_gib": round(_est.streaming_bytes / 1024**3, 2),
+            "scan_ms": round(_scan_ms, 1),
+        }
+        print(f"estimate {_estimate_out}")
+    except Exception as _exc:  # never cost the run its numbers
+        print(f"estimate unavailable: {_exc}")
 
     phys0 = get_phys_footprint() / 1024**3
     t0 = time.perf_counter()
@@ -483,6 +509,7 @@ async def run(
         "single_request": single_request,
         "chunk_schedule": chunk_schedule,
         "runtime_est_gib": runtime / 1024**3,
+        "estimate": _estimate_out,
         "load_s": t_load,
         "phys_before_gib": round(phys0, 2),
         "phys_after_load_gib": round(phys_loaded, 2),

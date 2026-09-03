@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import struct
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _MODEL_OVERHEAD_FACTOR = 1.05
 
@@ -561,7 +565,22 @@ def expert_streaming_estimate(model_path: str | Path) -> ExpertStreamingEstimate
     if index_path.is_file():
         st = index_path.stat()
         index_sig = (st.st_size, st.st_mtime_ns)
-    return _cached_estimate(str(p), sig, index_sig)
+    # Observability (Fase M): the VLM loader runs this scan on EVERY load
+    # (allowlist short-circuit + this lru_cache keep it cheap), so a timed
+    # debug line records the true cost and hit rate in production logs.
+    hits_before = _cached_estimate.cache_info().hits
+    t0 = time.perf_counter()
+    est = _cached_estimate(str(p), sig, index_sig)
+    scan_ms = (time.perf_counter() - t0) * 1000.0
+    logger.debug(
+        "Expert streaming scan %s: %.1f ms (%s), supported=%s layers=%d",
+        p.name,
+        scan_ms,
+        "cache-hit" if _cached_estimate.cache_info().hits > hits_before else "header-scan",
+        est.supported,
+        est.num_moe_layers,
+    )
+    return est
 
 
 def clear_estimate_cache() -> None:

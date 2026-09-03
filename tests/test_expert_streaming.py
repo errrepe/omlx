@@ -1293,6 +1293,23 @@ def test_budget_zero_means_page_cache_only():
     assert cache.get((0, 0, "k")) is None
 
 
+def test_estimate_scan_is_cached(caplog):
+    """Repeat scans hit the lru_cache (identity) and emit the timed debug line."""
+    import logging
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_glm_checkpoint(tmp, num_layers=2, experts=4, hidden=32, moe_hidden=16)
+        with caplog.at_level(logging.DEBUG, logger="omlx.patches.expert_streaming.residency"):
+            est1 = expert_streaming_estimate(str(tmp))
+            est2 = expert_streaming_estimate(str(tmp))
+        assert est1 is est2
+        assert any(
+            "Expert streaming scan" in rec.message and "cache-hit" in rec.message
+            for rec in caplog.records
+        )
+
+
 def test_engine_pool_budget_zero_streaming_bytes():
     from omlx.patches.expert_streaming.residency import expert_streaming_estimate
 
