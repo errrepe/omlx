@@ -20,10 +20,19 @@ Inspired by [slipstream](https://github.com/dwijenpatel/slipstream) (Swift/Metal
 
 | model_type | example | MoE | per-expert (oQ4e) |
 |---|---|---|---|
-| `glm5_next` | GLM-5.3-Flash-oQ4e (190G) | 42 layers × 288 routed | ~13 MB weight + scales |
-| `qwen4_exp` | Qwen3.8-Flash-Next-oQ4e (99G) | 48 layers × 512 routed + PLE | ~2.7 MB weight + scales |
+| `glm5_next` / `glm5_next_text` | GLM-5.3-Flash-oQ4e (190G) | 42 layers × 288 routed | ~13 MB weight + scales |
+| `qwen4_exp` / `qwen4_exp_text` | Qwen3.8-Flash-Next-oQ4e (99G) | 48 layers × 512 routed + PLE | ~2.7 MB weight + scales |
 | `glm_moe_dsa` | GLM-5.2 MoE DSA | — | ~1.7 MB (BF16) / quantized packed |
-| `deepseek_v4` | DeepSeek-V4-Flash-0731-oQ4e-mtp (166G) | 43 layers + 3 MTP stages × 256 routed | ~12.6 MB (mxfp4 gs32) |
+| `deepseek_v32` | DeepSeek-V3.2 family | — | quantized packed |
+| `deepseek_v4` / `deepseek_v4_mtp` | DeepSeek-V4-Flash-0731-oQ4e-mtp (166G) | 43 layers + 3 MTP stages × 256 routed | ~12.6 MB (mxfp4 gs32) |
+| `qwen3_moe` | Qwen3-MoE family (128 experts, top-8) | sparse-step pattern¹ | stacked `switch_mlp` |
+| `qwen2_moe` | Qwen2-MoE family (60 experts, top-4) | every layer is MoE² | stacked `switch_mlp` |
+| `deepseek_v3` | DeepSeek-V3 (256 routed, top-8) | dense-first layers skipped³ | stacked `switch_mlp` |
+| `glm4_moe` | GLM-4-MoE (128 routed, top-8) | dense-first layers skipped³ | stacked `switch_mlp` |
+
+The allowlist (`SUPPORTED_TYPES` in `residency.py`, the single source of truth) is a hard gate: an unlisted `switch_mlp` family reports `supported = False` (fail closed) instead of forcing streaming without the lazy load — that combination used to materialize multi-hundred-GB banks before conversion (OOM/SIGKILL).
+
+¹ `qwen3_moe`: a layer is MoE iff `(layer_idx + 1) % decoder_sparse_step == 0` and it is not in `mlp_only_layers` (mirrors mlx_lm; defaults resolve to all-MoE). ² `qwen2_moe`: the mlx decoder is unconditionally all-MoE. ³ `deepseek_v3` / `glm4_moe`: resolved from `first_k_dense_replace` (generic fallback). All four carry `moe_intermediate_size`, which the estimate reads instead of the 1407 fallback. Runtime conversion of the widened four is covered by fake-checkpoint walk tests; bit-exact validation on real weights is the Etapa L follow-up.
 
 Loading a glm5_next / qwen4_exp checkpoint with `expert_streaming_enabled` uses the lazy loader (`lazy=True`) and converts to streaming **before** `materialize_lazy_state` — the multi-hundred-GB MoE banks are dropped as lazy arrays instead of ever being materialized. GLM decoders additionally get `compile_ffn` disabled and a per-layer `mx.eval(out)` + `mx.clear_cache()` so the per-layer expert mini-banks (~3.4 GB at prefill) do not accumulate in the lazy graph / allocator and swap the machine. Text-engine loads (BatchedEngine) apply the same lazy + convert-before-materialize order for streaming-supported model types — this is what makes `deepseek_v4` viable on 16 GB Macs.
 
@@ -42,15 +51,18 @@ Loading a glm5_next / qwen4_exp checkpoint with `expert_streaming_enabled` uses 
 | field | type | notes |
 |---|---|---|
 | `expert_streaming_enabled` | bool | hardware-specific; excluded from profiles/templates |
-| `expert_streaming_budget_gib` | float? | `null` / `0` = **page-cache only** (default; no app-level LRU), `>0` = fixed LRU heap (opt-in), clamp `0–64` |
-| `expert_streaming_topk_threshold` | float? | `null` / `>= 1.0` = exact routing (default, bit-exact); `0.05–0.95` = adaptive top-k mass truncation (approximate, changes outputs) |
+| `expert_streaming_budget_gib` | float? | `null` / `0` = **page-cache only** (default; no app-level LRU), `>0` = fixed LRU heap (opt-in), clamp `0–64`. An explicit `>0` always wins over `budget_auto` |
+| `expert_streaming_budget_auto` | bool? | Opt-in RAM-scaled cache: `min((ceiling − streaming − 2 GiB) × 0.5, min(8 GiB, knee))`, whole MiB. More RAM = more cached experts; `null`/`false` keeps the default. Machine-specific; excluded from profiles |
+| `expert_streaming_topk_threshold` | float? | `null` / `>= 1.0` = exact routing (default, bit-exact); `0.05–0.95` = adaptive top-k mass truncation (approximate, changes outputs). Hooks exist only for `qwen4_exp` and `glm5_next` (+ `_text`); other types warn and stay exact |
+| `expert_streaming_pin_sync` | bool? | Fase M1: apply learned pins synchronously at load (bench arms). Default off (background) |
+| `expert_streaming_pin_regime` | str? | Which routing sample pins read: `decode` (default) or `prefill` |
 
 All are load-time settings: toggling unloads (and re-loads if pinned) the model. The runtime signature includes the *effective* (forced-or-requested) value and the threshold when `< 1.0` (it changes outputs), so the `GET /admin/api/models` capability flags `expert_streaming_supported / forced / reason / *_bytes / moe_layers / per_expert_bytes` always reflect what would actually run.
 
 ## UI
 
-- **WebUI**: card `Advanced → Expert Streaming (SSD)` → toggle + `Cache budget (GiB)` input. Visible only when `supported`; disabled amber hint when `forced`. Lives under the `Experimental Features` header, before the Qwen ANE block.
-- **macOS app**: `Model Settings → Advanced` → same toggle + conditional `Cache budget` row (auto-save, like `qwen4_ple_ssd_offload`). The `GiB` field clears to `null` when empty; values outside `0–64` are rejected.
+- **WebUI**: card `Advanced → Expert Streaming (SSD)` → toggle + `Cache budget (GiB)` input + `Auto RAM-scaled cache` toggle + pins block (`Pin budget`, `Apply pins synchronously at load`, `Pin profile regime`). Visible only when `supported`; disabled amber hint when `forced`. Lives under the `Experimental Features` header, before the Qwen ANE block.
+- **macOS app**: `Model Settings → Advanced` → same toggle + conditional `Expert LRU budget` and `Auto RAM-scaled cache` rows, pins block with sync toggle + regime field (auto-save, like `qwen4_ple_ssd_offload`). The `GiB` field clears to `null` when empty; values outside `0–64` are rejected; regime accepts `decode`/`prefill`, empty clears.
 
 ## Measured baseline (48 GiB Mac, external SSD, warm page cache)
 
@@ -1382,6 +1394,20 @@ Fixed order, one window at a time, machine idle:
 5. Merge decision only after 1-4 green: suite green at HEAD, gates green,
    comparator rejects the known invalid pairs (negative proof), docs cite
    only artifacts with a valid effective_config.
+
+
+## Fase N — allowlist widening, per-type fallbacks, budget_auto (branch fase-0/routing-capture)
+
+Code-only line (no bench runs; the machine never freed up):
+
+- **Widening**: `qwen3_moe`, `qwen2_moe`, `deepseek_v3`, `glm4_moe` join the allowlist (same stacked `switch_mlp` + `moe_intermediate_size` contract, verified against mlx_lm sources). Split into two commits: the fail-closed single-source fix first, the widening second.
+- **Layer-count fallbacks**: `deepseek_v3`/`glm4_moe` resolve via `first_k_dense_replace`; `qwen3_moe` via a dedicated `decoder_sparse_step` + `mlp_only_layers` branch; `qwen2_moe` documents the all-MoE invariant. Covered by config-only fallback tests (keys without `layers.N.` indices).
+- **Top-k gate**: `is_topk_applicable` + `TOPK_APPLICABLE_TYPES` — an approximate threshold on a type without a hook warns and stays exact instead of logging active while changing nothing.
+- **budget_auto** (the RAM-scaled cache): formula above; resolved in `_effective_expert_streaming_settings` **and** the admission path so pre-load accounting matches the loader; autotune emits the LRU knee (`budget_knee_gib`, smallest budget at ~95% of best) into `recommendation.json` and `<model>/.omlx/expert_budget_knee.json` on `--apply`.
+- **Parity**: `pin_sync`/`pin_regime` + `budget_auto` reach Swift (DTO/VM/Screen) and webUI (load/save/modal) with all nine i18n locales translated (1155 keys each).
+- **JANGQ**: mixed-precision conversion-walk test (2-bit gate + 3-bit up/down keeps per-projection packing).
+- **Observability**: timed scan debug line (`scan ms, cache-hit vs header-scan`); bench `result.json` gains the `estimate` block.
+- **Follow-up (needs real multi-GB checkpoints)**: Etapa L bit-exact validation gate on real weights for the four widened types; autotune knee measurement on a free machine.
 
 
 ## References
