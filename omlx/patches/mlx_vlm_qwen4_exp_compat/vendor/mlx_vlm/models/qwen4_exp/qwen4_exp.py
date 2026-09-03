@@ -42,6 +42,11 @@ _RMSNORM_ONES_CENTERED_MEDIAN_MAX = 1.5
 _RMSNORM_ZERO_CENTERED_VOTE = 0.1
 _RMSNORM_ZERO_CENTERED_MEDIAN_MIN = -0.5
 _RMSNORM_ZERO_CENTERED_MEDIAN_MAX = 0.25
+# Per-tensor guard under a ones-centered checkpoint decision: a direct gamma
+# averages near one, so a tensor averaging at or below one half is already a
+# residual and must be left unchanged (mixed-centering checkpoints keep e.g.
+# the MTP pre_fc norms residual-centered while the base model is direct).
+_RMSNORM_RESIDUAL_MEAN_MAX = 0.5
 
 
 def _normalize_ones_centered_rmsnorm_weights(model, weights):
@@ -107,12 +112,34 @@ def _normalize_ones_centered_rmsnorm_weights(model, weights):
         for path, module in named_modules()
         if isinstance(module, Qwen4ExpRMSNorm)
     }
+    candidates = [
+        (key, weights[key])
+        for key in target_keys
+        if isinstance(weights.get(key), mx.array)
+        and mx.issubdtype(weights[key].dtype, mx.floating)
+    ]
+    if candidates:
+        candidate_means = mx.stack(
+            [mx.mean(value.astype(mx.float32)) for _, value in candidates]
+        )
+        mx.eval(candidate_means)
+    else:
+        candidate_means = []
     normalized = 0
-    for key in target_keys:
-        value = weights.get(key)
-        if not isinstance(value, mx.array) or not mx.issubdtype(
-            value.dtype, mx.floating
-        ):
+    skipped_residual = 0
+    skipped_keys: list[str] = []
+    for (key, value), mean in zip(
+        candidates, candidate_means if candidates else []
+    ):
+        # Mixed-centering checkpoints (e.g. JANGQ) keep a few norms —
+        # notably the MTP pre_fc norms — already residual-centered while
+        # the base model is ones-centered. A direct gamma must average
+        # near one; a tensor averaging at or below one half is already a
+        # residual, and shifting it would corrupt the module it backs.
+        if float(mean.item()) <= _RMSNORM_RESIDUAL_MEAN_MAX:
+            skipped_residual += 1
+            if len(skipped_keys) < 8:
+                skipped_keys.append(key)
             continue
         # Keep the residual in FP32. Subtracting in BF16 can lose information
         # for direct gamma values below 0.5, which occur in the trained MTP head.
@@ -121,10 +148,13 @@ def _normalize_ones_centered_rmsnorm_weights(model, weights):
 
     logger.info(
         "Canonicalized %d ones-centered Qwen4-Exp RMSNorm tensors "
-        "(%d anchors, median %.4f)",
+        "(%d anchors, median %.4f; %d already-residual tensors left "
+        "unchanged%s)",
         normalized,
         len(anchors),
         median_value,
+        skipped_residual,
+        f": {', '.join(skipped_keys)}" if skipped_keys else "",
     )
 
 
@@ -237,9 +267,35 @@ class Model(Qwen3_5Model):
                 None,
             )
             if gate_up_key is not None:
-                gate, up = mx.split(weights.pop(gate_up_key), 2, axis=-2)
+                stem = gate_up_key[: -len(".weight")] if gate_up_key.endswith(
+                    ".weight"
+                ) else gate_up_key
+                # Fused-quantized checkpoints (JANGQ MTP head) store the
+                # routed experts fused: experts.gate_up_proj.{weight,
+                # scales,biases} plus experts.down_proj.{weight,scales,
+                # biases}. The runtime MoE keeps split gate/up
+                # projections, so split every present suffix along the
+                # stacked output axis (mirrors the .weight split) and
+                # rename the down triple. Splitting .weight alone leaves
+                # scales/biases under experts.* names and strict
+                # load_weights rejects them as "parameters not in model".
+                banks = {}
+                for suffix in ("weight", "scales", "biases"):
+                    key = (
+                        gate_up_key
+                        if suffix == "weight"
+                        else f"{stem}.{suffix}"
+                    )
+                    if key in weights:
+                        banks[suffix] = weights.pop(key)
+                gate, up = mx.split(banks["weight"], 2, axis=-2)
                 weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate
                 weights[f"{prefix}.switch_mlp.up_proj.weight"] = up
+                for suffix in ("scales", "biases"):
+                    if suffix in banks:
+                        gate_s, up_s = mx.split(banks[suffix], 2, axis=-2)
+                        weights[f"{prefix}.switch_mlp.gate_proj.{suffix}"] = gate_s
+                        weights[f"{prefix}.switch_mlp.up_proj.{suffix}"] = up_s
                 for down_key in (
                     f"{prefix}.experts.down_proj",
                     f"{prefix}.experts.down_proj.weight",
@@ -249,6 +305,12 @@ class Model(Qwen3_5Model):
                             down_key
                         )
                         break
+                for suffix in ("scales", "biases"):
+                    down_suffix_key = f"{prefix}.experts.down_proj.{suffix}"
+                    if down_suffix_key in weights:
+                        weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = (
+                            weights.pop(down_suffix_key)
+                        )
                 return
 
             if f"{prefix}.experts.0.gate_proj.weight" not in weights:

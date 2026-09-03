@@ -131,6 +131,28 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
     return load(path_or_repo, **kwargs)
 
 
+def _register_fused_experts_split_variants(
+    key: str, val: dict, quant: dict, extras: dict
+) -> None:
+    """Add split-half overrides for one fused experts.* policy entry.
+
+    Fused-quantized MoE banks (JANGQ MTP head) publish one override for
+    the fused ``experts.gate_up_proj`` triple, but sanitize splits it
+    into ``switch_mlp.gate_proj`` + ``switch_mlp.up_proj`` before
+    ``nn.quantize`` runs. Without a variant per half, the lookup misses
+    and the halves are built at the global bits (wrong width).
+    """
+    if ".experts.gate_up_proj" in key:
+        for half in ("gate_proj", "up_proj"):
+            half_key = key.replace(".experts.gate_up_proj", f".switch_mlp.{half}")
+            if half_key not in quant and half_key not in extras:
+                extras[half_key] = val
+    if ".experts.down_proj" in key:
+        down_key = key.replace(".experts.down_proj", ".switch_mlp.down_proj")
+        if down_key not in quant and down_key not in extras:
+            extras[down_key] = val
+
+
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
     """Add module-tree-path variants of per-layer quantization keys.
 
@@ -203,6 +225,14 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 extras[variant] = val
         if extras:
             quant.update(extras)
+        # Second pass: fused experts.* entries (originals and the prefix
+        # variants just added) each need switch_mlp split-half variants.
+        # Runs after the merge so every spelling is covered; the added
+        # switch_mlp.* keys contain no ".experts." marker, so one pass
+        # terminates.
+        for key, val in list(quant.items()):
+            if isinstance(val, dict):
+                _register_fused_experts_split_variants(key, val, quant, quant)
         if str(cfg.get("model_type", "")).startswith("minimax_m3"):
             # The mlx-lm adapter stores the vendored mlx-vlm tree under
             # ``Model.inner`` and sanitize() re-roots checkpoint weights to

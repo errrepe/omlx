@@ -231,7 +231,15 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
         with caplog.at_level("INFO"):
             result = Model.sanitize(model, dict(shifted))
 
+        pre_fc_key = "mtp.pre_fc_norm_embedding.weight"
         for key in target_keys:
+            if key == pre_fc_key:
+                # Mixed centering: the shifted pre_fc mean (+0.275) reads as
+                # an already-residual tensor, so it is left unchanged while
+                # the ones-centered remainder is shifted back.
+                assert result[key].dtype == shifted[key].dtype
+                assert mx.array_equal(result[key], shifted[key]).item()
+                continue
             assert result[key].dtype == mx.float32
             assert mx.array_equal(
                 1.0 + result[key], shifted[key].astype(mx.float32)
@@ -239,14 +247,15 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
 
         gated_key = "language_model.model.layers.0.linear_attn.norm.weight"
         assert mx.array_equal(result[gated_key], shifted[gated_key]).item()
-        assert "Canonicalized 15 ones-centered" in caplog.text
+        assert "Canonicalized 14 ones-centered" in caplog.text
+        assert "1 already-residual tensors left unchanged" in caplog.text
 
         mtp_norm = dict(modules)["mtp.pre_fc_norm_embedding"]
-        mtp_norm.weight = result["mtp.pre_fc_norm_embedding.weight"]
+        mtp_norm.weight = result[pre_fc_key]
         x = mx.array([[1.0, -2.0, 3.0, -4.0]], dtype=mx.float32)
         actual = mtp_norm(x)
         rms = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1e-6)
-        expected = rms * shifted["mtp.pre_fc_norm_embedding.weight"].astype(mx.float32)
+        expected = rms * (1.0 + result[pre_fc_key].astype(mx.float32))
         assert mx.array_equal(actual, expected).item()
 
         second = Model.sanitize(model, dict(result))
@@ -513,6 +522,165 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.index_position_ids.shape[-1] == 4
 
 
+def _assert_ple_state_matches(actual_cache, expected_cache):
+    mx.eval(
+        actual_cache[2],
+        actual_cache[3],
+        expected_cache[2],
+        expected_cache[3],
+    )
+    assert mx.array_equal(actual_cache[3], expected_cache[3]).item()
+    assert mx.allclose(actual_cache[2], expected_cache[2], rtol=1e-3, atol=1e-3).item()
+
+
+def test_qwen4_ple_rollback_keeps_only_committed_verify_prefix():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    verify_cache = model.make_cache()
+    replay_cache = model.make_cache()
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    confirmed = mx.array([[5]], dtype=mx.int32)
+    draft = mx.array([[6]], dtype=mx.int32)
+    next_token = mx.array([[7]], dtype=mx.int32)
+    model(prefix, cache=verify_cache)
+    model(prefix, cache=replay_cache)
+
+    verified = model(
+        mx.concatenate([confirmed, draft], axis=1),
+        cache=verify_cache,
+        return_hidden=True,
+    )
+    model(confirmed, cache=replay_cache)
+    model.rollback_speculative_cache(
+        verify_cache,
+        verified.gdn_states,
+        accepted=0,
+        block_size=2,
+    )
+
+    _assert_ple_state_matches(verify_cache[0], replay_cache[0])
+    rolled_back = model(next_token, cache=verify_cache)
+    replayed = model(next_token, cache=replay_cache)
+    mx.eval(rolled_back.logits, replayed.logits)
+    assert mx.allclose(rolled_back.logits, replayed.logits, rtol=1e-3, atol=1e-3).item()
+
+
+def test_qwen4_ple_partial_rollback_and_accept_match_sequential_replay():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    verify_tokens = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
+
+    accepted_cache = model.make_cache()
+    sequential_cache = model.make_cache()
+    model(prefix, cache=accepted_cache)
+    model(prefix, cache=sequential_cache)
+    model(verify_tokens, cache=accepted_cache, return_hidden=True)
+    for token in (5, 6, 7, 8):
+        model(mx.array([[token]], dtype=mx.int32), cache=sequential_cache)
+    _assert_ple_state_matches(accepted_cache[0], sequential_cache[0])
+
+    partial_cache = model.make_cache()
+    replay_cache = model.make_cache()
+    model(prefix, cache=partial_cache)
+    model(prefix, cache=replay_cache)
+    verified = model(verify_tokens, cache=partial_cache, return_hidden=True)
+    for token in (5, 6, 7):
+        model(mx.array([[token]], dtype=mx.int32), cache=replay_cache)
+    model.rollback_speculative_cache(
+        partial_cache,
+        verified.gdn_states,
+        accepted=2,
+        block_size=4,
+    )
+
+    _assert_ple_state_matches(partial_cache[0], replay_cache[0])
+
+
+def test_qwen4_ple_ordinary_forward_disarms_stale_snapshot():
+    """A fully accepted verify cycle never calls rollback. The snapshot it armed
+    must be dropped by the next ordinary forward so it cannot be mistaken for the
+    current committed position by a later rollback."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    ple_cache = cache[0]
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+
+    model(mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True)
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is not None
+
+    # ordinary decode forward (no verify): the stale snapshot must be gone
+    model(mx.array([[7]], dtype=mx.int32), cache=cache)
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
+
+
+def test_qwen4_ple_rollback_fails_closed_on_incomplete_snapshot():
+    """An aborted verify forward can leave a half-written snapshot. Rollback must
+    reject it before mutating any cache, not apply a mixed-epoch state."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import (
+        LanguageModel,
+        _PLESpeculativeRollbackError,
+    )
+
+    model = LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+    verified = model(
+        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
+    )
+
+    ple_cache, qsa_cache = cache[0], cache[1]
+    before_hist = mx.array(ple_cache[3])
+    before_conv = mx.array(ple_cache[2])
+    before_offset = int(qsa_cache.offset)
+
+    ple_cache._qwen4_exp_ple_speculative_state.complete = False
+    with pytest.raises(_PLESpeculativeRollbackError):
+        model.rollback_speculative_cache(
+            cache, verified.gdn_states, accepted=0, block_size=2
+        )
+
+    mx.eval(ple_cache[3], ple_cache[2])
+    assert mx.array_equal(ple_cache[3], before_hist).item()
+    assert mx.array_equal(ple_cache[2], before_conv).item()
+    assert int(qsa_cache.offset) == before_offset
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
+
+
+def test_qwen4_ple_rollback_validates_snapshot_before_qsa_mutation():
+    """A malformed accepted-count aborts the whole rollback with QSA/GDN
+    untouched (validation runs before the inherited rollback)."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import (
+        LanguageModel,
+        _PLESpeculativeRollbackError,
+    )
+
+    model = LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+    verified = model(
+        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
+    )
+    before_offset = int(cache[1].offset)
+
+    # batch is 1, so a 2-element accepted list cannot match
+    with pytest.raises(_PLESpeculativeRollbackError):
+        model.rollback_speculative_cache(
+            cache, verified.gdn_states, accepted=[0, 0], block_size=2
+        )
+    assert int(cache[1].offset) == before_offset
+    assert getattr(cache[0], "_qwen4_exp_ple_speculative_state", None) is None
+
+
 def test_qwen4_lightning_mtp_rejects_nextn_only_layout(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
@@ -748,6 +916,96 @@ def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
         configure_ple_runtime(compute, mode="resident")
 
 
+def test_sanitize_splits_fused_mtp_experts_scales_and_biases():
+    """Fused MTP experts triples split fully into switch_mlp banks.
+
+    Fused-quantized checkpoints (JANGQ MTP head) store
+    experts.gate_up_proj.{weight,scales,biases}; the runtime MoE keeps
+    split gate/up projections. Splitting .weight alone orphans
+    scales/biases under experts.* names and strict load_weights rejects
+    them as "parameters not in model".
+    """
+    config = _tiny_config()
+    # _tiny_config applies the compat patch, which aliases the vendored
+    # qwen4_exp tree into mlx_vlm.models.
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
+    language._MTP_RUNTIME = language.Qwen4ExpMTPRuntime(
+        enabled=True, checkpoint_prefix="mtp."
+    )
+    try:
+        model = Model(config)
+        weights = {}
+        prefix = "mtp.layers.0.mlp"
+        weights[f"{prefix}.experts.gate_up_proj.weight"] = mx.zeros((4, 8, 16))
+        weights[f"{prefix}.experts.gate_up_proj.scales"] = mx.zeros((4, 8, 2))
+        weights[f"{prefix}.experts.gate_up_proj.biases"] = mx.zeros((4, 8, 2))
+        weights[f"{prefix}.experts.down_proj.weight"] = mx.zeros((4, 16, 4))
+        weights[f"{prefix}.experts.down_proj.scales"] = mx.zeros((4, 16, 2))
+        weights[f"{prefix}.experts.down_proj.biases"] = mx.zeros((4, 16, 2))
+        out = model.sanitize(dict(weights))
+    finally:
+        language._MTP_RUNTIME = language.Qwen4ExpMTPRuntime()
+    assert not [k for k in out if ".experts." in k]
+    for proj, rows in (
+        ("gate_proj", 4),
+        ("up_proj", 4),
+        ("down_proj", 16),
+    ):
+        for suffix, last in (
+            ("weight", 4 if proj == "down_proj" else 16),
+            ("scales", 2),
+            ("biases", 2),
+        ):
+            key = f"{prefix}.switch_mlp.{proj}.{suffix}"
+            assert key in out, key
+    assert out[f"{prefix}.switch_mlp.gate_proj.weight"].shape == (4, 4, 16)
+    assert out[f"{prefix}.switch_mlp.up_proj.scales"].shape == (4, 4, 2)
+
+
+def test_ones_centered_sanitize_leaves_residual_norms_unchanged():
+    """Mixed-centering checkpoints keep residual norms intact.
+
+    JANGQ stores the base-model RMSNorms as direct gamma (ones-centered)
+    but the MTP pre_fc norms already residual-centered (identical to the
+    fp8 reference). The checkpoint-wide ones-centered conversion must
+    skip tensors averaging at or below one half instead of shifting them
+    by -1, which had zeroed MTP draft acceptance.
+    """
+    _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpRMSNorm
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import (
+        _normalize_ones_centered_rmsnorm_weights,
+    )
+
+    class _FakeModel:
+        def __init__(self):
+            self.direct = Qwen4ExpRMSNorm(4)
+            self.residual = Qwen4ExpRMSNorm(4)
+
+        def named_modules(self):
+            return [
+                ("mod.direct", self.direct),
+                ("mod.residual", self.residual),
+            ]
+
+    weights = {
+        f"language_model.model.layers.{i}."
+        "attn_hyper_connection.hc_norm.weight": mx.ones((8,)) * 0.95
+        for i in range(8)
+    }
+    weights["mod.direct.weight"] = mx.ones((4,)) * 1.02
+    weights["mod.residual.weight"] = mx.ones((4,)) * -0.76
+    _normalize_ones_centered_rmsnorm_weights(_FakeModel(), weights)
+    assert float(mx.mean(weights["mod.direct.weight"]).item()) == pytest.approx(
+        0.02, abs=1e-6
+    )
+    assert float(mx.mean(weights["mod.residual.weight"]).item()) == pytest.approx(
+        -0.76, abs=1e-6
+    )
+
+
 def test_ple_runtime_auto_defaults_to_mmap():
     """auto resolves to SSD mmap regardless of checkpoint size; resident
     remains reachable only as an explicit choice."""
@@ -765,3 +1023,56 @@ def test_ple_runtime_auto_defaults_to_mmap():
         resolve_ple_runtime_mode("mmap", checkpoint_bytes=1, physical_memory=1)
         == "mmap"
     )
+
+
+def _make_bound_qwen4_language_model(config):
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpMTPModule
+
+    class MTPOwner:
+        pass
+
+    model = LanguageModel(config.text_config, config)
+    owner = MTPOwner()
+    owner.mtp = Qwen4ExpMTPModule(config.text_config)
+    model.bind_mtp_owner(owner)
+    return model, owner
+
+
+def _assert_qwen4_lightning_mtp_hidden_width(model, text_config):
+    expected_width = text_config.hc_count * text_config.hidden_size
+    output = model(
+        mx.array([[2, 3, 4]], dtype=mx.int32),
+        cache=model.make_cache(),
+        return_hidden=True,
+    )
+    hidden = output.hidden_states[-1]
+    logits, head_hidden = model.mtp_forward(
+        hidden[:, -1:],
+        mx.array([[7]], dtype=mx.uint32),
+        model.make_mtp_cache(),
+        return_hidden=True,
+        logits_keep=1,
+    )
+    mx.eval(hidden, logits, head_hidden)
+
+    assert hidden.shape == (1, 3, expected_width)
+    assert logits.shape == (1, 1, text_config.vocab_size)
+    assert head_hidden.shape == (1, 1, expected_width)
+
+
+def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
+    """Qwen3.5 patching must preserve resident and later Qwen4 MTP models."""
+    from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
+    config = _tiny_config()
+    resident_model, resident_owner = _make_bound_qwen4_language_model(config)
+    _assert_qwen4_lightning_mtp_hidden_width(resident_model, config.text_config)
+
+    apply_mlx_vlm_mtp_runtime_patch()
+    _assert_qwen4_lightning_mtp_hidden_width(resident_model, config.text_config)
+
+    later_model, later_owner = _make_bound_qwen4_language_model(config)
+    _assert_qwen4_lightning_mtp_hidden_width(later_model, config.text_config)
+
+    assert resident_owner.mtp is not None
+    assert later_owner.mtp is not None

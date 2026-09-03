@@ -99,6 +99,7 @@ def _bench_settings(
     ane: bool,
     specprefill_draft: str | None,
     specprefill_keep: float | None,
+    mtp_native: bool = False,
 ):
     """Fase M1: the bench's ModelSettings, wired EXPLICITLY.
 
@@ -129,7 +130,11 @@ def _bench_settings(
         expert_streaming_pin_regime=pin_regime if pins else None,
         expert_streaming_pin_sync=True if pins else None,
         qwen4_ple_ssd_offload=True,
-        vlm_mtp_enabled=mtp,
+        # The two speculative paths are mutually exclusive by design:
+        # qwen4_exp runs native Lightning MTP (mtp_enabled); other VLM
+        # types use the external-assistant path (vlm_mtp_enabled).
+        vlm_mtp_enabled=mtp and not mtp_native,
+        mtp_enabled=mtp and mtp_native,
         vlm_mtp_draft_block_size=mtp_block,
         qwen35_ane_prefill_enabled=ane,
         specprefill_enabled=bool(specprefill_draft),
@@ -356,6 +361,16 @@ async def run(
 
     model_path = MODEL_PATHS[model_key]
     entry_name = DEFAULT_ENTRIES[model_key]
+    # Native Lightning MTP serves qwen4_exp; every other bench type keeps
+    # the external-assistant VLM path. Read from config.json (cheap) so a
+    # new model folder picks the right path without bench edits.
+    _mtp_native = False
+    if mtp:
+        try:
+            with open(os.path.join(model_path, "config.json")) as f:
+                _mtp_native = json.load(f).get("model_type") == "qwen4_exp"
+        except Exception:
+            _mtp_native = False
     # Fase M5: record the exact code revision of the run.
     _GIT_SHA = None
     try:
@@ -380,6 +395,7 @@ async def run(
     settings = _bench_settings(
         pins, pin_gib, pin_regime, budget, topk, cold_tier, hot_fraction,
         mtp, mtp_block, ane, specprefill_draft, specprefill_keep,
+        mtp_native=_mtp_native,
     )
     runtime = pool._entry_runtime_resident_size(entry, settings)
     print(f"runtime est {runtime / 1024**3:.2f}G")
@@ -722,6 +738,14 @@ async def run(
     stats = None
     profile = None
     pf_stats = None
+    # Non-streaming (resident-expert) models skip the telemetry block below;
+    # pre-initialize every var it assigns so results.update stays bound.
+    advise_stats = None
+    _read_stats_out = None
+    _pool_after = None
+    _memtrace_summary = None
+    _ctx_fb = None
+    _pin_out = None
     if cache is not None:
         stats = {
             "hits": cache.stats.hits,

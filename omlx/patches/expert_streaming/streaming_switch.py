@@ -2535,6 +2535,23 @@ class StreamingSwitchGLU(nn.Module):
         # Create streaming linears lazily; actual keys set by converter
         self._initialized = False
 
+    @property
+    def activation(self) -> Any:
+        """Stock SwitchGLU surface for verify paths.
+
+        The MTP target-verify path (mlx_vlm qwen3_5_moe
+        ``_target_verify_switch_glu``) reaches into
+        ``switch_mlp.activation`` directly. The captured callable lives
+        in ``_activation`` to stay out of the parameter tree, so
+        re-expose it here; fall back to the stock SwiGLU convention.
+        """
+        act = getattr(self, "_activation", None)
+        if act is not None:
+            return act
+        from mlx_lm.models.switch_layers import SwiGLU
+
+        return SwiGLU()
+
     def _ensure_initialized(self, template_glu: Any) -> None:
         if self._initialized:
             return
