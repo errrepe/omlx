@@ -111,6 +111,9 @@ def run_streaming(model_path: str, text: str, args) -> dict:
             expert_streaming_enabled=True,
             expert_streaming_budget_gib=args.budget,
             expert_streaming_cache_prior=args.cache_prior,
+            expert_streaming_topk_threshold=(
+                None if args.topk is None or args.topk >= 1.0 else args.topk
+            ),
             expert_streaming_cold_tier=(
                 None if args.cold_tier == "none" else args.cold_tier
             ),
@@ -422,6 +425,14 @@ def main() -> None:
         metavar="BONUS",
         help="cache-prior logit bonus for resident experts (streaming mode "
         "only; approximate routing quality gate)",
+    )
+    ap.add_argument(
+        "--topk",
+        type=float,
+        default=None,
+        metavar="MASS",
+        help="adaptive top-k mass threshold (streaming mode only; approximate "
+        "routing quality gate — matches bench_expert_streaming.py --topk)",
     )
     ap.add_argument(
         "--mem-ceiling-gib",
