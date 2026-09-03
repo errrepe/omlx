@@ -5771,3 +5771,108 @@ class TestFaseA5OverheadProbe:
         ):
             assert rep[key] > 0.0, key
 
+
+class TestStreamingWeightedSumFastPath:
+    """The MoE weighted-sum must reach the 0.6.4 native kernel when present
+    (it used to import a ``.kernels.fast`` package that never existed, so the
+    fast path silently never engaged) and fall back to scatter-unsort when
+    the kernel raises or is missing."""
+
+    @staticmethod
+    def _make_split_glu():
+        import mlx.core as mx
+
+        from omlx.patches.expert_streaming.streaming_switch import (
+            ExpertLRUCache,
+            StreamingSwitchGLU,
+            StreamingSwitchLinear,
+        )
+
+        experts, moe_hidden, hidden = 4, 6, 8
+        cache = ExpertLRUCache(1 << 24, 4096, num_layers=1)
+        backing = {
+            (0, "gate_proj"): mx.arange(experts * moe_hidden * hidden, dtype=mx.float32).reshape(
+                experts, moe_hidden, hidden
+            )
+            / 100.0,
+            (0, "up_proj"): mx.arange(experts * moe_hidden * hidden, dtype=mx.float32).reshape(
+                experts, moe_hidden, hidden
+            )
+            / 200.0,
+            (0, "down_proj"): mx.arange(experts * hidden * moe_hidden, dtype=mx.float32).reshape(
+                experts, hidden, moe_hidden
+            )
+            / 300.0,
+        }
+        glu = StreamingSwitchGLU(
+            input_dims=hidden,
+            hidden_dims=moe_hidden,
+            num_experts=experts,
+            layer_idx=0,
+            backing=backing,
+            cache=cache,
+            quantized=False,
+            activation=lambda up, gate: up + gate,
+        )
+        for name, out_dim, in_dim in [
+            ("gate_proj", moe_hidden, hidden),
+            ("up_proj", moe_hidden, hidden),
+            ("down_proj", hidden, moe_hidden),
+        ]:
+            setattr(
+                glu,
+                name,
+                StreamingSwitchLinear(
+                    layer_idx=0,
+                    proj_name=name,
+                    stacked_key=f"k.{name}",
+                    num_experts=experts,
+                    input_dims=in_dim,
+                    output_dims=out_dim,
+                    backing=backing,
+                    cache=cache,
+                ),
+            )
+        return glu
+
+    def test_weighted_sum_routes_to_native_kernel(self, monkeypatch):
+        import mlx.core as mx
+
+        import omlx.custom_kernels.glm_moe_dsa.fast as glm_fast
+
+        assert hasattr(glm_fast, "glm_moe_weighted_sum")
+        sentinel = object()
+        seen = {}
+
+        def spy(x_sorted, inv_order, scores):
+            seen["shapes"] = (tuple(x_sorted.shape), tuple(scores.shape))
+            return sentinel
+
+        monkeypatch.setattr(glm_fast, "glm_moe_weighted_sum", spy)
+        glu = self._make_split_glu()
+        # >= 64 routed rows so the gather-sort path (do_sort) engages.
+        x = mx.random.uniform(shape=(1, 32, 8))
+        idx = mx.broadcast_to(mx.array([0, 1, 2, 3]), (1, 32, 4))
+        scores = mx.ones((1, 32, 4), dtype=mx.float32) / 4.0
+        out = glu(x, idx, scores=scores, weighted_sum=True)
+        assert out is sentinel
+        assert seen["shapes"][1] == (1, 32, 4)
+
+    def test_weighted_sum_falls_back_when_kernel_raises(self, monkeypatch):
+        import mlx.core as mx
+
+        import omlx.custom_kernels.glm_moe_dsa.fast as glm_fast
+
+        def boom(x_sorted, inv_order, scores):
+            raise RuntimeError("native weighted-sum unavailable")
+
+        monkeypatch.setattr(glm_fast, "glm_moe_weighted_sum", boom)
+        glu = self._make_split_glu()
+        x = mx.random.uniform(shape=(1, 32, 8))
+        idx = mx.broadcast_to(mx.array([0, 1, 2, 3]), (1, 32, 4))
+        scores = mx.ones((1, 32, 4), dtype=mx.float32) / 4.0
+        out = glu(x, idx, scores=scores, weighted_sum=True)
+        mx.eval(out)
+        # Fallback keeps the top-k axis (scatter-unsort + squeeze(-2)).
+        assert tuple(out.shape) == (1, 32, 4, 8)
+
