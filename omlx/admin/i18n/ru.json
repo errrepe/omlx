@@ -1143,7 +1143,7 @@
   "modal.model_settings.expert_streaming_pins": "Закрепление экспертов (mlock)",
   "modal.model_settings.expert_streaming_pins_hint": "Закрепляет самые горячие эксперты слоя в RAM (блокировка страниц без копирования) и обучает сохраняемый при выгрузке профиль пинов на модель — горячий набор прогрет с первого токена при следующей загрузке. Выход не меняется.",
   "modal.model_settings.expert_streaming_pin_gib": "Бюджет закрепления (GiB)",
-  "modal.model_settings.expert_streaming_pin_gib_hint": "Потолок проводной памяти для закреплённых экспертов. Пусто = по умолчанию 1,25 GiB.",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "Потолок проводной памяти для закреплённых экспертов. Пусто = по умолчанию 0,25 GiB.",
   "modal.model_settings.expert_streaming_cold_tier": "Холодный ярус экспертов (биты)",
   "modal.model_settings.expert_streaming_cold_tier_hint": "Требуется tools/requant_cold_tier.py (есть expert_cold/). Потоковые эксперты читаются из яруса низкой точности — меньше байт на токен по нижней границе I/O. Приближённо: проверяйте замером перплексии. Пусто = выключено.",
   "modal.model_settings.expert_streaming_hot_fraction": "Доля горячих экспертов (сплит HOBBIT)",

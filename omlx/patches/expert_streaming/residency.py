@@ -57,6 +57,14 @@ SUPPORTED_TYPES = frozenset(
         "glm5_next_text",
         "qwen4_exp",
         "qwen4_exp_text",
+        # Wider coverage: these expose the same stacked
+        # ``layers.N.mlp.switch_mlp.{gate,up,down}_proj`` layout and the
+        # ``moe_intermediate_size`` key _resolve_moe_dims reads, so they pass
+        # the structural estimate as-is. They were only missing from the list.
+        "qwen3_moe",
+        "qwen2_moe",
+        "deepseek_v3",
+        "glm4_moe",
     }
 )
 

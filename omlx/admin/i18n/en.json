@@ -1143,7 +1143,7 @@
   "modal.model_settings.expert_streaming_pins": "Expert pins (mlock)",
   "modal.model_settings.expert_streaming_pins_hint": "Wire the hottest experts per layer into RAM (zero-copy page locking) and learn a per-model pin profile saved on unload — the hot set is warm from the first token next load. No output change.",
   "modal.model_settings.expert_streaming_pin_gib": "Pin budget (GiB)",
-  "modal.model_settings.expert_streaming_pin_gib_hint": "Wired-memory cap for pinned experts. Empty = 1.25 GiB default.",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "Wired-memory cap for pinned experts. Empty = 0.25 GiB default.",
   "modal.model_settings.expert_streaming_cold_tier": "Cold expert tier (bits)",
   "modal.model_settings.expert_streaming_cold_tier_hint": "Requires tools/requant_cold_tier.py (expert_cold/ present). Reads streamed experts from the low-precision tier — fewer bytes per token on the I/O floor. Approximate: gate with the perplexity harness. Empty = off.",
   "modal.model_settings.expert_streaming_hot_fraction": "Hot expert fraction (HOBBIT split)",

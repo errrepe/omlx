@@ -1143,7 +1143,7 @@
   "modal.model_settings.expert_streaming_pins": "Fixação de especialistas (mlock)",
   "modal.model_settings.expert_streaming_pins_hint": "Fixa na RAM (lock de páginas sem cópia) os especialistas mais quentes por camada e aprende um perfil de pins por modelo salvo no descarregamento — o conjunto quente parte morno do primeiro token no próximo carregamento. Sem mudança na saída.",
   "modal.model_settings.expert_streaming_pin_gib": "Orçamento de fixação (GiB)",
-  "modal.model_settings.expert_streaming_pin_gib_hint": "Teto de memória cabeada para especialistas fixados. Vazio = padrão 1,25 GiB.",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "Teto de memória cabeada para especialistas fixados. Vazio = padrão 0,25 GiB.",
   "modal.model_settings.expert_streaming_cold_tier": "Camada fria de especialistas (bits)",
   "modal.model_settings.expert_streaming_cold_tier_hint": "Requer tools/requant_cold_tier.py (expert_cold/ presente). Lê os especialistas em streaming da camada de baixa precisão — menos bytes por token no piso de I/O. Aproximado: valide com o harness de perplexidade. Vazio = desativado.",
   "modal.model_settings.expert_streaming_hot_fraction": "Fração de especialistas quentes (split HOBBIT)",

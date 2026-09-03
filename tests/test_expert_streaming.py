@@ -131,6 +131,20 @@ def test_residency_unsupported_for_dense_model():
         assert est.supported is False
 
 
+# Widened into the allowlist (Fase B3): all four expose the same stacked
+# ``layers.N.mlp.switch_mlp.{gate,up,down}_proj`` layout and the
+# ``moe_intermediate_size`` key that _resolve_moe_dims reads, so they already
+# passed the structural estimate — they were only missing from the list.
+# (experts_key varies: the Qwen families call it num_experts, DeepSeek/GLM-4
+# call it n_routed_experts.)
+_WIDENED_MOE_TYPES = [
+    ("qwen3_moe", "num_experts"),
+    ("qwen2_moe", "num_experts"),
+    ("deepseek_v3", "n_routed_experts"),
+    ("glm4_moe", "n_routed_experts"),
+]
+
+
 def _write_fake_switch_mlp_checkpoint(
     tmp: Path,
     model_type: str,
@@ -178,6 +192,44 @@ def _write_fake_switch_mlp_checkpoint(
         json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
     )
     return config
+
+
+@pytest.mark.parametrize("model_type,experts_key", _WIDENED_MOE_TYPES)
+def test_widened_moe_type_estimate_supported(model_type, experts_key):
+    """The four widened types produce a usable streaming estimate."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_switch_mlp_checkpoint(
+            tmp, model_type, experts_key, num_layers=4, experts=8
+        )
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True, est.reason
+        assert est.num_moe_layers == 4
+        assert est.experts_per_layer == 8
+        assert est.per_expert_bytes > 0
+        assert est.expert_bytes > 0
+        assert est.dense_bytes > 0
+        assert est.resident_bytes > est.streaming_bytes
+
+
+@pytest.mark.parametrize("model_type,experts_key", _WIDENED_MOE_TYPES)
+def test_widened_moe_type_dims_not_defaulted(model_type, experts_key):
+    """Dims regression: the resolved moe_hidden must come from the config's
+    moe_intermediate_size, never from the 1407 fallback in _resolve_moe_dims.
+
+    1407 is a GLM-4.5-Air-specific constant. A silent fallthrough would slice
+    every expert bank at the wrong offset — corrupt outputs with no error.
+    """
+    from omlx.patches.expert_streaming import _resolve_moe_dims
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        config = _write_fake_switch_mlp_checkpoint(
+            tmp, model_type, experts_key, num_layers=2, experts=4, hidden=32, moe_hidden=16
+        )
+        hidden, moe_hidden = _resolve_moe_dims([config])
+        assert moe_hidden == 16, f"{model_type}: fell back to the 1407 default"
+        assert hidden == 32
 
 
 def test_unlisted_switch_mlp_type_is_not_supported():

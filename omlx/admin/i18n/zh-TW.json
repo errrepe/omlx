@@ -1143,7 +1143,7 @@
   "modal.model_settings.expert_streaming_pins": "專家頁鎖定（mlock）",
   "modal.model_settings.expert_streaming_pins_hint": "將每層最熱門的專家零拷貝鎖定進記憶體，並學習按模型儲存的鎖定畫像（卸載時寫入）——下次載入從第一個 token 起即預熱。不改變輸出。",
   "modal.model_settings.expert_streaming_pin_gib": "鎖定預算（GiB）",
-  "modal.model_settings.expert_streaming_pin_gib_hint": "鎖定專家所佔用的記憶體上限。留空 = 預設 1.25 GiB。",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "鎖定專家所佔用的記憶體上限。留空 = 預設 0.25 GiB。",
   "modal.model_settings.expert_streaming_cold_tier": "冷專家層（位元寬度）",
   "modal.model_settings.expert_streaming_cold_tier_hint": "需要先執行 tools/requant_cold_tier.py（expert_cold/ 已存在）。從低精度層讀取串流專家——降低 I/O 下限上的每 token 位元組。近似計算：請用困惑度基準把關。留空 = 關閉。",
   "modal.model_settings.expert_streaming_hot_fraction": "熱專家比例（HOBBIT 分層）",

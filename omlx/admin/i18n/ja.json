@@ -1143,7 +1143,7 @@
   "modal.model_settings.expert_streaming_pins": "エキスパートのピン留め（mlock）",
   "modal.model_settings.expert_streaming_pins_hint": "各レイヤーの最ホットなエキスパートを RAM にゼロコピーでロックし、アンロード時に保存されるモデル別 pin プロファイルを学習します——次回ロード時は最初のトークンからホットセットが温まっています。出力は変わりません。",
   "modal.model_settings.expert_streaming_pin_gib": "ピン留め予算（GiB）",
-  "modal.model_settings.expert_streaming_pin_gib_hint": "ピン留めエキスパートのワイヤードメモリ上限。空 = デフォルト 1.25 GiB。",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "ピン留めエキスパートのワイヤードメモリ上限。空 = デフォルト 0.25 GiB。",
   "modal.model_settings.expert_streaming_cold_tier": "コールドエキスパート層（ビット）",
   "modal.model_settings.expert_streaming_cold_tier_hint": "tools/requant_cold_tier.py が必要（expert_cold/ が存在）。ストリーミングエキスパートを低精度層から読み込みます——I/O 下限でのトークンあたりバイト数を削減。近似計算：パープレキシティ計測で検証してください。空 = オフ。",
   "modal.model_settings.expert_streaming_hot_fraction": "ホットエキスパート割合（HOBBIT スプリット）",

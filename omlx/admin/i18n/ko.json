@@ -1143,7 +1143,7 @@
   "modal.model_settings.expert_streaming_pins": "전문가 고정 (mlock)",
   "modal.model_settings.expert_streaming_pins_hint": "레이어별 가장 핫한 전문가를 RAM에 제로카피로 잠그고 언로드 시 저장되는 모델별 pin 프로파일을 학습합니다 — 다음 로드에서 첫 토큰부터 핫셋이 준비됩니다. 출력 변화 없음.",
   "modal.model_settings.expert_streaming_pin_gib": "고정 예산 (GiB)",
-  "modal.model_settings.expert_streaming_pin_gib_hint": "고정 전문가의 실메모리 상한. 비움 = 기본 1.25 GiB.",
+  "modal.model_settings.expert_streaming_pin_gib_hint": "고정 전문가의 실메모리 상한. 비움 = 기본 0.25 GiB.",
   "modal.model_settings.expert_streaming_cold_tier": "콜드 전문가 티어 (비트)",
   "modal.model_settings.expert_streaming_cold_tier_hint": "tools/requant_cold_tier.py 필요 (expert_cold/ 존재). 스트리밍 전문가를 저정밀 티어에서 읽습니다 — I/O 하한에서 토큰당 바이트가 줄어듭니다. 근사 계산: 퍼플렉시티 벤치로 검증하세요. 비움 = 끔.",
   "modal.model_settings.expert_streaming_hot_fraction": "핫 전문가 비율 (HOBBIT 분할)",
