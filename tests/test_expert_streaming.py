@@ -6026,3 +6026,23 @@ class TestCachePrior:
             monkeypatch.delenv("OMLX_EXPERT_STREAMING_CACHE_PRIOR", raising=False)
             tk.configure_cache_prior(prev if prev > 0 else None)
 
+    def test_boost_logits_matches_numpy_oracle(self):
+        import mlx.core as mx
+        import numpy as np
+
+        from omlx.patches.expert_streaming.adaptive_topk import (
+            apply_cache_prior_to_logits,
+        )
+
+        vals = np.array([[0.5, -1.0, 2.0, 0.0]], dtype=np.float32)
+        logits = mx.array(vals)
+        out = apply_cache_prior_to_logits(logits, {1, 2}, 3.0)
+        mx.eval(out)
+        expect = vals.copy()
+        expect[0, [1, 2]] += 3.0
+        assert np.allclose(np.array(out), expect, atol=1e-6)
+        # Identity paths return the same object.
+        assert apply_cache_prior_to_logits(logits, {1}, 0.0) is logits
+        assert apply_cache_prior_to_logits(logits, set(), 3.0) is logits
+        assert apply_cache_prior_to_logits(logits, {99}, 3.0) is logits
+

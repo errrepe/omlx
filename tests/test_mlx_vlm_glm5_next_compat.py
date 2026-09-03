@@ -763,3 +763,74 @@ def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
     mx.eval(actual, reference)
 
     assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+def _tiny_moe():
+    import inspect
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.glm5_next.language import Glm5NextMoE
+
+    # Prove we exercise the vendored copy carrying the cache-prior hook.
+    assert "omlx/patches" in inspect.getfile(Glm5NextMoE).replace(chr(92), "/")
+    cfg = SimpleNamespace(
+        hidden_size=8,
+        moe_intermediate_size=8,
+        n_routed_experts=8,
+        n_shared_experts=None,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        swiglu_limit=1.0,
+    )
+    moe = Glm5NextMoE(cfg)
+    # Deterministic increasing rows: stock top-2 is {6, 7}.
+    moe.gate.weight = mx.arange(8 * 8, dtype=mx.float32).reshape(8, 8) / 100.0
+    seen = {}
+
+    class _StubGLU:
+        _num_experts = 8
+
+        class _Lin:
+            @staticmethod
+            def bundle_key(e):
+                return ("L", int(e))
+
+        gate_proj = _Lin()
+        up_proj = _Lin()
+        down_proj = _Lin()
+        _cache = SimpleNamespace(_store=set())
+
+        def __call__(self, x, indices, scores=None, weighted_sum=False):
+            seen["inds"] = [int(v) for v in mx.reshape(indices, (-1,)).tolist()]
+            return mx.zeros_like(x)
+
+    moe.switch_mlp = _StubGLU()
+    return moe, seen
+
+
+def test_glm5_next_cache_prior_reroutes_to_resident(monkeypatch):
+    import omlx.patches.expert_streaming.adaptive_topk as tk
+
+    monkeypatch.setattr(tk, "_CACHE_PRIOR", 5.0)
+    moe, seen = _tiny_moe()
+    moe.switch_mlp._cache._store.update({("L", e) for e in (0, 7)})
+    x = mx.ones((1, 1, 8), dtype=mx.float32)
+    out = moe(x)
+    mx.eval(out)
+    # Resident expert 0 (stock rank 8th) is boosted into the top-2.
+    assert set(seen["inds"]) == {0, 7}
+
+
+def test_glm5_next_cache_prior_off_is_stock(monkeypatch):
+    import omlx.patches.expert_streaming.adaptive_topk as tk
+
+    monkeypatch.setattr(tk, "_CACHE_PRIOR", 0.0)
+    moe, seen = _tiny_moe()
+    moe.switch_mlp._cache._store.update({("L", e) for e in (0, 7)})
+    x = mx.ones((1, 1, 8), dtype=mx.float32)
+    out = moe(x)
+    mx.eval(out)
+    assert set(seen["inds"]) == {6, 7}

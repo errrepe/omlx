@@ -790,13 +790,37 @@ class Glm5NextMoE(nn.Module):
 
     def __call__(self, x):
         indices, scores = self.gate(x)
-        # Opt-in adaptive top-k truncation (cumulative mass). Exact mode
-        # (None/1.0) leaves the routing untouched — zero overhead.
+        # Opt-in adaptive top-k truncation (cumulative mass) and
+        # cache-prior rerank. Exact mode (None/1.0, bonus 0.0) leaves the
+        # routing untouched — zero overhead.
         from omlx.patches.expert_streaming.adaptive_topk import (
+            apply_cache_prior_to_logits as _prior_boost,
+            cache_prior_bonus as _prior_bonus,
             current_threshold as _topk_threshold,
+            resident_experts as _resident_experts,
             truncate_topk_mass as _topk_truncate,
         )
 
+        _bonus = _prior_bonus()
+        if _bonus > 0:
+            # Group router consumes raw logits (sigmoid is inside
+            # group_expert_select): recompute them, boost the resident
+            # set, reselect. Any failure keeps the stock routing above.
+            try:
+                _res = _resident_experts(self.switch_mlp)
+                if _res:
+                    _logits = x.astype(mx.float32) @ self.gate.weight.astype(mx.float32).T
+                    indices, scores = group_expert_select(
+                        _prior_boost(_logits, _res, _bonus),
+                        self.gate.e_score_correction_bias,
+                        self.gate.top_k,
+                        self.gate.n_group,
+                        self.gate.topk_group,
+                        self.gate.routed_scaling_factor,
+                        self.gate.norm_topk_prob,
+                    )
+            except Exception:
+                pass
         _thr = _topk_threshold()
         if _thr is not None and _thr < 1.0:
             indices, scores = _topk_truncate(indices, scores, _thr)

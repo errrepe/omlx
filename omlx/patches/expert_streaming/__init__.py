@@ -60,6 +60,18 @@ def _get_budget_bytes(model_settings: Any | None, estimate: Any | None) -> int:
     return 0
 
 
+def _prior_usable(cache: Any) -> bool:
+    """Cache-prior needs app-level LRU residency as its signal.
+
+    With a page-cache-only budget the resident set is always empty and the
+    rerank is pure overhead (autotune b0 trials regressed) — refuse it so
+    budget-0 stays on the stock path."""
+    try:
+        return int(getattr(cache, "capacity", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
     """Per-model streaming IO overrides with env-fallback semantics.
 
@@ -1035,6 +1047,17 @@ def convert_model_to_streaming(
 
         thr = configure_from_settings(model_settings, model_type=estimate.model_type)
         prior = cache_prior_from_settings(model_settings)
+        # Cache-prior needs app-level LRU residency as its signal (see
+        # _prior_usable): refuse it at page-cache-only budgets.
+        if prior > 0 and not _prior_usable(cache):
+            logger.warning(
+                "expert_streaming_cache_prior=%.2f ignored: no app-level LRU "
+                "(budget 0 = page-cache only, resident set always empty)",
+                prior,
+            )
+            from .adaptive_topk import configure_cache_prior
+
+            prior = configure_cache_prior(0.0)
         if thr is not None or prior > 0:
             # configure() already refused inapplicable types (thr None);
             # the qwen hook engages here while the glm hook is inline in

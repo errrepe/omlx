@@ -82,7 +82,9 @@ Calibragem (Qwen-JANG_4M, budget 1 GiB):
 | 2.0 | **2.78 (×3)** | 38.0% | **1.76** | 17.6% | sã (short + 2k) |
 | 4.0 | 1.01 | 17.7% | — | — | **degenerada** ("This just a response is a response") |
 
-Penhasco de fidelidade entre 2.0 e 4.0; default recomendado `2.0` onde houver headroom de qualidade, `1.0` conservador. TTFT idêntico ao exato (hook só no decode). Métricas: tok/s (gate **+10%**), TTFT, hit_rate, read p50/p95, bytes/token, acurácia de proposta por camada (`prediction_totals.recall`, bar **≥85%** para preditores). Abaixo do gate: revert sem resíduo + linha no scoreboard. Cada fase: testes → subagente auditor (bit-exatidão do default, thread-safety MLX, custo zero com feature off) → bench → gate → commit.
+Penhasco de fidelidade entre 2.0 e 4.0; default recomendado `2.0` onde houver headroom de qualidade, `1.0` conservador. TTFT idêntico ao exato (hook só no decode).
+
+Fidelidade (bateria 6 prompts, greedy, exato vs 2.0): divergência no token 0 em todos (rerank atua já no prefill) mas 6/6 saídas sãs e on-task (haiku, 17×23=391, Hamlet, HTTP/2); prefill-ppl idêntico (3.3144 exato e prior, 8 janelas canary) — o knob só morde no decode, onde o LRU tem o que dizer. **Condicional de orçamento**: com budget 0 (page-cache only) o resident set é vazio e o rerank é overhead puro (autotune b0: 1.60 vs 1.70) — o conversor recusa o prior sem LRU com warning. GLM-5.3: rerank portado para o group router (bônus nos logits crus antes do `group_expert_select`); sem checkpoint GLM local para A/B, só testes. Métricas: tok/s (gate **+10%**), TTFT, hit_rate, read p50/p95, bytes/token, acurácia de proposta por camada (`prediction_totals.recall`, bar **≥85%** para preditores). Abaixo do gate: revert sem resíduo + linha no scoreboard. Cada fase: testes → subagente auditor (bit-exatidão do default, thread-safety MLX, custo zero com feature off) → bench → gate → commit.
 
 ### DeepSeek V4 Flash (oQ4e-mtp)
 

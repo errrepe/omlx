@@ -110,6 +110,7 @@ def run_streaming(model_path: str, text: str, args) -> dict:
         settings = ModelSettings(
             expert_streaming_enabled=True,
             expert_streaming_budget_gib=args.budget,
+            expert_streaming_cache_prior=args.cache_prior,
             expert_streaming_cold_tier=(
                 None if args.cold_tier == "none" else args.cold_tier
             ),
@@ -413,6 +414,14 @@ def main() -> None:
         default=2.0,
         metavar="GIB",
         help="streaming cache budget (streaming mode only)",
+    )
+    ap.add_argument(
+        "--cache-prior",
+        type=float,
+        default=None,
+        metavar="BONUS",
+        help="cache-prior logit bonus for resident experts (streaming mode "
+        "only; approximate routing quality gate)",
     )
     ap.add_argument(
         "--mem-ceiling-gib",

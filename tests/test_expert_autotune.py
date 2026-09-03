@@ -61,6 +61,18 @@ class TestTrialScore:
         assert dirty == pytest.approx(0.5 - 0.25)
 
 
+class TestPriorUsable:
+    def test_lru_capacity_gates_prior(self):
+        from types import SimpleNamespace
+
+        from omlx.patches.expert_streaming import _prior_usable
+
+        assert _prior_usable(SimpleNamespace(capacity=1141)) is True
+        assert _prior_usable(SimpleNamespace(capacity=0)) is False
+        assert _prior_usable(None) is False
+        assert _prior_usable(object()) is False
+
+
 class TestWatchdog:
     POLICY = at.WatchdogPolicy(floor_available_gib=5.0, max_swap_growth_gib=2.0, floor_consecutive=2)
 

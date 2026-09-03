@@ -206,6 +206,32 @@ def rerank_cache_prior(gates: Any, resident: set[int] | None, bonus: float) -> A
         return gates
 
 
+def apply_cache_prior_to_logits(logits: Any, resident: set[int] | None, bonus: float) -> Any:
+    """Boost resident experts by *bonus* on raw (pre-sigmoid) logits.
+
+    The GLM/DeepSeek-style group router consumes raw logits (sigmoid is
+    inside group_expert_select), so unlike rerank_cache_prior there is no
+    log/softmax roundtrip — a plain masked add. Identity when off/empty;
+    fail closed to the input on any error.
+    """
+    if bonus <= 0 or not resident:
+        return logits
+    try:
+        width = int(logits.shape[-1])
+        res = sorted({int(e) for e in resident if 0 <= int(e) < width})
+        if not res:
+            return logits
+        import mlx.core as _mx
+
+        anchors = _mx.array(res, dtype=_mx.int32)
+        is_res = (
+            _mx.arange(width)[None, :] == anchors[:, None]
+        ).any(axis=0)
+        return logits.astype(_mx.float32) + is_res.astype(_mx.float32) * float(bonus)
+    except Exception:
+        return logits
+
+
 def current_threshold() -> float | None:
     return _THRESHOLD
 

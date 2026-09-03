@@ -282,7 +282,7 @@ def screen_candidates(
         elif knob == "topk":
             cands = [None, 0.85]
         elif knob == "prior":
-            cands = list(priors) if priors else [0.0, 1.0]
+            cands = list(priors) if priors else [0.0, 1.0, 2.0]
         else:
             cands = [True, False]
         for value in cands:
@@ -955,7 +955,7 @@ def main() -> int:
                     help="also sweep expert_streaming_topk_threshold (trades output fidelity)")
     ap.add_argument("--sweep-prior", action="store_true",
                     help="also sweep expert_streaming_cache_prior (trades output fidelity)")
-    ap.add_argument("--priors", default="0.0,1.0", help="comma-separated cache_prior candidates")
+    ap.add_argument("--priors", default="0.0,1.0,2.0", help="comma-separated cache_prior candidates (calibration: 2.0 short+2k winner, 4.0 degenerates)")
     ap.add_argument("--reserve-gib", type=float, default=10.0,
                     help="memory kept away from the bench ceiling: your apps + KV + headroom")
     ap.add_argument("--min-free-gb", type=float, default=22.0)
