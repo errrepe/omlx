@@ -889,7 +889,42 @@ class TestExpandPerLayerQuantKeys:
         model_loading.expand_per_layer_quant_keys(cfg)
 
         assert cfg["quantization"][key] == spec
-        assert len(cfg["quantization"]) == 3
+
+    def test_adds_split_variants_for_fused_experts_overrides(self):
+        """Fused experts.gate_up_proj policy covers the split halves.
+
+        Fused-quantized MoE banks (JANGQ MTP head) publish one override
+        for experts.gate_up_proj, but sanitize splits it into
+        switch_mlp.gate_proj + switch_mlp.up_proj before nn.quantize
+        runs. Without a variant per half, the lookup misses and the
+        halves are built at the global bits (wrong width).
+        """
+        cfg = {
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                "mtp.layers.0.mlp.experts.gate_up_proj": {
+                    "bits": 4,
+                    "group_size": 64,
+                },
+                "mtp.layers.0.mlp.experts.down_proj": {
+                    "bits": 4,
+                    "group_size": 64,
+                },
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        expected = {"bits": 4, "group_size": 64, "mode": "affine"}
+        for stem in (
+            "mtp.layers.0.mlp",
+            "language_model.mtp.layers.0.mlp",
+        ):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                assert cfg["quantization"][f"{stem}.switch_mlp.{proj}"] == (
+                    expected
+                )
 
 
 class TestMaterializeLazyState:
