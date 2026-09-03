@@ -58,6 +58,14 @@ Base 1.79–1.82 tok/s, hit 9.2%, ~1.6 GB/token relidos (91% miss), 93% dos runs
 
 Conclusão: neste workload o teto é volume (1.6 GB/tok) + granularidade (200k preads singletons) + custo por uso (promote/stack/eval). Retenção e prefetch por prev-token perdem; alavanca restante seria QMM sem stack por expert (não tentado). QSA nativo, em contraste: 4.3 ms vs 18.0 ms portable (~4.1×).
 
+### Protocolo A/B congelado (Fase 2: prefetch cross-layer)
+
+```sh
+.venv/bin/python bench/bench_expert_streaming.py --model qwen-jang4m --budget 1.0 --prompt-len short --out /tmp/<arm>.json
+```
+
+3 reps por braço, page cache warm, checkpoint `Qwen3.8-Flash-Next-JANG_4M`. Métricas: tok/s (gate **+10%**), TTFT, hit_rate, read p50/p95, bytes/token, acurácia de proposta por camada (`prediction_totals.recall`, bar **≥85%** para preditores). Abaixo do gate: revert sem resíduo + linha no scoreboard. Cada fase: testes → subagente auditor (bit-exatidão do default, thread-safety MLX, custo zero com feature off) → bench → gate → commit.
+
 ### DeepSeek V4 Flash (oQ4e-mtp)
 
 `deepseek_v4` nests the MoE under `layer.ffn` (not `mlp`) and keeps one routed bank per **MTP/DSpark stage** under `mtp.<stage>[.block].ffn.switch_mlp`. The converter walks both: 43 main layers + 3 draft stages (layer ids `43..45` share the same LRU). Notes:

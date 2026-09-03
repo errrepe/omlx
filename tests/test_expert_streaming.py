@@ -5876,3 +5876,59 @@ class TestStreamingWeightedSumFastPath:
         # Fallback keeps the top-k axis (scatter-unsort + squeeze(-2)).
         assert tuple(out.shape) == (1, 32, 4, 8)
 
+
+class TestProposalCounters:
+    """Fase 0: cross-layer proposal plumbing (predicted vs observed).
+
+    The Fase 1 predictor records proposals for layer l+1 while layer l
+    runs; the demand path records observations. report() must turn the
+    two sets into per-layer recall/precision so a bench can gate the
+    predictor on measured accuracy (>=85% bar)."""
+
+    @staticmethod
+    def _acc():
+        from omlx.patches.expert_streaming.streaming_switch import (
+            ProfileAccumulator,
+        )
+
+        return ProfileAccumulator(enabled=True)
+
+    def test_cross_layer_recall_and_precision(self):
+        acc = self._acc()
+        # Asymmetric sizes pin the denominators: 4 proposed, 3 observed,
+        # 2 in common -> recall 2/3, precision 2/4 (a recall/precision
+        # swap would fail).
+        acc.record_predicted(6, [10, 11, 12, 13])
+        acc.record_observed(6, [11, 12, 14])
+        rep = acc.report()
+        per = rep["prediction"]["6"]
+        assert per["predicted"] == 4
+        assert per["observed"] == 3
+        assert per["hit"] == 2
+        assert per["recall"] == 2 / 3
+        assert per["precision"] == 2 / 4
+        tots = rep["prediction_totals"]
+        assert tots["predicted"] == 4
+        assert tots["observed"] == 3
+        assert tots["hit"] == 2
+        assert tots["recall"] == 2 / 3
+
+    def test_empty_proposal_side_is_zero_not_nan(self):
+        acc = self._acc()
+        acc.record_observed(2, [1, 2])
+        rep = acc.report()
+        assert rep["prediction"]["2"]["recall"] == 0.0
+        assert rep["prediction"]["2"]["precision"] == 0.0
+
+    def test_disabled_accumulator_is_zero_cost(self):
+        from omlx.patches.expert_streaming.streaming_switch import (
+            ProfileAccumulator,
+        )
+
+        acc = ProfileAccumulator(enabled=False)
+        acc.record_predicted(6, [10, 11])
+        acc.record_observed(6, [11])
+        assert acc.predicted == {}
+        assert acc.observed == {}
+        assert acc.report()["prediction_totals"]["hit"] == 0
+
