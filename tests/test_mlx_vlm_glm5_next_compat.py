@@ -633,9 +633,10 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     base = nn.Linear(1536, 4096, bias=False)
     base.set_dtype(mx.float16)
     linear = base.to_quantized(group_size=64, bits=8, mode="affine")
-    # T=512: the tile engages from min_tokens=1024 ... but see
-    # _tile_corrupts_at_long_prefill — T >= 1024 is blocked. Use 1023 so the
-    # routed path (not the fallback) is what the spy observes.
+    # q8's routing window is currently empty: min_tokens=1024 but
+    # _tile_corrupts_at_long_prefill blocks T >= 1024, so every q8 shape
+    # takes the fallback. Pin that (spy observes zero native calls) and
+    # assert the fallback still matches the module reference.
     x = mx.random.normal((1, 1023, 1536), dtype=mx.float16)
     reference = linear(x)
 
@@ -651,7 +652,7 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     actual = linear_forward(linear, x)
     mx.eval(actual, reference)
 
-    assert calls == 1
+    assert calls == 0
     assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
 
 
