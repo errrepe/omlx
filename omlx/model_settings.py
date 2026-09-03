@@ -227,13 +227,13 @@ class ModelSettings:
     # GiB app-level LRU.
     expert_streaming_enabled: bool = False
     expert_streaming_budget_gib: Optional[float] = None
-    expert_streaming_budget_auto: Optional[bool] = (
-        None  # Opt-in RAM-scaled expert cache: size the app-level LRU from
-        # the machine's memory ceiling (more RAM = more cached experts)
-        # instead of streaming everything. An explicit budget_gib > 0 always
-        # wins; None/False keeps the default (None/0 = page-cache only).
-        # Machine-specific: never propagated via model profiles.
-    )
+    expert_streaming_budget_auto: Optional[bool] = True
+    # Default-on RAM-scaled expert cache: size the app-level LRU from the
+    # memory ceiling (more RAM = more cached experts) instead of streaming
+    # everything. An explicit budget_gib (including 0 = page-cache only)
+    # always wins; auto only applies when the budget is unset. None follows
+    # the default (on); False opts back out to page-cache only.
+    # Machine-specific: never propagated via model profiles.
     # Opt-in approximate MoE routing: keep the smallest score-descending
     # prefix of the top-k experts whose cumulative mass reaches this
     # threshold. None/1.0 = exact routing (bit-identical to the reference

@@ -1135,7 +1135,7 @@
   "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
   "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
-  "modal.model_settings.expert_streaming_budget_hint": "オプションのエキスパートLRU。空または0 = OSのページキャッシュのみ（デフォルト。実測で高速かつ省RAM）。>0で固定サイズ（GiB）のキャッシュを確保。",
+  "modal.model_settings.expert_streaming_budget_hint": "固定エキスパートLRU。空 = RAM連動の自動キャッシュ（既定）；0 = page cacheのみ；>0 でGiBキャッシュを固定。",
   "modal.model_settings.expert_streaming_budget_auto": "RAM連動の自動キャッシュ",
   "modal.model_settings.expert_streaming_budget_auto_hint": "このマシンのメモリ上限からエキスパートキャッシュを自動調整（RAMが多いほど常駐エキスパートが増加）。固定予算の指定が優先。リロード後に有効。",
   "modal.model_settings.expert_streaming_topk": "Top-k 質量しきい値",

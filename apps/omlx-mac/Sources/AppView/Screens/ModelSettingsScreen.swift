@@ -763,7 +763,7 @@ private struct AdvancedTab: View {
                                           defaultValue: "Expert LRU budget",
                                           comment: "Row label for the expert cache budget field"),
                             sublabel: String(localized: "settings.advanced.expert_streaming.budget.sub",
-                                             defaultValue: "Optional app-level expert LRU. Empty or 0 = page-cache only (default; measured faster with less RAM). >0 pins a fixed GiB cache.",
+                                             defaultValue: "Fixed app-level expert LRU. Empty = automatic RAM-scaled cache (default); 0 = page-cache only; >0 pins a fixed GiB cache.",
                                              comment: "Sublabel for the expert cache budget field")) {
                             TextInput(text: vm.bind(
                                 $vm.expertStreamingBudgetGib,

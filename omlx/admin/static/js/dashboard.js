@@ -7385,7 +7385,7 @@
                     expert_streaming_forced:
                         model?.expert_streaming_forced === true,
                     expert_streaming_budget_gib: s.expert_streaming_budget_gib ?? null,
-                    expert_streaming_budget_auto: s.expert_streaming_budget_auto ?? false,
+                    expert_streaming_budget_auto: s.expert_streaming_budget_auto ?? true,
                     expert_streaming_topk_threshold: s.expert_streaming_topk_threshold ?? null,
                     expert_streaming_per_layer_eval: s.expert_streaming_per_layer_eval ?? true,
                     expert_streaming_pins: s.expert_streaming_pins ?? false,

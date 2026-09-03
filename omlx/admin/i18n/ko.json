@@ -1135,7 +1135,7 @@
   "modal.model_settings.expert_streaming_hint": "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for a large memory saving. Disables batching — one request at a time. Takes effect after reload.",
   "modal.model_settings.expert_streaming_forced": "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
   "modal.model_settings.expert_streaming_budget": "Cache budget (GiB)",
-  "modal.model_settings.expert_streaming_budget_hint": "선택적 전문가 LRU. 비우거나 0 = OS 페이지 캐시만 사용(기본값; 측정상 더 빠르고 RAM 적게 사용). >0이면 고정 GiB 캐시 유지.",
+  "modal.model_settings.expert_streaming_budget_hint": "고정 엑스퍼트 LRU. 비움 = RAM 자동 확장 캐시(기본값); 0 = page cache만; >0이면 GiB 캐시 고정.",
   "modal.model_settings.expert_streaming_budget_auto": "RAM 자동 확장 캐시",
   "modal.model_settings.expert_streaming_budget_auto_hint": "이 머신의 메모리 상한에 따라 엑스퍼트 캐시를 조정합니다 (RAM이 많을수록 더 많은 엑스퍼트 캐시). 고정 예산이 우선합니다. 다시 로드 후 적용.",
   "modal.model_settings.expert_streaming_topk": "Top-k 질량 임계값",

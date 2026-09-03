@@ -543,7 +543,7 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingEnabled = self.expertStreamingForced
                     || (s?.expertStreamingEnabled ?? false)
                 self.expertStreamingBudgetGib = s?.expertStreamingBudgetGib.map { String($0) } ?? ""
-                self.expertStreamingBudgetAuto = s?.expertStreamingBudgetAuto ?? false
+                self.expertStreamingBudgetAuto = s?.expertStreamingBudgetAuto ?? true
                 self.expertStreamingTopkThreshold = s?.expertStreamingTopkThreshold.map { String($0) } ?? ""
                 // Null means the env/built-in default, which is on — show the
                 // effective state so the toggle is never a lie.

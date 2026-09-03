@@ -500,7 +500,8 @@ class EnginePool:
         if forced and not getattr(settings, "expert_streaming_enabled", False):
             effective = copy.copy(settings)
             setattr(effective, "expert_streaming_enabled", True)
-        if getattr(effective, "expert_streaming_budget_auto", False):
+        # None follows the default (on); only an explicit False opts out.
+        if getattr(effective, "expert_streaming_budget_auto", True) is not False:
             auto_bytes = self._resolve_auto_budget_bytes(effective, est, entry)
             if auto_bytes:
                 if effective is settings:
@@ -514,9 +515,10 @@ class EnginePool:
                 )
         return effective
 
-    # Opt-in RAM-scaled expert cache (expert_streaming_budget_auto): commit
-    # a fraction of the post-load headroom to the app-level LRU so bigger
-    # machines keep more experts resident instead of streaming everything.
+    # Default-on RAM-scaled expert cache (expert_streaming_budget_auto):
+    # commit a fraction of the post-load headroom to the app-level LRU so
+    # bigger machines keep more experts resident instead of streaming
+    # everything. Only False opts out; an explicit budget (even 0) wins.
     _AUTO_BUDGET_FRACTION = 0.5
     _AUTO_BUDGET_RESERVE_BYTES = 2 * 1024**3  # headroom kept free past streaming bytes
     _AUTO_BUDGET_MAX_BYTES = 8 * 1024**3  # default cap without autotune knee data
@@ -551,17 +553,14 @@ class EnginePool:
     ) -> int | None:
         """Pure auto-budget formula. None = leave settings untouched.
 
-        ``manual_gib > 0`` always wins (explicit operator choice); a missing
-        ceiling or no post-reserve headroom also declines (the default
-        page-cache behavior already applies). Otherwise half the headroom
-        past streaming bytes + reserve, capped at min(8 GiB, knee).
+        Any explicit ``manual_gib`` — including 0 (= page-cache only) —
+        always wins (explicit operator choice); auto only sizes the cache
+        when the budget is unset. A missing ceiling or no post-reserve
+        headroom also declines. Otherwise half the headroom past streaming
+        bytes + reserve, capped at min(8 GiB, knee).
         """
         if manual_gib is not None:
-            try:
-                if float(manual_gib) > 0:
-                    return None
-            except (TypeError, ValueError):
-                return None
+            return None
         if ceiling_bytes <= 0 or streaming_bytes <= 0:
             return None
         headroom = (

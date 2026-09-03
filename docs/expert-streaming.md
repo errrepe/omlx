@@ -51,8 +51,8 @@ Loading a glm5_next / qwen4_exp checkpoint with `expert_streaming_enabled` uses 
 | field | type | notes |
 |---|---|---|
 | `expert_streaming_enabled` | bool | hardware-specific; excluded from profiles/templates |
-| `expert_streaming_budget_gib` | float? | `null` / `0` = **page-cache only** (default; no app-level LRU), `>0` = fixed LRU heap (opt-in), clamp `0–64`. An explicit `>0` always wins over `budget_auto` |
-| `expert_streaming_budget_auto` | bool? | Opt-in RAM-scaled cache: `min((ceiling − streaming − 2 GiB) × 0.5, min(8 GiB, knee))`, whole MiB. More RAM = more cached experts; `null`/`false` keeps the default. Machine-specific; excluded from profiles |
+| `expert_streaming_budget_gib` | float? | `null` = automatic RAM-scaled cache (default, via `budget_auto`); `0` = **page-cache only** (no app-level LRU); `>0` = fixed LRU heap, clamp `0–64`. Any explicit value (including `0`) always wins over `budget_auto` |
+| `expert_streaming_budget_auto` | bool? | Default-**on** RAM-scaled cache: `min((ceiling − streaming − 2 GiB) × 0.5, min(8 GiB, knee))`, whole MiB. More RAM = more cached experts. `null` follows the default (on); `false` opts back out to page-cache only. Machine-specific; excluded from profiles |
 | `expert_streaming_topk_threshold` | float? | `null` / `>= 1.0` = exact routing (default, bit-exact); `0.05–0.95` = adaptive top-k mass truncation (approximate, changes outputs). Hooks exist only for `qwen4_exp` and `glm5_next` (+ `_text`); other types warn and stay exact |
 | `expert_streaming_pin_sync` | bool? | Fase M1: apply learned pins synchronously at load (bench arms). Default off (background) |
 | `expert_streaming_pin_regime` | str? | Which routing sample pins read: `decode` (default) or `prefill` |
