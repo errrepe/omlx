@@ -7385,10 +7385,13 @@
                     expert_streaming_forced:
                         model?.expert_streaming_forced === true,
                     expert_streaming_budget_gib: s.expert_streaming_budget_gib ?? null,
+                    expert_streaming_budget_auto: s.expert_streaming_budget_auto ?? false,
                     expert_streaming_topk_threshold: s.expert_streaming_topk_threshold ?? null,
                     expert_streaming_per_layer_eval: s.expert_streaming_per_layer_eval ?? true,
                     expert_streaming_pins: s.expert_streaming_pins ?? false,
                     expert_streaming_pin_gib: s.expert_streaming_pin_gib ?? null,
+                    expert_streaming_pin_sync: s.expert_streaming_pin_sync ?? false,
+                    expert_streaming_pin_regime: s.expert_streaming_pin_regime ?? null,
                     expert_streaming_cold_tier_present: model?.expert_streaming_cold_tier_present === true,
                     expert_streaming_cold_tier: s.expert_streaming_cold_tier ?? null,
                     expert_streaming_hot_fraction: s.expert_streaming_hot_fraction ?? null,
@@ -8323,6 +8326,7 @@
                                 expert_streaming_budget_gib: this.modelSettings.expert_streaming_budget_gib != null && String(this.modelSettings.expert_streaming_budget_gib).length
                                     ? parseFloat(this.modelSettings.expert_streaming_budget_gib)
                                     : null,
+                                expert_streaming_budget_auto: !!this.modelSettings.expert_streaming_budget_auto,
                                 expert_streaming_topk_threshold: this.modelSettings.expert_streaming_topk_threshold != null && String(this.modelSettings.expert_streaming_topk_threshold).length
                                     ? parseFloat(this.modelSettings.expert_streaming_topk_threshold)
                                     : null,
@@ -8330,6 +8334,10 @@
                                 expert_streaming_pins: !!this.modelSettings.expert_streaming_pins,
                                 expert_streaming_pin_gib: this.modelSettings.expert_streaming_pin_gib != null && String(this.modelSettings.expert_streaming_pin_gib).length
                                     ? parseFloat(this.modelSettings.expert_streaming_pin_gib)
+                                    : null,
+                                expert_streaming_pin_sync: !!this.modelSettings.expert_streaming_pin_sync,
+                                expert_streaming_pin_regime: (this.modelSettings.expert_streaming_pin_regime === "decode" || this.modelSettings.expert_streaming_pin_regime === "prefill")
+                                    ? this.modelSettings.expert_streaming_pin_regime
                                     : null,
                                 expert_streaming_cold_tier: (this.modelSettings.expert_streaming_cold_tier != null && String(this.modelSettings.expert_streaming_cold_tier).length && Number(this.modelSettings.expert_streaming_cold_tier) >= 2)
                                     ? String(Math.min(3, Math.floor(Number(this.modelSettings.expert_streaming_cold_tier))))

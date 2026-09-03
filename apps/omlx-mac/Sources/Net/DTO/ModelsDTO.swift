@@ -103,10 +103,13 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen4PleSsdOffload: Bool?
     let expertStreamingEnabled: Bool?
     let expertStreamingBudgetGib: Double?
+    let expertStreamingBudgetAuto: Bool?
     let expertStreamingTopkThreshold: Double?
     let expertStreamingPerLayerEval: Bool?
     let expertStreamingPins: Bool?
     let expertStreamingPinGib: Double?
+    let expertStreamingPinSync: Bool?
+    let expertStreamingPinRegime: String?
     let expertStreamingColdTier: String?
     let expertStreamingColdTierPresent: Bool?
     let expertStreamingHotFraction: Double?
@@ -199,10 +202,13 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen4PleSsdOffload: Bool? = nil
     var expertStreamingEnabled: Bool? = nil
     var expertStreamingBudgetGib: Double? = nil
+    var expertStreamingBudgetAuto: Bool? = nil
     var expertStreamingTopkThreshold: Double? = nil
     var expertStreamingPerLayerEval: Bool? = nil
     var expertStreamingPins: Bool? = nil
     var expertStreamingPinGib: Double? = nil
+    var expertStreamingPinSync: Bool? = nil
+    var expertStreamingPinRegime: String? = nil
     var expertStreamingColdTier: String? = nil
     var expertStreamingHotFraction: Double? = nil
     var thinkingBudgetEnabled: Bool? = nil

@@ -774,6 +774,23 @@ private struct AdvancedTab: View {
                                 }
                             ), mono: true, suffix: "GiB", width: 110)
                         }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.budget_auto.label",
+                                          defaultValue: "Auto RAM-scaled cache",
+                                          comment: "Row label for the automatic expert cache budget toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.budget_auto.sub",
+                                             defaultValue: "Size the expert cache from this machine's memory ceiling (more RAM = more cached experts). A fixed budget above always wins. Takes effect after reload.",
+                                             comment: "Sublabel for the automatic expert cache budget toggle")) {
+                            Toggle("", isOn: vm.bind(
+                                $vm.expertStreamingBudgetAuto,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingBudgetAuto, client: client)
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                        }
                     }
                     if vm.expertStreamingEnabled {
                         Row(label: String(localized: "settings.advanced.expert_streaming.topk.label",
@@ -840,6 +857,40 @@ private struct AdvancedTab: View {
                                 .labelsHidden()
                                 .toggleStyle(.switch)
                             }
+                        }
+                    }
+                    if vm.expertStreamingEnabled && vm.expertStreamingPins {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.pin_sync.label",
+                                          defaultValue: "Apply pins synchronously at load",
+                                          comment: "Row label for the synchronous pinning toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.pin_sync.sub",
+                                             defaultValue: "Bench arms set this so the mlock pass provably completes before the first request. Off = pin in the background.",
+                                             comment: "Sublabel for the synchronous pinning toggle")) {
+                            Toggle("", isOn: vm.bind(
+                                $vm.expertStreamingPinSync,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingPinSync, client: client)
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.pin_regime.label",
+                                          defaultValue: "Pin profile regime",
+                                          comment: "Row label for the pin regime field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.pin_regime.sub",
+                                             defaultValue: "Which routing sample the pin selection reads: decode or prefill. Empty = decode.",
+                                             comment: "Sublabel for the pin regime field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingPinRegime,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingPinRegime, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
                         }
                     }
                     if vm.expertStreamingEnabled && vm.expertStreamingColdTierPresent {

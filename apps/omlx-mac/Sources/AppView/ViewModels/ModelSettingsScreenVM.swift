@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingColdTier, expertStreamingHotFraction
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingBudgetAuto, expertStreamingTopkThreshold, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingPinSync, expertStreamingPinRegime, expertStreamingColdTier, expertStreamingHotFraction
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -245,10 +245,13 @@ final class ModelSettingsScreenVM {
     var expertStreamingSupported: Bool = false
     var expertStreamingForced: Bool = false
     var expertStreamingBudgetGib: String = ""
+    var expertStreamingBudgetAuto: Bool = false
     var expertStreamingTopkThreshold: String = ""
     var expertStreamingPerLayerEval: Bool = true
     var expertStreamingPins: Bool = false
     var expertStreamingPinGib: String = ""
+    var expertStreamingPinSync: Bool = false
+    var expertStreamingPinRegime: String = ""
     var expertStreamingColdTier: String = ""
     var expertStreamingColdTierPresent: Bool = false
     var expertStreamingHotFraction: String = ""
@@ -397,8 +400,9 @@ final class ModelSettingsScreenVM {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
-        case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib,
+        case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib, .expertStreamingBudgetAuto,
              .expertStreamingTopkThreshold, .expertStreamingPerLayerEval, .expertStreamingPins, .expertStreamingPinGib,
+             .expertStreamingPinSync, .expertStreamingPinRegime,
              .expertStreamingColdTier,
              .expertStreamingHotFraction,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
@@ -539,12 +543,15 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingEnabled = self.expertStreamingForced
                     || (s?.expertStreamingEnabled ?? false)
                 self.expertStreamingBudgetGib = s?.expertStreamingBudgetGib.map { String($0) } ?? ""
+                self.expertStreamingBudgetAuto = s?.expertStreamingBudgetAuto ?? false
                 self.expertStreamingTopkThreshold = s?.expertStreamingTopkThreshold.map { String($0) } ?? ""
                 // Null means the env/built-in default, which is on — show the
                 // effective state so the toggle is never a lie.
                 self.expertStreamingPerLayerEval = s?.expertStreamingPerLayerEval ?? true
                 self.expertStreamingPins = s?.expertStreamingPins ?? false
                 self.expertStreamingPinGib = s?.expertStreamingPinGib.map { String($0) } ?? ""
+                self.expertStreamingPinSync = s?.expertStreamingPinSync ?? false
+                self.expertStreamingPinRegime = s?.expertStreamingPinRegime ?? ""
                 self.expertStreamingColdTier = s?.expertStreamingColdTier ?? ""
                 self.expertStreamingColdTierPresent = m.expertStreamingColdTierPresent ?? false
                 self.expertStreamingHotFraction = s?.expertStreamingHotFraction.map { String($0) } ?? ""
@@ -727,6 +734,20 @@ final class ModelSettingsScreenVM {
                 patch.expertStreamingPinGib = nil
             } else if let v = Double(expertStreamingPinGib), v >= 0, v <= 64 {
                 patch.expertStreamingPinGib = v
+            }
+        case .expertStreamingBudgetAuto:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingBudgetAuto = expertStreamingBudgetAuto
+        case .expertStreamingPinSync:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingPinSync = expertStreamingPinSync
+        case .expertStreamingPinRegime:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            let regime = expertStreamingPinRegime.trimmingCharacters(in: .whitespacesAndNewlines)
+            if regime.isEmpty {
+                patch.expertStreamingPinRegime = nil
+            } else if regime == "decode" || regime == "prefill" {
+                patch.expertStreamingPinRegime = regime
             } else {
                 lastError = "Pin budget must be between 0 and 64 GiB"
                 return
