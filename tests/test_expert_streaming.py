@@ -232,6 +232,199 @@ def test_widened_moe_type_dims_not_defaulted(model_type, experts_key):
         assert hidden == 32
 
 
+def _write_no_layer_index_checkpoint(
+    tmp: Path,
+    model_type: str,
+    experts_key: str,
+    num_layers=4,
+    experts=8,
+    hidden=32,
+    moe_hidden=16,
+    extra_config: dict | None = None,
+):
+    """Checkpoint whose expert keys carry no ``layers.N.`` index.
+
+    Forces the estimate down the config-only fallback path (the header scan
+    finds no layer indices), which is what _CONFIG_DERIVABLE_MOE_LAYERS and
+    _ALL_LAYERS_MOE exist for.
+    """
+    config = {
+        "model_type": model_type,
+        "num_hidden_layers": num_layers,
+        experts_key: experts,
+        "hidden_size": hidden,
+        "moe_intermediate_size": moe_hidden,
+    }
+    if extra_config:
+        config.update(extra_config)
+    (tmp / "config.json").write_text(json.dumps(config))
+    tensors = {}
+    for proj, shape in [
+        ("gate_proj", (experts, moe_hidden, hidden)),
+        ("up_proj", (experts, moe_hidden, hidden)),
+        ("down_proj", (experts, hidden, moe_hidden)),
+    ]:
+        key = f"model.mlp.switch_mlp.{proj}.weight"
+        tensors[key] = (shape, "BF16", int(np.prod(shape)) * 2)
+    tensors["model.embed_tokens.weight"] = ((32000, hidden), "BF16", 32000 * hidden * 2)
+
+    header = {}
+    offset = 0
+    for k, (shape, dtype, size) in tensors.items():
+        header[k] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+    header_bytes = json.dumps(header).encode()
+    with (tmp / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(b"\x00" * offset)
+    (tmp / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
+    )
+    return config
+
+
+def test_config_derivable_first_k_fallback():
+    """deepseek_v3 / glm4_moe resolve MoE layers from first_k_dense_replace."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_no_layer_index_checkpoint(
+            tmp, "deepseek_v3", "n_routed_experts",
+            num_layers=8, experts=8, extra_config={"first_k_dense_replace": 3},
+        )
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True, est.reason
+        assert est.num_moe_layers == 5, est.num_moe_layers  # layers 3..7
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_no_layer_index_checkpoint(
+            tmp, "glm4_moe", "n_routed_experts",
+            num_layers=4, experts=8, extra_config={"first_k_dense_replace": 1},
+        )
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True, est.reason
+        assert est.num_moe_layers == 3, est.num_moe_layers  # layers 1..3
+
+
+def test_config_derivable_qwen3_sparse_step():
+    """qwen3_moe mirrors mlx: (i+1) % step == 0 minus mlp_only_layers."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_no_layer_index_checkpoint(
+            tmp, "qwen3_moe", "num_experts", num_layers=6, experts=8,
+            extra_config={"decoder_sparse_step": 2, "mlp_only_layers": [0]},
+        )
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True, est.reason
+        assert est.num_moe_layers == 3, est.num_moe_layers  # i=1,3,5
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_no_layer_index_checkpoint(
+            tmp, "qwen3_moe", "num_experts", num_layers=4, experts=8,
+        )
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True, est.reason
+        assert est.num_moe_layers == 4, est.num_moe_layers  # defaults: all MoE
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_no_layer_index_checkpoint(
+            tmp, "qwen3_moe", "num_experts", num_layers=4, experts=8,
+            extra_config={"decoder_sparse_step": 0},
+        )
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True, est.reason
+        assert est.num_moe_layers == 4, est.num_moe_layers  # invalid step -> 1
+
+
+def test_all_layers_moe_qwen2():
+    """qwen2_moe's decoder is unconditionally all-MoE."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_no_layer_index_checkpoint(
+            tmp, "qwen2_moe", "num_experts", num_layers=5, experts=8,
+        )
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True, est.reason
+        assert est.num_moe_layers == 5, est.num_moe_layers
+
+
+class _FakeMLPLayer:
+    def __init__(self, e, o, i):
+        self.mlp = _FakeMoE(e, o, i)
+
+
+@pytest.mark.parametrize("model_type,experts_key", _WIDENED_MOE_TYPES)
+def test_convert_walk_mlp_layout_widened(model_type, experts_key):
+    """convert_model_to_streaming reaches the ``.mlp.switch_mlp`` banks of
+    the four widened types — the runtime half of the allowlist widening.
+    Header-only estimates cannot prove the layer walk finds the banks."""
+    from omlx.patches.expert_streaming import convert_model_to_streaming
+    from omlx.patches.expert_streaming.streaming_switch import StreamingSwitchGLU
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        num_layers, experts, hidden, moe_hidden = 2, 4, 32, 16
+        _write_fake_switch_mlp_checkpoint(
+            tmp, model_type, experts_key,
+            num_layers=num_layers, experts=experts,
+            hidden=hidden, moe_hidden=moe_hidden,
+        )
+        layers = [_FakeMLPLayer(experts, moe_hidden, hidden) for _ in range(num_layers)]
+        model = _FakeTextModel(
+            layers,
+            [],
+            {
+                "model_type": model_type,
+                experts_key: experts,
+                "hidden_size": hidden,
+                "moe_intermediate_size": moe_hidden,
+                "num_hidden_layers": num_layers,
+            },
+        )
+        out_model, _backing = convert_model_to_streaming(
+            model, str(tmp), None, use_file_backing=False
+        )
+        assert out_model is model
+        for layer in layers:
+            assert isinstance(layer.mlp.switch_mlp, StreamingSwitchGLU), model_type
+
+
+def test_topk_inapplicable_is_soft_noop():
+    """An approximate threshold on a type without a hook warns and stays exact."""
+    from omlx.patches.expert_streaming import adaptive_topk
+
+    try:
+        for model_type in ("qwen3_moe", "qwen2_moe", "deepseek_v3", "glm4_moe"):
+            assert not adaptive_topk.is_topk_applicable(model_type)
+            assert (
+                adaptive_topk.configure_from_settings(
+                    ModelSettings(expert_streaming_topk_threshold=0.5),
+                    model_type=model_type,
+                )
+                is None
+            )
+        # Applicable types still resolve; exact stays exact.
+        for model_type in ("qwen4_exp", "glm5_next", "qwen4_exp_text", "glm5_next_text"):
+            assert adaptive_topk.is_topk_applicable(model_type)
+        assert (
+            adaptive_topk.configure_from_settings(
+                ModelSettings(expert_streaming_topk_threshold=0.5),
+                model_type="qwen4_exp",
+            )
+            == 0.5
+        )
+        assert (
+            adaptive_topk.configure_from_settings(ModelSettings(), model_type="qwen3_moe")
+            is None
+        )
+    finally:
+        adaptive_topk.configure(None)
+
+
 def test_unlisted_switch_mlp_type_is_not_supported():
     """The OOM guard. A checkpoint with stacked switch_mlp banks whose
     model_type is outside the allowlist must NOT report as streamable.

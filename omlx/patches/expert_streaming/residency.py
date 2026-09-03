@@ -82,6 +82,18 @@ _CONFIG_DERIVABLE_MOE_LAYERS = frozenset(
         "glm5_next_text",
         "qwen4_exp",
         "qwen4_exp_text",
+        # deepseek_v3 / glm4_moe resolve through the generic
+        # first_k_dense_replace branch below (verified keys).
+        "deepseek_v3",
+        "glm4_moe",
+        # qwen3_moe resolves through the dedicated decoder_sparse_step +
+        # mlp_only_layers branch below (verified against mlx_lm).
+        "qwen3_moe",
+        # qwen2_moe: its decoder is unconditionally all-MoE and its config
+        # carries no pattern keys, so the generic loop below (first_k=0,
+        # freq=1 defaults) already counts every layer; the _ALL_LAYERS_MOE
+        # membership documents the invariant and backstops it.
+        "qwen2_moe",
     }
 )
 
@@ -93,6 +105,9 @@ _ALL_LAYERS_MOE = frozenset(
         "qwen4_exp_text",
         "deepseek_v4",
         "deepseek_v4_mtp",
+        # qwen2_moe's mlx decoder is unconditionally all-MoE (every layer
+        # carries a Qwen2MoeSparseMoeBlock; no sparse/dense pattern keys).
+        "qwen2_moe",
     }
 )
 
@@ -112,6 +127,10 @@ class ExpertStreamingEstimate:
     per_expert_bytes: int
     per_layer_expert_bytes: int
     reason: str | None = None
+    # Normalized effective model_type (top-level config wins, VLM wrappers
+    # fall back to text_config). Lets consumers scope per-family behavior
+    # (e.g. adaptive top-k hooks) without re-reading config.json.
+    model_type: str = ""
     # Fase J Etapa E: text hidden size, used to charge one materialized layer
     # activation to the prefill guard when a per-layer eval boundary is live.
     # 0 when the config does not expose it (the guard then charges the bank
@@ -290,6 +309,30 @@ def _detect_expert_keys(
                 cnt = sum(1 for t in mlp_types if str(t).lower() == "sparse")
                 if cnt > 0:
                     num_moe_layers = cnt
+            if num_moe_layers == 0 and normalize_model_type(model_type) == "qwen3_moe" and n_routed:
+                # qwen3_moe: a layer is MoE iff it is not dense-only and
+                # (layer_idx + 1) % decoder_sparse_step == 0, mirroring
+                # mlx_lm's Qwen3MoeDecoderLayer. Defaults (step=1, no
+                # dense-only layers) resolve to every layer being MoE.
+                try:
+                    step = int(config.get("decoder_sparse_step") or text_cfg.get("decoder_sparse_step") or 1)
+                except (TypeError, ValueError):
+                    step = 1
+                if step < 1:
+                    step = 1
+                raw_only = config.get("mlp_only_layers")
+                if raw_only is None:
+                    raw_only = text_cfg.get("mlp_only_layers")
+                only: set[int] = set()
+                if isinstance(raw_only, (list, tuple)):
+                    for v in raw_only:
+                        try:
+                            only.add(int(v))
+                        except (TypeError, ValueError):
+                            continue
+                num_moe_layers = sum(
+                    1 for i in range(num_layers) if i not in only and (i + 1) % step == 0
+                )
             if num_moe_layers == 0 and n_routed:
                 # generic first_k/moe_freq fallback
                 first_k = int(config.get("first_k_dense_replace") or text_cfg.get("first_k_dense_replace") or 0)
@@ -501,6 +544,7 @@ def _cached_estimate(
         per_layer_expert_bytes=per_layer_expert,
         reason=reason,
         hidden_size=hidden_size,
+        model_type=model_type,
     )
 
 

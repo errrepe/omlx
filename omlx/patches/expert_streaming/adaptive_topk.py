@@ -36,6 +36,27 @@ _MEAN_KEEPS: float | None = None
 _MIN_THRESHOLD = 0.05
 _MAX_THRESHOLD = 1.0
 
+# Model types with a truncation hook. The qwen hook wraps
+# Qwen3_5MoeSparseMoeBlock (shared by the vendored qwen4_exp decoder); the
+# glm hook lives in the vendored Glm5NextMoE.__call__. Any other supported
+# streaming type silently ignores the threshold without this gate — the
+# converter must warn instead of logging it active (see is_topk_applicable).
+TOPK_APPLICABLE_TYPES = frozenset(
+    {
+        "qwen4_exp",
+        "qwen4_exp_text",
+        "glm5_next",
+        "glm5_next_text",
+    }
+)
+
+
+def is_topk_applicable(model_type: object) -> bool:
+    """True when an adaptive top-k hook exists for this model type."""
+    from .residency import normalize_model_type
+
+    return normalize_model_type(model_type) in TOPK_APPLICABLE_TYPES
+
 
 def configure(threshold: float | None) -> None:
     """Set the active routing threshold (None or >= 1.0 = exact)."""
@@ -53,8 +74,13 @@ def configure(threshold: float | None) -> None:
         logger.info("Adaptive top-k truncation active: threshold=%.2f", _THRESHOLD)
 
 
-def configure_from_settings(settings: Any | None) -> float | None:
-    """Resolve the threshold from ModelSettings with an env fallback."""
+def configure_from_settings(settings: Any | None, model_type: object = None) -> float | None:
+    """Resolve the threshold from ModelSettings with an env fallback.
+
+    When *model_type* is given and has no truncation hook, an approximate
+    threshold is a silent no-op downstream — fail soft here instead: warn
+    and return None so the caller skips the patch (exact routing stays on).
+    """
     t = getattr(settings, "expert_streaming_topk_threshold", None) if settings else None
     if t is None:
         env = os.environ.get("OMLX_MOE_TOPK_THRESHOLD", "")
@@ -64,6 +90,14 @@ def configure_from_settings(settings: Any | None) -> float | None:
             except ValueError:
                 logger.warning("Invalid OMLX_MOE_TOPK_THRESHOLD=%r; ignoring", env)
     configure(t)
+    if _THRESHOLD is not None and model_type is not None and not is_topk_applicable(model_type):
+        logger.warning(
+            "Adaptive top-k threshold %.2f ignored: no truncation hook for model type %r "
+            "(exact routing stays on)",
+            _THRESHOLD,
+            model_type,
+        )
+        return None
     return _THRESHOLD
 
 

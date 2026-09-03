@@ -1028,9 +1028,22 @@ def convert_model_to_streaming(
         # (None/1.0) by default — no patch engagement, zero overhead.
         from .adaptive_topk import apply_qwen35_moe_topk_patch, configure_from_settings
 
-        thr = configure_from_settings(model_settings)
+        thr = configure_from_settings(model_settings, model_type=estimate.model_type)
         if thr is not None:
-            apply_qwen35_moe_topk_patch()
+            # configure() already refused inapplicable types (thr None);
+            # the qwen hook engages here while the glm hook is inline in
+            # the vendored Glm5NextMoE, so a False return only matters
+            # when the type itself has no hook at all.
+            from .adaptive_topk import is_topk_applicable
+
+            engaged = apply_qwen35_moe_topk_patch()
+            if not engaged and not is_topk_applicable(estimate.model_type):
+                logger.warning(
+                    "Adaptive top-k threshold %.2f set but no truncation hook engaged "
+                    "for model type %r (exact routing stays on)",
+                    thr,
+                    estimate.model_type,
+                )
         # Qwen3.5/3.8 prefill eval boundary (G4): the installed qwen decoder
         # ignores _stream_eval; wrap it so long prefill chunks evaluate per
         # layer instead of pinning every layer's mini-bank in the lazy graph
