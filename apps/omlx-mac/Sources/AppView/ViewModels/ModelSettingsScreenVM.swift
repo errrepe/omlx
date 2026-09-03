@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingBudgetAuto, expertStreamingTopkThreshold, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingPinSync, expertStreamingPinRegime, expertStreamingColdTier, expertStreamingHotFraction
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingBudgetAuto, expertStreamingTopkThreshold, expertStreamingCachePrior, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingPinSync, expertStreamingPinRegime, expertStreamingColdTier, expertStreamingHotFraction
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -247,6 +247,7 @@ final class ModelSettingsScreenVM {
     var expertStreamingBudgetGib: String = ""
     var expertStreamingBudgetAuto: Bool = false
     var expertStreamingTopkThreshold: String = ""
+    var expertStreamingCachePrior: String = ""
     var expertStreamingPerLayerEval: Bool = true
     var expertStreamingPins: Bool = false
     var expertStreamingPinGib: String = ""
@@ -401,7 +402,7 @@ final class ModelSettingsScreenVM {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
         case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib, .expertStreamingBudgetAuto,
-             .expertStreamingTopkThreshold, .expertStreamingPerLayerEval, .expertStreamingPins, .expertStreamingPinGib,
+             .expertStreamingTopkThreshold, .expertStreamingCachePrior, .expertStreamingPerLayerEval, .expertStreamingPins, .expertStreamingPinGib,
              .expertStreamingPinSync, .expertStreamingPinRegime,
              .expertStreamingColdTier,
              .expertStreamingHotFraction,
@@ -545,6 +546,7 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingBudgetGib = s?.expertStreamingBudgetGib.map { String($0) } ?? ""
                 self.expertStreamingBudgetAuto = s?.expertStreamingBudgetAuto ?? true
                 self.expertStreamingTopkThreshold = s?.expertStreamingTopkThreshold.map { String($0) } ?? ""
+                self.expertStreamingCachePrior = s?.expertStreamingCachePrior.map { String($0) } ?? ""
                 // Null means the env/built-in default, which is on — show the
                 // effective state so the toggle is never a lie.
                 self.expertStreamingPerLayerEval = s?.expertStreamingPerLayerEval ?? true
@@ -720,6 +722,16 @@ final class ModelSettingsScreenVM {
                 patch.expertStreamingTopkThreshold = v < 1.0 ? v : nil
             } else {
                 lastError = "Top-k threshold must be between 0.05 and 1.0"
+                return
+            }
+        case .expertStreamingCachePrior:
+            guard expertStreamingSupported else { return }
+            if expertStreamingCachePrior.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                patch.expertStreamingCachePrior = nil
+            } else if let v = Double(expertStreamingCachePrior), v >= 0.0, v <= 10.0 {
+                patch.expertStreamingCachePrior = v > 0 ? v : nil
+            } else {
+                lastError = "Cache-prior bonus must be between 0.0 and 10.0"
                 return
             }
         case .expertStreamingPerLayerEval:

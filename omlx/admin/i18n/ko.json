@@ -1140,6 +1140,8 @@
   "modal.model_settings.expert_streaming_budget_auto_hint": "이 머신의 메모리 상한에 따라 엑스퍼트 캐시를 조정합니다 (RAM이 많을수록 더 많은 엑스퍼트 캐시). 고정 예산이 우선합니다. 다시 로드 후 적용.",
   "modal.model_settings.expert_streaming_topk": "Top-k 질량 임계값",
   "modal.model_settings.expert_streaming_topk_hint": "옵트인 근사 라우팅: 점수 내림차순 top-k 접두사 중 이 질량 비율에 도달하는 최소치를 유지. 1.0 또는 비움 = 정확(비트 동일). ~0.85은 측정된 속도 절벽(약 1.8배, 0.70에서 10토큰 중 7개 일치).",
+  "modal.model_settings.expert_streaming_cache_prior": "스태키캐시 우선 보너스",
+  "modal.model_settings.expert_streaming_cache_prior_hint": "선택적 근사 라우팅: 캐시에 있는 엑스퍼트에 top-k 전에 이 로짓 보너스를 부여. 0.0 또는 비움 = 정확. Qwen-JANG_4M short에서 1.0은 히트율 약 2배, tok/s 약 +11% 측정.",
   "modal.model_settings.expert_streaming_eval": "프리필 시 레이어별 동기화 (Qwen)",
   "modal.model_settings.expert_streaming_eval_hint": "스트리밍 프리필 중 디코더의 각 레이어를 평가하고 할당자 캐시를 정리합니다. 비트 정확; 긴 프롬프트의 메모리 피크를 억제해 페이지 캐시를 보존합니다. A/B 테스트 때만 끄세요.",
   "modal.model_settings.expert_streaming_pins": "전문가 고정 (mlock)",

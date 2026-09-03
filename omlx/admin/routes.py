@@ -142,6 +142,7 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_budget_gib: float | None = None
     expert_streaming_budget_auto: bool | None = None
     expert_streaming_topk_threshold: float | None = None
+    expert_streaming_cache_prior: float | None = None
     # Expert-streaming IO knobs (autotune-tuned, per model; None = env/default)
     expert_streaming_io_depth: int | None = None
     expert_streaming_coalesce: bool | None = None
@@ -2466,6 +2467,19 @@ async def update_model_settings(
                 raise HTTPException(status_code=400, detail="expert_streaming_topk_threshold must be between 0.05 and 1.0")
             # >= 1.0 normalizes to exact routing (None)
             current_settings.expert_streaming_topk_threshold = float(thr) if thr < 1.0 else None
+    if "expert_streaming_cache_prior" in sent:
+        v = request.expert_streaming_cache_prior
+        if v is None:
+            current_settings.expert_streaming_cache_prior = None
+        else:
+            try:
+                prior = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expert_streaming_cache_prior must be a number")
+            if not 0.0 <= prior <= 10.0:
+                raise HTTPException(status_code=400, detail="expert_streaming_cache_prior must be between 0.0 and 10.0")
+            # 0.0 normalizes to exact routing (None)
+            current_settings.expert_streaming_cache_prior = float(prior) if prior > 0 else None
     if "expert_streaming_io_depth" in sent:
         v = request.expert_streaming_io_depth
         if v is None:

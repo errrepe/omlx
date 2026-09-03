@@ -1029,12 +1029,13 @@ def convert_model_to_streaming(
         # patch engagement, zero overhead.
         from .adaptive_topk import (
             apply_qwen35_moe_topk_patch,
-            cache_prior_bonus,
+            cache_prior_from_settings,
             configure_from_settings,
         )
 
         thr = configure_from_settings(model_settings, model_type=estimate.model_type)
-        if thr is not None or cache_prior_bonus() > 0:
+        prior = cache_prior_from_settings(model_settings)
+        if thr is not None or prior > 0:
             # configure() already refused inapplicable types (thr None);
             # the qwen hook engages here while the glm hook is inline in
             # the vendored Glm5NextMoE, so a False return only matters

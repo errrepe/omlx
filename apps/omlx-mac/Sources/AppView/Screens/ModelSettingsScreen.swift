@@ -810,6 +810,23 @@ private struct AdvancedTab: View {
                         }
                     }
                     if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.cacheprior.label",
+                                          defaultValue: "Cache-prior bonus",
+                                          comment: "Row label for the cache-prior routing bonus field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.cacheprior.sub",
+                                             defaultValue: "Opt-in approximate routing: resident experts get this logit bonus before top-k. 0.0 or empty = exact.",
+                                             comment: "Sublabel for the cache-prior routing bonus field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingCachePrior,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingCachePrior, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
+                    if vm.expertStreamingEnabled {
                         Row(label: String(localized: "settings.advanced.expert_streaming.eval.label",
                                           defaultValue: "Prefill per-layer sync (Qwen)",
                                           comment: "Row label for the streaming prefill per-layer eval toggle"),

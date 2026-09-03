@@ -813,6 +813,9 @@ class EnginePool:
                 thr = data.get("expert_streaming_topk_threshold", None)
                 if thr is not None and float(thr) < 1.0:
                     add("expert_streaming_topk_threshold", thr)
+                prior = data.get("expert_streaming_cache_prior", None)
+                if prior is not None and float(prior) > 0:
+                    add("expert_streaming_cache_prior", prior)
                 # IO-layer tuning knobs (autotune): the IO pool depth is fixed
                 # at conversion time and warmer/prefetcher attach is decided
                 # at load, so any of these changes must rebuild the engine.

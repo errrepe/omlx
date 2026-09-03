@@ -7387,6 +7387,7 @@
                     expert_streaming_budget_gib: s.expert_streaming_budget_gib ?? null,
                     expert_streaming_budget_auto: s.expert_streaming_budget_auto ?? true,
                     expert_streaming_topk_threshold: s.expert_streaming_topk_threshold ?? null,
+                    expert_streaming_cache_prior: s.expert_streaming_cache_prior ?? null,
                     expert_streaming_per_layer_eval: s.expert_streaming_per_layer_eval ?? true,
                     expert_streaming_pins: s.expert_streaming_pins ?? false,
                     expert_streaming_pin_gib: s.expert_streaming_pin_gib ?? null,
@@ -8329,6 +8330,9 @@
                                 expert_streaming_budget_auto: !!this.modelSettings.expert_streaming_budget_auto,
                                 expert_streaming_topk_threshold: this.modelSettings.expert_streaming_topk_threshold != null && String(this.modelSettings.expert_streaming_topk_threshold).length
                                     ? parseFloat(this.modelSettings.expert_streaming_topk_threshold)
+                                    : null,
+                                expert_streaming_cache_prior: this.modelSettings.expert_streaming_cache_prior != null && String(this.modelSettings.expert_streaming_cache_prior).length
+                                    ? parseFloat(this.modelSettings.expert_streaming_cache_prior)
                                     : null,
                                 expert_streaming_per_layer_eval: !!this.modelSettings.expert_streaming_per_layer_eval,
                                 expert_streaming_pins: !!this.modelSettings.expert_streaming_pins,

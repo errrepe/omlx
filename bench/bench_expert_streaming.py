@@ -98,6 +98,7 @@ def _bench_settings(
     pin_regime: str,
     budget: float,
     topk: float | None,
+    prior: float | None,
     cold_tier: str | None,
     hot_fraction: float | None,
     mtp: bool,
@@ -119,6 +120,7 @@ def _bench_settings(
         expert_streaming_enabled=True,
         expert_streaming_budget_gib=budget,
         expert_streaming_topk_threshold=topk,
+        expert_streaming_cache_prior=prior,
         expert_streaming_cold_tier=cold_tier,
         # Fase I6 HOBBIT split: top fraction of experts per layer (by
         # learned pin-profile frequency) keeps the ORIGINAL packing while
@@ -342,6 +344,7 @@ async def run(
     mtp: bool,
     out: str | None,
     topk: float | None = None,
+    prior: float | None = None,
     cold_tier: str | None = None,
     prompt_len: str = "short",
     hot_fraction: float | None = None,
@@ -399,7 +402,7 @@ async def run(
     pool._process_memory_enforcer = None  # keep _propagate no-op path quiet
 
     settings = _bench_settings(
-        pins, pin_gib, pin_regime, budget, topk, cold_tier, hot_fraction,
+        pins, pin_gib, pin_regime, budget, topk, prior, cold_tier, hot_fraction,
         mtp, mtp_block, ane, specprefill_draft, specprefill_keep,
         mtp_native=_mtp_native,
     )
@@ -521,6 +524,7 @@ async def run(
         "model": model_key,
         "budget_gib": budget,
         "topk_threshold": topk,
+        "cache_prior": prior,
         "cold_tier": cold_tier,
         "hot_fraction": hot_fraction,
         "mtp": mtp,
@@ -957,6 +961,7 @@ def main():
     ap.add_argument("--decode", type=int, default=96)
     ap.add_argument("--mtp", action="store_true")
     ap.add_argument("--topk", type=float, default=None, help="adaptive top-k mass threshold (default exact)")
+    ap.add_argument("--cache-prior", type=float, default=None, help="cache-prior logit bonus for resident experts (default exact)")
     ap.add_argument("--cold-tier", default=None, metavar="BITS",
                     help="route expert reads to the <model>/expert_cold/ 3/2-bit tier (I5)")
     ap.add_argument("--hot-fraction", type=float, default=None, metavar="FRAC",
@@ -1019,6 +1024,7 @@ def main():
             args.mtp,
             args.out,
             args.topk,
+            args.cache_prior,
             args.cold_tier,
             prompt_len=args.prompt_len,
             hot_fraction=args.hot_fraction,

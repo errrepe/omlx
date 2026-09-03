@@ -1140,6 +1140,8 @@
   "modal.model_settings.expert_streaming_budget_auto_hint": "Размер кэша экспертов подбирается по потолку памяти этой машины (больше ОЗУ = больше экспертов в кэше). Фиксированный бюджет важнее. Действует после перезагрузки.",
   "modal.model_settings.expert_streaming_topk": "Порог массы top-k",
   "modal.model_settings.expert_streaming_topk_hint": "Опциональный приблизительный роутинг: сохраняет наименьший префикс top-k (по убыванию score), набирающий эту долю массы. 1.0 или пусто — точный (бит-в-бит). ~0.85 — измеренный порог ускорения (~1.8x, 7/10 токенов совпадают при 0.70).",
+  "modal.model_settings.expert_streaming_cache_prior": "Бонус кэшированных экспертов",
+  "modal.model_settings.expert_streaming_cache_prior_hint": "Опциональный приблизительный роутинг: эксперты из кэша получают бонус логита перед top-k. 0.0 или пусто = точно. 1.0: ~2x hit rate и +11% tok/s на Qwen-JANG_4M short.",
   "modal.model_settings.expert_streaming_eval": "Послойная синхронизация при предзаполнении (Qwen)",
   "modal.model_settings.expert_streaming_eval_hint": "Вычисляет каждый слой декодера при потоковом предзаполнении и подрезает кэш аллокатора. Побитово точно; ограничивает пики памяти на длинных промптах, чтобы кэш страниц выживал. Отключайте только для A/B-тестов.",
   "modal.model_settings.expert_streaming_pins": "Закрепление экспертов (mlock)",

@@ -119,6 +119,8 @@ class TestKnobs:
         assert env["OMLX_EXPERT_STREAMING_RA"] == "0"
         assert env["OMLX_EXPERT_STREAMING_SEED"] == "1"
         assert env["OMLX_EXPERT_STREAMING_PILOT"] == "1"
+        assert env["OMLX_EXPERT_STREAMING_CACHE_PRIOR"] == "0.0"
+        assert at.Knobs(prior=2.0).env()["OMLX_EXPERT_STREAMING_CACHE_PRIOR"] == "2.0"
 
     def test_profile_kwargs_matches_settings_fields(self):
         kw = at.Knobs(budget_gib=2.0, topk=None).profile_kwargs()
@@ -130,6 +132,25 @@ class TestKnobs:
     def test_label_is_stable_and_filesystem_safe(self):
         label = at.Knobs(budget_gib=4.0, topk=0.85).label()
         assert label == "b4_qd16_c1_ra1_s1_p0_tk0.85"
+
+    def test_prior_knob_label_profile_and_screen(self):
+        assert at.Knobs(prior=1.0).label() == "b0_qd16_c1_ra1_s1_p0_cp1"
+        kw = at.Knobs(prior=1.0).profile_kwargs()
+        s = ModelSettings(**kw)
+        assert s.expert_streaming_cache_prior == 1.0
+        kw0 = at.Knobs().profile_kwargs()
+        assert ModelSettings(**kw0).expert_streaming_cache_prior is None
+        base = at.Knobs()
+        off = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False, sweep_prior=False
+        )
+        assert all(knob != "prior" for knob, _ in off)
+        on = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[0.0, 1.0],
+        )
+        got = [(knob, cfg.prior) for knob, cfg in on if knob == "prior"]
+        assert got == [("prior", 1.0)]
 
 
 class TestScreenCandidates:

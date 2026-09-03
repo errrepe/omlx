@@ -1140,6 +1140,8 @@
   "modal.model_settings.expert_streaming_budget_auto_hint": "根據本機記憶體上限自動調整專家快取（記憶體越大，快取的專家越多）。上方固定預算優先。重新載入後生效。",
   "modal.model_settings.expert_streaming_topk": "Top-k 質量門檻",
   "modal.model_settings.expert_streaming_topk_hint": "可選的近似路由：保留按分數降序的 top-k 前綴中達到該質量比例的最小集合。1.0 或留空 = 精確（位元級一致）。~0.85 是實測的速度拐點（約 1.8x，0.70 時 10 個 token 中 7 個一致）。",
+  "modal.model_settings.expert_streaming_cache_prior": "快取優先加成",
+  "modal.model_settings.expert_streaming_cache_prior_hint": "可選近似路由：已在快取中的專家在 top-k 之前獲得此 logit 加成。0.0 或空 = 精確。Qwen-JANG_4M short 上 1.0 測得命中率約 2 倍、tok/s 約 +11%。",
   "modal.model_settings.expert_streaming_eval": "預填充逐層同步（Qwen）",
   "modal.model_settings.expert_streaming_eval_hint": "串流預填充時逐層求值解碼層並清理分配器快取。位元級一致；限制長提示的記憶體峰值，保護頁面快取。僅在 A/B 測試時關閉。",
   "modal.model_settings.expert_streaming_pins": "專家頁鎖定（mlock）",

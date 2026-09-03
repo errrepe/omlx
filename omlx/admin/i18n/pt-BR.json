@@ -1140,6 +1140,8 @@
   "modal.model_settings.expert_streaming_budget_auto_hint": "Dimensiona o cache de experts pelo teto de memória desta máquina (mais RAM = mais experts em cache). Um orçamento fixo acima sempre vence. Vale após recarregar.",
   "modal.model_settings.expert_streaming_topk": "Limiar de massa do top-k",
   "modal.model_settings.expert_streaming_topk_hint": "Roteamento aproximado opcional: mantém o menor prefixo do top-k (ordem decrescente de score) que atinge esta fração de massa. 1.0 ou vazio = exato (bit-idêntico). ~0.85 é o ponto de aceleração medido (~1.8x, 7/10 tokens idênticos a 0.70).",
+  "modal.model_settings.expert_streaming_cache_prior": "Bônus de cache-prior",
+  "modal.model_settings.expert_streaming_cache_prior_hint": "Roteamento aproximado opcional: experts já no cache recebem este bônus de logit antes do top-k. 0.0 ou vazio = exato (bit-idêntico). 1.0 mediu ~2x hit rate e +11% tok/s no Qwen-JANG_4M short.",
   "modal.model_settings.expert_streaming_eval": "Sincronização por camada no prefill (Qwen)",
   "modal.model_settings.expert_streaming_eval_hint": "Avalia cada camada do decodificador durante o prefill em streaming e apara o cache do alocador. Bit-exato; limita picos de memória em prompts longos para que o cache de páginas sobreviva. Desative apenas para testes A/B.",
   "modal.model_settings.expert_streaming_pins": "Fixação de especialistas (mlock)",

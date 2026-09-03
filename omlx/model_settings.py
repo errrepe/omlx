@@ -243,6 +243,12 @@ class ModelSettings:
     # threshold. None/1.0 = exact routing (bit-identical to the reference
     # path); <1.0 trades output fidelity for fewer streamed expert bytes.
     expert_streaming_topk_threshold: Optional[float] = None
+    # Opt-in cache-conditional MoE routing: logit bonus for LRU-resident
+    # experts before top-k. None/0.0 = exact routing (bit-identical);
+    # >0 trades output fidelity for fewer SSD re-reads (Fase 3: hit
+    # 9.2%->19.3%, +10.8% tok/s at 1.0 on Qwen-JANG_4M short).
+    # Machine-specific: never propagated via model profiles.
+    expert_streaming_cache_prior: Optional[float] = None
     # Per-model overrides for the expert-streaming IO layer. None keeps the
     # env-var / built-in default behavior (see patches/expert_streaming).
     # Autotune (bench/autotune_expert_streaming.py) writes the winning values

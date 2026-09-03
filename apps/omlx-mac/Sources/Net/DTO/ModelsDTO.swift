@@ -105,6 +105,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let expertStreamingBudgetGib: Double?
     let expertStreamingBudgetAuto: Bool?
     let expertStreamingTopkThreshold: Double?
+    let expertStreamingCachePrior: Double?
     let expertStreamingPerLayerEval: Bool?
     let expertStreamingPins: Bool?
     let expertStreamingPinGib: Double?
@@ -204,6 +205,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var expertStreamingBudgetGib: Double? = nil
     var expertStreamingBudgetAuto: Bool? = nil
     var expertStreamingTopkThreshold: Double? = nil
+    var expertStreamingCachePrior: Double? = nil
     var expertStreamingPerLayerEval: Bool? = nil
     var expertStreamingPins: Bool? = nil
     var expertStreamingPinGib: Double? = nil

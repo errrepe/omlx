@@ -123,6 +123,28 @@ def cache_prior_bonus() -> float:
     return _CACHE_PRIOR
 
 
+def configure_cache_prior(value: Any) -> float:
+    """Set the active bonus (None = env fallback, <=0 = exact).
+
+    Mirrors configure(): explicit values win, env fills the gap, garbage
+    fails closed to exact. Returns the effective bonus."""
+    global _CACHE_PRIOR
+    if value is None:
+        _CACHE_PRIOR = max(0.0, _safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0))
+    else:
+        try:
+            _CACHE_PRIOR = max(0.0, float(value))
+        except (TypeError, ValueError):
+            _CACHE_PRIOR = 0.0
+    return _CACHE_PRIOR
+
+
+def cache_prior_from_settings(settings: Any | None) -> float:
+    """Resolve the bonus from ModelSettings with env fallback."""
+    v = getattr(settings, "expert_streaming_cache_prior", None) if settings else None
+    return configure_cache_prior(v)
+
+
 def resident_experts(switch_mlp: Any) -> set[int]:
     """Experts resident in the app-level LRU for this layer.
 

@@ -4860,6 +4860,7 @@ class TestFaseM1PinWiring:
             pin_regime=regime,
             budget=0.0,
             topk=None,
+            prior=None,
             cold_tier=None,
             hot_fraction=None,
             mtp=False,
@@ -6006,4 +6007,22 @@ class TestCachePrior:
         assert tk._safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0) == 0.0
         monkeypatch.setenv("OMLX_EXPERT_STREAMING_CACHE_PRIOR", "1.5")
         assert tk._safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0) == 1.5
+
+    def test_configure_cache_prior_settings_and_env(self, monkeypatch):
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.expert_streaming import adaptive_topk as tk
+
+        prev = tk.cache_prior_bonus()
+        try:
+            # Explicit settings win.
+            assert tk.cache_prior_from_settings(ModelSettings(expert_streaming_cache_prior=2.0)) == 2.0
+            assert tk.cache_prior_bonus() == 2.0
+            # None falls back to env; garbage fails closed to exact.
+            monkeypatch.setenv("OMLX_EXPERT_STREAMING_CACHE_PRIOR", "1.5")
+            assert tk.cache_prior_from_settings(ModelSettings()) == 1.5
+            assert tk.cache_prior_from_settings(ModelSettings(expert_streaming_cache_prior="nope")) == 0.0
+            assert tk.cache_prior_from_settings(None) == 1.5
+        finally:
+            monkeypatch.delenv("OMLX_EXPERT_STREAMING_CACHE_PRIOR", raising=False)
+            tk.configure_cache_prior(prev if prev > 0 else None)
 

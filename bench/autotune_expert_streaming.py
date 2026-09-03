@@ -58,6 +58,7 @@ class Knobs:
     seed: bool = True
     pilot: bool = False
     topk: float | None = None
+    prior: float = 0.0
 
     def label(self) -> str:
         parts = [
@@ -70,6 +71,8 @@ class Knobs:
         ]
         if self.topk is not None:
             parts.append(f"tk{self.topk:g}")
+        if self.prior > 0:
+            parts.append(f"cp{self.prior:g}")
         return "_".join(parts)
 
     def env(self) -> dict[str, str]:
@@ -80,6 +83,9 @@ class Knobs:
             "OMLX_EXPERT_STREAMING_RA": "1" if self.readahead else "0",
             "OMLX_EXPERT_STREAMING_SEED": "1" if self.seed else "0",
             "OMLX_EXPERT_STREAMING_PILOT": "1" if self.pilot else "0",
+            # Hermeticity: pin the fidelity fallback per trial so an ambient
+            # shell export cannot leak into base/calibration trials (audit).
+            "OMLX_EXPERT_STREAMING_CACHE_PRIOR": str(float(self.prior)),
         }
 
     def profile_kwargs(self) -> dict:
@@ -92,11 +98,12 @@ class Knobs:
             "expert_streaming_seed": bool(self.seed),
             "expert_streaming_pilot": bool(self.pilot),
             "expert_streaming_topk_threshold": self.topk,
+            "expert_streaming_cache_prior": (float(self.prior) if self.prior > 0 else None),
         }
 
 
 # Coordinate-descent sweep order: biggest measured lever first.
-KNOB_SWEEP_ORDER = ("budget_gib", "io_depth", "pilot", "coalesce", "readahead", "seed", "topk")
+KNOB_SWEEP_ORDER = ("budget_gib", "io_depth", "pilot", "coalesce", "readahead", "seed", "topk", "prior")
 
 KNOB_ATTRS = {
     "budget_gib": "budget_gib",
@@ -106,6 +113,7 @@ KNOB_ATTRS = {
     "readahead": "readahead",
     "seed": "seed",
     "topk": "topk",
+    "prior": "prior",
 }
 
 
@@ -244,6 +252,8 @@ def screen_candidates(
     budgets: list[float],
     depths: list[int],
     sweep_topk: bool,
+    sweep_prior: bool = False,
+    priors: list[float] | None = None,
     loaded_est_gib: float | None = None,
     available_gib: float | None = None,
     reserve_gib: float = 10.0,
@@ -258,6 +268,8 @@ def screen_candidates(
     for knob in KNOB_SWEEP_ORDER:
         if knob == "topk" and not sweep_topk:
             continue
+        if knob == "prior" and not sweep_prior:
+            continue
         if knob == "budget_gib":
             cands: list = list(budgets)
             # A positive budget lives in RSS: only sweep values that fit
@@ -269,6 +281,8 @@ def screen_candidates(
             cands = list(depths)
         elif knob == "topk":
             cands = [None, 0.85]
+        elif knob == "prior":
+            cands = list(priors) if priors else [0.0, 1.0]
         else:
             cands = [True, False]
         for value in cands:
@@ -365,6 +379,8 @@ def bench_command(
     ]
     if cfg.topk is not None:
         cmd += ["--topk", str(cfg.topk)]
+    if cfg.prior > 0:
+        cmd += ["--cache-prior", str(cfg.prior)]
     return cmd
 
 
@@ -793,6 +809,8 @@ def run_session(opts: argparse.Namespace) -> int:
             budgets=budgets,
             depths=depths,
             sweep_topk=opts.sweep_topk,
+            sweep_prior=opts.sweep_prior,
+            priors=opts.priors,
             loaded_est_gib=None,
             available_gib=baseline_available,
             reserve_gib=reserve,
@@ -834,6 +852,8 @@ def run_session(opts: argparse.Namespace) -> int:
         budgets=budgets,
         depths=depths,
         sweep_topk=opts.sweep_topk,
+        sweep_prior=opts.sweep_prior,
+        priors=opts.priors,
         loaded_est_gib=loaded_est,
         available_gib=baseline_available,
         reserve_gib=reserve,
@@ -933,6 +953,9 @@ def main() -> int:
     ap.add_argument("--qd", type=int, nargs="+", default=[8, 16, 32], help="IO depth candidates")
     ap.add_argument("--sweep-topk", action="store_true",
                     help="also sweep expert_streaming_topk_threshold (trades output fidelity)")
+    ap.add_argument("--sweep-prior", action="store_true",
+                    help="also sweep expert_streaming_cache_prior (trades output fidelity)")
+    ap.add_argument("--priors", default="0.0,1.0", help="comma-separated cache_prior candidates")
     ap.add_argument("--reserve-gib", type=float, default=10.0,
                     help="memory kept away from the bench ceiling: your apps + KV + headroom")
     ap.add_argument("--min-free-gb", type=float, default=22.0)
@@ -949,6 +972,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="probe the machine, print the plan, run nothing")
     opts = ap.parse_args()
     opts.budgets = [float(b) for b in opts.budgets.split(",")]
+    opts.priors = [float(p) for p in opts.priors.split(",")]
     return run_session(opts)
 
 

@@ -70,7 +70,19 @@ Conclusão: neste workload o teto é volume (1.6 GB/tok) + granularidade (200k p
 
 ### Knob aproximado: cache-prior rerank (Fase 3, LANDED opt-in)
 
-`OMLX_EXPERT_STREAMING_CACHE_PRIOR=<bonus>` (default `0.0` = roteamento exato, bit-idêntico): bônus em logit-space para experts residentes no LRU antes do top-k (Qualcomm 2412.00099). Aproximado por desenho — muda outputs; saída inspecionada sã no prompt short. Bonus `1.0`: hit 9.2%→19.3%, média +10.8% tok/s. Env-only (sem UI); no-op sem o env. Métricas: tok/s (gate **+10%**), TTFT, hit_rate, read p50/p95, bytes/token, acurácia de proposta por camada (`prediction_totals.recall`, bar **≥85%** para preditores). Abaixo do gate: revert sem resíduo + linha no scoreboard. Cada fase: testes → subagente auditor (bit-exatidão do default, thread-safety MLX, custo zero com feature off) → bench → gate → commit.
+`expert_streaming_cache_prior` (per-model settings + WebUI + app macOS; env `OMLX_EXPERT_STREAMING_CACHE_PRIOR` como fallback; excluído de profiles como os demais knobs de hardware; entra na runtime signature). Default `0.0`/nulo = roteamento exato, bit-idêntico. Bônus em logit-space para experts residentes no LRU antes do top-k (Qualcomm 2412.00099). Aproximado por desenho — muda outputs; saídas inspecionadas sãs. Sweep no autotuner (`--sweep-prior`, candidatos `--priors`).
+
+Calibragem (Qwen-JANG_4M, budget 1 GiB):
+
+| bonus | short tok/s | short hit | 2k tok/s | 2k hit | qualidade |
+|---|---|---|---|---|---|
+| 0.0 (exato) | 1.88 (×2) | 9.2% | 1.43 | 1.0% | referência |
+| 0.5 | 1.76 | 14.4% | — | — | sã |
+| 1.0 | 2.08 (×3) | 19.3% | — | — | sã |
+| 2.0 | **2.78 (×3)** | 38.0% | **1.76** | 17.6% | sã (short + 2k) |
+| 4.0 | 1.01 | 17.7% | — | — | **degenerada** ("This just a response is a response") |
+
+Penhasco de fidelidade entre 2.0 e 4.0; default recomendado `2.0` onde houver headroom de qualidade, `1.0` conservador. TTFT idêntico ao exato (hook só no decode). Métricas: tok/s (gate **+10%**), TTFT, hit_rate, read p50/p95, bytes/token, acurácia de proposta por camada (`prediction_totals.recall`, bar **≥85%** para preditores). Abaixo do gate: revert sem resíduo + linha no scoreboard. Cada fase: testes → subagente auditor (bit-exatidão do default, thread-safety MLX, custo zero com feature off) → bench → gate → commit.
 
 ### DeepSeek V4 Flash (oQ4e-mtp)
 

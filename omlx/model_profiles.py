@@ -108,6 +108,7 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "expert_streaming_budget_gib",
         "expert_streaming_budget_auto",
         "expert_streaming_topk_threshold",
+        "expert_streaming_cache_prior",
         # Machine/IO-tuned streaming knobs (autotune) — hardware-specific.
         "expert_streaming_io_depth",
         "expert_streaming_coalesce",

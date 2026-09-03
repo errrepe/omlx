@@ -1140,6 +1140,8 @@
   "modal.model_settings.expert_streaming_budget_auto_hint": "根据本机内存上限自动调整专家缓存（内存越大，缓存的专家越多）。上方固定预算优先。重新加载后生效。",
   "modal.model_settings.expert_streaming_topk": "Top-k 质量阈值",
   "modal.model_settings.expert_streaming_topk_hint": "可选的近似路由：保留按分数降序的 top-k 前缀中达到该质量比例的最小集合。1.0 或留空 = 精确（位级一致）。~0.85 是实测的速度拐点（约 1.8x，0.70 时 10 个 token 中 7 个一致）。",
+  "modal.model_settings.expert_streaming_cache_prior": "缓存优先加成",
+  "modal.model_settings.expert_streaming_cache_prior_hint": "可选近似路由：已在缓存中的专家在 top-k 之前获得此 logit 加成。0.0 或空 = 精确。Qwen-JANG_4M short 上 1.0 测得命中率约 2 倍、tok/s 约 +11%。",
   "modal.model_settings.expert_streaming_eval": "预填充逐层同步（Qwen）",
   "modal.model_settings.expert_streaming_eval_hint": "流式预填充时逐层求值解码层并清理分配器缓存。位级一致；限制长提示的内存峰值，保护页缓存。仅在 A/B 测试时关闭。",
   "modal.model_settings.expert_streaming_pins": "专家页锁定（mlock）",
