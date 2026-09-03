@@ -89,9 +89,37 @@ async def test_only_qwen4_exp_loader_defers_parameter_eval_to_materialize(
 
     from omlx.utils import model_loading
 
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": model_type}), encoding="utf-8"
-    )
+    # The lazy gate is fail-closed: allowlist membership alone is not
+    # enough, expert_streaming_estimate must find MoE banks in the headers.
+    # Plant one minimal switch_mlp layer for the qwen4_exp case so the
+    # estimate resolves supported=True; qwen2_vl stays bank-less.
+    if model_type == "qwen4_exp":
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": model_type,
+                    "num_hidden_layers": 1,
+                    "num_experts": 4,
+                }
+            ),
+            encoding="utf-8",
+        )
+        import numpy as np
+        from safetensors.numpy import save_file
+
+        save_file(
+            {
+                f"model.layers.0.mlp.switch_mlp.{proj}.weight": np.zeros(
+                    (4, 8), dtype=np.float32
+                )
+                for proj in ("gate_proj", "up_proj", "down_proj")
+            },
+            tmp_path / "model.safetensors",
+        )
+    else:
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": model_type}), encoding="utf-8"
+        )
     captured = {}
 
     def stop_after_load(model_name, **kwargs):
