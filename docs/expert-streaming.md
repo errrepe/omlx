@@ -54,6 +54,7 @@ Base 1.79–1.82 tok/s, hit 9.2%, ~1.6 GB/token relidos (91% miss), 93% dos runs
 | sem seed (SEED=0) | 1.78 (≈) | 0.0% | 0 | seeder é a única fonte de residency |
 | QD8 / QD24 (vs 16) | 1.85 / 1.78 | 9.2% | 0 | dentro do ruído; default 16 mantido |
 | single-promotion parcial (1 promote do bank + concat + remap, sem stack) | 1.80 (≈) | 9.2% | 0 | reverte: probe mostrou 2433 engajamentos corretos mas concat ≈ stack em wall — o custo está no tráfego de montagem, não nas alocações |
+| cold-aware retention (mincore: só retém repetido + não-residente) | 1.88 (≈, dentro do ruído) | 9.2% | 0 | reverte: prova que o LRU já é write-quiet no decode (puts ≈ 0; 125k misses com 0 evictions) — o gate não tinha o que filtrar; page cache (17% residente) + seeder bastam |
 
 Conclusão: neste workload o teto é volume (1.6 GB/tok) + granularidade (200k preads singletons) + custo por uso (promote/stack/eval). Retenção e prefetch por prev-token perdem; alavanca restante seria QMM sem stack por expert (não tentado). QSA nativo, em contraste: 4.3 ms vs 18.0 ms portable (~4.1×).
 
