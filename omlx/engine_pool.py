@@ -493,12 +493,110 @@ class EnginePool:
         entry: EngineEntry,
         settings: object | None,
     ) -> object | None:
-        enabled, forced, _ = self._expert_streaming_status(entry, settings)
-        if not enabled or not forced or settings is None:
+        enabled, forced, est = self._expert_streaming_status(entry, settings)
+        if not enabled or settings is None:
             return settings
-        effective = copy.copy(settings)
-        setattr(effective, "expert_streaming_enabled", True)
+        effective = settings
+        if forced and not getattr(settings, "expert_streaming_enabled", False):
+            effective = copy.copy(settings)
+            setattr(effective, "expert_streaming_enabled", True)
+        if getattr(effective, "expert_streaming_budget_auto", False):
+            auto_bytes = self._resolve_auto_budget_bytes(effective, est, entry)
+            if auto_bytes:
+                if effective is settings:
+                    effective = copy.copy(settings)
+                setattr(effective, "expert_streaming_budget_gib", auto_bytes / 1024**3)
+                logger.info(
+                    "Expert streaming: auto budget %.2f GiB for %s "
+                    "(ceiling-scaled LRU; manual budget unset)",
+                    auto_bytes / 1024**3,
+                    getattr(entry, "model_id", "?"),
+                )
         return effective
+
+    # Opt-in RAM-scaled expert cache (expert_streaming_budget_auto): commit
+    # a fraction of the post-load headroom to the app-level LRU so bigger
+    # machines keep more experts resident instead of streaming everything.
+    _AUTO_BUDGET_FRACTION = 0.5
+    _AUTO_BUDGET_RESERVE_BYTES = 2 * 1024**3  # headroom kept free past streaming bytes
+    _AUTO_BUDGET_MAX_BYTES = 8 * 1024**3  # default cap without autotune knee data
+    _AUTO_BUDGET_KNEE_FILENAME = "expert_budget_knee.json"
+
+    @staticmethod
+    def _budget_knee_bytes(model_path: object) -> int | None:
+        """Autotuned LRU knee for this checkpoint, if the autotuner wrote one.
+
+        Reads ``<model>/.omlx/expert_budget_knee.json`` (written by
+        bench/autotune_expert_streaming.py --apply): the smallest budget
+        reaching ~95% of the best measured score. None when absent or
+        unreadable — the caller then falls back to the default cap.
+        """
+        try:
+            raw = json.loads(
+                (Path(str(model_path)) / ".omlx" / EnginePool._AUTO_BUDGET_KNEE_FILENAME).read_text()
+            )
+            knee_gib = float(raw.get("knee_gib", 0.0))
+        except Exception:
+            return None
+        if knee_gib < 0:
+            return None
+        return int(knee_gib * 1024**3)
+
+    @staticmethod
+    def _auto_streaming_budget_bytes(
+        manual_gib: object,
+        streaming_bytes: int,
+        ceiling_bytes: int,
+        knee_bytes: int | None = None,
+    ) -> int | None:
+        """Pure auto-budget formula. None = leave settings untouched.
+
+        ``manual_gib > 0`` always wins (explicit operator choice); a missing
+        ceiling or no post-reserve headroom also declines (the default
+        page-cache behavior already applies). Otherwise half the headroom
+        past streaming bytes + reserve, capped at min(8 GiB, knee).
+        """
+        if manual_gib is not None:
+            try:
+                if float(manual_gib) > 0:
+                    return None
+            except (TypeError, ValueError):
+                return None
+        if ceiling_bytes <= 0 or streaming_bytes <= 0:
+            return None
+        headroom = (
+            ceiling_bytes
+            - streaming_bytes
+            - EnginePool._AUTO_BUDGET_RESERVE_BYTES
+        )
+        if headroom <= 0:
+            return None
+        cap = EnginePool._AUTO_BUDGET_MAX_BYTES
+        if knee_bytes is not None and knee_bytes >= 0:
+            cap = min(cap, int(knee_bytes))
+        auto = min(int(headroom * EnginePool._AUTO_BUDGET_FRACTION), cap)
+        auto = (auto // (1024 * 1024)) * (1024 * 1024)  # whole MiB
+        return auto or None
+
+    def _resolve_auto_budget_bytes(
+        self,
+        settings: object,
+        est: object | None,
+        entry: EngineEntry,
+    ) -> int | None:
+        """Resolve the auto budget against the live ceiling and knee data."""
+        streaming_bytes = int(getattr(est, "streaming_bytes", 0) or 0) if est is not None else 0
+        if not streaming_bytes or not getattr(est, "supported", False):
+            return None
+        ceiling = self._fallback_admission_ceiling()
+        if ceiling <= 0:
+            ceiling = self._current_ceiling()
+        return self._auto_streaming_budget_bytes(
+            getattr(settings, "expert_streaming_budget_gib", None),
+            streaming_bytes,
+            ceiling,
+            self._budget_knee_bytes(getattr(entry, "model_path", "")),
+        )
 
     def _dflash_blocked_by_expert_streaming(
         self,
@@ -1703,6 +1801,13 @@ class EnginePool:
                 get_settings = getattr(self._settings_manager, "get_settings", None)
                 if callable(get_settings):
                     admission_settings = get_settings(model_id)
+            # Resolve budget_auto before accounting: the auto LRU grows
+            # resident size, so admission must see the same effective
+            # settings the loader will use (else it admits by the smaller
+            # page-cache-only size and the load over-commits).
+            admission_settings = self._effective_expert_streaming_settings(
+                entry, admission_settings
+            )
             admission_size = self._entry_runtime_resident_size(
                 entry,
                 admission_settings,

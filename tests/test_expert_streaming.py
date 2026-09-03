@@ -484,6 +484,7 @@ def test_model_settings_default_not_streaming():
     s = ModelSettings()
     assert s.expert_streaming_enabled is False
     assert s.expert_streaming_budget_gib is None
+    assert s.expert_streaming_budget_auto is None
 
 
 @pytest.mark.asyncio
@@ -539,11 +540,30 @@ async def test_expert_streaming_change_triggers_reload_signature():
         assert result["auto_unloaded"] is True
 
 
+@pytest.mark.asyncio
+async def test_expert_streaming_budget_auto_persists_via_api():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(expert_streaming_budget_auto=True),
+    )
+    assert settings.expert_streaming_budget_auto is True
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(expert_streaming_budget_auto=None),
+    )
+    assert settings.expert_streaming_budget_auto is None
+
+
 def test_expert_streaming_excluded_from_profiles():
     from omlx.model_profiles import EXCLUDED_FROM_PROFILES
 
     assert "expert_streaming_enabled" in EXCLUDED_FROM_PROFILES
     assert "expert_streaming_budget_gib" in EXCLUDED_FROM_PROFILES
+    assert "expert_streaming_budget_auto" in EXCLUDED_FROM_PROFILES
 
 
 def test_engine_pool_forced_streaming_status(monkeypatch):
@@ -1219,6 +1239,96 @@ def test_engine_pool_streaming_budget_helper():
     assert EnginePool._streaming_budget_bytes(ModelSettings()) == 0
     assert EnginePool._streaming_budget_bytes(ModelSettings(expert_streaming_budget_gib=0.0)) == 0
     assert EnginePool._streaming_budget_bytes(ModelSettings(expert_streaming_budget_gib=4)) == 4 << 30
+
+
+class TestAutoStreamingBudget:
+    GIB = 1024**3
+
+    def test_manual_wins(self):
+        from omlx.engine_pool import EnginePool
+
+        assert (
+            EnginePool._auto_streaming_budget_bytes(4.0, 10 * self.GIB, 64 * self.GIB)
+            is None
+        )
+
+    def test_no_ceiling_or_no_headroom_declines(self):
+        from omlx.engine_pool import EnginePool
+
+        assert EnginePool._auto_streaming_budget_bytes(None, 10 * self.GIB, 0) is None
+        # ceiling covers streaming + reserve exactly -> no headroom
+        assert (
+            EnginePool._auto_streaming_budget_bytes(None, 10 * self.GIB, 12 * self.GIB)
+            is None
+        )
+
+    def test_half_headroom_capped_at_8gib(self):
+        from omlx.engine_pool import EnginePool
+
+        # headroom 52 GiB -> half 26, capped at 8 GiB default
+        got = EnginePool._auto_streaming_budget_bytes(None, 10 * self.GIB, 64 * self.GIB)
+        assert got == 8 * self.GIB
+        # small headroom 6 GiB -> half 3 GiB, whole MiB
+        got = EnginePool._auto_streaming_budget_bytes(None, 10 * self.GIB, 18 * self.GIB)
+        assert got == 3 * self.GIB
+
+    def test_knee_caps_below_default(self):
+        from omlx.engine_pool import EnginePool
+
+        got = EnginePool._auto_streaming_budget_bytes(
+            None, 10 * self.GIB, 64 * self.GIB, knee_bytes=2 * self.GIB
+        )
+        assert got == 2 * self.GIB
+
+    def test_knee_zero_means_page_cache(self):
+        from omlx.engine_pool import EnginePool
+
+        # bench measured the LRU as adding nothing -> cap 0 -> decline (None)
+        assert (
+            EnginePool._auto_streaming_budget_bytes(
+                None, 10 * self.GIB, 64 * self.GIB, knee_bytes=0
+            )
+            is None
+        )
+
+    def test_effective_settings_resolves_auto(self):
+        from types import SimpleNamespace
+
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._get_final_ceiling = lambda: 0
+        pool._fallback_admission_ceiling = lambda: 64 * self.GIB
+        est = SimpleNamespace(supported=True, streaming_bytes=10 * self.GIB)
+        entry = SimpleNamespace(model_id="m", model_path="/nonexistent")
+        pool._expert_streaming_status = lambda _e, _s: (True, False, est)
+        settings = ModelSettings(
+            expert_streaming_enabled=True, expert_streaming_budget_auto=True
+        )
+        with tempfile.TemporaryDirectory() as td:
+            entry.model_path = td  # no knee file -> default 8 GiB cap
+            out = pool._effective_expert_streaming_settings(entry, settings)
+        assert out is not settings  # copied, input untouched
+        assert settings.expert_streaming_budget_gib is None
+        assert out.expert_streaming_budget_gib == 8.0
+
+    def test_effective_settings_manual_wins_over_auto(self):
+        from types import SimpleNamespace
+
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._get_final_ceiling = lambda: 0
+        pool._fallback_admission_ceiling = lambda: 64 * self.GIB
+        est = SimpleNamespace(supported=True, streaming_bytes=10 * self.GIB)
+        entry = SimpleNamespace(model_id="m", model_path="/nonexistent")
+        settings = ModelSettings(
+            expert_streaming_enabled=True,
+            expert_streaming_budget_auto=True,
+            expert_streaming_budget_gib=1.0,
+        )
+        out = pool._resolve_auto_budget_bytes(settings, est, entry)
+        assert out is None
 
 
 @pytest.mark.asyncio

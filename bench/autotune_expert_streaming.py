@@ -134,6 +134,46 @@ def trial_score(result: "TrialResult", ref: "TrialResult") -> float:
     return score - 0.25 * max(0.0, result.swap_growth_gib)
 
 
+def budget_knee_gib(budget_scores: list[tuple[float, float]]) -> float | None:
+    """Smallest budget reaching >=95% of the best score (the LRU knee).
+
+    Input is (budget_gib, score) pairs for completed same-context trials.
+    Empty/all-failed input returns None (no knee data). Best-at-zero
+    returns 0.0: the bench measured the LRU as adding nothing. The runtime
+    caps ``expert_streaming_budget_auto`` at min(8 GiB, knee).
+    """
+    if not budget_scores:
+        return None
+    best = max(s for _, s in budget_scores)
+    if best == float("-inf"):
+        return None
+    target = 0.95 * best if best > 0 else best
+    cands = sorted(b for b, s in budget_scores if s >= target)
+    return float(cands[0]) if cands else None
+
+
+def write_budget_knee(model_path: Path, model_key: str, knee_gib: float) -> Path:
+    """Persist the knee next to the checkpoint for budget_auto to read."""
+    dest = Path(model_path) / ".omlx" / "expert_budget_knee.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "model": model_key,
+                "knee_gib": round(float(knee_gib), 3),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "note": (
+                    "smallest budget reaching ~95% of the best autotune "
+                    "score; caps expert_streaming_budget_auto"
+                ),
+            },
+            indent=2,
+        )
+    )
+    return dest
+
+
 @dataclass(frozen=True)
 class WatchdogPolicy:
     floor_available_gib: float = 5.0
@@ -592,6 +632,7 @@ def build_recommendation(
     validate_context: str,
     applied: bool,
     notes: list[str] | None = None,
+    budget_knee: float | None = None,
 ) -> dict:
     return {
         "version": 1,
@@ -602,7 +643,8 @@ def build_recommendation(
         "machine": machine.dict(),
         "screen_context": screen_context,
         "validate_context": validate_context,
-        "winner": winner.profile_kwargs() | {"label": winner.label()},
+        "budget_knee_gib": budget_knee,
+        "winner": winner.profile_kwargs() | {"label": winner.label()}, 
         "winner_score": round(winner_score, 4) if winner_score == winner_score else None,
         "trials": [t.row() for t in trials],
         "applied_to_profile": applied,
@@ -832,6 +874,16 @@ def run_session(opts: argparse.Namespace) -> int:
             )
 
     print(f"=== Winner: {best_cfg.label()} ===", flush=True)
+    # LRU knee from same-context screening scores: caps budget_auto so the
+    # cache stops growing where the bench stopped paying off.
+    knee_gib = budget_knee_gib(
+        [
+            (t.cfg.budget_gib, trial_score(t, calib))
+            for t in trials
+            if t.ok and t.context == opts.screen_context
+        ]
+    )
+    print(f"Budget knee: {knee_gib if knee_gib is not None else 'n/a'} GiB", flush=True)
     applied = False
     if opts.apply:
         try:
@@ -840,6 +892,12 @@ def run_session(opts: argparse.Namespace) -> int:
             print(f"Applied to per-model profile: {path}", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: --apply failed: {exc}", flush=True)
+        if knee_gib is not None:
+            try:
+                knee_path = write_budget_knee(model_path, opts.model, knee_gib)
+                print(f"Wrote budget knee: {knee_path}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: knee write failed: {exc}", flush=True)
 
     rec = build_recommendation(
         model_key=opts.model,
@@ -854,6 +912,7 @@ def run_session(opts: argparse.Namespace) -> int:
         validate_context=opts.validate_context,
         applied=applied,
         notes=notes,
+        budget_knee=knee_gib,
     )
     (session_dir / "recommendation.json").write_text(json.dumps(rec, indent=2))
     (session_dir / "trials.json").write_text(json.dumps([t.row() for t in trials], indent=2))

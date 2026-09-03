@@ -106,6 +106,7 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "qwen4_ple_ssd_offload",
         "expert_streaming_enabled",
         "expert_streaming_budget_gib",
+        "expert_streaming_budget_auto",
         "expert_streaming_topk_threshold",
         # Machine/IO-tuned streaming knobs (autotune) — hardware-specific.
         "expert_streaming_io_depth",

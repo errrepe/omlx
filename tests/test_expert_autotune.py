@@ -266,3 +266,33 @@ class TestBuildRecommendation:
         assert rec["applied_to_profile"] is True
         assert rec["machine"]["metal_cap_gib"] == 36.0
         assert rec["notes"] == ["n1"]
+        assert rec["budget_knee_gib"] is None
+
+
+class TestBudgetKnee:
+    def test_empty_is_none(self):
+        assert at.budget_knee_gib([]) is None
+
+    def test_all_failed_is_none(self):
+        assert at.budget_knee_gib([(0.0, float("-inf")), (2.0, float("-inf"))]) is None
+
+    def test_best_at_zero_is_zero(self):
+        # The LRU adds nothing: knee 0 caps budget_auto at page-cache.
+        assert at.budget_knee_gib([(0.0, 0.0), (2.0, -0.1), (4.0, -0.2)]) == 0.0
+
+    def test_smallest_budget_at_95pct(self):
+        # best 1.0 at 8 GiB; 2 GiB already reaches 0.96 -> knee 2.
+        pairs = [(0.0, 0.0), (1.0, 0.5), (2.0, 0.96), (4.0, 0.99), (8.0, 1.0)]
+        assert at.budget_knee_gib(pairs) == 2.0
+
+    def test_plateau_picks_first(self):
+        pairs = [(1.0, 0.5), (2.0, 0.5), (4.0, 0.5)]
+        assert at.budget_knee_gib(pairs) == 1.0
+
+    def test_write_budget_knee(self, tmp_path):
+        dest = at.write_budget_knee(tmp_path, "qwen", 2.5)
+        assert dest == tmp_path / ".omlx" / "expert_budget_knee.json"
+        data = json.loads(dest.read_text())
+        assert data["version"] == 1
+        assert data["knee_gib"] == 2.5
+        assert data["model"] == "qwen"

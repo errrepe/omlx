@@ -132,6 +132,7 @@ class ModelSettingsRequest(BaseModel):
     qwen4_ple_ssd_offload: bool | None = None
     expert_streaming_enabled: bool | None = None
     expert_streaming_budget_gib: float | None = None
+    expert_streaming_budget_auto: bool | None = None
     expert_streaming_topk_threshold: float | None = None
     # Expert-streaming IO knobs (autotune-tuned, per model; None = env/default)
     expert_streaming_io_depth: int | None = None
@@ -2436,6 +2437,11 @@ async def update_model_settings(
                 raise HTTPException(status_code=400, detail="expert_streaming_budget_gib must be between 0 and 64 GiB")
             # 0 = page-cache only (no app-level LRU); null = engine default
             current_settings.expert_streaming_budget_gib = float(gib)
+    if "expert_streaming_budget_auto" in sent:
+        current_settings.expert_streaming_budget_auto = (
+            None if request.expert_streaming_budget_auto is None
+            else bool(request.expert_streaming_budget_auto)
+        )
     if "expert_streaming_topk_threshold" in sent:
         v = request.expert_streaming_topk_threshold
         if v is None:
