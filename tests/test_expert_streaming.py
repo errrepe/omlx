@@ -393,6 +393,80 @@ def test_convert_walk_mlp_layout_widened(model_type, experts_key):
             assert isinstance(layer.mlp.switch_mlp, StreamingSwitchGLU), model_type
 
 
+class _FakeQuantProj:
+    def __init__(self, shape, scales_shape, group_size, bits, mode="affine"):
+        import mlx.core as mx
+
+        self.weight = mx.ones(shape)
+        self.scales = mx.ones(scales_shape)
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+
+
+class _FakeQuantSwitchMLP:
+    def __init__(self, e, o, i):
+        # JANGQ mixed precision: a 2-bit gate with 3-bit up/down.
+        self.gate_proj = _FakeQuantProj((e, o, i), (e, o, 1), 32, 2)
+        self.up_proj = _FakeQuantProj((e, o, i), (e, o, 1), 64, 3)
+        self.down_proj = _FakeQuantProj((e, i, o), (e, 1, 1), 64, 3)
+
+
+class _FakeQuantMoE:
+    def __init__(self, e, o, i):
+        self.switch_mlp = _FakeQuantSwitchMLP(e, o, i)
+
+
+class _FakeQuantMLPLayer:
+    def __init__(self, e, o, i):
+        self.mlp = _FakeQuantMoE(e, o, i)
+
+
+def test_convert_walk_mixed_precision_jangq():
+    """Each streaming linear keeps its own source projection packing.
+
+    JANGQ checkpoints mix precisions inside one layer; a layer-level
+    single packing would silently requantize two of the three banks."""
+    from omlx.patches.expert_streaming import convert_model_to_streaming
+    from omlx.patches.expert_streaming.streaming_switch import (
+        StreamingQuantizedSwitchLinear,
+        StreamingSwitchGLU,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        num_layers, experts, hidden, moe_hidden = 2, 4, 32, 16
+        _write_fake_switch_mlp_checkpoint(
+            tmp, "qwen3_moe", "num_experts",
+            num_layers=num_layers, experts=experts,
+            hidden=hidden, moe_hidden=moe_hidden,
+        )
+        layers = [_FakeQuantMLPLayer(experts, moe_hidden, hidden) for _ in range(num_layers)]
+        model = _FakeTextModel(
+            layers,
+            [],
+            {
+                "model_type": "qwen3_moe",
+                "num_experts": experts,
+                "hidden_size": hidden,
+                "moe_intermediate_size": moe_hidden,
+                "num_hidden_layers": num_layers,
+            },
+        )
+        out_model, _backing = convert_model_to_streaming(
+            model, str(tmp), None, use_file_backing=False
+        )
+        assert out_model is model
+        for layer in layers:
+            sm = layer.mlp.switch_mlp
+            assert isinstance(sm, StreamingSwitchGLU)
+            for proj in (sm.gate_proj, sm.up_proj, sm.down_proj):
+                assert isinstance(proj, StreamingQuantizedSwitchLinear)
+            assert (sm.gate_proj.bits, sm.gate_proj.group_size) == (2, 32)
+            assert (sm.up_proj.bits, sm.up_proj.group_size) == (3, 64)
+            assert (sm.down_proj.bits, sm.down_proj.group_size) == (3, 64)
+
+
 def test_topk_inapplicable_is_soft_noop():
     """An approximate threshold on a type without a hook warns and stays exact."""
     from omlx.patches.expert_streaming import adaptive_topk
