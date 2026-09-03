@@ -283,6 +283,23 @@ def screen_candidates(
             cands = [None, 0.85]
         elif knob == "prior":
             cands = list(priors) if priors else [0.0, 1.0, 2.0]
+            # The reranker is refused at budget 0 (no LRU to rank with), so
+            # a prior arm on a zero-budget base is a no-op re-measurement of
+            # the base. Carry prior arms on a positive budget that fits
+            # alongside the loaded runtime, mirroring how the budget knob
+            # itself picks candidates; with no room at all, skip the arms.
+            if getattr(base, "budget_gib", 0.0) <= 0.0:
+                room = None
+                if loaded_est_gib is not None and available_gib is not None:
+                    room = available_gib - reserve_gib - loaded_est_gib - 2.0
+                if room is None:
+                    carry_budget = 1.0
+                else:
+                    carry_budget = 1.0 if room >= 1.0 else room
+                if carry_budget <= 0.0:
+                    cands = []
+                else:
+                    base = replace(base, budget_gib=carry_budget)
         else:
             cands = [True, False]
         for value in cands:

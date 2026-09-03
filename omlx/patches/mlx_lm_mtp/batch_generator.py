@@ -1958,6 +1958,24 @@ class _DepthController:
         self._ms_probe += cycle_ms
         self._ms_explore += cycle_ms
 
+        # TEMP DETERMINISM (revert after the 8k probe): pin the trajectory.
+        # Runs after the acceptance/time EMA updates (those are measurements,
+        # not decisions) and returns before every decision path — warmup
+        # sweep, probe burst, and the per-cycle re-decide — so `cur` can
+        # never be moved off the pin while the env is set. A garbage value
+        # falls through to normal adaptive behavior.
+        _fixed = __import__("os").environ.get("OMLX_MTP_FIXED_DEPTH")
+        if _fixed is not None:
+            try:
+                _cur = max(0, min(self.max_depth, int(_fixed)))
+            except ValueError:
+                _cur = None
+            if _cur is not None:
+                self._warmup = []
+                self.probe_left = 0
+                self.cur = _cur
+                return
+
         if self._speculation_losing():
             self.exit_streak += 1
         else:
@@ -2950,6 +2968,9 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         draft_ids: List[int] = []
         emit_last_id = int(step_tok.tolist()[0])
         emit_last_lp = combined_lp[0]
+        # TEMP FORENSICS (revert with the k>0 log above).
+        if __import__("os").environ.get("OMLX_MTP_DIV_LOG"):
+            logger.info("MTP div k=0 plain=%d", emit_last_id)
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
         state.stats.zero_cycles += 1
@@ -2963,6 +2984,15 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         m = int(host[0])
         target_ids = host[1 : k + 2]
         draft_ids = host[k + 2 :]
+        # TEMP FORENSICS (revert after the 8k divergence probe).
+        if __import__("os").environ.get("OMLX_MTP_DIV_LOG"):
+            logger.info(
+                "MTP div k=%d m=%d drafts=%s targets=%s",
+                k,
+                m,
+                draft_ids,
+                target_ids,
+            )
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
         emit_last_id = target_ids[m] if m < k else target_ids[k]

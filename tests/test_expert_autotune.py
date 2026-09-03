@@ -164,6 +164,61 @@ class TestKnobs:
         got = [(knob, cfg.prior) for knob, cfg in on if knob == "prior"]
         assert got == [("prior", 1.0)]
 
+    def test_prior_arms_carried_on_positive_budget(self):
+        """A prior arm on a zero-budget base is refused by the runtime (no
+        LRU to rank with) and re-measures the base. Prior arms must ride a
+        positive budget even when the sweep's budget list is [0]."""
+        base = at.Knobs()
+        on = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[1.0, 2.0],
+            loaded_est_gib=1.0, available_gib=30.0, reserve_gib=4.0,
+        )
+        prior_arms = [cfg for knob, cfg in on if knob == "prior"]
+        assert prior_arms, "prior arms disappeared from the sweep"
+        for cfg in prior_arms:
+            assert cfg.budget_gib > 0.0, (
+                f"prior arm {cfg.label()} carries a dead budget {cfg.budget_gib}"
+            )
+        # Room (30 - 4 - 1 - 2 = 23 GiB) comfortably admits 1 GiB.
+        assert all(cfg.budget_gib == 1.0 for cfg in prior_arms)
+
+    def test_prior_arms_follow_room_when_tight(self):
+        """With almost no room the carry budget shrinks below 1 GiB but the
+        prior arm still rides a positive budget (clamped to the room)."""
+        base = at.Knobs()
+        on = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[2.0],
+            loaded_est_gib=10.0, available_gib=14.0, reserve_gib=1.0,
+        )
+        prior_arms = [cfg for knob, cfg in on if knob == "prior"]
+        assert prior_arms
+        assert all(0.0 < cfg.budget_gib <= 1.0 for cfg in prior_arms)
+
+    def test_prior_arms_survive_zero_room_as_no_candidates(self):
+        """With literally no room for any positive budget the sweep skips
+        prior arms rather than sending refused trials."""
+        base = at.Knobs()
+        on = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[2.0],
+            loaded_est_gib=20.0, available_gib=14.0, reserve_gib=4.0,
+        )
+        assert not [cfg for knob, cfg in on if knob == "prior"]
+
+    def test_prior_arms_untouched_when_base_already_positive(self):
+        """A base that already rides a positive budget keeps it — the carry
+        fix must not rewrite existing arms."""
+        base = at.Knobs(budget_gib=2.0)
+        on = at.screen_candidates(
+            base, budgets=[0.0, 2.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[1.0],
+        )
+        prior_arms = [cfg for knob, cfg in on if knob == "prior"]
+        assert prior_arms
+        assert all(cfg.budget_gib == 2.0 for cfg in prior_arms)
+
 
 class TestScreenCandidates:
     def test_ofat_candidates_carried_on_base(self):
