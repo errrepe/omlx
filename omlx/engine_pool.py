@@ -723,6 +723,8 @@ class EnginePool:
                     "expert_streaming_per_layer_eval",
                     "expert_streaming_pins",
                     "expert_streaming_pin_gib",
+                    "expert_streaming_pin_sync",
+                    "expert_streaming_pin_regime",
                     "expert_streaming_cold_tier",
                     "expert_streaming_hot_fraction",
                 ):

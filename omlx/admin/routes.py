@@ -142,6 +142,8 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_per_layer_eval: bool | None = None
     expert_streaming_pins: bool | None = None
     expert_streaming_pin_gib: float | None = None
+    expert_streaming_pin_sync: bool | None = None
+    expert_streaming_pin_regime: str | None = None
     expert_streaming_cold_tier: str | None = None
     expert_streaming_hot_fraction: float | None = None
     thinking_budget_enabled: bool | None = None
@@ -2477,6 +2479,20 @@ async def update_model_settings(
             if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 <= v <= 64:
                 raise HTTPException(status_code=400, detail="expert_streaming_pin_gib must be a number between 0 and 64 GiB")
             current_settings.expert_streaming_pin_gib = float(v)
+    if "expert_streaming_pin_sync" in sent:
+        v = request.expert_streaming_pin_sync
+        current_settings.expert_streaming_pin_sync = None if v is None else bool(v)
+    if "expert_streaming_pin_regime" in sent:
+        v = request.expert_streaming_pin_regime
+        if v is None or str(v).strip() == "":
+            current_settings.expert_streaming_pin_regime = None
+        elif str(v) in ("decode", "prefill"):
+            current_settings.expert_streaming_pin_regime = str(v)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expert_streaming_pin_regime must be 'decode' or 'prefill'",
+            )
     if "expert_streaming_cold_tier" in sent:
         v = request.expert_streaming_cold_tier
         if v is None or str(v).strip() == "":

@@ -13,6 +13,82 @@ from pathlib import Path
 _MODEL_OVERHEAD_FACTOR = 1.05
 
 
+def normalize_model_type(model_type: object) -> str:
+    """Canonical form of a config ``model_type`` for allowlist membership."""
+    if not model_type:
+        return ""
+    return str(model_type).replace("-", "_").lower()
+
+
+def _config_model_type(config: dict) -> str:
+    """Effective model_type: top level wins, VLM wrappers fall back to
+    ``text_config`` (glm5_next / qwen4_exp nest the language model there)."""
+    model_type = str(config.get("model_type") or "")
+    if model_type:
+        return normalize_model_type(model_type)
+    text_cfg = config.get("text_config")
+    if isinstance(text_cfg, dict):
+        return normalize_model_type(text_cfg.get("model_type"))
+    return ""
+
+
+# Model types whose MoE expert banks can be streamed from disk.
+#
+# Single source of truth — every gate reads this object. It used to be
+# re-declared as four independent tuples (three here, one in __init__.py, one
+# hardcoded in engine/vlm.py), and they drifted: a checkpoint could pass the
+# structural estimate below (which is what forces streaming in EnginePool)
+# while failing the converter's list (which is what gates lazy loading in
+# engine/batched.py). That combination materializes the full multi-hundred-GB
+# MoE banks before the converter can drop them — OOM / SIGKILL. Sharing one
+# object removes the divergence by construction rather than by keeping lists
+# in sync.
+#
+# Kept in this leaf module: residency.py has no intra-package imports, so
+# every consumer (including the package __init__) can import it without a
+# cycle.
+SUPPORTED_TYPES = frozenset(
+    {
+        "glm_moe_dsa",
+        "deepseek_v32",
+        "deepseek_v4",
+        "deepseek_v4_mtp",
+        "glm5_next",
+        "glm5_next_text",
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }
+)
+
+# Subset whose MoE layer count can be derived from config.json alone, used
+# only when the header scan finds no ``layers.N.`` indices. Deliberately NOT
+# the full set: the sparse/dense pattern differs per family
+# (mlp_layer_types vs first_k_dense_replace vs decoder_sparse_step), so a type
+# is listed here only once its config keys are verified. Unlisted types fall
+# through to ``supported = False`` — fail closed rather than slice banks with
+# a guessed layer count.
+_CONFIG_DERIVABLE_MOE_LAYERS = frozenset(
+    {
+        "glm_moe_dsa",
+        "glm5_next",
+        "glm5_next_text",
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }
+)
+
+# Types where every layer is MoE when routing experts are present and no
+# sparse/dense pattern resolved a count.
+_ALL_LAYERS_MOE = frozenset(
+    {
+        "qwen4_exp",
+        "qwen4_exp_text",
+        "deepseek_v4",
+        "deepseek_v4_mtp",
+    }
+)
+
+
 @dataclass(frozen=True)
 class ExpertStreamingEstimate:
     """Estimated bytes with and without expert streaming."""
@@ -143,16 +219,7 @@ def _detect_expert_keys(
             # weight_map may point to sharded files, need headers per file
             # we will check later via header shape; for now consider candidate
             is_expert = True
-        elif model_type.lower().replace("-", "_") in (
-            "glm_moe_dsa",
-            "deepseek_v32",
-            "deepseek_v4",
-            "deepseek_v4_mtp",
-            "glm5_next",
-            "glm5_next_text",
-            "qwen4_exp",
-            "qwen4_exp_text",
-        ) and "switch_mlp" in key:
+        elif normalize_model_type(model_type) in SUPPORTED_TYPES and "switch_mlp" in key:
             is_expert = True
         if not is_expert:
             continue
@@ -205,7 +272,7 @@ def _detect_expert_keys(
                 pass
     num_moe_layers = len(layers) if layers else 0
     # fallback to config's derived count when headers incomplete
-    if num_moe_layers == 0 and model_type.lower().replace("-", "_") in ("glm_moe_dsa", "glm5_next", "glm5_next_text", "qwen4_exp", "qwen4_exp_text"):
+    if num_moe_layers == 0 and normalize_model_type(model_type) in _CONFIG_DERIVABLE_MOE_LAYERS:
         # For glm5_next: use mlp_layer_types sparse count (most accurate)
         try:
             mlp_types = config.get("mlp_layer_types")
@@ -227,12 +294,7 @@ def _detect_expert_keys(
                     num_moe_layers = cnt
                 # qwen4_exp / deepseek_v4: every layer is MoE when
                 # num_experts / n_routed present and no mlp types
-                if num_moe_layers == 0 and model_type.lower().replace("-", "_") in (
-                    "qwen4_exp",
-                    "qwen4_exp_text",
-                    "deepseek_v4",
-                    "deepseek_v4_mtp",
-                ) and n_routed:
+                if num_moe_layers == 0 and normalize_model_type(model_type) in _ALL_LAYERS_MOE and n_routed:
                     num_moe_layers = int(num_layers) if num_layers else 0
         except Exception:
             pass
@@ -323,22 +385,11 @@ def _cached_estimate(
             # we have checkpoint_bytes fallback later
             pass
 
+    model_type = _config_model_type(config)
+
     # If no expert_keys but model_type indicates MoE, try fallback scan of headers for switch_mlp
     if not expert_keys:
-        model_type = str(config.get("model_type") or "")
-        text_cfg_local = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
-        if not model_type and text_cfg_local:
-            model_type = str(text_cfg_local.get("model_type") or "")
-        if model_type.lower().replace("-", "_") in (
-            "glm_moe_dsa",
-            "deepseek_v32",
-            "deepseek_v4",
-            "deepseek_v4_mtp",
-            "glm5_next",
-            "glm5_next_text",
-            "qwen4_exp",
-            "qwen4_exp_text",
-        ) and headers:
+        if model_type in SUPPORTED_TYPES and headers:
             for k, entry in headers.items():
                 if "switch_mlp" in k:
                     try:
@@ -373,7 +424,28 @@ def _cached_estimate(
     reason: str | None = None
     per_expert = 0
     per_layer_expert = 0
-    if expert_keys and num_moe_layers > 0 and experts_per_layer > 0 and expert_bytes > 0:
+    # The allowlist is a hard gate, not a decoration. Structural detection
+    # alone finds stacked switch_mlp banks in families we have never sliced
+    # (mixtral's block_sparse_moe, ernie4_5_moe's moe_num_experts, ...), and
+    # EnginePool forces streaming from this flag. The converter is only
+    # reached on a lazy-loaded model, and lazy loading is gated on the same
+    # allowlist — so a structurally-detected but unlisted type would be
+    # forced into streaming WITHOUT the lazy load and mlx_lm would
+    # materialize the full multi-hundred-GB banks before the converter could
+    # drop them (OOM / SIGKILL). Fail closed instead: no streaming means the
+    # normal load path, which the admission gate can refuse cleanly.
+    if model_type not in SUPPORTED_TYPES:
+        label = model_type or "unknown"
+        reason = f"model type {label!r} is not in the expert-streaming allowlist"
+    elif not expert_keys:
+        reason = "no expert tensors found"
+    elif num_moe_layers <= 0:
+        reason = "could not determine MoE layer count"
+    elif experts_per_layer <= 0:
+        reason = "n_routed_experts missing in config"
+    elif expert_bytes <= 0:
+        reason = "expert byte size 0"
+    else:
         # per_expert = expert_bytes / (layers*experts)
         try:
             per_expert = expert_bytes // (num_moe_layers * experts_per_layer)
@@ -384,15 +456,6 @@ def _cached_estimate(
                 reason = "per-expert bytes computed as 0"
         except Exception as e:
             reason = str(e)
-    else:
-        if not expert_keys:
-            reason = "no expert tensors found"
-        elif num_moe_layers <= 0:
-            reason = "could not determine MoE layer count"
-        elif experts_per_layer <= 0:
-            reason = "n_routed_experts missing in config"
-        elif expert_bytes <= 0:
-            reason = "expert byte size 0"
 
     # Hidden size: prefer text_config (VLMs put the vision tower's width at
     # the top level and the language model's under text_config).

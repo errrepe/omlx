@@ -11,22 +11,19 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 
-SUPPORTED_TYPES = {
-    "glm_moe_dsa",
-    "deepseek_v32",
-    "deepseek_v4",
-    "deepseek_v4_mtp",
-    "glm5_next",
-    "glm5_next_text",
-    "qwen4_exp",
-    "qwen4_exp_text",
-}
+# Re-exported from residency.py — the leaf module holds the single copy.
+# Keeping a second literal here is what allowed the gates to drift apart
+# (engine/batched.py and engine/vlm.py checked this set while the structural
+# estimate checked the checkpoint, so a mismatch forced streaming without the
+# lazy load and materialized the full MoE banks). Both names stay importable
+# from the package root; there is exactly one definition.
+from .residency import SUPPORTED_TYPES, normalize_model_type
 
 
 def is_supported_model_type(model_type: str | None) -> bool:
     if not model_type:
         return False
-    return model_type.replace("-", "_").lower() in SUPPORTED_TYPES
+    return normalize_model_type(model_type) in SUPPORTED_TYPES
 
 
 def apply_expert_streaming_patch() -> bool:
@@ -1303,5 +1300,6 @@ __all__ = [
     "convert_model_to_streaming",
     "save_expert_pin_profile",
     "is_supported_model_type",
+    "normalize_model_type",
     "SUPPORTED_TYPES",
 ]

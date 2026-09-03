@@ -1695,7 +1695,31 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type in (QWEN4_EXP_MODEL_TYPE, "glm5_next"):
+                    # Single predicate shared with EnginePool and the
+                    # converter (engine/batched.py carries the same call).
+                    #
+                    # The old two-element tuple left every supported MoE VLM
+                    # except these two (glm_moe_dsa, deepseek_v4, ...) fully
+                    # materializing its banks at load — with expert streaming
+                    # enabled that is the OOM path, since the converter only
+                    # reaches the banks on a lazy model.
+                    #
+                    # Still not gated on expert_streaming_enabled: lazy
+                    # loading is a peak-memory win on its own for these
+                    # checkpoints, and dropping it would regress loads with
+                    # the feature turned off. Because that makes this run on
+                    # EVERY VLM load, the cheap allowlist test short-circuits
+                    # the header scan for everything else — the estimate would
+                    # reject those anyway (it requires the same allowlist), so
+                    # this is an optimization, not a second opinion.
+                    from ..patches.expert_streaming import is_supported_model_type
+                    from ..patches.expert_streaming.residency import (
+                        expert_streaming_estimate,
+                    )
+
+                    if is_supported_model_type(model_type) and expert_streaming_estimate(
+                        self._model_name
+                    ).supported:
                         # Lazy-load so giant MoE checkpoints (Qwen3.8-Flash-Next
                         # 99G, GLM-5.3-Flash-oQ4e 190G) stream from SSD instead of
                         # materializing fully in RAM; expert streaming replaces

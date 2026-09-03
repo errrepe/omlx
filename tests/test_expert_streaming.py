@@ -131,6 +131,86 @@ def test_residency_unsupported_for_dense_model():
         assert est.supported is False
 
 
+def _write_fake_switch_mlp_checkpoint(
+    tmp: Path,
+    model_type: str,
+    experts_key: str,
+    num_layers=4,
+    experts=8,
+    hidden=32,
+    moe_hidden=16,
+):
+    """Minimal stacked-switch_mlp checkpoint (headers only) for one model type."""
+    config = {
+        "model_type": model_type,
+        "num_hidden_layers": num_layers,
+        experts_key: experts,
+        "hidden_size": hidden,
+        "moe_intermediate_size": moe_hidden,
+    }
+    (tmp / "config.json").write_text(json.dumps(config))
+    tensors = {}
+    for layer in range(num_layers):
+        for proj, shape in [
+            ("gate_proj", (experts, moe_hidden, hidden)),
+            ("up_proj", (experts, moe_hidden, hidden)),
+            ("down_proj", (experts, hidden, moe_hidden)),
+        ]:
+            key = f"model.layers.{layer}.mlp.switch_mlp.{proj}.weight"
+            tensors[key] = (shape, "BF16", int(np.prod(shape)) * 2)
+    tensors["model.embed_tokens.weight"] = ((32000, hidden), "BF16", 32000 * hidden * 2)
+
+    header = {}
+    offset = 0
+    for k, (shape, dtype, size) in tensors.items():
+        header[k] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+    header_bytes = json.dumps(header).encode()
+    with (tmp / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(b"\x00" * offset)
+    (tmp / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
+    )
+    return config
+
+
+def test_unlisted_switch_mlp_type_is_not_supported():
+    """The OOM guard. A checkpoint with stacked switch_mlp banks whose
+    model_type is outside the allowlist must NOT report as streamable.
+
+    Structural detection alone would accept it — and EnginePool forces
+    streaming from that flag, while the converter only reaches the banks on a
+    lazy-loaded model. So an unlisted type would be forced into streaming
+    without the lazy load and mlx_lm would materialize the full
+    multi-hundred-GB banks: OOM / SIGKILL. This is the regression that
+    motivated making the allowlist a hard gate.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # Same layout as a supported type, only the model_type differs.
+        _write_fake_switch_mlp_checkpoint(
+            tmp, "hypothetical_future_moe", "n_routed_experts", num_layers=4, experts=8
+        )
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is False
+        assert est.reason is not None and "allowlist" in est.reason
+
+
+def test_allowlist_is_single_source_of_truth():
+    """The package root must re-export residency.py's set, not keep a copy —
+    a second literal is exactly how the gates drifted apart."""
+    from omlx.patches.expert_streaming import SUPPORTED_TYPES
+    from omlx.patches.expert_streaming import residency
+
+    assert SUPPORTED_TYPES is residency.SUPPORTED_TYPES
+
+
 def test_residency_force_streaming():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1854,6 +1934,48 @@ async def test_expert_streaming_pins_persist_via_api():
 
 
 @pytest.mark.asyncio
+async def test_expert_streaming_pin_sync_regime_persist_via_api():
+    """Fase M1: the two pin knobs were reachable only through the bench
+    harness — the patch model did not declare them, so the webUI could not
+    send them at all."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            expert_streaming_pin_sync=True, expert_streaming_pin_regime="prefill"
+        ),
+    )
+    assert settings.expert_streaming_pin_sync is True
+    assert settings.expert_streaming_pin_regime == "prefill"
+
+    # Clearing sends explicit nulls, not absent keys.
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            expert_streaming_pin_sync=None, expert_streaming_pin_regime=None
+        ),
+    )
+    assert settings.expert_streaming_pin_sync is None
+    assert settings.expert_streaming_pin_regime is None
+
+
+@pytest.mark.asyncio
+async def test_expert_streaming_pin_regime_validation():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+    with pytest.raises(admin_routes.HTTPException, match="'decode' or 'prefill'"):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(expert_streaming_pin_regime="nope"),
+        )
+
+
+@pytest.mark.asyncio
 async def test_expert_streaming_pin_gib_validation():
     pool, _ = _failed_pool()
     settings = ModelSettings()
@@ -1870,6 +1992,12 @@ def test_expert_streaming_pins_excluded_from_profiles():
 
     assert "expert_streaming_pins" in EXCLUDED_FROM_PROFILES
     assert "expert_streaming_pin_gib" in EXCLUDED_FROM_PROFILES
+    # Fase M1 knobs. Left unclassified these leak through profiles and
+    # templates, and they also break the completeness test in
+    # tests/test_admin_profiles_api.py (every ModelSettings field must be
+    # classified in exactly one of the three sets).
+    assert "expert_streaming_pin_sync" in EXCLUDED_FROM_PROFILES
+    assert "expert_streaming_pin_regime" in EXCLUDED_FROM_PROFILES
 
 
 def test_save_expert_pin_profile_hook():

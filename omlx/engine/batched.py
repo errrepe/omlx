@@ -26,19 +26,6 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-def _read_config_model_type(model_path: str) -> str | None:
-    """Read ``model_type`` from a local checkpoint's config.json (None if absent)."""
-    import json
-    from pathlib import Path
-
-    try:
-        cfg = json.loads((Path(model_path) / "config.json").read_text())
-        model_type = cfg.get("model_type")
-        return str(model_type) if model_type else None
-    except Exception:
-        return None
-
-
 # Optional Harmony adapter import
 try:
     from ..adapter.harmony import preprocess_harmony_messages
@@ -281,10 +268,23 @@ class BatchedEngine(BaseEngine):
 
             load_kwargs: dict[str, Any] = {}
             if getattr(self._model_settings, "expert_streaming_enabled", False):
-                from ..patches.expert_streaming import is_supported_model_type
+                # One predicate for "this checkpoint can stream", shared with
+                # EnginePool (which forces streaming) and the converter below
+                # (which does the conversion): the structural estimate.
+                #
+                # This used to test the model_type allowlist instead, which
+                # disagreed with the estimate: any checkpoint with stacked
+                # switch_mlp banks outside the list was forced into streaming
+                # by EnginePool while this gate declined the lazy load, so
+                # mlx_lm materialized the full multi-hundred-GB MoE banks and
+                # the process was OOM-killed before the converter ran. The
+                # estimate itself now requires the allowlist (residency.py),
+                # so a single check cannot diverge from itself.
+                from ..patches.expert_streaming.residency import (
+                    expert_streaming_estimate,
+                )
 
-                model_type = _read_config_model_type(self._model_name)
-                if model_type and is_supported_model_type(model_type):
+                if expert_streaming_estimate(self._model_name).supported:
                     # Lazy-load so giant MoE checkpoints (DeepSeek V4 Flash
                     # oQ4e ~166G) stream from SSD instead of materializing
                     # fully in RAM; expert streaming replaces the MoE banks

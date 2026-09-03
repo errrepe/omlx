@@ -1499,6 +1499,18 @@ def _model_declares_llama4(model: Any) -> bool:
     return False
 
 
+def _model_uses_expert_streaming(model: Any) -> bool:
+    """Return True if the model was converted to MoE expert streaming.
+
+    The converter attaches the ExpertBackingStore to both the engine and the
+    model object, so its presence is the ground truth — not the per-model
+    setting (which EnginePool may force on, and which the conversion may have
+    declined). Read at Scheduler construction, which happens after the
+    conversion in both engine/batched.py and engine/vlm.py.
+    """
+    return getattr(model, "_expert_streaming_backing", None) is not None
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -1749,6 +1761,17 @@ class Scheduler:
             logger.info(
                 "Llama 4 detected; serializing requests because ChunkedKVCache "
                 "does not support multi-row batching yet"
+            )
+        # Expert streaming serves one request at a time: the LRU is budgeted
+        # for a single stream's working set and the IO pool is a
+        # process-wide singleton. Both the webUI and the doc promised this
+        # already; until now nothing enforced it, so a concurrent second
+        # request thrashed the cache instead of being queued.
+        self._serialize_streaming_requests = _model_uses_expert_streaming(model)
+        if self._serialize_streaming_requests and self.config.max_num_seqs > 1:
+            logger.info(
+                "Expert streaming detected; serializing requests because the "
+                "expert LRU is budgeted for a single stream"
             )
 
         # Load additional EOS tokens from generation_config.json.
@@ -9444,7 +9467,11 @@ class Scheduler:
     def _effective_max_num_seqs(self) -> int:
         """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
+        if (
+            self._serialize_llama4_requests
+            or self._serialize_streaming_requests
+            or self._generation_overflow_recovery_ids
+        ):
             return 1
         return max(1, self.config.max_num_seqs)
 
