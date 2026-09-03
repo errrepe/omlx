@@ -108,7 +108,8 @@ class TestSchedulerConfig:
         assert config.policy == SchedulingPolicy.FCFS
         assert config.completion_batch_size == 32
         assert config.embedding_batch_size == 32
-        assert config.prefill_step_size == 2048
+        # Fase J O1 step: default prefill chunk is 4096 (was 2048 pre-merge).
+        assert config.prefill_step_size == 4096
         assert config.paged_cache_block_size == 256
         assert config.max_cache_blocks is None
         assert config.initial_cache_blocks == 256
@@ -3406,6 +3407,9 @@ class TestSchedulerArraysCacheBlockAlignment:
                 model=self._hybrid_model(model_type="qwen4_exp_text"),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
+                    # Pin the step: the branch default is 4096 (Fase J) and
+                    # this test isolates the gate (floor 0 -> follows step).
+                    prefill_step_size=2048,
                     paged_ssd_cache_dir=str(tmp_path),
                     paged_cache_block_size=256,
                 ),
@@ -3427,6 +3431,9 @@ class TestSchedulerArraysCacheBlockAlignment:
                 model=self._hybrid_model(),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
+                    # Pin the step: the branch default is 4096 (Fase J) and
+                    # this test isolates the gate (floor 0 -> follows step).
+                    prefill_step_size=2048,
                     paged_ssd_cache_dir=str(tmp_path),
                     paged_cache_block_size=256,
                 ),
@@ -3445,6 +3452,9 @@ class TestSchedulerArraysCacheBlockAlignment:
                 model=self._hybrid_model(),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
+                    # Pin the step: the branch default is 4096 (Fase J) and
+                    # this test isolates the gate (floor 0 -> follows step).
+                    prefill_step_size=2048,
                     paged_ssd_cache_dir=str(tmp_path),
                     paged_cache_block_size=256,
                 ),
@@ -3464,6 +3474,9 @@ class TestSchedulerArraysCacheBlockAlignment:
                 model=self._hybrid_model(model_type="other_hybrid"),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
+                    # Pin the step: the branch default is 4096 (Fase J) and
+                    # this test isolates the gate (floor 0 -> follows step).
+                    prefill_step_size=2048,
                     paged_ssd_cache_dir=str(tmp_path),
                     paged_cache_block_size=256,
                 ),
