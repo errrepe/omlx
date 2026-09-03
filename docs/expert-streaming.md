@@ -53,6 +53,7 @@ Base 1.79–1.82 tok/s, hit 9.2%, ~1.6 GB/token relidos (91% miss), 93% dos runs
 | stash prefetch (STASH=1) | 1.38 (−23%) | 5.3% | 63.1k | reverte: +52 GB especulativos roubam banda |
 | sem seed (SEED=0) | 1.78 (≈) | 0.0% | 0 | seeder é a única fonte de residency |
 | QD8 / QD24 (vs 16) | 1.85 / 1.78 | 9.2% | 0 | dentro do ruído; default 16 mantido |
+| single-promotion parcial (1 promote do bank + concat + remap, sem stack) | 1.80 (≈) | 9.2% | 0 | reverte: probe mostrou 2433 engajamentos corretos mas concat ≈ stack em wall — o custo está no tráfego de montagem, não nas alocações |
 
 Conclusão: neste workload o teto é volume (1.6 GB/tok) + granularidade (200k preads singletons) + custo por uso (promote/stack/eval). Retenção e prefetch por prev-token perdem; alavanca restante seria QMM sem stack por expert (não tentado). QSA nativo, em contraste: 4.3 ms vs 18.0 ms portable (~4.1×).
 
