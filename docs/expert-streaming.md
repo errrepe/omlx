@@ -40,6 +40,22 @@ Loading a glm5_next / qwen4_exp checkpoint with `expert_streaming_enabled` uses 
 
 Streaming only replaces `switch_mlp` (MoE experts) — attention is never touched, so the 0.6.4 fast paths stay engaged under streaming: Qwen4's exact QSA prefill/decode (`qsa_fast.py`), resident-PLE/`hc_projection` opts and sparse-native kernel (`qwen4_qsa_sparse_gqa`), and GLM-5.3's affine prefill tile (incl. the strided-input `contiguous` fix). Two deliberate interactions: (1) the scheduler gates *wide* Qwen4 prefill chunks on the sparse native kernel being built — without it, chunks stay at 2048 and streaming still works, just with smaller prefill steps; (2) PLE speculative-rollback snapshots use the simplified single-site capture (no `complete` two-phase protocol) with `ValueError` validation, and the lazy gate is fail-closed on `estimate.supported` — a checkpoint with no detectable MoE banks loads non-lazy even if its `model_type` is listed. The MoE weighted-sum in the streaming GLU routes to `glm_moe_weighted_sum` (native ext, `mx.fast` fallback inside) with scatter-unsort as the last resort.
 
+### Decode latency: o que foi medido (Qwen3.8-JANG_4M, budget 1 GiB, short, 96 toks)
+
+Base 1.79–1.82 tok/s, hit 9.2%, ~1.6 GB/token relidos (91% miss), 93% dos runs de leitura de tamanho 1, read p95 3.8 ms (p95 do SSD: 270 µs), pool QD16 saturado, GPU a 38%. Tentativas e resultado (kill criteria: +10% tok/s):
+
+| variante | tok/s | hit | evictions | veredito |
+|---|---|---|---|---|
+| retenção np no ctx-path | 1.62 (−9%) | 14.5% | 47.9k | reverte: page cache já serve o re-read; todo uso re-paga promote |
+| + admission filter | 1.71 (−4%) | 15.8% | 29.0k | reverte |
+| + budget 3 GiB | 1.52 (−15%) | 32.0% | 25.9k | reverte: mais RAM retida, mais lento |
+| retenção pós-promote (mx) | 1.70 (−5%) | 15.9% | 59.3k | reverte: churn de buffers MLX come a economia |
+| stash prefetch (STASH=1) | 1.38 (−23%) | 5.3% | 63.1k | reverte: +52 GB especulativos roubam banda |
+| sem seed (SEED=0) | 1.78 (≈) | 0.0% | 0 | seeder é a única fonte de residency |
+| QD8 / QD24 (vs 16) | 1.85 / 1.78 | 9.2% | 0 | dentro do ruído; default 16 mantido |
+
+Conclusão: neste workload o teto é volume (1.6 GB/tok) + granularidade (200k preads singletons) + custo por uso (promote/stack/eval). Retenção e prefetch por prev-token perdem; alavanca restante seria QMM sem stack por expert (não tentado). QSA nativo, em contraste: 4.3 ms vs 18.0 ms portable (~4.1×).
+
 ### DeepSeek V4 Flash (oQ4e-mtp)
 
 `deepseek_v4` nests the MoE under `layer.ffn` (not `mlp`) and keeps one routed bank per **MTP/DSpark stage** under `mtp.<stage>[.block].ffn.switch_mlp`. The converter walks both: 43 main layers + 3 draft stages (layer ids `43..45` share the same LRU). Notes:
