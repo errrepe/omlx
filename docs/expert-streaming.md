@@ -55,6 +55,7 @@ Base 1.79–1.82 tok/s, hit 9.2%, ~1.6 GB/token relidos (91% miss), 93% dos runs
 | QD8 / QD24 (vs 16) | 1.85 / 1.78 | 9.2% | 0 | dentro do ruído; default 16 mantido |
 | single-promotion parcial (1 promote do bank + concat + remap, sem stack) | 1.80 (≈) | 9.2% | 0 | reverte: probe mostrou 2433 engajamentos corretos mas concat ≈ stack em wall — o custo está no tráfego de montagem, não nas alocações |
 | cold-aware retention (mincore: só retém repetido + não-residente) | 1.88 (≈, dentro do ruído) | 9.2% | 0 | reverte: prova que o LRU já é write-quiet no decode (puts ≈ 0; 125k misses com 0 evictions) — o gate não tinha o que filtrar; page cache (17% residente) + seeder bastam |
+| cross-layer prefetch Fate-style (router l+1 sobre gate-input l, top-k+2, F_RDADVISE) | 1.82–1.86 (≈; OFF 1.96 no mesmo box) | 9.2% | 0 | reverte: recall 51% (bar 85%; Fate relata 97% noutros modelos — similaridade cross-layer menor neste checkpoint) com 2× advises (117k vs 63k) e zero ganho — o teto é entrega/overlap, não o sinal; auditoria achou ainda env-parse sem guarda e união multi-row sem budget (corrigidos antes do revert) |
 
 Conclusão: neste workload o teto é volume (1.6 GB/tok) + granularidade (200k preads singletons) + custo por uso (promote/stack/eval). Retenção e prefetch por prev-token perdem; alavanca restante seria QMM sem stack por expert (não tentado). QSA nativo, em contraste: 4.3 ms vs 18.0 ms portable (~4.1×).
 
