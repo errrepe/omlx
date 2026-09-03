@@ -36,6 +36,10 @@ The allowlist (`SUPPORTED_TYPES` in `residency.py`, the single source of truth) 
 
 Loading a glm5_next / qwen4_exp checkpoint with `expert_streaming_enabled` uses the lazy loader (`lazy=True`) and converts to streaming **before** `materialize_lazy_state` — the multi-hundred-GB MoE banks are dropped as lazy arrays instead of ever being materialized. GLM decoders additionally get `compile_ffn` disabled and a per-layer `mx.eval(out)` + `mx.clear_cache()` so the per-layer expert mini-banks (~3.4 GB at prefill) do not accumulate in the lazy graph / allocator and swap the machine. Text-engine loads (BatchedEngine) apply the same lazy + convert-before-materialize order for streaming-supported model types — this is what makes `deepseek_v4` viable on 16 GB Macs.
 
+### 0.6.4 optimized paths (QSA / affine tile)
+
+Streaming only replaces `switch_mlp` (MoE experts) — attention is never touched, so the 0.6.4 fast paths stay engaged under streaming: Qwen4's exact QSA prefill/decode (`qsa_fast.py`), resident-PLE/`hc_projection` opts and sparse-native kernel (`qwen4_qsa_sparse_gqa`), and GLM-5.3's affine prefill tile (incl. the strided-input `contiguous` fix). Two deliberate interactions: (1) the scheduler gates *wide* Qwen4 prefill chunks on the sparse native kernel being built — without it, chunks stay at 2048 and streaming still works, just with smaller prefill steps; (2) PLE speculative-rollback snapshots use the simplified single-site capture (no `complete` two-phase protocol) with `ValueError` validation, and the lazy gate is fail-closed on `estimate.supported` — a checkpoint with no detectable MoE banks loads non-lazy even if its `model_type` is listed. The MoE weighted-sum in the streaming GLU routes to `glm_moe_weighted_sum` (native ext, `mx.fast` fallback inside) with scatter-unsort as the last resort.
+
 ### DeepSeek V4 Flash (oQ4e-mtp)
 
 `deepseek_v4` nests the MoE under `layer.ffn` (not `mlp`) and keeps one routed bank per **MTP/DSpark stage** under `mtp.<stage>[.block].ffn.switch_mlp`. The converter walks both: 43 main layers + 3 draft stages (layer ids `43..45` share the same LRU). Notes:
