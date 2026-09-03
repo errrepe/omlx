@@ -1022,6 +1022,24 @@ class LanguageModel(nn.Module):
         fg_parts = ("A_log", "dt_bias", "f_a_proj.weight", "f_b_proj.weight")
         for k, v in weights.items():
             nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
+            # Raw-transformers export names HyperConnection params hc_base/
+            # hc_fn/hc_scale; the vendored module expects base/fn/scale.
+            nk = nk.replace(".hc_base", ".base").replace(".hc_fn", ".fn").replace(".hc_scale", ".scale")
+            # Raw-transformers export carries o_norm bare (the module is a
+            # custom RMSNormGated holding .weight).
+            if nk.endswith(".self_attn.o_norm"):
+                nk = nk + ".weight"
+            # Raw-transformers export carries the per-stream convs bare
+            # (self_attn.q_conv1d, no .weight suffix).
+            for stream in ("q", "k", "v"):
+                bare = ".self_attn." + stream + "_conv1d"
+                if nk.endswith(bare):
+                    nk = nk + ".weight"
+                    break
+            # Raw-transformers export carries the router bias at the MoE
+            # level; the vendored gate is a submodule holding it.
+            if nk.endswith(".mlp.e_score_correction_bias"):
+                nk = nk.replace(".mlp.e_score_correction_bias", ".mlp.gate.e_score_correction_bias")
 
             fused = False
             for part in ("q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"):
@@ -1044,9 +1062,14 @@ class LanguageModel(nn.Module):
 
         for prefix, parts in conv_parts.items():
             if all(c in parts for c in ("q", "k", "v")):
-                remapped[prefix + "conv1d.weight"] = mx.concatenate(
+                fused = mx.concatenate(
                     [parts["q"], parts["k"], parts["v"]], axis=0
                 )
+                # Raw-transformers export carries convs 2D (out, k); MLX
+                # Conv1d expects (out, k, 1).
+                if fused.ndim == 2:
+                    fused = fused.reshape(fused.shape[0], fused.shape[1], 1)
+                remapped[prefix + "conv1d.weight"] = fused
             else:
                 for c, w in parts.items():
                     remapped[prefix + c + "_conv1d.weight"] = w

@@ -834,3 +834,134 @@ def test_glm5_next_cache_prior_off_is_stock(monkeypatch):
     out = moe(x)
     mx.eval(out)
     assert set(seen["inds"]) == {6, 7}
+
+
+def test_glm5_next_sanitize_raw_transformers_layout():
+    """JANG-MTP raw-transformers export remaps onto the vendored module.
+
+    Covers every remap added for the checkpoint that previously failed to
+    load with 2376 unmatched params: bare model.* container, hc_base/hc_fn/
+    hc_scale, bare q/k/v_conv1d (2D), bare o_norm, MoE-level router bias,
+    draft-layer drop."""
+    from mlx_vlm.models.glm5_next.config import ModelConfig, TextConfig, VisionConfig
+    from mlx_vlm.models.glm5_next.glm5_next import Model
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    tc = TextConfig.from_dict(
+        {
+            "model_type": "glm5_next_text",
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "moe_intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "n_shared_experts": None,
+            "n_routed_experts": 8,
+            "routed_scaling_factor": 1.0,
+            "kv_lora_rank": 4,
+            "q_lora_rank": 4,
+            "qk_rope_head_dim": 0,
+            "v_head_dim": 4,
+            "qk_nope_head_dim": 4,
+            "num_experts_per_tok": 2,
+            "first_k_dense_replace": 1,
+            "max_position_embeddings": 64,
+            "rms_norm_eps": 1e-5,
+            "index_topk": 2,
+            "index_head_dim": 4,
+            "index_n_heads": 1,
+            "layer_types": ["linear_attention", "linear_attention"],
+            "mlp_layer_types": ["dense", "sparse"],
+            "n_group": 1,
+            "topk_group": 1,
+            "norm_topk_prob": True,
+            "swiglu_limit": 7.0,
+            "linear_attn_config": {
+                "num_heads": 2,
+                "head_dim": 8,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+            },
+            "index_kpool": 2,
+            "hc_mult": 2,
+            "hc_sinkhorn_iters": 2,
+        }
+    )
+    vc = VisionConfig.from_dict(
+        {
+            "model_type": "glm5_next_vision",
+            "depth": 1,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "patch_size": 1,
+            "out_hidden_size": 8,
+            "projection_intermediate_size": 16,
+            "image_size": 4,
+            "spatial_merge_size": 1,
+            "temporal_patch_size": 1,
+        }
+    )
+    mc = ModelConfig(model_type="glm5_next", text_config=tc, vision_config=vc, image_token_id=30, video_token_id=31)
+    model = Model(mc)
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    flat = nn.utils.tree_flatten(
+        model.parameters(), is_leaf=lambda v: isinstance(v, mx.array)
+    )
+    model_names = {k for k, _ in flat}
+
+    # Fabricate the raw-transformers surface the JANG-MTP export carries.
+    # tree_flatten names are bare (model.layers.*, vision_model.*, ...) with
+    # no language_model. container level — the export carries exactly that
+    # bare layout for the LLM, plus visual.* and lm_head.* siblings.
+    weights = {}
+    for name in model_names:
+        if name.startswith("vision_model."):
+            weights[name.replace("vision_model.", "visual.", 1)] = mx.zeros((2,))
+        elif name.startswith("model."):
+            body = name[len("model.") :]
+            body = body.replace(".attn_hc.base", ".attn_hc.hc_base")
+            body = body.replace(".attn_hc.fn", ".attn_hc.hc_fn")
+            body = body.replace(".attn_hc.scale", ".attn_hc.hc_scale")
+            body = body.replace(".ffn_hc.base", ".ffn_hc.hc_base")
+            body = body.replace(".ffn_hc.fn", ".ffn_hc.hc_fn")
+            body = body.replace(".ffn_hc.scale", ".ffn_hc.hc_scale")
+            body = body.replace(".mlp.gate.e_score_correction_bias", ".mlp.e_score_correction_bias")
+            body = body.replace(".self_attn.o_norm.weight", ".self_attn.o_norm")
+            body = body.replace(".self_attn.forget_gate.", ".self_attn.")
+            if body.endswith(".self_attn.conv1d.weight"):
+                continue  # exported as three bare 2D convs
+            weights["model." + body] = mx.zeros((2,))
+        else:
+            # lm_head and any other top-level siblings keep their bare names.
+            weights[name] = mx.zeros((2,))
+    # three bare per-stream convs (2D) per linear-attention layer
+    for layer in range(2):
+        for stream in ("q", "k", "v"):
+            weights[f"model.layers.{layer}.self_attn.{stream}_conv1d"] = mx.zeros((4, 2))
+    # draft/MTP layer keys that must be dropped entirely
+    weights["model.layers.2.eh_proj.weight"] = mx.zeros((2,))
+    weights["model.layers.2.shared_head.norm.weight"] = mx.zeros((2,))
+
+    sanitized = model.sanitize(weights)
+    sani_names = set(sanitized)
+
+    # Every surviving key must match a model parameter.
+    extras = sani_names - model_names
+    assert not extras, f"unmatched after sanitize: {sorted(extras)[:10]}"
+    # The draft layer was dropped, not remapped into the model.
+    assert not any("layers.2" in k or "eh_proj" in k or "shared_head" in k for k in sani_names)
+    # The fused conv is 3D now.
+    fused = [k for k in sani_names if k.endswith("self_attn.conv1d.weight")]
+    assert len(fused) == 2
+    for k in fused:
+        assert sanitized[k].ndim == 3
+    # Router bias landed inside the gate submodule.
+    assert any(k.endswith("mlp.gate.e_score_correction_bias") for k in sani_names)
+    # forget-gate params were remapped under their module.
+    assert any(".forget_gate.A_log" in k for k in sani_names)

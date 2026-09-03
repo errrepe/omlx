@@ -128,15 +128,31 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         # HF container: Glm5NextForConditionalGeneration -> model.{visual,language_model} + lm_head
+        # JANG-MTP raw-transformers export: bare model.* LLM (no language_model
+        # level), hc_base/hc_fn/hc_scale params, bare q/k/v_conv1d, bare o_norm,
+        # and a layer-45 draft head (eh_proj/shared_head/enorm/hnorm) to drop.
+        draft_layer = None
+        try:
+            draft_layer = self.language_model.args.num_hidden_layers
+        except AttributeError:
+            draft_layer = None
         remapped = {}
         for k, v in weights.items():
             nk = k
+            if draft_layer is not None and nk.startswith(
+                f"model.layers.{draft_layer}."
+            ):
+                # Draft/MTP head never runs in the non-MTP path — drop it.
+                continue
             if nk.startswith("model.visual."):
                 nk = "vision_model." + nk[len("model.visual.") :]
             elif nk.startswith("visual."):
                 nk = "vision_model." + nk[len("visual.") :]
             elif nk.startswith("model.language_model."):
                 nk = "language_model.model." + nk[len("model.language_model.") :]
+            elif nk.startswith("model."):
+                # Raw-transformers layout: the LLM sits at bare model.*.
+                nk = "language_model.model." + nk[len("model.") :]
             elif nk.startswith("lm_head."):
                 nk = "language_model." + nk
             remapped[nk] = v
