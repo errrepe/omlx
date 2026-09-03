@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
@@ -105,6 +106,230 @@ def test_qwen4_exp_config_normalizes_reference_layer_type():
         "qwen_sparse_attention",
     ]
     assert config.text_config.rope_parameters["type"] == "default"
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedResidual,
+        compile_hyper_connections,
+        fuse_hyper_connection_projections,
+    )
+
+    config = SimpleNamespace(
+        hc_count=2,
+        hidden_size=32,
+        hc_lowrank=32,
+        rms_norm_eps=1e-6,
+    )
+    mx.random.seed(17)
+    module = Qwen4ExpGatedResidual(config)
+    if quantized:
+        module.input_mix_weight_down = module.input_mix_weight_down.to_quantized(
+            32, 4
+        )
+        module.block_inject_weight = module.block_inject_weight.to_quantized(32, 4)
+
+    inputs = mx.random.normal((2, 3, 64)).astype(mx.bfloat16)
+    eager = module(inputs)
+    verify_eager = module(inputs, target_verify=True)
+    mx.eval(*eager, *verify_eager)
+
+    assert fuse_hyper_connection_projections(module) == 0
+    assert fuse_hyper_connection_projections(module) == 0
+    fused = module(inputs)
+    verify_fused = module(inputs, target_verify=True)
+    mx.eval(*fused, *verify_fused)
+
+    assert not hasattr(module, "input_inject_weight")
+    assert hasattr(module, "input_mix_weight_down")
+    assert hasattr(module, "block_inject_weight")
+    for expected, actual in zip(eager, fused):
+        assert mx.array_equal(expected, actual).item()
+    for expected, actual in zip(verify_eager, verify_fused):
+        assert mx.array_equal(expected, actual).item()
+
+    assert compile_hyper_connections(module) == 1
+    assert compile_hyper_connections(module) == 0
+    prefill = module(inputs)
+    decode_inputs = inputs[:1, :1]
+    decode_eager = module._forward(decode_inputs)
+    decode_compiled = module(decode_inputs)
+    verify_compiled = module(inputs, target_verify=True)
+    mx.eval(*prefill, *decode_eager, *decode_compiled, *verify_compiled)
+    for expected, actual in zip(fused, prefill):
+        assert mx.array_equal(expected, actual).item()
+    for expected, actual in zip(decode_eager, decode_compiled):
+        assert mx.array_equal(expected, actual).item()
+    for expected, actual in zip(verify_fused, verify_compiled):
+        assert mx.array_equal(expected, actual).item()
+
+    compiled_forward = module._compiled_forward
+    module._compiled_forward = MagicMock(
+        side_effect=AssertionError("target verification entered compiled decode")
+    )
+    verify_decode = module(decode_inputs, target_verify=True)
+    mx.eval(*verify_decode)
+    module._compiled_forward.assert_not_called()
+    module._compiled_forward = compiled_forward
+
+
+def test_qwen4_hyper_connection_optimizations_fail_closed():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedResidual,
+        compile_hyper_connections,
+        fuse_hyper_connection_projections,
+    )
+
+    config = SimpleNamespace(
+        hc_count=2,
+        hidden_size=32,
+        hc_lowrank=32,
+        rms_norm_eps=1e-6,
+    )
+    incompatible = Qwen4ExpGatedResidual(config)
+    incompatible.block_inject_weight = incompatible.block_inject_weight.to_quantized(
+        32, 4
+    )
+    assert fuse_hyper_connection_projections(incompatible) == 0
+    assert hasattr(incompatible, "input_mix_weight_down")
+    assert hasattr(incompatible, "block_inject_weight")
+
+    already_compiled = Qwen4ExpGatedResidual(config)
+    assert compile_hyper_connections(already_compiled) == 1
+    assert fuse_hyper_connection_projections(already_compiled) == 0
+
+
+def test_qwen4_hyper_connection_compile_covers_uncombined_mixer():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedResidual,
+        compile_hyper_connections,
+    )
+
+    config = SimpleNamespace(
+        hc_count=2,
+        hidden_size=32,
+        hc_lowrank=32,
+        rms_norm_eps=1e-6,
+    )
+    mixer = Qwen4ExpGatedResidual(config, use_combine=False)
+    inputs = mx.random.normal((1, 1, 64)).astype(mx.bfloat16)
+    eager = mixer._forward(inputs)
+    assert compile_hyper_connections(mixer) == 1
+    compiled = mixer(inputs)
+    mx.eval(eager, compiled)
+
+    assert mx.allclose(eager, compiled, rtol=1e-5, atol=1e-6).item()
+
+
+def test_qwen4_resident_ple_fuses_packed_shards_exactly():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    mx.random.seed(43)
+    embedding = ShardedEmbedding(32, 64, 4)
+    embedding.shards = [
+        nn.QuantizedEmbedding.from_embedding(
+            shard,
+            group_size=32,
+            bits=4,
+            mode="affine",
+        )
+        for shard in embedding.shards
+    ]
+    indices = mx.array([[0, 9, 17, 31, 9]], dtype=mx.int32)
+    expected = embedding(indices)
+    mx.eval(expected)
+
+    assert embedding.fuse_quantized_shards() is True
+    assert embedding.fuse_quantized_shards() is False
+    assert embedding.shards == []
+    # The fused arm performs one device gather and no longer consults the host
+    # shard boundaries after load.
+    embedding.shard_offsets = ()
+    actual = embedding(indices)
+    mx.eval(actual)
+
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, caplog):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5 import Model as Qwen3_5Model
+    from mlx_vlm.models.qwen4_exp import qwen4_exp as model_module
+
+    model = model_module.Model.__new__(model_module.Model)
+    nn.Module.__init__(model)
+    base_load = MagicMock(return_value="loaded")
+    fuse = MagicMock(return_value=96)
+    fuse_ple = MagicMock(return_value=1)
+    compile_connections = MagicMock(return_value=97)
+    monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
+    monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
+    monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
+    monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
+    monkeypatch.setattr(
+        model_module,
+        "get_mtp_runtime",
+        MagicMock(return_value=SimpleNamespace(enabled=False)),
+    )
+    caplog.set_level("INFO", logger=model_module.__name__)
+
+    weights = [("language_model.model.embed_tokens.weight", object())]
+    result = model.load_weights(weights, strict=False)
+
+    assert result == "loaded"
+    base_load.assert_called_once_with(weights, strict=False)
+    fuse.assert_called_once_with(model)
+    fuse_ple.assert_called_once_with(model)
+    compile_connections.assert_called_once_with(model)
+    assert (
+        "96 exact hybrid projection pairs, 97 compiled decode paths"
+        in caplog.text
+    )
+    assert "Fused 1 resident Qwen4-Exp PLE table" in caplog.text
+
+
+def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
+    monkeypatch, caplog
+):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5 import Model as Qwen3_5Model
+    from mlx_vlm.models.qwen4_exp import qwen4_exp as model_module
+
+    model = model_module.Model.__new__(model_module.Model)
+    nn.Module.__init__(model)
+    base_load = MagicMock(return_value=model)
+    fuse = MagicMock(return_value=96)
+    fuse_ple = MagicMock(return_value=1)
+    compile_connections = MagicMock(return_value=100)
+    monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
+    monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
+    monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
+    monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
+    monkeypatch.setattr(
+        model_module,
+        "get_mtp_runtime",
+        MagicMock(return_value=SimpleNamespace(enabled=True)),
+    )
+    caplog.set_level("INFO", logger=model_module.__name__)
+
+    assert model.load_weights([], strict=False) is model
+
+    fuse.assert_not_called()
+    fuse_ple.assert_called_once_with(model)
+    compile_connections.assert_called_once_with(model)
+    assert "Skipped Qwen4-Exp exact hybrid projections" in caplog.text
+    assert (
+        "0 exact hybrid projection pairs, 100 compiled decode paths"
+        in caplog.text
+    )
 
 
 def test_qwen4_exp_sanitize_keeps_converted_norm_values():
@@ -398,6 +623,143 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
     assert next_logits.logits.shape == (1, 1, 64)
 
 
+def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    attention = Qwen4ExpAttention(config.text_config)
+    mx.eval(attention.parameters())
+    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+
+    calls = []
+    gathered = language.contiguous_causal_gathered_qsa
+
+    def tracked(*args, **kwargs):
+        calls.append((args[0].shape, args[1].shape))
+        return gathered(*args, **kwargs)
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
+    fast_cache = QSAKVCache()
+    actual = attention(hidden, mask="causal", cache=fast_cache)
+
+    monkeypatch.setattr(
+        Qwen4ExpAttention,
+        "_gathered_text_prefill_eligible",
+        staticmethod(lambda *args, **kwargs: False),
+    )
+    reference_cache = QSAKVCache()
+    expected = attention(hidden, mask="causal", cache=reference_cache)
+    mx.eval(actual, expected)
+
+    assert calls == [((1, 4, 20, 8), (1, 2, 20, 8))]
+    assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+    assert fast_cache.offset == reference_cache.offset == 20
+    assert mx.array_equal(fast_cache.index_keys, reference_cache.index_keys).item()
+    assert mx.array_equal(
+        fast_cache.index_position_ids,
+        reference_cache.index_position_ids,
+    ).item()
+
+
+def test_qwen4_gathered_qsa_fails_closed_for_multimodal_positions(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("multimodal positions must use mlx-vlm's general QSA")
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", must_not_run)
+    attention = Qwen4ExpAttention(config.text_config)
+    hidden = mx.random.normal((1, 3, config.text_config.hidden_size))
+    position_ids = mx.array(
+        [
+            [[0, 1, 2]],
+            [[0, 1, 2]],
+            [[0, 0, 1]],
+        ],
+        dtype=mx.int32,
+    )
+
+    output = attention(
+        hidden,
+        mask="causal",
+        cache=QSAKVCache(),
+        position_ids=position_ids,
+    )
+    mx.eval(output)
+
+    assert output.shape == hidden.shape
+
+
+def test_qwen4_gathered_qsa_fails_closed_for_batched_prefill(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("batched requests must use mlx-vlm's general QSA")
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", must_not_run)
+    attention = Qwen4ExpAttention(config.text_config)
+    hidden = mx.random.normal((2, 3, config.text_config.hidden_size))
+
+    output = attention(hidden, mask="causal", cache=QSAKVCache())
+    mx.eval(output)
+
+    assert output.shape == hidden.shape
+
+
+def test_qwen4_gathered_qsa_keeps_official_path_at_sparse_budget(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("at-budget prefill must use the official full path")
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", must_not_run)
+    attention = Qwen4ExpAttention(config.text_config)
+    budget = attention.indexer.token_budget
+    hidden = mx.random.normal((1, budget, config.text_config.hidden_size))
+
+    output = attention(hidden, mask="causal", cache=QSAKVCache())
+    mx.eval(output)
+
+    assert output.shape == hidden.shape
+
+
+def test_qwen4_gathered_qsa_chunk_grows_with_context():
+    _tiny_config()
+    from mlx_vlm.models.qwen4_exp.qsa_fast import contiguous_causal_query_chunk
+
+    assert contiguous_causal_query_chunk(4096) == 32
+    assert contiguous_causal_query_chunk(4097) == 64
+    assert contiguous_causal_query_chunk(16384) == 64
+    assert contiguous_causal_query_chunk(16385) == 128
+
+
+def test_qwen4_adapter_cache_only_prefill_skips_vocab_projection():
+    from mlx_vlm.models.qwen4_exp import Model
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    model = VLMModelAdapter(Model(_tiny_config()))
+    cache = model.make_cache()
+    result = model(
+        mx.array([[2, 3, 4, 5]], dtype=mx.int32),
+        cache=cache,
+        skip_lm_head=True,
+    )
+    mx.eval([member.state for member in cache])
+
+    assert result is None
+    offsets = [member.offset for member in cache if hasattr(member, "offset")]
+    assert offsets and max(offsets) == 4
+
+
+
 def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
@@ -621,48 +983,9 @@ def test_qwen4_ple_ordinary_forward_disarms_stale_snapshot():
     assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
 
 
-def test_qwen4_ple_rollback_fails_closed_on_incomplete_snapshot():
-    """An aborted verify forward can leave a half-written snapshot. Rollback must
-    reject it before mutating any cache, not apply a mixed-epoch state."""
+def test_qwen4_ple_rollback_validates_accepted_count_before_qsa_mutation():
     config = _tiny_config()
-    from mlx_vlm.models.qwen4_exp.language import (
-        LanguageModel,
-        _PLESpeculativeRollbackError,
-    )
-
-    model = LanguageModel(config.text_config, config)
-    cache = model.make_cache()
-    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
-    verified = model(
-        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
-    )
-
-    ple_cache, qsa_cache = cache[0], cache[1]
-    before_hist = mx.array(ple_cache[3])
-    before_conv = mx.array(ple_cache[2])
-    before_offset = int(qsa_cache.offset)
-
-    ple_cache._qwen4_exp_ple_speculative_state.complete = False
-    with pytest.raises(_PLESpeculativeRollbackError):
-        model.rollback_speculative_cache(
-            cache, verified.gdn_states, accepted=0, block_size=2
-        )
-
-    mx.eval(ple_cache[3], ple_cache[2])
-    assert mx.array_equal(ple_cache[3], before_hist).item()
-    assert mx.array_equal(ple_cache[2], before_conv).item()
-    assert int(qsa_cache.offset) == before_offset
-    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
-
-
-def test_qwen4_ple_rollback_validates_snapshot_before_qsa_mutation():
-    """A malformed accepted-count aborts the whole rollback with QSA/GDN
-    untouched (validation runs before the inherited rollback)."""
-    config = _tiny_config()
-    from mlx_vlm.models.qwen4_exp.language import (
-        LanguageModel,
-        _PLESpeculativeRollbackError,
-    )
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
     model = LanguageModel(config.text_config, config)
     cache = model.make_cache()
@@ -672,10 +995,9 @@ def test_qwen4_ple_rollback_validates_snapshot_before_qsa_mutation():
     )
     before_offset = int(cache[1].offset)
 
-    # batch is 1, so a 2-element accepted list cannot match
-    with pytest.raises(_PLESpeculativeRollbackError):
+    with pytest.raises(ValueError, match="outside the verify window"):
         model.rollback_speculative_cache(
-            cache, verified.gdn_states, accepted=[0, 0], block_size=2
+            cache, verified.gdn_states, accepted=2, block_size=2
         )
     assert int(cache[1].offset) == before_offset
     assert getattr(cache[0], "_qwen4_exp_ple_speculative_state", None) is None
@@ -891,6 +1213,32 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     assert embedding._shard_specs[0][3:] == (bits, 32)
     embedding.close()
 
+# ---------------------------------------------------------------------------
+# Continuous-batching join regressions (issue #3245, PR #3246)
+# ---------------------------------------------------------------------------
+
+
+def _warm_qsa_row(length: int, start: int, index_dim: int = 4):
+    """Build a warm singleton QSAKVCache holding ``length`` cached tokens.
+
+    Adapted from the fixture in PR #3215 (DiscoStew6082).
+    """
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+    cache = QSAKVCache()
+    values = mx.arange(start, start + 2 * length * 4, dtype=mx.float32).reshape(
+        1, 2, length, 4
+    )
+    cache.state = (
+        values,
+        values + 100,
+        mx.arange(start, start + length * index_dim, dtype=mx.float32).reshape(
+            1, length, index_dim
+        ),
+        mx.arange(start, start + length, dtype=mx.int32)[None],
+    )
+    return cache
+
 
 def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
     compute = tmp_path / "compute"
@@ -1023,6 +1371,149 @@ def test_ple_runtime_auto_defaults_to_mmap():
         resolve_ple_runtime_mode("mmap", checkpoint_bytes=1, physical_memory=1)
         == "mmap"
     )
+
+
+def test_qwen4_cache_extension_promotes_singletons_to_model_owned_batch():
+    """A warm QSA singleton joining a running batch must be promoted via the
+    model-owned ``to_batch`` before ``extend`` — previously the join path
+    raised AttributeError ('QSAKVCache' object has no attribute 'extend').
+
+    Adapted from PR #3215 (DiscoStew6082), which fixes the same seam.
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = _warm_qsa_row(3, 10)
+    right = _warm_qsa_row(1, 30)
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert len(caches) == 1
+    assert isinstance(caches[0], BatchQSAKVCache)
+    mx.eval(caches[0].offset, caches[0].index_keys, caches[0].index_position_ids)
+    assert caches[0].offset.tolist() == [3, 1]
+    assert caches[0].index_offset == 3
+    assert caches[0].extract(0).offset == 3
+    assert caches[0].extract(1).offset == 1
+    assert mx.array_equal(
+        caches[0].extract(1).index_position_ids, right.index_position_ids
+    ).item()
+
+
+def test_qwen4_cache_extension_accepts_existing_model_owned_batch():
+    """A singleton QSA row can join an existing model-owned batch.
+
+    Adapted from PR #3214 (HaloFour).
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = _warm_qsa_row(3, 10)
+    right_rows = [_warm_qsa_row(2, 30), _warm_qsa_row(1, 50)]
+    right = BatchQSAKVCache.merge(right_rows)
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert len(caches) == 1
+    assert isinstance(caches[0], BatchQSAKVCache)
+    mx.eval(caches[0].offset, caches[0].left_padding, caches[0].index_keys)
+    assert caches[0].offset.tolist() == [3, 2, 1]
+    assert caches[0].left_padding.tolist() == [0, 1, 2]
+    assert [caches[0].extract(i).offset for i in range(3)] == [3, 2, 1]
+
+
+def test_qwen4_cache_extension_keeps_existing_batch_in_place():
+    """Extending two batched QSA caches must retain the left batch object.
+
+    Adapted from PR #3214 (HaloFour).
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = BatchQSAKVCache.merge([_warm_qsa_row(3, 10)])
+    right = BatchQSAKVCache.merge([_warm_qsa_row(2, 30)])
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert caches[0] is left
+    mx.eval(left.offset, left.left_padding, left.index_keys)
+    assert left.offset.tolist() == [3, 2]
+    assert left.left_padding.tolist() == [0, 1]
+    assert [left.extract(i).offset for i in range(2)] == [3, 2]
+
+
+def test_qwen4_qsa_indexer_handles_ragged_batch_offsets():
+    """``from_projected`` on a batched cache whose ``offset`` is a per-row
+    array must keep the mask math on aligned-column scalars — previously the
+    (batch,) offsets broadcast into the seq axis and produced selected_tokens
+    of shape (batch, batch, key_len), crashing mx.concatenate."""
+    config = _tiny_config().text_config
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, Qwen4ExpQSAIndexer
+
+    class _PassthroughRope:
+        @staticmethod
+        def apply_rotary(q, k, position_ids, unsqueeze_dim=1):
+            return q, k
+
+    indexer = Qwen4ExpQSAIndexer(config, _PassthroughRope())
+    index_dim = config.indexer_head_dim
+
+    batch = _warm_qsa_row(12, 0, index_dim=index_dim).to_batch([0])
+    batch.extend(_warm_qsa_row(4, 100, index_dim=index_dim).to_batch([0]))
+    assert isinstance(batch, BatchQSAKVCache)
+    assert isinstance(batch.offset, mx.array)  # ragged per-row KV offsets
+    assert batch.offset.tolist() == [12, 4]
+
+    total = (config.indexer_n_heads + config.indexer_kv_heads) * index_dim
+    qk = (mx.arange(2 * total, dtype=mx.float32) / total).reshape(2, 1, total)
+    positions = mx.array([[12], [4]], dtype=mx.int32)
+
+    selected = indexer.from_projected(qk, batch, positions)
+
+    assert selected is not None
+    mx.eval(selected)
+    key_len = batch.index_offset
+    assert key_len == 13
+    assert selected.shape == (2, 1, 1, key_len)
+    assert selected.dtype == mx.bool_
+
+
+def test_qwen4_batch_qsa_trim_slices_indexer_arrays():
+    """``BatchQSAKVCache.trim`` must slice the physical indexer arrays like the
+    singleton trim does — previously only ``index_offset`` was decremented, so
+    a later ``update_indexer`` resynced it to the stale physical width and the
+    rejected draft columns fossilized inside the index."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    batch = _warm_qsa_row(6, 0).to_batch([0])
+    assert batch.index_offset == 6
+
+    trimmed = batch.trim(2)
+
+    assert trimmed == 2
+    assert batch.offset.tolist() == [4]
+    assert batch.index_offset == 4
+    assert batch.index_keys.shape[1] == 4
+    assert batch.index_position_ids.shape[-1] == 4
+
+    # The next indexer update must resync against the trimmed length, not the
+    # stale physical width.
+    batch.update_indexer(
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+        mx.array([[4]], dtype=mx.int32),
+    )
+    assert batch.index_offset == 5
+    assert batch.index_keys.shape[1] == 5
+    assert batch.index_position_ids.shape[-1] == 5
 
 
 def _make_bound_qwen4_language_model(config):

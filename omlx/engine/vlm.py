@@ -925,6 +925,20 @@ def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
     )
 
 
+def _model_shard_matcher(model_dir: Path):
+    """Return a predicate for safetensors shards directly under *model_dir*."""
+    target_dir = model_dir.resolve()
+
+    def matches(filename: object) -> bool:
+        try:
+            path = Path(filename)
+            return path.suffix == ".safetensors" and path.parent.resolve() == target_dir
+        except (TypeError, OSError, RuntimeError):
+            return False
+
+    return matches
+
+
 @contextlib.contextmanager
 def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
@@ -951,7 +965,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
 
     original_safe_open = safetensors.safe_open
     original_sanitize_moe_weights = _minimax_m3_vl._sanitize_moe_weights
-    target_dir = model_dir.resolve()
+    is_target_shard = _model_shard_matcher(model_dir)
 
     class _SafeOpenMetadataWrapper:
         def __init__(self, inner):
@@ -976,11 +990,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
 
     def _patched_safe_open(filename, *args, **kwargs):
         handle = original_safe_open(filename, *args, **kwargs)
-        try:
-            path = Path(filename).resolve()
-        except TypeError:
-            return handle
-        if path.parent == target_dir and path.suffix == ".safetensors":
+        if is_target_shard(filename):
             return _SafeOpenMetadataWrapper(handle)
         return handle
 
@@ -1072,7 +1082,7 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
     import safetensors
 
     original_safe_open = safetensors.safe_open
-    target_dir = model_dir.resolve()
+    is_target_shard = _model_shard_matcher(model_dir)
 
     class _SafeOpenMetadataWrapper:
         def __init__(self, inner):
@@ -1097,11 +1107,7 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
 
     def _patched_safe_open(filename, *args, **kwargs):
         handle = original_safe_open(filename, *args, **kwargs)
-        try:
-            path = Path(filename).resolve()
-        except TypeError:
-            return handle
-        if path.parent == target_dir and path.suffix == ".safetensors":
+        if is_target_shard(filename):
             return _SafeOpenMetadataWrapper(handle)
         return handle
 

@@ -39,6 +39,9 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
         name = f"qwen35_q{bits}_affine_qmm_t"
         if not fast.has_symbol(name) or not _is_supported_affine_linear(linear, x):
             return None
+        # The tile indexes x as row-major packed and ignores its strides, so a
+        # last-axis view reads the wrong lanes.
+        x = mx.contiguous(x)
         return getattr(fast, name)(
             x,
             linear.weight,
@@ -103,6 +106,8 @@ def fused_quantized_matmul(
 
             name = f"qwen35_q{bits}_affine_qmm_t"
             if fast.has_symbol(name) and fast.qmm_supports_group_size(group_size):
+                # The tile ignores the input's strides. See _native_qmm.
+                x = mx.contiguous(x)
                 return getattr(fast, name)(
                     x,
                     weight,
