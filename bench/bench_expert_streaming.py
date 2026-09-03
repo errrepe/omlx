@@ -28,21 +28,27 @@ MODEL_PATHS = {
     "qwen-jang": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4S",
     "qwen-jang4m": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4M",
     "glm": "/Volumes/SSD 4TB/AI Models/GLM-5.3-Flash-oQ4e",
+    "glm-jang": "/Volumes/SSD 4TB/AI Models/GLM-5.3-Flash-JANG-MTP",
     "dsv4": "/Volumes/SSD 4TB/AI Models/DeepSeek-V4-Flash-0731-oQ4e-mtp",
+    "dsv4-jang": "/Volumes/SSD 4TB/AI Models/DeepSeek-V4-Flash-0731-JANG",
 }
 DEFAULT_ENTRIES = {
     "qwen": "Qwen3.8-Flash-Next-oQ4e-mtp",
     "qwen-jang": "Qwen3.8-Flash-Next-JANG_4S",
     "qwen-jang4m": "Qwen3.8-Flash-Next-JANG_4M",
     "glm": "GLM-5.3-Flash-oQ4e",
+    "glm-jang": "GLM-5.3-Flash-JANG-MTP",
     "dsv4": "DeepSeek-V4-Flash-0731-oQ4e-mtp",
+    "dsv4-jang": "DeepSeek-V4-Flash-0731-JANG",
 }
 PROMPTS = {
     "qwen": [{"role": "user", "content": "Hello, how are you?"}],
     "qwen-jang": [{"role": "user", "content": "Hello, how are you?"}],
     "qwen-jang4m": [{"role": "user", "content": "Hello, how are you?"}],
     "glm": [{"role": "user", "content": "Hello, how are you?"}],
+    "glm-jang": [{"role": "user", "content": "Hello, how are you?"}],
     "dsv4": [{"role": "user", "content": "Hello, how are you?"}],
+    "dsv4-jang": [{"role": "user", "content": "Hello, how are you?"}],
 }
 
 _FILLER = (
