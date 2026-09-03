@@ -2660,10 +2660,12 @@ class StreamingSwitchGLU(nn.Module):
             mx.eval(x_out)
             p.add_gpu(self.layer_idx, time.perf_counter() - t_gpu0)
 
-        # weighted sum fast path — keep compatible but may not use fast kernel when streaming
+        # Weighted-sum fast path: native ext via
+        # omlx.custom_kernels.glm_moe_dsa.fast (falls back to mx.fast
+        # inside the wrapper); plain scatter-unsort when unavailable.
         if weighted_sum and scores is not None and do_sort:
             try:
-                from .kernels import fast as glm_fast  # type: ignore
+                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast  # type: ignore
 
                 if hasattr(glm_fast, "glm_moe_weighted_sum"):
                     return glm_fast.glm_moe_weighted_sum(x_out, inv_order, scores)
