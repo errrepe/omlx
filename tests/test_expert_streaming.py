@@ -5932,3 +5932,78 @@ class TestProposalCounters:
         assert acc.observed == {}
         assert acc.report()["prediction_totals"]["hit"] == 0
 
+
+class TestCachePrior:
+    """Fase 3: cache-conditional routing (approximate, opt-in).
+
+    A logit bonus for LRU-resident experts before top-k. Bonus <= 0 or
+    an empty/unknown residency must leave routing bit-identical."""
+
+    def test_rerank_promotes_resident(self):
+        import mlx.core as mx
+
+        from omlx.patches.expert_streaming.adaptive_topk import (
+            rerank_cache_prior,
+        )
+
+        # Ascending probs: stock top-2 is {2, 3}; a big bonus on expert 0
+        # must flip it into the top-2.
+        gates = mx.array([[0.1, 0.2, 0.3, 0.4]], dtype=mx.float32)
+        out = rerank_cache_prior(gates, {0}, 5.0)
+        mx.eval(out)
+        top2 = set(int(v) for v in mx.argpartition(out, kth=-2, axis=-1)[..., -2:].reshape(-1).tolist())
+        assert top2 == {0, 3}
+        # Still a distribution.
+        assert abs(float(mx.sum(out).item()) - 1.0) < 1e-5
+
+    def test_rerank_identity_when_off(self):
+        import mlx.core as mx
+
+        from omlx.patches.expert_streaming.adaptive_topk import (
+            rerank_cache_prior,
+        )
+
+        gates = mx.array([[0.1, 0.2, 0.3, 0.4]], dtype=mx.float32)
+        mx.eval(gates)
+        assert rerank_cache_prior(gates, {0}, 0.0) is gates
+        assert rerank_cache_prior(gates, set(), 5.0) is gates
+        assert rerank_cache_prior(gates, {99}, 5.0) is gates
+
+    def test_resident_experts_intersection_and_closed(self):
+        from omlx.patches.expert_streaming.adaptive_topk import (
+            resident_experts,
+        )
+
+        class _Lin:
+            def __init__(self, keys):
+                self._keys = keys
+
+            def bundle_key(self, e):
+                return ("L", e, self._keys)
+
+        class _GLU:
+            _num_experts = 4
+            gate_proj = _Lin("g")
+            up_proj = _Lin("u")
+            down_proj = None
+            _cache = type("C", (), {"_store": {
+                ("L", 1, "g"), ("L", 2, "g"),
+                ("L", 1, "u"), ("L", 2, "u"), ("L", 3, "u"),
+            }})()
+
+        # Intersection over projections: only {1, 2} are fully resident.
+        assert resident_experts(_GLU()) == {1, 2}
+        # Fail closed on anything unexpected.
+        assert resident_experts(object()) == set()
+        assert resident_experts(None) == set()
+
+    def test_safe_float_env(self, monkeypatch):
+        import omlx.patches.expert_streaming.adaptive_topk as tk
+
+        monkeypatch.setenv("OMLX_EXPERT_STREAMING_CACHE_PRIOR", "banana")
+        assert tk._safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0) == 0.0
+        monkeypatch.setenv("OMLX_EXPERT_STREAMING_CACHE_PRIOR", "")
+        assert tk._safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0) == 0.0
+        monkeypatch.setenv("OMLX_EXPERT_STREAMING_CACHE_PRIOR", "1.5")
+        assert tk._safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0) == 1.5
+

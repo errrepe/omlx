@@ -1024,12 +1024,17 @@ def convert_model_to_streaming(
                 io_ov["expert_streaming_coalesce"],
                 io_wired,
             )
-        # Opt-in adaptive top-k routing truncation (cumulative mass). Exact
-        # (None/1.0) by default — no patch engagement, zero overhead.
-        from .adaptive_topk import apply_qwen35_moe_topk_patch, configure_from_settings
+        # Opt-in adaptive top-k routing truncation (cumulative mass) and
+        # cache-prior rerank. Exact (None/1.0, bonus 0.0) by default — no
+        # patch engagement, zero overhead.
+        from .adaptive_topk import (
+            apply_qwen35_moe_topk_patch,
+            cache_prior_bonus,
+            configure_from_settings,
+        )
 
         thr = configure_from_settings(model_settings, model_type=estimate.model_type)
-        if thr is not None:
+        if thr is not None or cache_prior_bonus() > 0:
             # configure() already refused inapplicable types (thr None);
             # the qwen hook engages here while the glm hook is inline in
             # the vendored Glm5NextMoE, so a False return only matters
@@ -1037,7 +1042,11 @@ def convert_model_to_streaming(
             from .adaptive_topk import is_topk_applicable
 
             engaged = apply_qwen35_moe_topk_patch()
-            if not engaged and not is_topk_applicable(estimate.model_type):
+            if (
+                thr is not None
+                and not engaged
+                and not is_topk_applicable(estimate.model_type)
+            ):
                 logger.warning(
                     "Adaptive top-k threshold %.2f set but no truncation hook engaged "
                     "for model type %r (exact routing stays on)",

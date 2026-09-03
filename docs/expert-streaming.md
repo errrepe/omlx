@@ -66,7 +66,11 @@ Conclusão: neste workload o teto é volume (1.6 GB/tok) + granularidade (200k p
 .venv/bin/python bench/bench_expert_streaming.py --model qwen-jang4m --budget 1.0 --prompt-len short --out /tmp/<arm>.json
 ```
 
-3 reps por braço, page cache warm, checkpoint `Qwen3.8-Flash-Next-JANG_4M`. Métricas: tok/s (gate **+10%**), TTFT, hit_rate, read p50/p95, bytes/token, acurácia de proposta por camada (`prediction_totals.recall`, bar **≥85%** para preditores). Abaixo do gate: revert sem resíduo + linha no scoreboard. Cada fase: testes → subagente auditor (bit-exatidão do default, thread-safety MLX, custo zero com feature off) → bench → gate → commit.
+3 reps por braço (Fase 3: 3 reps prior + 2 exact — terceira exact abortada pelo guarda de RAM do box), page cache warm, checkpoint `Qwen3.8-Flash-Next-JANG_4M`.
+
+### Knob aproximado: cache-prior rerank (Fase 3, LANDED opt-in)
+
+`OMLX_EXPERT_STREAMING_CACHE_PRIOR=<bonus>` (default `0.0` = roteamento exato, bit-idêntico): bônus em logit-space para experts residentes no LRU antes do top-k (Qualcomm 2412.00099). Aproximado por desenho — muda outputs; saída inspecionada sã no prompt short. Bonus `1.0`: hit 9.2%→19.3%, média +10.8% tok/s. Env-only (sem UI); no-op sem o env. Métricas: tok/s (gate **+10%**), TTFT, hit_rate, read p50/p95, bytes/token, acurácia de proposta por camada (`prediction_totals.recall`, bar **≥85%** para preditores). Abaixo do gate: revert sem resíduo + linha no scoreboard. Cada fase: testes → subagente auditor (bit-exatidão do default, thread-safety MLX, custo zero com feature off) → bench → gate → commit.
 
 ### DeepSeek V4 Flash (oQ4e-mtp)
 

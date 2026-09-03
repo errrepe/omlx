@@ -101,6 +101,89 @@ def configure_from_settings(settings: Any | None, model_type: object = None) -> 
     return _THRESHOLD
 
 
+def _safe_float_env(name: str, default: float) -> float:
+    """Fail-closed env-float parse (audit Fase 1 lesson: never bare-cast
+    at import — a malformed value must disable the knob, not brick the
+    module)."""
+    try:
+        raw = os.environ.get(name, "")
+        return float(raw) if raw.strip() else default
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
+# Fase 2 P3 (cache-conditional routing, Qualcomm 2412.00099): logit bonus
+# for LRU-resident experts before top-k. 0.0 = exact routing (default).
+# Approximate by design — opt-in only.
+_CACHE_PRIOR = max(0.0, _safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0))
+
+
+def cache_prior_bonus() -> float:
+    """Active cache-prior logit bonus (0.0 = exact routing)."""
+    return _CACHE_PRIOR
+
+
+def resident_experts(switch_mlp: Any) -> set[int]:
+    """Experts resident in the app-level LRU for this layer.
+
+    Intersection over the GLU's projection linears (an expert needs every
+    projection to avoid I/O). Duck-typed and fail-closed: anything
+    unexpected yields the empty set (no rerank)."""
+    try:
+        cache = getattr(switch_mlp, "_cache", None)
+        store = getattr(cache, "_store", None)
+        if store is None:
+            return set()
+        n = int(getattr(switch_mlp, "_num_experts", 0) or 0)
+        if n <= 0:
+            return set()
+        lins = [
+            getattr(switch_mlp, a, None)
+            for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+        ]
+        lins = [l for l in lins if l is not None and hasattr(l, "bundle_key")]
+        if not lins:
+            return set()
+        res: set[int] | None = None
+        for lin in lins:
+            try:
+                present = {e for e in range(n) if lin.bundle_key(e) in store}
+            except Exception:
+                return set()
+            res = present if res is None else (res & present)
+            if not res:
+                return set()
+        return res or set()
+    except Exception:
+        return set()
+
+
+def rerank_cache_prior(gates: Any, resident: set[int] | None, bonus: float) -> Any:
+    """Boost resident experts by *bonus* in logit space before top-k.
+
+    Identity when the bonus is off or the set is empty (exact routing
+    untouched). Implemented as two lazy ops (broadcast compare + add),
+    no per-expert graph bloat.
+    """
+    if bonus <= 0 or not resident:
+        return gates
+    try:
+        width = int(gates.shape[-1])
+        res = sorted({int(e) for e in resident if 0 <= int(e) < width})
+        if not res:
+            return gates
+        import mlx.core as _mx
+
+        anchors = _mx.array(res, dtype=_mx.int32)
+        is_res = (
+            _mx.arange(width)[None, :] == anchors[:, None]
+        ).any(axis=0)
+        LOG = _mx.log(_mx.maximum(gates, 1e-30))
+        return _mx.softmax(LOG + is_res.astype(LOG.dtype) * float(bonus), axis=-1)
+    except Exception:
+        return gates
+
+
 def current_threshold() -> float | None:
     return _THRESHOLD
 
@@ -163,16 +246,22 @@ def apply_qwen35_moe_topk_patch() -> bool:
 
     def patched_call(self, x, target_verify: bool = False):
         thr = current_threshold()
-        if thr is None or thr >= 1.0:
+        bonus = _CACHE_PRIOR
+        if (thr is None or thr >= 1.0) and bonus <= 0:
             return orig_call(self, x, target_verify=target_verify)
         try:
             gates = q35._target_verify_linear(self.gate, x, target_verify)
             gates = mx.softmax(gates, axis=-1, precise=True)
+            if bonus > 0:
+                gates = rerank_cache_prior(
+                    gates, resident_experts(self.switch_mlp), bonus
+                )
             k = self.top_k
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
             scores = mx.take_along_axis(gates, inds, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
-            inds, scores = truncate_topk_mass(inds, scores, thr)
+            if thr is not None and thr < 1.0:
+                inds, scores = truncate_topk_mass(inds, scores, thr)
             y = q35._target_verify_switch_glu(self.switch_mlp, x, inds, target_verify)
             y = (y * scores[..., None]).sum(axis=-2)
             shared_y = self.shared_expert(x, target_verify)
