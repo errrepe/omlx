@@ -7090,6 +7090,159 @@ async def cancel_ane_tuning(
 
 
 # =============================================================================
+# Storage Roofline API Routes (MUST be before throughput {bench_id} routes)
+# =============================================================================
+
+
+@router.post("/api/bench/storage/start")
+async def start_storage_benchmark(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start an uncached storage measurement for the MoE roofline.
+
+    Measures the volume holding the model (or the server's model dir when
+    no model_id is given). Rejects with 409 while any benchmark —
+    throughput, context, ANE, or another storage run — is active: they
+    share the volume queue and would corrupt each other's numbers.
+    Clients should run this with inference IDLE for the same reason.
+    """
+    import asyncio
+
+    from .ane_tuning import get_active_run as get_active_ane_tuning
+    from .benchmark import get_active_run as get_active_throughput_run
+    from .context_benchmark import get_active_run as get_active_context_run
+    from .storage_bench import (
+        StorageBenchRequest,
+        create_job,
+        get_active_job,
+        run_storage_benchmark,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    for label, active in (
+        ("throughput benchmark", get_active_throughput_run()),
+        ("context benchmark", get_active_context_run()),
+        ("ANE tuning", get_active_ane_tuning()),
+        ("storage benchmark", get_active_job()),
+    ):
+        if active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A {label} is already running.",
+            )
+
+    try:
+        bench_request = StorageBenchRequest(**(await request.json()))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    target_dir: str
+    if bench_request.model_id is not None:
+        entry = engine_pool.get_entry(bench_request.model_id)
+        if entry is None:
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {bench_request.model_id}"
+            )
+        if entry.model_type not in ("llm", "vlm", None):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model {bench_request.model_id} is not a supported model "
+                f"(type: {entry.model_type})",
+            )
+        target_dir = entry.model_path
+    else:
+        # Volume-only: measure where the checkpoints live. The pool root
+        # is not exposed, so fall back to the server working directory.
+        target_dir = "."
+
+    job = create_job(bench_request, target_dir)
+    asyncio.get_running_loop().run_in_executor(None, run_storage_benchmark, job)
+    logger.info("Storage benchmark started: %s target=%s", job.job_id, target_dir)
+    return {"job_id": job.job_id, "status": "started"}
+
+
+@router.get("/api/bench/storage/{job_id}/results")
+async def get_storage_benchmark_results(
+    job_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Poll a storage benchmark job (1 Hz like the other benches)."""
+    from .storage_bench import get_job, job_to_response
+
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Storage job not found: {job_id}")
+    return job_to_response(job)
+
+
+@router.get("/api/bench/storage/predict")
+async def get_storage_prediction(
+    model_id: str,
+    tok_per_cycle: float = 1.0,
+    verify_mult: float = 2.3,
+    measured_base_tok_s: float | None = None,
+    is_admin: bool = Depends(require_admin),
+):
+    """Roofline prediction for a model from the latest measurement.
+
+    Fresh profile, reused measurement: profiling headers is milliseconds,
+    measuring the SSD is minutes. 404 when the model is unknown, the
+    profile is unsupported, or no measurement exists yet.
+    """
+    from .storage_bench import latest_measurement
+    from omlx.utils.storage_roofline import (
+        StorageMeasurement,
+        build_report,
+        moe_step_profile,
+        predict_roofline,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    measurement_dict = latest_measurement()
+    if measurement_dict is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No completed storage measurement yet — run the storage benchmark first.",
+        )
+    try:
+        measurement = StorageMeasurement(**measurement_dict)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stored measurement unreadable: {e}")
+
+    profile = moe_step_profile(entry.model_path)
+    if not profile.supported:
+        raise HTTPException(
+            status_code=404, detail=f"Model not supported for roofline: {profile.reason}"
+        )
+    prediction = predict_roofline(
+        profile, measurement,
+        tok_per_cycle=tok_per_cycle, verify_byte_mult=verify_mult,
+    )
+    return build_report(
+        volume_info_for_measurement(measurement_dict),
+        measurement, profile, prediction,
+        measured_base_tok_s=measured_base_tok_s,
+    )
+
+
+def volume_info_for_measurement(measurement_dict: dict):
+    """Rebuild a VolumeInfo for the volume a measurement was taken on."""
+    from omlx.utils.storage_roofline import VolumeInfo, volume_info_for
+
+    return volume_info_for(measurement_dict.get("volume_mount") or ".")
+
+
+# =============================================================================
 # Context Benchmark API Routes (MUST be before throughput {bench_id} routes)
 # =============================================================================
 

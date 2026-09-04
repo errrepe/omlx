@@ -110,4 +110,9 @@ enum AdminAPI {
     static let contextBenchStart   = "\(prefix)/bench/context/start"
     static func contextBenchResults(_ benchId: String) -> String { "\(prefix)/bench/context/\(benchId)/results" }
     static func contextBenchCancel(_ benchId: String) -> String  { "\(prefix)/bench/context/\(benchId)/cancel" }
+
+    // Storage roofline bench
+    static let storageBenchStart = "\(prefix)/bench/storage/start"
+    static func storageBenchResults(_ jobId: String) -> String { "\(prefix)/bench/storage/\(jobId)/results" }
+    static let storageBenchPredict = "\(prefix)/bench/storage/predict"
 }

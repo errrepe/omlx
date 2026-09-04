@@ -506,6 +506,32 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.contextBenchCancel(benchId))
     }
 
+    // Storage roofline bench
+
+    @discardableResult
+    func startStorageBench(_ body: StorageBenchStartRequest) async throws -> StorageBenchStartResponse {
+        try await post(AdminAPI.storageBenchStart, body: body)
+    }
+
+    func getStorageBenchResults(jobId: String) async throws -> StorageBenchJobResponse {
+        try await get(AdminAPI.storageBenchResults(jobId))
+    }
+
+    func getStoragePrediction(modelId: String,
+                              tokPerCycle: Double = 1.0,
+                              verifyMult: Double = 2.3,
+                              measuredBaseTokS: Double? = nil) async throws -> StorageRooflineReportDTO {
+        var query: [URLQueryItem] = [
+            URLQueryItem(name: "model_id", value: modelId),
+            URLQueryItem(name: "tok_per_cycle", value: String(format: "%g", tokPerCycle)),
+            URLQueryItem(name: "verify_mult", value: String(format: "%g", verifyMult)),
+        ]
+        if let measured = measuredBaseTokS {
+            query.append(URLQueryItem(name: "measured_base_tok_s", value: String(format: "%g", measured)))
+        }
+        return try await get(AdminAPI.storageBenchPredict, query: query)
+    }
+
     // MARK: - Core request
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {

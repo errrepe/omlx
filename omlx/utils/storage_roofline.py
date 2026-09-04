@@ -613,6 +613,26 @@ def load_report(slug: str) -> dict | None:
         return None
 
 
+def latest_saved_report() -> dict | None:
+    """Most recent report on disk (survives server restarts)."""
+    try:
+        candidates = sorted(
+            _results_dir().glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return None
+    for path in candidates:
+        try:
+            report = json.loads(path.read_text())
+            if isinstance(report, dict) and "measurement" in report:
+                return report
+        except Exception:
+            continue
+    return None
+
+
 def build_report(
     volume: VolumeInfo,
     measurement: StorageMeasurement,
