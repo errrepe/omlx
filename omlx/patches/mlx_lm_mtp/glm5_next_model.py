@@ -17,16 +17,24 @@ The compat patch (``mlx_vlm_glm5_next_compat``) registers
 - ``Glm5NextMTPBlock``: enorm/hnorm/eh_proj fusion + a full
   ``Glm5NextDecoderLayer`` (synthesized sparse config entry).
 - ``LanguageModel.__init__`` wrap: attach ``self.mtp`` when the load-time
-  MTP flag is active; stamp the chain/depth/head-prenorm markers that
+  MTP flag is active; stamp the chain/depth markers that
   ``batch_generator._resolve_mtp_chain_depth`` reads.
 - ``LanguageModel.__call__`` wrap: ``return_hidden=True`` returns the
-  pre-norm trunk hidden (the chain applies the final norm via
-  ``_HEAD_HIDDEN_POST_NORM``; ``hnorm`` re-normalises inside the block).
-- ``mtp_forward`` / ``make_mtp_cache``: the chain-cycle contract.
-- ``mtp_partial_rollback``: CacheList(KVCache + PoolingCache) trim for
-  the DSA layers and ArraysCache rollback for the linear-attention
-  trunk layers — the batched-verify semantics the vendored README
-  deferred are exactly this shim.
+  post-norm trunk hidden (GLM-5.2 convention — ``hnorm`` re-normalises
+  inside the block) plus logits from ONE backbone pass.
+- ``mtp_forward`` / ``make_mtp_cache`` / ``get_mtp_module``: the
+  chain-cycle contract; the draft cache is CacheList(KVCache +
+  PoolingCache), mirroring the trunk's sparse-attention layers.
+- Linear-attention rollback: ``Glm5NextLinearAttention.__call__`` is
+  replaced with an ``n_confirmed``-aware body that stashes the
+  pre-forward recurrent state plus the verify window's projected inputs
+  (``rollback_state`` / ``_mtp_draft_stash``, the qwen35 unsplit-verify
+  pattern); ``mtp_partial_rollback`` replays the accepted prefix through
+  the factored ``_process_chunk`` on rejection. DSA layers trim through
+  PoolingCache's cross-boundary undo. ``mtp_clamp_accept`` bounds the
+  accept count to what every layer can roll back (DeepSeek-V4 pattern).
+- Prompt-priming capture: ``Glm5NextModel.__call__`` wrap folds prompt
+  chunks into the head cache via ``prompt_priming.maybe_capture``.
 
 Apply order: the compat patch must register the module first; this
 patch's ``apply()`` no-ops when ``mlx_vlm.models.glm5_next`` is absent.
@@ -36,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import weakref
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -44,6 +53,12 @@ logger = logging.getLogger(__name__)
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
     existing = cls.__dict__.get(attr)
     return getattr(existing, marker, False)
+
+
+def _language_mod(glm: Any):
+    return getattr(glm, "language", None) or __import__(
+        "mlx_vlm.models.glm5_next.language", fromlist=["LanguageModel"]
+    )
 
 
 def apply() -> bool:
@@ -56,6 +71,20 @@ def apply() -> bool:
         )
         return False
 
+    # The draft's DSA indexer needs PoolingCache (same class the trunk's
+    # sparse layers use). The compat patch injects it too; this is a
+    # belt-and-suspenders re-run for direct apply() orderings.
+    try:
+        from ..deepseek_v4 import _inject_cache_extras
+
+        _inject_cache_extras()
+    except Exception:
+        logger.debug("PoolingCache injection unavailable", exc_info=True)
+
+    lang = _language_mod(glm)
+    _patch_linear_attention(lang)
+    _patch_decoder_layer(lang)
+    _patch_trunk_model(lang)
     _patch_language_model(glm)
     if not hasattr(glm.LanguageModel, "_omlx_mtp_patched"):
         glm.LanguageModel._omlx_mtp_patched = "patch"
@@ -107,6 +136,34 @@ def remap_mtp_quant_overrides(
             break
 
 
+def _head_pool_adapter(pool: Any):
+    """Expose the head PoolingCache through a token-offset contract.
+
+    The chain's ``_mtp_head_trim_to`` counts history in TOKENS while the
+    PoolingCache's native ``offset`` counts completed pool WINDOWS — mixing
+    the units would make trims silently miss. The adapter keeps the same
+    underlying object (state lives there) and routes every method through,
+    but reports ``offset`` in tokens (``pool_len * ratio + remainder``) so
+    ``_mtp_head_trim_to``'s token-space arithmetic stays correct.
+    """
+    ratio = int(pool.ratio)
+
+    class _HeadPoolAdapter:
+        def __init__(self):
+            self._pool = pool
+
+        def __getattr__(self, name):
+            # Everything else (trim, is_trimmable, size, state, ...) is the
+            # PoolingCache's own token-space API — delegate verbatim.
+            return getattr(pool, name)
+
+        @property
+        def offset(self):
+            return int(pool.size() * ratio + pool.remainder)
+
+    return _HeadPoolAdapter()
+
+
 def _mtp_layer_config(args: Any):
     """Synthesize the draft layer's config entry.
 
@@ -129,6 +186,292 @@ def _mtp_layer_config(args: Any):
     cfg.layer_types = layer_types
     cfg.mlp_layer_types = mlp_types
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Glm5NextLinearAttention — n_confirmed-aware unsplit verify + rollback stash.
+# Mirrors qwen35_model's GatedDeltaNet replacement: the whole verify window
+# runs as ONE chunk (cheaper than splitwise across 33 linear layers), with
+# zero-copy pre-forward state refs plus the projected inputs stashed on the
+# ArraysCache. On rejection, mtp_partial_rollback replays the kept prefix
+# through _process_chunk from those refs.
+# ---------------------------------------------------------------------------
+
+
+def _patch_linear_attention(lang: Any) -> None:
+    cls = getattr(lang, "Glm5NextLinearAttention", None)
+    if cls is None:
+        logger.debug("Glm5NextLinearAttention missing; skip linear patch")
+        return
+    if getattr(cls, "_omlx_mtp_patched", False):
+        return
+
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_vlm.models.glm5_next.gated_delta import gated_delta_update
+    from mlx_vlm.models.glm5_next.linear import (
+        fused_quantized_matmul,
+        linear_forward,
+    )
+
+    def _l2norm(x, eps: float = 1e-6):
+        return x * mx.rsqrt((x * x).sum(-1, keepdims=True) + eps)
+
+    def _process_chunk(
+        self,
+        mixed,
+        fa_o,
+        ga_o,
+        b_o,
+        conv_state,
+        ssm_state,
+        mask,
+    ):
+        """Recurrent core from the projected inputs to the layer output.
+
+        ``mixed`` is the fused q|k|v concat (B, S, 3*qkv_dim) ALREADY
+        gated by the boolean mask (the caller applies mx.where); the rest
+        are the forget-gate / output-gate projections. Returns
+        ``(out, new_conv_state, new_ssm_state)`` without touching any
+        cache — the caller owns cache writes so the verify path can stash
+        and the replay path can run on snapshots.
+        """
+        B, S, _ = mixed.shape
+        conv_dim = self.conv_dim
+        if conv_state is None:
+            conv_state = mx.zeros(
+                (B, self.conv_kernel_size - 1, conv_dim), dtype=mixed.dtype
+            )
+        conv_input = mx.concatenate([conv_state, mixed], axis=1)
+        new_conv_state = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+        conv_out = nn.silu(self.conv1d(conv_input))
+
+        q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)
+        q = q.reshape(B, S, self.num_heads, self.head_dim)
+        k = k.reshape(B, S, self.num_heads, self.head_dim)
+        v = v.reshape(B, S, self.num_heads, self.head_dim)
+
+        fg = self.forget_gate
+        a = linear_forward(fg.f_b_proj, fa_o).reshape(
+            B, S, self.num_heads, self.head_dim
+        )
+        in_dtype = q.dtype
+        q = (_l2norm(q.astype(mx.float32)) * (self.head_dim**-0.5)).astype(in_dtype)
+        k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
+
+        out, state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b_o,
+            fg.A_log.reshape(self.num_heads, 1),
+            fg.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=ssm_state,
+            mask=mask if mask is not None and mask.dtype == mx.bool_ else None,
+            lower_bound=fg.safe_gate_lower_bound,
+        )
+        gate = linear_forward(self.g_b_proj, ga_o).reshape(
+            B, S, self.num_heads, self.head_dim
+        )
+        out = self.o_norm(out, gate).reshape(B, S, -1)
+        return linear_forward(self.o_proj, out), new_conv_state, state
+
+    def __call__(
+        self,
+        inputs,
+        mask=None,
+        cache=None,
+        n_confirmed: int = 0,
+    ):
+        B, S, _ = inputs.shape
+        has_right_padding = cache is not None and cache.lengths is not None
+        if has_right_padding:
+            mask = mx.arange(S)[None] < cache.lengths[:, None]
+        if self.fuse_in:
+            q_o, k_o, v_o, fa_o, ga_o, b_o = self._fused_in_proj(inputs)
+            mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
+        else:
+            mixed = mx.concatenate(
+                [self.q_proj(inputs), self.k_proj(inputs), self.v_proj(inputs)],
+                axis=-1,
+            )
+            fa_o = self.forget_gate.f_a_proj(inputs)
+            ga_o = self.g_a_proj(inputs)
+            b_o = self.b_proj(inputs)
+        if mask is not None and mask.dtype == mx.bool_:
+            mixed = mx.where(mask[..., None], mixed, 0)
+
+        conv_state = (
+            cache[0]
+            if cache is not None and cache[0] is not None
+            else None
+        )
+        ssm_state = (
+            cache[1]
+            if cache is not None and cache[1] is not None
+            else None
+        )
+        # Right-padding batches (continuous batching) read conv_state from
+        # the take_along_axis write path below, which concatenates it — a
+        # fresh cache's empty slot must look like zeros there, exactly as
+        # the stock body's guard does.
+        conv_state_for_write = (
+            conv_state
+            if conv_state is not None
+            else mx.zeros(
+                (B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype
+            )
+        )
+
+        if n_confirmed > 0 and n_confirmed < S:
+            # MTP verify forward (single chunk, qwen35-style): keep zero-copy
+            # pre-forward state refs plus the projected inputs so a
+            # rejection can replay the accepted prefix through
+            # _process_chunk. Full accepts drop the refs (no replay cost).
+            out, conv_f, ssm_f = _process_chunk(
+                self, mixed, fa_o, ga_o, b_o, conv_state, ssm_state, mask
+            )
+            if cache is not None:
+                cache.rollback_state = (conv_state, ssm_state)
+                cache._mtp_draft_stash = (mixed, fa_o, ga_o, b_o, mask)
+        else:
+            out, conv_f, ssm_f = _process_chunk(
+                self, mixed, fa_o, ga_o, b_o, conv_state, ssm_state, mask
+            )
+
+        if cache is not None:
+            if has_right_padding:
+                state_size = self.conv_kernel_size - 1
+                valid_lengths = mx.sum(mask, axis=-1).astype(mx.int32)
+                state_indices = valid_lengths[:, None] + mx.arange(state_size)[None]
+                state_indices = mx.broadcast_to(
+                    state_indices[..., None], (B, state_size, self.conv_dim)
+                )
+                cache[0] = mx.contiguous(
+                    mx.take_along_axis(
+                        mx.concatenate([conv_state_for_write, mixed], axis=1),
+                        state_indices,
+                        axis=1,
+                    )
+                )
+            else:
+                cache[0] = conv_f
+            cache[1] = ssm_f
+            cache.advance(S)
+
+        return out
+
+    cls._process_chunk = _process_chunk
+    __call__._omlx_mtp_call_marker = True
+    cls.__call__ = __call__
+    cls._omlx_mtp_patched = True
+
+
+def _patch_decoder_layer(lang: Any) -> None:
+    """Pass ``n_confirmed`` through to the linear-attention layer only.
+
+    Sparse-attention layers ignore it (their rollback is trim-based).
+    """
+    cls = getattr(lang, "Glm5NextDecoderLayer", None)
+    if cls is None or getattr(cls, "_omlx_mtp_patched", False):
+        return
+
+    import mlx.core as mx
+    from mlx_vlm.models.deepseek_v4.hyper_connection import hc_expand
+
+    original_call = cls.__call__
+
+    def __call__(self, x, mask=None, cache=None, n_confirmed: int = 0):
+        if n_confirmed and self.is_linear:
+            residual = x
+            xc, post, comb = self.attn_hc(x)
+            r = self.self_attn(
+                self.input_layernorm(xc), mask, cache, n_confirmed=n_confirmed
+            )
+            x = hc_expand(r, residual, post, comb)
+            if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
+                if self._ffn_c is None:
+                    self._ffn_c = mx.compile(self._ffn_block)
+                out = self._ffn_c(x)
+            else:
+                out = self._ffn_block(x)
+            if getattr(self, "_stream_eval", False):
+                mx.eval(out)
+                mx.clear_cache()
+            return out
+        return original_call(self, x, mask, cache)
+
+    __call__._omlx_mtp_call_marker = True
+    cls.__call__ = __call__
+    cls._omlx_mtp_patched = True
+
+
+def _patch_trunk_model(lang: Any) -> None:
+    """n_confirmed plumbing + prompt-priming capture on the trunk model.
+
+    The stock ``Glm5NextModel.__call__`` loops the layers with
+    ``layer(h, mask, c)``; this wrap re-runs the loop itself when
+    ``n_confirmed`` is set so the linear layers get the verify-aware
+    call, and folds prompt chunks into the MTP head cache through
+    ``prompt_priming.maybe_capture`` otherwise.
+    """
+    cls = getattr(lang, "Glm5NextModel", None)
+    if cls is None or getattr(cls, "_omlx_mtp_patched", False):
+        return
+
+    import mlx.core as mx
+    import numpy as np
+    from mlx_vlm.models.base import create_attention_mask, create_ssm_mask
+
+    original_call = cls.__call__
+
+    def __call__(self, inputs, cache=None, inputs_embeds=None, n_confirmed: int = 0, skip_capture: bool = False):
+        if n_confirmed:
+            # Verify forward: run the layer loop with n_confirmed reaching
+            # the linear-attention layers (their unsplit-verify stash). The
+            # expert-prefetch pilot is skipped here — verify windows are
+            # S=k+1>1 and the stock loop only runs the pilot in decode (S=1);
+            # the next decode fold re-arms it.
+            h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+            if cache is None:
+                cache = [None] * len(self.layers)
+            fa_cache = cache[self.fa_idx]
+            fa_mask = create_attention_mask(
+                h, fa_cache[0] if fa_cache else None, return_array=True
+            )
+            ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+            h = mx.broadcast_to(
+                h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[2])
+            )
+            h = mx.contiguous(h)
+            for i, (layer, c) in enumerate(zip(self.layers, cache)):
+                mask = ssm_mask if layer.is_linear else fa_mask
+                h = layer(h, mask=mask, cache=c, n_confirmed=n_confirmed)
+            h = h.mean(axis=2)
+            return self.norm(h)
+
+        out = original_call(self, inputs, cache=cache, inputs_embeds=inputs_embeds)
+        if inputs_embeds is None and cache is not None and not skip_capture:
+            host_ref = getattr(self, "_omlx_mtp_prime_host", None)
+            host = host_ref() if host_ref is not None else None
+            if host is not None:
+                try:
+                    from . import prompt_priming
+
+                    prompt_priming.maybe_capture(host, inputs, out, cache)
+                except Exception:
+                    logger.debug("MTP prompt-priming capture failed", exc_info=True)
+        return out
+
+    __call__._omlx_mtp_call_marker = True
+    cls.__call__ = __call__
+    cls._omlx_mtp_patched = True
+
+
+# ---------------------------------------------------------------------------
+# LanguageModel — head attach, return_hidden, chain contract, rollback.
+# ---------------------------------------------------------------------------
 
 
 def _patch_language_model(glm: Any) -> None:
@@ -155,11 +498,23 @@ def _patch_language_model(glm: Any) -> None:
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
             self._omlx_mtp_head_clone = False
-            self._omlx_mtp_head_prenorm = True
+            # Head input is the trunk's POST-final-norm hidden (same as
+            # GLM-5.2's validated nextn head: hnorm re-normalises inside
+            # the block; folded history and decode folds must match).
+            self._omlx_mtp_head_prenorm = False
+            # The return_hidden wrapper already applies the trunk's final
+            # norm (GLM-5.2 head-input convention), so the chain's
+            # ``_trunk_norm_module`` must be the identity — without this
+            # marker the chain would norm the already-normed hidden twice.
+            self._omlx_mtp_head_hidden_normed = True
             # Marginal-cost prior for the adaptive depth controller: the
             # draft's own MoE pulls a near-disjoint expert set per extra
             # verify row (same regime as GLM-5.2's 8-of-256 routing).
             self._omlx_mtp_marginal_ms = 35.0
+            # Prompt-priming capture runs inside the trunk forward, which
+            # has no reference back to this module; a weakref avoids a
+            # tracked-module cycle.
+            self.model._omlx_mtp_prime_host = weakref.ref(self)
             quant = getattr(args, "quantization", None)
             if isinstance(quant, dict):
                 remap_mtp_quant_overrides(quant, int(args.num_hidden_layers), n_mtp)
@@ -173,7 +528,8 @@ def _patch_language_model(glm: Any) -> None:
         **kwargs,
     ):
         return_hidden = bool(kwargs.pop("return_hidden", False))
-        if not return_hidden:
+        n_confirmed = int(kwargs.pop("n_confirmed", 0) or 0)
+        if not return_hidden and not n_confirmed:
             return original_call(
                 self,
                 inputs,
@@ -182,14 +538,18 @@ def _patch_language_model(glm: Any) -> None:
                 mask=mask,
                 **kwargs,
             )
-        # return_hidden path: one forward, both products. The stock call
-        # projects the post-norm hidden and discards the pre-norm variant;
-        # the chain needs the pre-norm hidden (it applies the final norm
-        # itself via _HEAD_HIDDEN_POST_NORM), so project the logits tail
-        # from the same single backbone pass here.
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        # One backbone pass, both products: the trunk returns the
+        # post-norm hidden (the head's input variant); logits project from
+        # the same pass's tail.
+        out = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            n_confirmed=n_confirmed,
+            skip_capture=bool(return_hidden or n_confirmed),
+        )
         nlk = kwargs.get("num_logits_to_keep", 0)
         out_tail = out[:, -nlk:, :] if nlk else out
         if self.args.tie_word_embeddings:
@@ -198,12 +558,11 @@ def _patch_language_model(glm: Any) -> None:
             from mlx_vlm.models.glm5_next.language import linear_forward
 
             logits = linear_forward(self.lm_head, out_tail)
-        try:
-            from mlx_vlm.models.base import LanguageModelOutput
-        except ImportError:
-            from ..base import LanguageModelOutput
+        from mlx_vlm.models.base import LanguageModelOutput
 
-        return LanguageModelOutput(logits=logits, hidden_states=out)
+        if return_hidden:
+            return LanguageModelOutput(logits=logits, hidden_states=out)
+        return LanguageModelOutput(logits=logits)
 
     def get_mtp_module(self):
         return getattr(self, "mtp", None)
@@ -212,20 +571,22 @@ def _patch_language_model(glm: Any) -> None:
         """One CacheList(KVCache + PoolingCache) per draft block.
 
         Mirrors ``LanguageModel.make_cache``'s sparse-attention entry so
-        the DSA indexer's pooling window advances identically in the
-        draft.
+        the DSA indexer's pooling window advances identically in the draft.
         """
-        from mlx_lm.models.cache import PoolingCache
+        from mlx_lm.models.cache import KVCache, PoolingCache
 
-        blocks = getattr(self, "mtp", None) or []
         caches = []
-        for block in blocks:
-            from mlx_vlm.models.cache import KVCache, CacheList
-
+        for block in getattr(self, "mtp", None) or []:
+            # FLAT list, not CacheList: the chain's ``_mtp_head_trim_to``
+            # reads ``offset`` on each entry directly (CacheList has none,
+            # so speculative rows would never trim and the head cache
+            # would grow without bound). ``mtp_forward`` re-slices the
+            # pairs per block below. Same layout as glm_moe_dsa's head
+            # cache (flat KVCache pairs).
+            caches.append(KVCache())
             caches.append(
-                CacheList(
-                    KVCache(),
-                    PoolingCache(block.block.self_attn.indexer.index_kpool),
+                _head_pool_adapter(
+                    PoolingCache(block.block.self_attn.indexer.index_kpool)
                 )
             )
         return caches
@@ -240,22 +601,38 @@ def _patch_language_model(glm: Any) -> None:
     ):
         """Run the draft block(s) + shared_head norm + shared lm_head.
 
-        ``h`` is the trunk's pre-norm hidden for the history fold (the
-        chain applies the trunk norm before calling when needed) or the
-        head's own raw output for chained steps — ``hnorm`` inside the
-        block normalises either. ``return_hidden`` returns the block's
+        ``h`` is the trunk's post-norm hidden for the history fold, or the
+        head's own raw output for chained draft steps — ``hnorm`` inside
+        the block normalises either. ``return_hidden`` returns the block's
         raw residual output (the next chain step's ``h``).
         """
-        import mlx.core as mx  # noqa: F401  (block __call__ imports its own)
+        import mlx.core as mx
 
         if cache is None:
             cache = [None] * len(self.mtp)
 
-        last_block = None
-        for i, block in enumerate(self.mtp):
-            layer_cache = cache[i] if i < len(cache) else None
-            h = block(h, self.model.embed_tokens, input_ids, layer_cache)
-            last_block = block
+        # Arm the PoolingCache undo log around the fold: the chain folds
+        # committed history AND speculative drafts through this same
+        # entry, and a rejected cycle trims the speculative tail via
+        # ``_mtp_head_trim_to`` — which needs the undo stash those folds
+        # left behind (it is only recorded while the flag is armed).
+        from . import cache_rollback
+
+        cache_rollback.set_undo_armed(True)
+        try:
+            last_block = None
+            for i, block in enumerate(self.mtp):
+                # Flat head-cache layout (see make_mtp_cache): entry 2*i is the
+                # draft's KVCache, 2*i+1 its PoolingCache.
+                layer_cache = (
+                    cache[2 * i : 2 * i + 2]
+                    if isinstance(cache, list) and len(cache) > 2 * i + 1
+                    else (cache[i] if i < len(cache) else None)
+                )
+                h = block(h, self.model.embed_tokens, input_ids, layer_cache)
+                last_block = block
+        finally:
+            cache_rollback.set_undo_armed(False)
 
         logits_source = h
         if logits_keep and logits_source.shape[1] > logits_keep:
@@ -271,33 +648,99 @@ def _patch_language_model(glm: Any) -> None:
             return logits, h
         return logits
 
-    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
-        """Trim the verify window back to ``accepted`` drafts on every layer.
+    def _cache_can_trim(c, n: int) -> bool:
+        """Non-mutating check that ``c.trim(n)`` (or its replay) will
+        succeed. A failed trim on one layer after earlier layers already
+        trimmed desynchronises per-layer lengths (the hazard
+        ``_restore_or_trim_caches`` documents).
+        """
+        subs = getattr(c, "caches", None)
+        if subs is not None:
+            return all(_cache_can_trim(sub, n) for sub in subs)
+        if getattr(c, "_mtp_draft_stash", None) is not None:
+            # Unsplit-verify replay: keep = accepted + 1 <= stash rows.
+            mixed = c._mtp_draft_stash[0]
+            return c.rollback_state is not None and bool(
+                mixed.shape[1] >= n
+            )
+        if getattr(c, "rollback_state", None) is not None:
+            # Bare snapshot semantics (single-position restore).
+            return n == 1
+        remainder = getattr(c, "remainder", None)
+        if remainder is not None:  # PoolingCache / BatchPoolingCache
+            rem_min = remainder if isinstance(remainder, int) else min(remainder)
+            if n <= rem_min:
+                return True
+            can_undo = getattr(c, "_can_undo", None)
+            return bool(can_undo and can_undo(n))
+        is_trimmable = getattr(c, "is_trimmable", None)
+        if callable(is_trimmable) and is_trimmable():
+            return True
+        return False
 
-        Sparse layers are CacheList(KVCache + PoolingCache): both expose
-        ``trim`` and PoolingCache carries the cross-boundary rollback
-        buffer from the DeepSeek-V4 patch set. Linear-attention layers
-        are ArraysCache with a ``rollback_state`` snapshot (populated by
-        the patched ``Glm5NextLinearAttention.__call__`` under verify —
-        see the linear-attention snapshot hook in this package's
-        ``glm5_next_linear`` module); a positional restore replaces the
-        trim for those. All layers are validated before any mutation.
+    def mtp_clamp_accept(self, cache, accepted: int, num_drafts: int) -> int:
+        """Largest m' <= accepted whose rollback every layer supports.
+
+        The 12 DSA layers' PoolingCache windows bound a partial rollback
+        (same shape as DeepSeek-V4's compressed attention); the 33
+        linear-attention layers replay from the verify stash. Emitting
+        fewer verified drafts than the acceptance test allowed is always
+        correct — the skipped ones are re-derived next cycle.
+        """
+        for m in range(accepted, -1, -1):
+            n = num_drafts - m
+            if n <= 0 or all(_cache_can_trim(c, n) for c in cache):
+                return m
+        return 0
+
+    def _layer_cache_of(self, idx: int):
+        return self.model.layers[idx]
+
+    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
+        """Roll the trunk caches back to ``accepted`` drafts after a
+        depth-k verify forward over ``[confirmed, d1..dk]``.
+
+        Sparse layers are CacheList(KVCache + PoolingCache) and trim
+        through PoolingCache's cross-boundary undo. Linear-attention
+        layers are ArraysCache: the unsplit-verify stash
+        (``rollback_state`` + ``_mtp_draft_stash``) replays the kept
+        prefix — the confirmed token plus the accepted drafts — through
+        the factored ``_process_chunk``, one small recurrent kernel per
+        layer, paid only on rejections. All layers are validated before
+        any mutation.
         """
         n = num_drafts - accepted
         if n <= 0:
             return True
+        if not all(_cache_can_trim(c, n) for c in cache):
+            return False
+        linear_idx = [
+            i for i, layer in enumerate(self.model.layers) if layer.is_linear
+        ]
+        for i, c in zip(linear_idx, [cache[j] for j in linear_idx]):
+            stash = getattr(c, "_mtp_draft_stash", None)
+            if stash is None:
+                continue
+            mixed, fa_o, ga_o, b_o, mask = stash
+            conv_0, ssm_0 = c.rollback_state
+            keep = 1 + accepted
+            layer = self.model.layers[i]
+            _, conv_m, ssm_m = layer.self_attn._process_chunk(
+                mixed[:, :keep],
+                fa_o[:, :keep],
+                ga_o[:, :keep],
+                b_o[:, :keep],
+                conv_0,
+                ssm_0,
+                mask[:, :keep] if mask is not None else None,
+            )
+            c[0] = conv_m
+            c[1] = ssm_m
+            c.rollback_state = None
+            c._mtp_draft_stash = None
         for c in cache:
-            subs = getattr(c, "caches", None)
-            candidates = subs if subs is not None else [c]
-            for sub in candidates:
-                if getattr(sub, "rollback_state", None) is not None:
-                    if getattr(sub, "_mtp_draft_stash", None) is not None:
-                        return False
-                    continue
-                if hasattr(sub, "is_trimmable") and sub.is_trimmable():
-                    continue
-                return False
-        for c in cache:
+            if getattr(c, "_mtp_draft_stash", None) is not None:
+                continue  # handled above
             subs = getattr(c, "caches", None)
             candidates = subs if subs is not None else [c]
             for sub in candidates:
@@ -308,13 +751,14 @@ def _patch_language_model(glm: Any) -> None:
                     sub[1] = ssm_snap
                     sub.rollback_state = None
                     continue
-                trimmed = sub.trim(n)
-                if trimmed != n:
-                    logger.warning(
-                        "glm5_next MTP rollback trim shortfall on %s",
-                        type(sub).__name__,
-                    )
-                    return False
+                if hasattr(sub, "trim"):
+                    trimmed = sub.trim(n)
+                    if trimmed != n:
+                        logger.warning(
+                            "glm5_next MTP rollback trim shortfall on %s",
+                            type(sub).__name__,
+                        )
+                        return False
         return True
 
     if not init_wrapped:
@@ -325,18 +769,15 @@ def _patch_language_model(glm: Any) -> None:
     cls.get_mtp_module = get_mtp_module
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_forward = mtp_forward
+    cls.mtp_clamp_accept = mtp_clamp_accept
     cls.mtp_partial_rollback = mtp_partial_rollback
 
 
 def _make_mtp_block(glm: Any, layer_config: Any, args: Any):
     import mlx.nn as nn
 
-    # The vendored package re-exports only the top-level classes; the
-    # decoder layer lives on the language submodule.
-    language_mod = getattr(glm, "language", None) or __import__(
-        "mlx_vlm.models.glm5_next.language", fromlist=["Glm5NextDecoderLayer"]
-    )
-    Glm5NextDecoderLayer = language_mod.Glm5NextDecoderLayer
+    lang = _language_mod(glm)
+    Glm5NextDecoderLayer = lang.Glm5NextDecoderLayer
 
     class Glm5NextMTPBlock(nn.Module):
         """One MTP layer: enorm/hnorm/eh_proj fusion + a full glm5_next
@@ -378,3 +819,5 @@ def _make_mtp_block(glm: Any, layer_config: Any, args: Any):
             return out.mean(axis=2)
 
     return Glm5NextMTPBlock()
+
+

@@ -65,7 +65,12 @@ class TestHeadAttach:
         assert lm._omlx_mtp_chain is True
         assert lm._omlx_mtp_depth >= 1
         assert lm._omlx_mtp_head_clone is False
-        assert lm._omlx_mtp_head_prenorm is True
+        # GLM-5.2 head-input convention: the return_hidden wrapper feeds
+        # the head the POST-final-norm hidden (hnorm re-normalises inside
+        # the block), and the hidden-normed marker keeps the chain's
+        # _trunk_norm_module the identity (no double norm).
+        assert lm._omlx_mtp_head_prenorm is False
+        assert lm._omlx_mtp_head_hidden_normed is True
         assert lm._omlx_mtp_decode_enabled is True
 
     def test_block_layout_matches_nextn_surface(self, glm, mtp_active):
@@ -80,14 +85,20 @@ class TestHeadAttach:
         assert block.block.is_linear is False
         assert type(block.block.mlp).__name__ == "Glm5NextMoE"
 
-    def test_mtp_cache_is_cache_list_with_pooling(self, glm, mtp_active):
+    def test_mtp_cache_is_flat_with_pooling(self, glm, mtp_active):
         text = _headful_text_config()
         lm = glm.LanguageModel(text)
         caches = lm.make_mtp_cache()
-        assert len(caches) == 1
-        assert type(caches[0]).__name__ == "CacheList"
-        assert len(caches[0].caches) == 2
-        assert type(caches[0].caches[0]).__name__ == "KVCache"
+        # FLAT pair per draft block (not CacheList): _mtp_head_trim_to
+        # reads offset on each entry directly. The pooling entry rides a
+        # token-offset adapter (native offset counts pool windows).
+        assert len(caches) == 2
+        assert type(caches[0]).__name__ == "KVCache"
+        assert type(caches[1]).__name__ == "_HeadPoolAdapter"
+        pool = caches[1]._pool
+        assert type(pool).__name__ == "PoolingCache"
+        # adapter offset is token-space: pool_len * ratio + remainder
+        assert caches[1].offset == pool.size() * pool.ratio + pool.remainder
 
 
 class TestForward:
@@ -192,4 +203,190 @@ class TestPartialRollback:
     def test_no_rollback_needed_accepts(self, glm, mtp_active):
         lm = glm.LanguageModel(_headful_text_config())
         assert lm.mtp_partial_rollback([], accepted=2, num_drafts=2) is True
+
+class TestVerifyCycleRollback:
+    """Full depth-3 cycle on a linear+sparse hybrid trunk: fold history,
+    verify window forward, then partial rollback at every accept count."""
+
+    def _verify_and_rollback(self, lm, accepted, num_drafts=3):
+        prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+        cache = lm.make_cache()
+        lm(prompt, cache=cache)
+        window = mx.array([[7, 8, 9, 10]])[:, : 1 + num_drafts]
+        out = lm(window, cache=cache, return_hidden=True, n_confirmed=1)
+        mx.eval(out.logits, out.hidden_states)
+        ok = lm.mtp_partial_rollback(cache, accepted=accepted, num_drafts=num_drafts)
+        # Expected state: prompt + confirmed + accepted drafts, replayed
+        # one token at a time on a fresh cache.
+        exp = lm.make_cache()
+        lm(prompt, cache=exp)
+        kept = [7] + [8, 9, 10][:accepted]
+        lm(mx.array([kept]), cache=exp)
+        lin = [i for i, l in enumerate(lm.model.layers) if l.is_linear]
+        worst = 0.0
+        for i in lin:
+            worst = max(
+                worst,
+                mx.abs(cache[i][0] - exp[i][0]).max().item(),
+                mx.abs(cache[i][1] - exp[i][1]).max().item(),
+            )
+        spa = [i for i, l in enumerate(lm.model.layers) if not l.is_linear]
+        kv_ok = all(cache[i][0].offset == exp[i][0].offset for i in spa)
+        pool_ok = all(cache[i][1].offset == exp[i][1].offset for i in spa)
+        # Continuity: the next decode step must agree with the reference.
+        nxt = 11 if accepted == num_drafts else 7 + 1 + accepted + 1
+        o1 = lm(mx.array([[nxt]]), cache=cache)
+        o2 = lm(mx.array([[nxt]]), cache=exp)
+        mx.eval(o1.logits, o2.logits)
+        cont = mx.abs(o1.logits - o2.logits).max().item()
+        return ok, worst, kv_ok, pool_ok, cont
+
+    def test_all_accept_counts_recover_exact_state(self, glm, mtp_active):
+        text = _headful_text_config()
+        mx.random.seed(7)
+        lm = glm.LanguageModel(text)
+        mx.eval(lm.parameters())
+        for accepted in (0, 1, 2):
+            ok, worst, kv_ok, pool_ok, cont = self._verify_and_rollback(
+                lm, accepted
+            )
+            # ULP-level drift is inherent to windowed recurrent kernels
+            # (same regime the qwen35 unsplit verify accepts); anything
+            # larger indicates a stale stash or wrong prefix replay.
+            assert ok is True
+            assert worst < 1e-4, (accepted, worst)
+            assert kv_ok and pool_ok
+            assert cont < 1e-4, (accepted, cont)
+
+    def test_unsplit_verify_forward_matches_sequential_logits(self, glm, mtp_active):
+        text = _headful_text_config()
+        mx.random.seed(19)
+        lm = glm.LanguageModel(text)
+        mx.eval(lm.parameters())
+        prompt = mx.array([[1, 2, 3, 4]])
+        c_seq = lm.make_cache()
+        lm(prompt, cache=c_seq)
+        last = None
+        for t in (5, 6, 7):
+            last = lm(mx.array([[t]]), cache=c_seq)
+            mx.eval(last.logits)
+        c_win = lm.make_cache()
+        lm(prompt, cache=c_win)
+        win = lm(mx.array([[5, 6, 7]]), cache=c_win, num_logits_to_keep=1)
+        mx.eval(win.logits)
+        d = mx.abs(last.logits - win.logits).max().item()
+        assert d < 1e-4, d
+
+    def test_clamp_accept_bounds_to_rollback_support(self, glm, mtp_active):
+        text = _headful_text_config()
+        lm = glm.LanguageModel(text)
+        prompt = mx.array([[1, 2, 3, 4]])
+        cache = lm.make_cache()
+        lm(prompt, cache=cache)
+        out = lm(mx.array([[5, 6, 7, 8]]), cache=cache, return_hidden=True, n_confirmed=1)
+        mx.eval(out.logits)
+        # Stash-backed rollback supports any partial accept while the
+        # verify window is still stashed.
+        assert lm.mtp_clamp_accept(cache, accepted=2, num_drafts=3) == 2
+        # Full accept needs no rollback (n=0) and is always viable.
+        assert lm.mtp_clamp_accept(cache, accepted=3, num_drafts=3) == 3
+        # A consumed stash (cleared by an earlier rollback/full accept)
+        # cannot replay a partial prefix: every m < num_drafts fails the
+        # validation and the accept clamps to 0 (full reject semantics).
+        for c in cache:
+            if hasattr(c, "_mtp_draft_stash") and c._mtp_draft_stash is not None:
+                c._mtp_draft_stash = None
+                c.rollback_state = None
+        assert lm.mtp_clamp_accept(cache, accepted=2, num_drafts=3) == 0
+
+
+class TestHeadPoolAdapterTokens:
+    def test_adapter_offset_is_token_space(self, glm, mtp_active):
+        text = _headful_text_config()
+        lm = glm.LanguageModel(text)
+        hc = lm.make_mtp_cache()
+        pool = hc[1]._pool
+        # Fold three history rows: offset counts tokens, not windows.
+        h = mx.zeros((1, 3, text.hidden_size))
+        lm.mtp_forward(h, mx.array([[1, 2, 3]]), hc, logits_keep=1)
+        mx.eval(hc[0].state[0]) if hasattr(hc[0], "state") else None
+        assert hc[1].offset == pool.size() * pool.ratio + pool.remainder
+        assert hc[1].offset == 3
+
+    def test_speculative_tail_trims_back_to_history(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _mtp_head_trim_to
+
+        text = _headful_text_config()
+        mx.random.seed(23)
+        lm = glm.LanguageModel(text)
+        mx.eval(lm.parameters())
+        hc = lm.make_mtp_cache()
+        h = mx.zeros((1, 1, text.hidden_size))
+        lm.mtp_forward(h, mx.array([[5]]), hc, logits_keep=1)
+        h2 = mx.zeros((1, 2, text.hidden_size))
+        lm.mtp_forward(h2, mx.array([[6, 7]]), hc, logits_keep=1)
+        assert hc[0].offset == 3 and hc[1].offset == 3
+        _mtp_head_trim_to(hc, 1)
+        assert hc[0].offset == 1
+        assert hc[1].offset == 1
+
+class TestPromptPriming:
+    """Chunked prefill folds the head history through maybe_capture and
+    the seam finishes via take_primed — the head KV must match a one-shot
+    oracle fold of the same timeline."""
+
+    def _prefill_chunked(self, lm, cache, tokens, chunks):
+        i = 0
+        for c in chunks:
+            out = lm(tokens[:, i : i + c], cache=cache)
+            mx.eval(out.logits)
+            i += c
+
+    def test_chunked_prefill_primes_and_seam_matches_oracle(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp import prompt_priming
+
+        text = _headful_text_config()
+        mx.random.seed(41)
+        lm = glm.LanguageModel(text)
+        mx.eval(lm.parameters())
+
+        n = 9
+        tokens = mx.array([[11, 12, 13, 14, 15, 16, 17, 18, 19]])
+        main_tok = mx.array([20])
+        cache = lm.make_cache()
+        self._prefill_chunked(lm, cache, tokens, [6, 3])
+        stats = prompt_priming.prime_ctx_stats(lm)
+        assert stats == n - 1
+
+        # Activation forward (return_hidden): capture skips it.
+        lm(main_tok[None, :], cache=cache, return_hidden=True)
+        primed = prompt_priming.take_primed(lm, cache, main_tok)
+        assert primed is not None
+        mtp_cache, hist_offset = primed
+        assert hist_offset == n
+        assert prompt_priming._find_ctx(lm) is None
+
+        # Oracle: one-shot prefill over the same tokens, head cache from a
+        # single fold covering the whole history (incl. the seam token).
+        ref_cache = lm.make_cache()
+        out = lm(tokens, cache=ref_cache, return_hidden=True)
+        mx.eval(out.hidden_states)
+        ref_head = lm.make_mtp_cache()
+        lm.mtp_forward(
+            out.hidden_states[:, :-1, :],
+            tokens[:, 1:],
+            ref_head,
+            logits_keep=1,
+        )
+        lm.mtp_forward(
+            out.hidden_states[:, -1:, :], mx.array([[20]]), ref_head, logits_keep=1
+        )
+        kv_a = mtp_cache[0]
+        kv_b = ref_head[0]
+        assert kv_a.offset == kv_b.offset
+        mx.eval(kv_a.state[0], kv_b.state[0])
+        assert mx.allclose(kv_a.state[0], kv_b.state[0], rtol=1e-4, atol=1e-4)
+        assert mtp_cache[1].offset == ref_head[1].offset
+
+
 
