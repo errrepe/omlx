@@ -3224,6 +3224,1161 @@
         }
       }
     },
+    "bench.storage.badge.default" : {
+      "comment" : "Badge: default params in use",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "параметры по умолчанию"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "默认参数"
+          }
+        }
+      }
+    },
+    "bench.storage.badge.measured" : {
+      "comment" : "Badge: params derived on this date",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "измерено"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已实测"
+          }
+        }
+      }
+    },
+    "bench.storage.button.predict" : {
+      "comment" : "Predict-only button (reuses latest measurement)",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Только прогноз"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅预测"
+          }
+        }
+      }
+    },
+    "bench.storage.button.run" : {
+      "comment" : "Run button for the full storage measurement",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запустить замер"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "运行测量"
+          }
+        }
+      }
+    },
+    "bench.storage.calib.above" : {
+      "comment" : "Calibration note when efficiency exceeds 100%",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выше холодного потолка: выигрыш от локальности и префетча"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "高于冷上限：时间局部性 + 预取红利"
+          }
+        }
+      }
+    },
+    "bench.storage.calib.below" : {
+      "comment" : "Calibration note when efficiency is well under the ceiling",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ниже потолка: узкое место ещё не в SSD (проверьте compute/память)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "低于上限：瓶颈还不在 SSD（检查算力/内存）"
+          }
+        }
+      }
+    },
+    "bench.storage.calib.efficiency" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эффективность потолка"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上限效率"
+          }
+        }
+      }
+    },
+    "bench.storage.calib.efficiency_effective" : {
+      "comment" : "Row label: measured tok/s over the effective (measured bytes/token) ceiling",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эффективность эффективного потолка"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有效上限效率"
+          }
+        }
+      }
+    },
+    "bench.storage.calib.efficiency_effective.sub" : {
+      "comment" : "Sublabel for the effective-ceiling efficiency row",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Должно быть около 100% — эффективный потолок уже содержит выигрыш от локальности/префетча"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应接近 100% —— 有效上限已包含局部性/预取红利"
+          }
+        }
+      }
+    },
+    "bench.storage.calib.measured" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Измеренный base tok/s"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "实测 base tok/s"
+          }
+        }
+      }
+    },
+    "bench.storage.calib.measured.sub" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Значение из вашего bench-прогона (токены/сек на базовой руке)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "来自你的 bench 运行（基准臂 tokens/s）"
+          }
+        }
+      }
+    },
+    "bench.storage.calib.near" : {
+      "comment" : "Calibration note when efficiency is near the ceiling",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рядом с потолком: decode действительно ограничен SSD"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接近上限：decode 确实受限于 SSD"
+          }
+        }
+      }
+    },
+    "bench.storage.config.loading" : {
+      "comment" : "Section subtitle while the model list loads",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка моделей…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加载模型中…"
+          }
+        }
+      }
+    },
+    "bench.storage.config.measured_base" : {
+      "comment" : "Row label for measured base tok/s (optional)",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Измеренный base tok/s"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "实测 base tok/s"
+          }
+        }
+      }
+    },
+    "bench.storage.config.measured_base.sub" : {
+      "comment" : "Sublabel for measured base input",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Необязательно — заполняет строку калибровки результатом вашего bench."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可选 —— 用你的 bench 结果填入校准行。"
+          }
+        }
+      }
+    },
+    "bench.storage.config.model" : {
+      "comment" : "Row label for the model picker",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型"
+          }
+        }
+      }
+    },
+    "bench.storage.config.model.sub" : {
+      "comment" : "Sublabel for the model picker",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Профиль MoE читается из заголовков safetensors за миллисекунды."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE 配置从 safetensors 头信息读取，毫秒级。"
+          }
+        }
+      }
+    },
+    "bench.storage.config.model_count" : {
+      "comment" : "Section subtitle showing how many models are available; placeholder is the count",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%d моделей"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%d 个模型"
+          }
+        }
+      }
+    },
+    "bench.storage.config.params_source" : {
+      "comment" : "Row label for where verdict params come from",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Параметры"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "参数"
+          }
+        }
+      }
+    },
+    "bench.storage.config.params_source.auto" : {
+      "comment" : "Sublabel when params are auto-derived",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Получены из bench-пар этой машины (%@)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "派生自本机的 bench 对（%@）。"
+          }
+        }
+      }
+    },
+    "bench.storage.config.params_source.none" : {
+      "comment" : "Sublabel when no auto params exist",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пары bench с телеметрией ещё нет — используются значения по умолчанию (1.0 / 2.3)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "尚无带遥测的 bench 对 —— 使用默认值 (1.0 / 2.3)。"
+          }
+        }
+      }
+    },
+    "bench.storage.config.tok_per_cycle" : {
+      "comment" : "Row label for measured MTP tok per cycle",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTP tok/cycle"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTP tok/cycle"
+          }
+        }
+      }
+    },
+    "bench.storage.config.tok_per_cycle.sub" : {
+      "comment" : "Sublabel for tok per cycle input",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "1 + доля принятия для depth-1."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "depth-1 的 1 + 接受率。"
+          }
+        }
+      }
+    },
+    "bench.storage.config.verify_mult" : {
+      "comment" : "Row label for verify byte multiplier",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Множитель байтов verify"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verify 字节倍数"
+          }
+        }
+      }
+    },
+    "bench.storage.config.verify_mult.sub" : {
+      "comment" : "Sublabel for verify byte multiplier",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Во сколько раз verify читает байтов больше базового шага."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "verify 每步读取基础步字节的多少倍。"
+          }
+        }
+      }
+    },
+    "bench.storage.header.eyebrow" : {
+      "comment" : "Eyebrow label above the Storage Roofline screen header",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "BENCHMARK"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "BENCHMARK"
+          }
+        }
+      }
+    },
+    "bench.storage.header.subtitle" : {
+      "comment" : "Storage Roofline screen subtitle",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Замер SSD + прогноз потолка MoE-стриминга и вердикт MTP"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测量 SSD 并预测 MoE 流式解码上限与 MTP 判定"
+          }
+        }
+      }
+    },
+    "bench.storage.header.title" : {
+      "comment" : "Storage Roofline screen primary header",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Потолок хранилища"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "存储上限"
+          }
+        }
+      }
+    },
+    "bench.storage.hint.not_cold" : {
+      "comment" : "Hint when the measurement could not bypass the page cache",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Замер мог включать чтения из кэша страниц — повторите после сброса кэша (или перезагрузки) для холодных чисел."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测量可能包含页缓存读取 —— 重置缓存（或重启）后再测以获得冷数据。"
+          }
+        }
+      }
+    },
+    "bench.storage.history.sub" : {
+      "comment" : "History section subtitle",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Последние 10 прогонов — дельты относительно предыдущего."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最近 10 次运行 —— 相对上一次的增量。"
+          }
+        }
+      }
+    },
+    "bench.storage.history.uncached_flag" : {
+      "comment" : "Flag: measurement may include page-cache reads",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "некэшировано"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未冷测"
+          }
+        }
+      }
+    },
+    "bench.storage.meas.latency" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Задержка p50"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "p50 延迟"
+          }
+        }
+      }
+    },
+    "bench.storage.meas.latency.sub" : {
+      "comment" : "Sublabel for latency row; placeholders are IOPS and method",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Случайное чтение 2 МБ, медиана на сэмпл"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2 MB 随机读，样本中位数"
+          }
+        }
+      }
+    },
+    "bench.storage.meas.media" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Носитель"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "介质"
+          }
+        }
+      }
+    },
+    "bench.storage.meas.rand" : {
+      "comment" : "Row label for the random-read measurement; placeholder is the block size",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Случайное чтение"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "随机读取"
+          }
+        }
+      }
+    },
+    "bench.storage.meas.rand.sub" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Предсказатель стриминга экспертов (decode)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "专家流式读取预测器（decode）"
+          }
+        }
+      }
+    },
+    "bench.storage.meas.seq" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Последовательное чтение"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "顺序读取"
+          }
+        }
+      }
+    },
+    "bench.storage.meas.seq.sub" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Предсказатель загрузки/спилла"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加载/spill 预测器"
+          }
+        }
+      }
+    },
+    "bench.storage.meas.write" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запись"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "写入"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.ceiling_base" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Базовый потолок (холодный)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "基础上限（冷）"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.ceiling_base.sub" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Макс. ток/с, если каждый байт эксперта читается с SSD холодным"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每个专家字节都从 SSD 冷读时的最大 tok/s"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.ceiling_effective" : {
+      "comment" : "Row label for the measured-bytes/token ceiling",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эффективный потолок"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有效上限"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.ceiling_effective.sub" : {
+      "comment" : "Sublabel: cold ceiling already nets out locality/prefetch",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Измеренные байты/токен ÷ пропускная способность случайного чтения этого тома"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "实测字节/token ÷ 该卷随机读带宽"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.ceiling_mtp" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Потолок MTP (холодный)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTP 上限（冷）"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.ceiling_mtp.sub" : {
+      "comment" : "Sublabel for MTP ceiling row; placeholders are tok/cycle and byte multiplier",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tok/cycle %.2f против %.2f× байтов verify"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tok/cycle %.2f 对 %.2f× verify 字节"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.measured_wallclock" : {
+      "comment" : "Row label for the measured MTP slowdown",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Измеренное время"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "实测耗时"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.measured_wallclock.sub" : {
+      "comment" : "Sublabel for the measured slowdown row",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tok/s base ÷ tok/s MTP из пары bench этой машины — ниже 1× окупается"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "来自本机 bench 对的 tok/s base ÷ tok/s MTP —— 低于 1× 即划算"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.not_profitable" : {
+      "comment" : "Verdict when MTP is structurally unprofitable",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Проигрывает структурно — держать OFF"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "结构性亏损 —— 保持 OFF"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.params_source" : {
+      "comment" : "Which params produced this verdict (explicit/auto/default)",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Параметры вердикта: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "判定参数：%@"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.profitable" : {
+      "comment" : "Verdict when MTP is structurally profitable",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Окупается — включить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "划算 —— 启用"
+          }
+        }
+      }
+    },
+    "bench.storage.pred.verdict" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вердикт MTP"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTP 判定"
+          }
+        }
+      }
+    },
+    "bench.storage.profile.arch" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Архитектура"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "架构"
+          }
+        }
+      }
+    },
+    "bench.storage.profile.bytes_step" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Байтов / шаг"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "字节 / 步"
+          }
+        }
+      }
+    },
+    "bench.storage.profile.bytes_step.sub" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Активные маршрутизированные эксперты на шаг decode (только хранимые байты)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每个 decode 步的活跃路由专家（仅存储字节）"
+          }
+        }
+      }
+    },
+    "bench.storage.profile.routing" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Маршрутизация"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "路由"
+          }
+        }
+      }
+    },
+    "bench.storage.profile.routing.sub" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Слоёв MoE × top-k активных из общего числа"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE 层数 × top-k 活跃/总数"
+          }
+        }
+      }
+    },
+    "bench.storage.progress.done" : {
+      "comment" : "Progress label for the completed phase",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Готово"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "完成"
+          }
+        }
+      }
+    },
+    "bench.storage.progress.queued" : {
+      "comment" : "Progress label for the queued phase",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "В очереди…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "排队中…"
+          }
+        }
+      }
+    },
+    "bench.storage.progress.rand_read" : {
+      "comment" : "Progress label for the random read phase",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Случайные чтения…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "随机读取…"
+          }
+        }
+      }
+    },
+    "bench.storage.progress.seq_read" : {
+      "comment" : "Progress label for the sequential read phase",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Последовательное чтение…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "顺序读取…"
+          }
+        }
+      }
+    },
+    "bench.storage.progress.write" : {
+      "comment" : "Progress label for the write phase",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запись временного файла…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "写入临时文件…"
+          }
+        }
+      }
+    },
+    "bench.storage.section.calibration" : {
+      "comment" : "Section header for measured-vs-ceiling calibration",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Калибровка"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "校准"
+          }
+        }
+      }
+    },
+    "bench.storage.section.configuration" : {
+      "comment" : "Section header for the roofline configuration rows",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Конфигурация"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "配置"
+          }
+        }
+      }
+    },
+    "bench.storage.section.history" : {
+      "comment" : "Section header for past storage measurements",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История замеров"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测量历史"
+          }
+        }
+      }
+    },
+    "bench.storage.section.measurement" : {
+      "comment" : "Section header for the storage measurement rows",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Замер"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测量"
+          }
+        }
+      }
+    },
+    "bench.storage.section.profile" : {
+      "comment" : "Section header for the per-model MoE step profile",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Профиль MoE"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE 配置"
+          }
+        }
+      }
+    },
+    "bench.storage.section.profile.sub" : {
+      "comment" : "Subheader for the model profile section",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Из заголовков чекпоинта (миллисекунды, без загрузки весов)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "来自检查点头信息（毫秒级，不加载权重）"
+          }
+        }
+      }
+    },
+    "bench.storage.section.verdict" : {
+      "comment" : "Section header for the roofline prediction",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Потолок и вердикт MTP"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上限与 MTP 判定"
+          }
+        }
+      }
+    },
+    "bench.storage.volume.free" : {
+      "comment" : "Volume subtitle fragment; placeholder is free space",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Свободно: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剩余空间：%@"
+          }
+        }
+      }
+    },
     "bench.throughput.batch.baseline_label" : {
       "comment" : "Row label for the synthetic 1x baseline in the batch results table",
       "extractionState" : "manual",

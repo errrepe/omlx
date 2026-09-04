@@ -1029,3 +1029,47 @@ def load_auto_params(model_dir: str | Path) -> dict | None:
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
+def list_reports(limit: int = 10) -> list[dict]:
+    """Recent reports, newest first, summarized for the history UI.
+
+    Each entry: timestamp, volume media/mount, seq + rand GB/s, bytes per
+    step + ceilings when present, and the raw path for drill-down. Deltas
+    between consecutive entries are computed client-side.
+    """
+    try:
+        paths = sorted(
+            _results_dir().glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return []
+    out: list[dict] = []
+    for path in paths[: max(1, limit)]:
+        try:
+            rep = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not (isinstance(rep, dict) and "measurement" in rep):
+            continue
+        meas = rep.get("measurement") or {}
+        pred = rep.get("prediction") or {}
+        vol = rep.get("volume") or {}
+        out.append(
+            {
+                "timestamp": rep.get("timestamp"),
+                "path": str(path),
+                "volume_media": vol.get("media_name") or vol.get("mount"),
+                "seq_read_GBps": round((meas.get("seq_read_Bps") or 0) / 1e9, 2),
+                "rand_read_GBps": round((meas.get("rand_read_Bps") or 0) / 1e9, 2),
+                "bytes_per_step_MB": round(
+                    (pred.get("bytes_per_step") or 0) / 1048576, 0
+                ),
+                "ceiling_base_tok_s": pred.get("ceiling_base_tok_s"),
+                "ceiling_effective_tok_s": pred.get("ceiling_effective_tok_s"),
+                "cache_clean": meas.get("cache_clean"),
+            }
+        )
+    return out

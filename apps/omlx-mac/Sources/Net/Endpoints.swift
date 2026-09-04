@@ -116,4 +116,5 @@ enum AdminAPI {
     static func storageBenchResults(_ jobId: String) -> String { "\(prefix)/bench/storage/\(jobId)/results" }
     static let storageBenchPredict = "\(prefix)/bench/storage/predict"
     static let storageBenchAutoParams = "\(prefix)/bench/storage/auto-params"
+    static let storageBenchHistory = "\(prefix)/bench/storage/history"
 }

@@ -7210,6 +7210,22 @@ async def get_storage_benchmark_results(
     return job_to_response(job)
 
 
+@router.get("/api/bench/storage/history")
+async def get_storage_history(
+    limit: int = 10,
+    is_admin: bool = Depends(require_admin),
+):
+    """Recent storage-roofline reports (newest first), summarized.
+
+    The UI computes deltas between consecutive entries so a drive/cable
+    swap shows up as a diff, not two absolute tables. Empty list (200)
+    before the first run.
+    """
+    from omlx.utils.storage_roofline import list_reports
+
+    return {"reports": list_reports(limit=max(1, min(limit, 100)))}
+
+
 @router.get("/api/bench/storage/auto-params")
 async def get_storage_auto_params(
     model_id: str,

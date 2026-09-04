@@ -21,6 +21,8 @@ final class StorageRooflineScreenVM {
     private(set) var report: StorageRooflineReportDTO?
     /// Derived verdict params for the selected model (auto-params endpoint).
     private(set) var autoParams: StorageAutoParamsDTO?
+    /// Recent measurement reports (newest first) with delta rendering.
+    private(set) var history: [OMLXClient.StorageHistoryEntry] = []
     var lastError: String?
 
     @ObservationIgnored
@@ -66,6 +68,7 @@ final class StorageRooflineScreenVM {
             await loadAutoParams()
             await predict()
         }
+        await loadHistory()
     }
 
     func stop() {
@@ -85,6 +88,16 @@ final class StorageRooflineScreenVM {
             }
         } catch {
             self.lastError = error.omlxDescription
+        }
+    }
+
+    @MainActor
+    func loadHistory() async {
+        guard let client else { return }
+        do {
+            history = try await client.getStorageHistory()
+        } catch {
+            // History is a nice-to-have; never surface as an error.
         }
     }
 
@@ -201,6 +214,7 @@ final class StorageRooflineScreenVM {
                             // re-predict with the freshest numbers.
                             Task { [weak self] in
                                 await self?.loadAutoParams()
+                                await self?.loadHistory()
                                 await self?.predict()
                             }
                         }

@@ -62,6 +62,10 @@ struct StorageRooflineScreen: View {
             if let report = vm.report {
                 ReportSections(report: report)
             }
+
+            if !vm.history.isEmpty {
+                HistorySection(entries: vm.history)
+            }
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
@@ -218,6 +222,91 @@ private func paramsSourceText(_ auto: StorageAutoParamsDTO) -> String {
     return String(localized: "bench.storage.config.params_source.none",
                   defaultValue: "No bench pair with telemetry yet — defaults in use (1.0 / 2.3).",
                   comment: "Sublabel when no auto params exist")
+}
+
+// MARK: - History
+
+private struct HistorySection: View {
+    let entries: [OMLXClient.StorageHistoryEntry]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionHeader(
+                String(localized: "bench.storage.section.history",
+                       defaultValue: "Measurement history",
+                       comment: "Section header for past storage measurements"),
+                subtitle: String(localized: "bench.storage.history.sub",
+                                 defaultValue: "Last 10 runs — deltas vs the previous run.",
+                                 comment: "History section subtitle")
+            )
+            ListGroup {
+                ForEach(Array(entries.enumerated()), id: \.offset) { pair in
+                    historyRow(pair.offset, pair.element)
+                }
+            }
+        }
+    }
+
+    private func historyRow(_ idx: Int, _ e: OMLXClient.StorageHistoryEntry) -> some View {
+        let rand: Double = e.randReadGBps ?? 0
+        let deltaText: String? = deltaLabel(idx: idx, e)
+        let deltaCol: Color = deltaColor(idx: idx, e)
+        let isLast: Bool = idx == entries.count - 1
+        let sub: String = rowSublabel(idx: idx, e)
+        return Row(
+            label: timestampLabel(e),
+            sublabel: sub,
+            isLast: isLast
+        ) {
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(String(format: "%.2f GB/s", rand))
+                    .font(.omlxMono(12))
+                if let d = deltaText {
+                    Text(d)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(deltaCol)
+                }
+            }
+        }
+    }
+
+    private func timestampLabel(_ e: OMLXClient.StorageHistoryEntry) -> String {
+        let ts = e.timestamp ?? ""
+        return String(ts.prefix(16))
+    }
+
+    /// Δ rand MB/s vs the previous (older) entry — the before/after
+    /// comparator for a drive or cable swap.
+    private func delta(idx: Int, _ e: OMLXClient.StorageHistoryEntry) -> Double? {
+        guard idx + 1 < entries.count,
+              let cur = e.randReadGBps,
+              let prev = entries[idx + 1].randReadGBps else { return nil }
+        return cur - prev
+    }
+
+    private func deltaLabel(idx: Int, _ e: OMLXClient.StorageHistoryEntry) -> String? {
+        guard let d = delta(idx: idx, e) else { return nil }
+        return String(format: "%+.2f", d)
+    }
+
+    private func deltaColor(idx: Int, _ e: OMLXClient.StorageHistoryEntry) -> Color {
+        guard let d = delta(idx: idx, e) else { return .secondary }
+        return d >= 0 ? .green : .orange
+    }
+
+    private func rowSublabel(idx: Int, _ e: OMLXClient.StorageHistoryEntry) -> String {
+        var parts: [String] = []
+        if let m = e.volumeMedia, !m.isEmpty { parts.append(m) }
+        if let ceilBase = e.ceilingBaseTokS {
+            parts.append(String(format: "teto %.2f tok/s", ceilBase))
+        }
+        if e.cacheClean != true {
+            parts.append(String(localized: "bench.storage.history.uncached_flag",
+                                 defaultValue: "uncached",
+                                 comment: "Flag: measurement may include page-cache reads"))
+        }
+        return parts.joined(separator: " · ")
+    }
 }
 
 // MARK: - Progress

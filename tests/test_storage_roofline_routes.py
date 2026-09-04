@@ -271,3 +271,56 @@ class TestStorageAutoParams:
         assert body["prediction"]["verify_byte_mult"] == 2.0
         # Auto rides along for inspection either way.
         assert body["params_auto"]["tok_per_cycle"] == 1.79
+
+class TestStorageHistory:
+    def test_history_empty_ok(self, client):
+        import omlx.utils.storage_roofline as sr
+
+        with patch.object(sr, "list_reports", return_value=[]):
+            r = client.get("/admin/api/bench/storage/history")
+        assert r.status_code == 200
+        assert r.json() == {"reports": []}
+
+    def test_history_lists_reports(self, client):
+        import omlx.utils.storage_roofline as sr
+
+        entries = [
+            {"timestamp": "2026-09-04T10:00:00", "path": "a.json",
+             "volume_media": "YSSDHB", "seq_read_GBps": 2.4,
+             "rand_read_GBps": 3.0, "bytes_per_step_MB": 1292,
+             "ceiling_base_tok_s": 2.27, "ceiling_effective_tok_s": None,
+             "cache_clean": True},
+            {"timestamp": "2026-09-01T10:00:00", "path": "b.json",
+             "volume_media": "YSSDHB", "seq_read_GBps": 2.2,
+             "rand_read_GBps": 2.8, "bytes_per_step_MB": 1292,
+             "ceiling_base_tok_s": 2.11, "ceiling_effective_tok_s": None,
+             "cache_clean": False},
+        ]
+        with patch.object(sr, "list_reports", return_value=entries):
+            r = client.get("/admin/api/bench/storage/history")
+        assert r.status_code == 200
+        assert len(r.json()["reports"]) == 2
+        assert r.json()["reports"][0]["rand_read_GBps"] == 3.0
+
+    def test_list_reports_reads_disk(self, tmp_path, monkeypatch):
+        import omlx.utils.storage_roofline as sr
+
+        monkeypatch.setattr(sr, "_results_dir", lambda: tmp_path)
+        # Two reports; newest mtime first.
+        for i, rand in enumerate([1.0e9, 3.0e9]):
+            rep = {
+                "timestamp": f"2026-09-0{i + 1}T10:00:00",
+                "volume": {"media_name": "SSD", "mount": "/"},
+                "measurement": {"seq_read_Bps": 2e9, "rand_read_Bps": rand,
+                                "cache_clean": True},
+                "prediction": {"bytes_per_step": 1292 * 1048576,
+                               "ceiling_base_tok_s": 2.3,
+                               "ceiling_effective_tok_s": None},
+            }
+            import time as _t
+            (tmp_path / f"rep{i}.json").write_text(json.dumps(rep))
+            _t.sleep(0.05)
+        out = sr.list_reports()
+        assert len(out) == 2
+        assert out[0]["rand_read_GBps"] == 3.0
+        assert out[0]["bytes_per_step_MB"] == 1292

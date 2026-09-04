@@ -523,6 +523,30 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    struct StorageHistoryResponse: Codable, Sendable {
+        let reports: [StorageHistoryEntry]?
+    }
+
+    struct StorageHistoryEntry: Codable, Equatable, Sendable {
+        let timestamp: String?
+        let path: String?
+        let volumeMedia: String?
+        let seqReadGBps: Double?
+        let randReadGBps: Double?
+        let bytesPerStepMB: Double?
+        let ceilingBaseTokS: Double?
+        let ceilingEffectiveTokS: Double?
+        let cacheClean: Bool?
+    }
+
+    func getStorageHistory(limit: Int = 10) async throws -> [StorageHistoryEntry] {
+        let resp: StorageHistoryResponse = try await get(
+            AdminAPI.storageBenchHistory,
+            query: [URLQueryItem(name: "limit", value: String(limit))]
+        )
+        return resp.reports ?? []
+    }
+
     /// Explicit params go to the server; nil leaves them to the server's
     /// auto-derived values (params_source rides in the report).
     func getStoragePrediction(modelId: String,
