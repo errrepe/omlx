@@ -800,7 +800,11 @@ def convert_model_to_streaming(
             import os
 
             from . import shard_bank as _shard_mod
-            from .shard_bank import ExpertBackingStore, cold_tier_status
+            from .shard_bank import (
+                ExpertBackingStore,
+                _cold_tier_status_dir,
+                cold_tier_status,
+            )
 
             extra_roots = [
                 p
@@ -824,7 +828,7 @@ def convert_model_to_streaming(
                 cold_root = Path(os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT", "")) \
                     if os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT") else None
                 cold_dir = cold_root if cold_root is not None else Path(model_path) / "expert_cold"
-                ok, why = _cold_tier_status_dir(cold_dir, model_path)
+                ok, why = _cold_tier_status_dir(cold_dir, Path(model_path))
                 if ok:
                     cold_root = cold_dir
                     logger.info("Expert streaming: cold tier %s-bit active (%s)", cold_setting, why)
