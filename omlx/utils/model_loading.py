@@ -781,6 +781,12 @@ def maybe_apply_pre_load_patches(
                 # controller's exploration costs ~10% throughput vs fixed
                 # depth 1 on it.
                 set_mtp_depth(1)
+            elif model_type == "glm5_next":
+                # GLM-5.3 Lightning draft: one attached block, chain-capable
+                # like GLM-5.2's. The draft runs its own 288-expert MoE, so
+                # the adaptive controller's marginal-cost prior matters;
+                # start at the validated general max.
+                set_mtp_depth(3)
             elif model_type in ("gemma4", "gemma4_unified"):
                 # The fused multi-row verify kernel keeps gemma4 global-layer
                 # attention near-flat in L, so depths 4..8 are genuinely
@@ -1152,6 +1158,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
+        or model_type == "glm5_next"
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
