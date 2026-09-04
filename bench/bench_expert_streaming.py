@@ -441,6 +441,16 @@ async def run(
     )
     if mtp_depth is not None:
         settings.mtp_num_draft_tokens = int(mtp_depth)
+    if mtp and not _mtp_native:
+        # Chain-level MTP aggregate for this arm only (roofline F1):
+        # reset before the first request so the snapshot carries exactly
+        # this arm's verify cycles and accepts.
+        try:
+            from omlx.patches.mlx_lm_mtp.batch_generator import mtp_stats_reset
+
+            mtp_stats_reset()
+        except Exception:
+            pass
     runtime = pool._entry_runtime_resident_size(entry, settings)
     print(f"runtime est {runtime / 1024**3:.2f}G")
     # Structural estimate block: what the tuner sized against (layer geometry
@@ -807,12 +817,16 @@ async def run(
         # PILOT prefetcher stats (attached on language_model.model or wrapper)
         # Two independent walks: a holder can carry the prefetcher, the
         # MTP accept counters, both, or neither - breaking on the first
-        # match of either would hide the other.
+        # match of either would hide the other. The adapter counters live
+        # on the VLMModelAdapter (engine._adapter / engine.model), while
+        # the prefetcher attaches to language_model.model - walk both.
         pf = None
         mtp_adapter_stats = None
         _holders = (
             getattr(vlm_model, "language_model", None),
             getattr(getattr(vlm_model, "language_model", None), "model", None),
+            getattr(engine, "_adapter", None),
+            getattr(engine, "model", None),
             vlm_model,
         )
         for holder in _holders:
@@ -833,6 +847,20 @@ async def run(
             print(f"prefetcher {pf_stats}")
         if mtp_adapter_stats is not None:
             print(f"mtp accept {mtp_adapter_stats}")
+        # Chain-level aggregate (authoritative): the batch_generator logs
+        # per-request cycles/accepts; summed here they cover FULL-accept
+        # cycles the adapter clamp hook misses. Native Lightning MTP never
+        # reaches this chain, leaving both None there.
+        chain_mtp_stats = None
+        if mtp:
+            try:
+                from omlx.patches.mlx_lm_mtp.batch_generator import mtp_stats_snapshot
+
+                chain_mtp_stats = mtp_stats_snapshot()
+                if chain_mtp_stats.get("cycles", 0) > 0:
+                    print(f"mtp chain {chain_mtp_stats}")
+            except Exception:
+                chain_mtp_stats = None
         # Fase K F3: export the O2 F_RDADVISE/stash speculation counters so
         # the readahead coverage is measurable (advised experts, stash hits).
         # K1: the counters live on the per-conversion SpeculationState.
@@ -964,7 +992,7 @@ async def run(
             "prefetcher": pf_stats,
             "advise_stats": advise_stats,
             "read_stats": _read_stats_out,
-            "mtp_accept_stats": mtp_adapter_stats,
+            "mtp_accept_stats": chain_mtp_stats or mtp_adapter_stats,
             "run_pool": _pool_after,
             "memtrace_summary": _memtrace_summary,
             "ctx_fallback_to_legacy": _ctx_fb,

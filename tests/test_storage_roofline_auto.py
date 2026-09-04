@@ -144,7 +144,10 @@ def test_update_and_load_auto_params(tmp_path, monkeypatch):
     rdir = _write_runs(tmp_path, runs)
     out = update_auto_params(MDIR, HINTS, results_dirs=[rdir])
     assert out is not None
-    assert out["verify_byte_mult"] == pytest.approx(2.3)
+    # Per-STEP verify mult: (mtp_bytes / cycles) / (base_bytes / tokens).
+    assert out["verify_byte_mult"] == pytest.approx(
+        (2_300_000 / 54) / (1_000_000 / 96), rel=1e-3
+    )
     assert out["tok_per_cycle"] == pytest.approx(96 / 54, abs=0.01)
     assert out["bytes_per_token_base"] == pytest.approx(1_000_000 / 96)
     # Round-trip through disk.
@@ -160,6 +163,58 @@ def test_update_auto_params_none_when_no_data(tmp_path, monkeypatch):
     rdir = _write_runs(tmp_path, [_run(bytes=None)])
     assert update_auto_params(MDIR, HINTS, results_dirs=[rdir]) is None
     assert load_auto_params(MDIR) is None
+
+
+def test_derive_verify_mult_carries_wall_clock(tmp_path):
+    # tok_s pair + per-step mult: the derivation must expose the measured
+    # slowdown so the verdict can override the byte model.
+    runs = [
+        {"model": "qwen-fake", "mtp": False, "decode_tokens": 42,
+         "tok_s": 1.95, "read_stats": {"decode": {"bytes": 39356928000}}},
+        {"model": "qwen-fake", "mtp": True, "mtp_depth": 1,
+         "decode_tokens": 42, "tok_s": 1.29,
+         "read_stats": {"decode": {"bytes": 30787891200}},
+         "mtp_accept_stats": {"cycles": 24, "accepts": 18, "drafted": 24,
+                               "emits": 44}},
+    ]
+    rdir = _write_runs(tmp_path, runs)
+    out = derive_verify_mult([rdir], MDIR, HINTS)
+    assert out["verify_byte_mult"] == pytest.approx(
+        (30787891200 / 24) / (39356928000 / 42), rel=1e-3
+    )
+    assert out["measured_mtp_slowdown"] == pytest.approx(1.95 / 1.29, rel=1e-3)
+
+
+def test_predict_roofline_effective_and_measured():
+    from omlx.utils.storage_roofline import (
+        MoEStepProfile,
+        RooflinePrediction,
+        StorageMeasurement,
+        predict_roofline,
+    )
+
+    prof = MoEStepProfile(
+        model_dir="m", model_type="t", supported=True, reason="",
+        num_moe_layers=1, routed_total_per_layer=512, top_k=10,
+        routed_active_bytes_per_layer=1000, shared_bytes_per_layer=0,
+        bytes_per_step=1000, checkpoint_bytes=1000,
+    )
+    meas = StorageMeasurement(
+        volume_mount="/", file_bytes=0, seq_read_Bps=1000.0,
+        rand_read_Bps=1000.0, rand_iops=100.0,
+        rand_lat_ms_p50=1.0, rand_lat_ms_p90=1.0, rand_lat_ms_p99=1.0,
+        rand_lat_ms_max=1.0, samples=10, read_mb=2, cache_clean=True,
+    )
+    # Byte model says pays (1.8 > 1.0); wall clock says loses (2.0x slower).
+    pred = predict_roofline(
+        prof, meas, tok_per_cycle=1.8, verify_byte_mult=1.0,
+        bytes_per_token_base=400.0, measured_mtp_slowdown=2.0,
+    )
+    assert isinstance(pred, RooflinePrediction)
+    assert pred.ceiling_effective_tok_s == pytest.approx(2.5)
+    assert pred.measured_mtp_pays is False
+    assert pred.mtp_profitable is True  # byte model still says pays...
+    assert "wall-clock" in pred.explanation  # ...but the report flags it
 
 
 # ---------------------------------------------------------------------------

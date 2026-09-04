@@ -69,6 +69,11 @@ class VolumeInfo:
     solid_state: bool
     total_bytes: int
     free_bytes: int
+    # Device id of the volume's disk (st_dev of the mount point). The
+    # volume-mismatch check compares THIS between measurement and target:
+    # mount paths can repeat across different physical disks after a drive
+    # swap, but st_dev cannot. 0 = unknown (older reports lack the field).
+    st_dev: int = 0
 
 
 def _diskutil_text(path: str) -> dict:
@@ -118,9 +123,14 @@ def volume_info_for(path: str | Path) -> VolumeInfo:
     """Identify the storage volume holding `path` (model dir or spill)."""
     p = str(Path(path).expanduser())
     total, free = _df_bytes(p)
+    try:
+        st_dev = os.stat(p).st_dev
+    except OSError:
+        st_dev = 0
     info = VolumeInfo(
         path=p, mount=p, filesystem="", media_name="", protocol="",
         location="", solid_state=False, total_bytes=total, free_bytes=free,
+        st_dev=st_dev,
     )
     if sys.platform == "darwin":
         d = _diskutil_text(p)
@@ -464,6 +474,10 @@ class MoEStepProfile:
     shared_bytes_per_layer: int = 0  # resident, informational
     bytes_per_step: int = 0
     checkpoint_bytes: int = 0
+    # Where decode pages experts from at runtime: a valid spill dir means
+    # the demand reads hit the spill volume, NOT the checkpoint volume.
+    data_source: str = "checkpoint"  # "checkpoint" | "spill"
+    data_source_dir: str = ""
 
 
 def moe_step_profile(model_dir: str | Path) -> MoEStepProfile:
@@ -483,6 +497,16 @@ def moe_step_profile(model_dir: str | Path) -> MoEStepProfile:
         config = {}
     tc = _text_cfg(config)
     est = expert_streaming_estimate(mdir)
+    # Spill awareness: dsv4-style spill dirs live on a (possibly different)
+    # volume from the checkpoint. When a fresh spill exists, decode demand
+    # reads page from THERE - the measurement must target that volume.
+    # Optional import: models without the dsv4 patch simply keep "checkpoint".
+    try:
+        from omlx.patches.deepseek_v4.spill import spill_is_valid
+
+        spill_dir = spill_is_valid(mdir)
+    except Exception:
+        spill_dir = None
     prof = MoEStepProfile(
         model_dir=str(mdir),
         model_type=est.model_type or "unknown",
@@ -491,6 +515,8 @@ def moe_step_profile(model_dir: str | Path) -> MoEStepProfile:
         num_moe_layers=est.num_moe_layers,
         routed_total_per_layer=est.experts_per_layer,
         checkpoint_bytes=est.checkpoint_bytes,
+        data_source="spill" if spill_dir else "checkpoint",
+        data_source_dir=str(spill_dir) if spill_dir else "",
     )
     if not est.supported:
         return prof
@@ -532,6 +558,13 @@ class RooflinePrediction:
     mtp_profitable: bool
     margin_tok_per_cycle: float  # tok_per_cycle - verify_byte_mult
     explanation: str
+    # Effective (measured bytes/token) ceiling: None until a telemetry
+    # bench pair exists. lower than ceiling_base by the locality dividend.
+    ceiling_effective_tok_s: float | None = None
+    bytes_per_token_base: float | None = None
+    # Measured wall-clock verdict inputs/outputs (authoritative).
+    measured_mtp_slowdown: float | None = None
+    measured_mtp_pays: bool | None = None
 
 
 def predict_roofline(
@@ -539,21 +572,43 @@ def predict_roofline(
     measurement: StorageMeasurement,
     tok_per_cycle: float = 1.0,
     verify_byte_mult: float = _VERIFY_BYTE_MULT_DEFAULT,
+    bytes_per_token_base: float | None = None,
+    measured_mtp_slowdown: float | None = None,
 ) -> RooflinePrediction:
     """Ceilings + MTP verdict from profile x measurement.
 
     `tok_per_cycle` (1 + accept_rate for depth-1) and `verify_byte_mult`
-    come from a Gap-2 style bench; defaults describe the base step only.
-    The verdict is deliberately independent of absolute bandwidth: both
-    arms share the same SSD, so only the byte ratio matters.
+    come from a telemetry-armed bench pair; defaults describe the base
+    step only. The verdict is deliberately independent of absolute
+    bandwidth: both arms share the same SSD, so only the byte ratio
+    matters.
+
+    `bytes_per_token_base` (optional, auto-derived) is the MEASURED cold
+    bytes per generated token on the base arm: measured decode bytes over
+    measured tokens. It already nets out hit-rate and prefetch dividends,
+    so `ceiling_effective_tok_s = bw / bytes_per_token_base` is the honest
+    reachable ceiling - while `ceiling_base_tok_s` (nominal bytes_per_step)
+    stays the worst case. The gap between them quantifies the locality +
+    prefetch dividend on this machine.
     """
     bw = measurement.rand_read_Bps
     bps = max(1, profile.bytes_per_step)
     bverify = int(bps * verify_byte_mult)
     ceiling_base = bw / bps
     ceiling_mtp = bw * tok_per_cycle / max(1, bverify)
+    ceiling_effective = (
+        bw / bytes_per_token_base if bytes_per_token_base and bytes_per_token_base > 0 else None
+    )
     profitable = tok_per_cycle > verify_byte_mult
     margin = tok_per_cycle - verify_byte_mult
+    # Measured wall-clock verdict (authoritative when present): the byte
+    # model assumes I/O-bound steps. When the verify batch's compute (or
+    # any other factor) dominates, only the measured tok_s pair tells the
+    # truth. measured_mtp_slowdown = tok_s_base / tok_s_mtp: > 1 means MTP
+    # is SLOWER in wall-clock — it loses regardless of the byte model.
+    measured_pays = None
+    if measured_mtp_slowdown is not None and measured_mtp_slowdown > 0:
+        measured_pays = measured_mtp_slowdown < 1.0
     # The ceilings assume every expert byte comes cold off SSD each step
     # (worst case). The real engine usually beats the base ceiling via
     # temporal locality (reselected experts hit the page cache) + prefetch
@@ -573,6 +628,20 @@ def predict_roofline(
             f"vs base {ceiling_base:.2f} tok/s). No faster SSD closes this "
             f"gap — only more stages or resident weights do."
         )
+    if measured_pays is not None and measured_pays != profitable:
+        expl += (
+            f" BUT measured wall-clock says MTP is "
+            + ("slower" if measured_mtp_slowdown > 1 else "faster")
+            + f" ({measured_mtp_slowdown:.2f}x) — the byte model misses a "
+            "non-I/O cost (verify-batch compute, draft head); trust the "
+            "measurement on this machine."
+        )
+    elif measured_pays is not None:
+        expl += (
+            f" Measured wall-clock agrees ({measured_mtp_slowdown:.2f}x "
+            + ("faster" if measured_pays else "slower")
+            + ")."
+        )
     return RooflinePrediction(
         bytes_per_step=profile.bytes_per_step,
         bytes_verify=bverify,
@@ -583,6 +652,10 @@ def predict_roofline(
         mtp_profitable=profitable,
         margin_tok_per_cycle=margin,
         explanation=expl,
+        ceiling_effective_tok_s=ceiling_effective,
+        bytes_per_token_base=bytes_per_token_base,
+        measured_mtp_slowdown=measured_mtp_slowdown,
+        measured_mtp_pays=measured_pays,
     )
 
 
@@ -771,18 +844,52 @@ def derive_verify_mult(
     b_mtp = _decode_bytes(newest_mtp.get("read_stats"))
     if not b_base or not b_mtp:
         return None
-    mult = b_mtp / b_base
+    # Per-STEP byte ratio: how many times the base step's bytes one MTP
+    # verify step reads. Base steps emit 1 token each (tokens == steps);
+    # MTP verify steps = the chain's cycle count (emits accept-rate extra).
+    # A per-TOKEN ratio (bytes/token ratio) is misleading for the verdict:
+    # the step must still WAIT for the whole (larger) read before compute.
+    try:
+        tok_base = int(newest_base.get("decode_tokens") or 0)
+    except (TypeError, ValueError):
+        tok_base = 0
+    acc = newest_mtp.get("mtp_accept_stats") or {}
+    try:
+        cyc_mtp = int(acc.get("cycles") or 0)
+    except (TypeError, ValueError):
+        cyc_mtp = 0
+    if tok_base > 0 and cyc_mtp > 0:
+        step_base = b_base / tok_base
+        step_mtp = b_mtp / cyc_mtp
+        mult = step_mtp / step_base
+    else:
+        # No chain cycle data (older runs): fall back to the per-token ratio.
+        mult = b_mtp / max(1, tok_base) / (b_base / max(1, tok_base))
     if not 0.5 <= mult <= 16.0:
         # Implausible ratio: unbalanced pair (different decode lengths) -
         # treat as unusable rather than poisoning the verdict.
         return None
-    return {
+    out = {
         "verify_byte_mult": round(mult, 3),
         "bytes_base": b_base,
         "bytes_mtp": b_mtp,
         "decode_tokens_base": newest_base.get("decode_tokens"),
         "decode_tokens_mtp": newest_mtp.get("decode_tokens"),
+        "verify_cycles_mtp": cyc_mtp or None,
+        # Wall-clock pair (authoritative ground truth when present): the
+        # byte model ignores per-step compute; the measured slowdown does
+        # not. The verdict surfaces both and flags disagreement.
+        "tok_s_base": newest_base.get("tok_s"),
+        "tok_s_mtp": newest_mtp.get("tok_s"),
     }
+    try:
+        if out["tok_s_base"] and out["tok_s_mtp"]:
+            out["measured_mtp_slowdown"] = round(
+                float(out["tok_s_base"]) / float(out["tok_s_mtp"]), 3
+            )
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return out
 
 
 def derive_tok_per_cycle(
@@ -802,12 +909,19 @@ def derive_tok_per_cycle(
             if not isinstance(acc, dict):
                 continue
             cycles = int(acc.get("cycles") or 0)
-            accepted = int(acc.get("accepted") or 0)
+            accepted = int(acc.get("accepts", acc.get("accepted")) or 0)
             if cycles <= 0 or accepted < 0:
                 continue
-            # tok/cycle = generated tokens per verify cycle. decode_tokens
-            # is the authoritative count; the accept rate is the fallback.
-            dtok = run.get("decode_tokens")
+            # tok/cycle = generated tokens per verify cycle. emits is the
+            # chain aggregate's authoritative token count; decode_tokens
+            # and the accept rate are fallbacks (adapter counters only
+            # see partial-accept cycles).
+            emitted = acc.get("emits")
+            try:
+                emitted = int(emitted) if emitted else None
+            except (TypeError, ValueError):
+                emitted = None
+            dtok = emitted or run.get("decode_tokens")
             try:
                 dtok = int(dtok)
             except (TypeError, ValueError):
@@ -820,7 +934,7 @@ def derive_tok_per_cycle(
                 "cycles": cycles,
                 "accepted": accepted,
                 "drafted": int(acc.get("drafted") or 0),
-                "fallbacks": int(acc.get("fallbacks") or 0),
+                "fallbacks": int(acc.get("reject_cycles", acc.get("fallbacks")) or 0),
                 "decode_tokens": dtok,
             }
     return None
@@ -881,6 +995,8 @@ def update_auto_params(
         "tok_per_cycle": (tpc or {}).get("tok_per_cycle"),
         "verify_byte_mult": (vm or {}).get("verify_byte_mult"),
         "bytes_per_token_base": (bpt or {}).get("bytes_per_token"),
+        # Wall-clock ground truth (roofline F2): measured tok_s pair.
+        "measured_mtp_slowdown": (vm or {}).get("measured_mtp_slowdown"),
         "source": {
             "verify_mult": vm,
             "tok_per_cycle": tpc,

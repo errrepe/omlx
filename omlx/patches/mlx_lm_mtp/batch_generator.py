@@ -2822,6 +2822,63 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
 
+# ---------------------------------------------------------------------------
+# Module-level MTP aggregate (roofline derivation support).
+#
+# _log_mtp_stats fires once per finished sequence with EXACT cycle/accept
+# numbers (the adapter clamp hook only fires on partial accepts). The
+# bench resets this before a run and snapshots it after, giving the
+# storage-roofline derivator authoritative tok/cycle inputs.
+# ---------------------------------------------------------------------------
+
+
+class _MtpAggregate:
+    """Sum of per-request MTP stats across a bench arm."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.cycles = 0
+        self.emits = 0
+        self.accepts = 0
+        self.drafted = 0
+        self.reject_cycles = 0
+        self.zero_cycles = 0
+
+    def aggregate(self, stats: "_MtpStats", total_emits: int, total_drafted: int) -> None:
+        self.requests += 1
+        self.cycles += stats.cycles
+        self.emits += total_emits
+        self.accepts += stats.accepts
+        self.drafted += total_drafted
+        self.reject_cycles += stats.rejects
+        self.zero_cycles += stats.zero_cycles
+
+    def snapshot(self) -> dict:
+        return {
+            "requests": self.requests,
+            "cycles": self.cycles,
+            "emits": self.emits,
+            "accepts": self.accepts,
+            "drafted": self.drafted,
+            "reject_cycles": self.reject_cycles,
+            "zero_cycles": self.zero_cycles,
+        }
+
+
+_MTP_AGG = _MtpAggregate()
+
+
+def mtp_stats_reset() -> None:
+    """Zero the module-level aggregate (bench arm start)."""
+    global _MTP_AGG
+    _MTP_AGG = _MtpAggregate()
+
+
+def mtp_stats_snapshot() -> dict:
+    """Copy of the module-level aggregate (bench arm end)."""
+    return _MTP_AGG.snapshot()
+
+
 def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
     """Emit a one-line summary of MTP draft/verify activity for a finished sequence.
 
@@ -2830,11 +2887,17 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
       MTP[<uid>] finish=<reason> tokens=<N> cycles=<C> accept=<A>/<C> (<rate>%)
         emits[init=<i>,draft=<d>,bonus=<b>,verify=<v>]
         timing[backbone=<X>ms mtp=<Y>ms sample=<S>ms cache=<C>ms]
+
+    Also feeds the module-level ``mtp_stats_snapshot()`` aggregator so
+    callers (bench / storage-roofline derivation) get EXACT per-cycle
+    numbers — the adapter-side clamp hook only fires on partial accepts
+    and undercounts full-accept cycles.
     """
     total_emits = (
         stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
     )
     total_drafted = sum(stats.depth_drafted) or stats.cycles
+    _MTP_AGG.aggregate(stats, total_emits, total_drafted)
     if total_drafted > 0:
         rate_str = f"{stats.accepts / total_drafted * 100:.1f}%"
     else:
