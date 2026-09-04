@@ -254,6 +254,33 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                     if nk is not None and nk not in quant:
                         quant[nk] = val
                     break
+        # mlx-lm DeepSeek V4 bookends: the checkpoint keys the 8-bit
+        # affine spec by the bare names ``embed``/``head``, but the runtime
+        # tree holds them at ``model.embed_tokens`` / ``lm_head``. Without
+        # the runtime variant the predicate falls back to the global bits
+        # and builds the bookends at the wrong width.
+        for _bare, _runtime in (
+            ("embed", "model.embed_tokens"),
+            ("head", "lm_head"),
+        ):
+            _spec = quant.get(_bare)
+            if isinstance(_spec, dict) and _runtime not in quant:
+                quant[_runtime] = _spec
+        # mlx-lm bare trunk-layer keys (`layers.N.*`): sanitize nests
+        # them under `model.layers.N.*` at runtime. Without the variant
+        # the lookup misses and mixed-bits checkpoints (e.g. 8-bit
+        # attention over a 2-bit global) build at the wrong width.
+        for key, val in list(quant.items()):
+            if not isinstance(val, dict):
+                continue
+            if not key.startswith("layers."):
+                continue
+            _rest = key[len("layers."):]
+            if not _rest[:1].isdigit():
+                continue
+            _variant = "model." + key
+            if _variant not in quant:
+                quant[_variant] = val
         # Second pass: fused experts.* entries (originals and the prefix
         # variants just added) each need switch_mlp split-half variants.
         # Runs after the merge so every spelling is covered; the added
@@ -344,6 +371,72 @@ def normalize_hy_v3_rope_config(cfg: dict) -> dict:
             "rope_theta": cfg["rope_theta"],
             "rope_type": "default",
         }
+    return cfg
+
+
+def normalize_dsv4_mixed_moe_quant(cfg: dict) -> dict:
+    """Synthesize per-projection MoE specs from a JANGQ bit plan.
+
+    JANGQ DeepSeek-V4 checkpoints mix precision inside the routed banks:
+    ``routed_projection_group_sizes`` sets per-projection group sizes
+    (w2/down is gs32 while w1/w3 are gs64) and
+    ``routed_projection_layer_bits`` overrides bits per layer (w1 is 3-bit
+    on a few layers). sanitize stacks ``experts.{i}.w*`` into
+    ``model.layers.N.ffn.switch_mlp.{gate,down,up}_proj``, but no
+    per-module spec exists for those runtime paths, so the predicate
+    falls back to the global bits and the strict load fails. Emit the
+    runtime-path specs here so each projection builds at its true width.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if not str(cfg.get("model_type", "")).startswith("deepseek_v4"):
+        return cfg
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict):
+        return cfg
+    plan = quant.get("routed_expert_bit_plan")
+    if not isinstance(plan, dict):
+        return cfg
+    group_sizes = plan.get("routed_projection_group_sizes") or {}
+    layer_bits = plan.get("routed_projection_layer_bits") or {}
+    layer_groups = plan.get("routed_projection_layer_group_sizes") or {}
+    try:
+        n_layers = int(cfg.get("num_hidden_layers", 0) or 0)
+    except (TypeError, ValueError):
+        return cfg
+    if n_layers <= 0:
+        return cfg
+    default_bits = int(plan.get("default_bits", quant.get("bits", 2)) or 2)
+    mode = plan.get("codec", quant.get("mode", "affine")) or "affine"
+    for proj, dst in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+        gs = int(group_sizes.get(proj, quant.get("group_size", 64)) or 64)
+        per_layer_bits = layer_bits.get(proj) or {}
+        per_layer_gs = layer_groups.get(proj) or {}
+        for n in range(n_layers):
+            try:
+                bits = int(per_layer_bits.get(str(n), per_layer_bits.get(n, default_bits)))
+            except (TypeError, ValueError):
+                bits = default_bits
+            try:
+                lgs = int(per_layer_gs.get(str(n), per_layer_gs.get(n, gs)))
+            except (TypeError, ValueError):
+                lgs = gs
+            key = f"model.layers.{n}.ffn.switch_mlp.{dst}"
+            if key not in quant:
+                quant[key] = {"group_size": lgs, "bits": bits, "mode": mode}
+    # Shared experts carry their own bare specs (`layers.N.ffn.
+    # shared_experts.w*`); sanitize renames w1/w2/w3 to
+    # gate/down/up_proj under `model.layers.N`, so copy the spec to the
+    # runtime path (same bare-vs-runtime miss as the bookends).
+    for n in range(n_layers):
+        for proj, dst in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+            bare = f"layers.{n}.ffn.shared_experts.{proj}"
+            spec = quant.get(bare)
+            if not isinstance(spec, dict):
+                continue
+            runtime = f"model.layers.{n}.ffn.shared_experts.{dst}"
+            if runtime not in quant:
+                quant[runtime] = spec
     return cfg
 
 
@@ -450,6 +543,7 @@ def _patch_mlx_lm_load_config() -> None:
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
+        normalize_dsv4_mixed_moe_quant(cfg)
         return cfg
 
     _lu.load_config = _patched

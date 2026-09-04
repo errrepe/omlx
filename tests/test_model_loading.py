@@ -881,6 +881,84 @@ class TestExpandPerLayerQuantKeys:
             "quantization"
         ]
 
+    def test_dsv4_bit_plan_synthesizes_switch_mlp_specs(self):
+        """JANGQ DeepSeek-V4 mixes MoE precision per projection/layer.
+
+        w2/down is gs32 while w1/w3 are gs64, and w1 is 3-bit on a few
+        layers. sanitize stacks experts.{i}.w* into
+        model.layers.N.ffn.switch_mlp.{gate,down,up}_proj; without
+        runtime-path specs the predicate falls back to the global bits
+        and the strict load fails on shape mismatch.
+        """
+        cfg = {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 3,
+            "quantization": {
+                "bits": 2,
+                "group_size": 64,
+                "mode": "affine",
+                "routed_expert_bit_plan": {
+                    "default_bits": 2,
+                    "codec": "affine",
+                    "routed_projection_group_sizes": {
+                        "w1": 64,
+                        "w2": 32,
+                        "w3": 64,
+                    },
+                    "routed_projection_layer_bits": {"w1": {"2": 3}},
+                },
+            },
+        }
+
+        model_loading.normalize_dsv4_mixed_moe_quant(cfg)
+
+        quant = cfg["quantization"]
+        assert quant["model.layers.0.ffn.switch_mlp.down_proj"] == {
+            "group_size": 32,
+            "bits": 2,
+            "mode": "affine",
+        }
+        assert quant["model.layers.0.ffn.switch_mlp.gate_proj"] == {
+            "group_size": 64,
+            "bits": 2,
+            "mode": "affine",
+        }
+        # Layer 2 w1 is 3-bit per the plan.
+        assert quant["model.layers.2.ffn.switch_mlp.gate_proj"]["bits"] == 3
+        assert quant["model.layers.1.ffn.switch_mlp.up_proj"] == {
+            "group_size": 64,
+            "bits": 2,
+            "mode": "affine",
+        }
+
+    def test_dsv4_shared_expert_specs_follow_runtime_names(self):
+        """Shared-expert bare specs copy to the sanitized proj names."""
+        spec = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 1,
+            "quantization": {
+                "bits": 2,
+                "group_size": 64,
+                "routed_expert_bit_plan": {"default_bits": 2},
+                "layers.0.ffn.shared_experts.w1": dict(spec),
+                "layers.0.ffn.shared_experts.w2": dict(spec),
+            },
+        }
+
+        model_loading.normalize_dsv4_mixed_moe_quant(cfg)
+
+        quant = cfg["quantization"]
+        assert quant["model.layers.0.ffn.shared_experts.gate_proj"] == spec
+        assert quant["model.layers.0.ffn.shared_experts.down_proj"] == spec
+
+    def test_dsv4_normalizer_ignores_other_model_types(self):
+        cfg = {"model_type": "qwen3", "quantization": {"bits": 2}}
+
+        model_loading.normalize_dsv4_mixed_moe_quant(cfg)
+
+        assert cfg["quantization"] == {"bits": 2}
+
     def test_leaves_runtime_keys_without_variant(self):
         key = "language_model.model.layers.0.q_proj"
         spec = {"bits": 4, "group_size": 64, "mode": "affine"}
