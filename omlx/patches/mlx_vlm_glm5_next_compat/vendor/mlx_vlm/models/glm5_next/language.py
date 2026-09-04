@@ -1014,7 +1014,17 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # Lightning MTP (JANG-MTP layout): when the model carries an
+        # attached draft head (``self.mtp``, set by the glm5_next_model
+        # patch when num_nextn_predict_layers>0 and MTP is active) the
+        # checkpoint's extra decoder layer survives as ``mtp.<i>.*``;
+        # every key still flows through the stock per-layer transforms
+        # below. Head-less loads (mtp_enabled=False, or checkpoints
+        # without draft weights) keep dropping the keys so the strict
+        # load never sees unused parameters.
+        has_mtp = bool(getattr(self, "mtp", None))
+        if not has_mtp:
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
         weights = DSV32Model.sanitize(self, weights)
 
         remapped = {}

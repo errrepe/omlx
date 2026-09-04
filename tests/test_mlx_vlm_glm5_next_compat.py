@@ -492,6 +492,74 @@ def test_sanitize_and_oq_keep_sensitive_parameters_in_fp32():
     ) == {"bits": 8, "group_size": 64, "mode": "affine"}
 
 
+def test_sanitize_keeps_and_remaps_draft_layer_when_mtp_head_attached():
+    """JANG-MTP draft layer (45) survives sanitize as mtp.0.* when attached.
+
+    With the head attached (glm5_next_model patch, num_nextn_predict_layers>0
+    and MTP active) the extra decoder layer's weights must remap to
+    ``mtp.0.block.*`` (+ the eh_proj/enorm/hnorm/shared_head.norm specials)
+    and flow through the stock per-layer transforms. Head-less loads keep
+    dropping them so the strict load never binds unused parameters.
+    """
+    from mlx_vlm.models import glm5_next
+
+    config = _tiny_config(with_vision=False)
+    text = config.text_config
+    text.num_nextn_predict_layers = 1
+    text.layer_types = [
+        "linear_attention",
+        "deepseek_sparse_attention",
+        "deepseek_sparse_attention",
+    ]
+    text.mlp_layer_types = ["dense", "dense", "sparse"]
+    text.first_k_dense_replace = 0
+    text.n_routed_experts = 4
+    text.n_shared_experts = 1
+
+    model = glm5_next.Model(config)
+    model.language_model.mtp = [object()]  # simulate the attached head
+
+    weights = {
+        "model.layers.0.input_layernorm.weight": mx.ones((32,)),
+        "model.layers.2.self_attn.q_a_proj.weight": mx.ones((8, 32)),
+        "model.layers.2.mlp.e_score_correction_bias": mx.ones((4,)),
+        "model.layers.2.mlp.gate.weight": mx.ones((4, 32)),
+        "model.layers.2.mlp.switch_mlp.gate_proj.weight": mx.ones((4, 16, 32)),
+        "model.layers.2.eh_proj.weight": mx.ones((32, 64)),
+        "model.layers.2.enorm.weight": mx.ones((32,)),
+        "model.layers.2.hnorm.weight": mx.ones((32,)),
+        "model.layers.2.shared_head.norm.weight": mx.ones((32,)),
+        "model.layers.2.shared_head.head.weight": mx.ones((128, 32)),
+    }
+    out = model.sanitize(weights)
+
+    expected = {
+        "language_model.mtp.0.block.self_attn.q_a_proj.weight",
+        "language_model.mtp.0.block.mlp.gate.e_score_correction_bias",
+        "language_model.mtp.0.block.mlp.gate.weight",
+        "language_model.mtp.0.block.mlp.switch_mlp.gate_proj.weight",
+        "language_model.mtp.0.eh_proj.weight",
+        "language_model.mtp.0.enorm.weight",
+        "language_model.mtp.0.hnorm.weight",
+        "language_model.mtp.0.norm.weight",
+    }
+    mtp_keys = {k for k in out if k.startswith("language_model.mtp.")}
+    assert mtp_keys == expected
+    # Router bias stays fp32 (sensitive parameter, same rule as the trunk).
+    assert (
+        out["language_model.mtp.0.block.mlp.gate.e_score_correction_bias"].dtype
+        == mx.float32
+    )
+    # lm_head duplicate of the shared head is dropped.
+    assert not any("shared_head" in k for k in out)
+
+    # Head-less: the draft layer is dropped entirely.
+    headless = glm5_next.Model(_tiny_config(with_vision=False))
+    headless.language_model.args.num_nextn_predict_layers = 1
+    out2 = headless.sanitize(weights)
+    assert not any("mtp" in k for k in out2)
+
+
 def test_vector_gate_kernel_matches_reference_with_padding_mask():
     from mlx_vlm.models.glm5_next.gated_delta import gated_delta_update
 
