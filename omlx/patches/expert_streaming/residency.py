@@ -245,6 +245,12 @@ def _detect_expert_keys(
         is_expert = False
         if ".mlp.experts." in key:
             is_expert = True
+        elif ".experts." in key and "shared_experts" not in key:
+            # Per-expert JANGQ layout (layers.N.ffn.experts.{i}.w{1,2,3}.*)
+            # or fused experts.gate_up_proj/down_proj: routed banks without
+            # a stacked switch_mlp key. Shared experts are dense-resident,
+            # never streamed, so they stay out of the byte accounting.
+            is_expert = True
         elif "switch_mlp" in key and ("gate_proj" in key or "up_proj" in key or "down_proj" in key or "gate_up_proj" in key):
             # check shape[0] == n_routed if we have headers
             # weight_map may point to sharded files, need headers per file

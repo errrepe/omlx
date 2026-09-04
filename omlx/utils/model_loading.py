@@ -538,6 +538,14 @@ def _patch_mlx_lm_load_config() -> None:
 
     def _patched(model_path, *args, **kwargs):
         cfg = _original(model_path, *args, **kwargs)
+        # Spill-stacking context for per-expert DeepSeek-V4 checkpoints:
+        # sanitize needs the checkpoint dir to locate/reuse spill shards.
+        try:
+            from ..patches.deepseek_v4.spill import set_spill_model_path
+
+            set_spill_model_path(str(model_path))
+        except Exception:
+            pass
         normalize_hy_v3_rope_config(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)

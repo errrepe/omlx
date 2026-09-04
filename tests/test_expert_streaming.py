@@ -1310,6 +1310,33 @@ def test_estimate_scan_is_cached(caplog):
         )
 
 
+def test_detect_per_expert_jangq_layout():
+    """Per-expert JANGQ banks count as routed experts.
+
+    layers.N.ffn.experts.{i}.w{1,2,3}.* carry no stacked switch_mlp
+    key; without this branch the estimate reports 'no expert tensors
+    found', lazy load never arms, and the eager eval OOMs (dsv4-jang).
+    Shared experts are dense-resident and must stay out.
+    """
+    from omlx.patches.expert_streaming.residency import _detect_expert_keys
+
+    wm = {}
+    for e in range(4):
+        for src in ("w1", "w2", "w3"):
+            for suf in ("weight", "scales", "biases"):
+                wm[f"layers.0.ffn.experts.{e}.{src}.{suf}"] = "m.safetensors"
+    for src in ("w1", "w2", "w3"):
+        wm[f"layers.0.ffn.shared_experts.{src}.weight"] = "m.safetensors"
+    cfg = {"model_type": "deepseek_v4", "num_hidden_layers": 1, "n_routed_experts": 4}
+
+    keys, n_layers, n_routed = _detect_expert_keys(wm, {}, cfg)
+
+    assert n_layers == 1
+    assert n_routed == 4
+    assert len(keys) == 4 * 3 * 3
+    assert not any("shared_experts" in k for k in keys)
+
+
 def test_engine_pool_budget_zero_streaming_bytes():
     from omlx.patches.expert_streaming.residency import expert_streaming_estimate
 

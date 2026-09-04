@@ -826,6 +826,28 @@ def convert_model_to_streaming(
                         why,
                     )
             backing = ExpertBackingStore(model_path, extra_roots=extra_roots, cold_root=cold_root)
+            # dsv4 spill-stacking: per-expert JANGQ checkpoints serve
+            # their stacked banks from spill shards outside the model
+            # dir. Absorb the manifest mapping so the stacked keys
+            # resolve without header scans.
+            try:
+                from ..deepseek_v4 import spill as _dsv4_spill
+
+                _spill_dir = _dsv4_spill.spill_is_valid(model_path)
+                if _spill_dir is not None:
+                    _spill_manifest = _dsv4_spill.read_manifest(_spill_dir) or {}
+                    _absorbed = backing.absorb_extra_map(
+                        _spill_dir,
+                        _dsv4_spill.spill_key_to_file(_spill_manifest),
+                    )
+                    if _absorbed:
+                        logger.info(
+                            "Expert streaming: %d spilled banks absorbed from %s",
+                            _absorbed,
+                            _spill_dir,
+                        )
+            except Exception:
+                logger.debug("Expert streaming: spill absorb skipped", exc_info=True)
             # HOBBIT per-expert hot/cold split (Fase I6): with a cold tier
             # active, the top fraction of experts per layer (by learned
             # pin-profile frequency) keeps the ORIGINAL packing while the

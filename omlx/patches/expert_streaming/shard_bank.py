@@ -1074,6 +1074,24 @@ class ExpertBackingStore:
     def _roots(self) -> list[Path]:
         return [self.model_path, *self._extra_roots]
 
+    def absorb_extra_map(self, root: str | Path, mapping: dict[str, str]) -> int:
+        """Serve spill/derived shards under *root* for *mapping* keys.
+
+        Registers *root* for file resolution (extra roots win) and maps
+each key to its shard filename, so stacked banks spilled outside the
+        checkpoint dir (dsv4 spill-stacking) resolve without header
+        scans. Returns the number of keys absorbed. Idempotent.
+        """
+        rp = Path(root).expanduser().resolve()
+        if rp not in self._extra_roots:
+            self._extra_roots.append(rp)
+        n = 0
+        for key, fname in mapping.items():
+            if self._weight_map.get(key) != fname:
+                self._weight_map[key] = fname
+                n += 1
+        return n
+
     def _resolve_file(self, fname: str) -> Path | None:
         """Resolve a shard filename across roots (extra roots win: mirrored
         shards on the stripe SSD are the ones we want served from there)."""
