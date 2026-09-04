@@ -725,10 +725,20 @@ def build_report(
         report["prediction"] = asdict(prediction)
     if measured_base_tok_s:
         ceil = (prediction.ceiling_base_tok_s if prediction else 0.0) or 0.0
+        eff_ceil = (
+            (prediction.ceiling_effective_tok_s if prediction else None) or 0.0
+        )
         report["calibration"] = {
             "measured_base_tok_s": measured_base_tok_s,
             "predicted_ceiling_base_tok_s": ceil,
             "efficiency": (measured_base_tok_s / ceil) if ceil > 0 else 0.0,
+            # F2: the effective ceiling is the honest target - measured
+            # bytes/token already contains the locality/prefetch dividend,
+            # so this efficiency should land near 100% on a healthy setup.
+            "predicted_ceiling_effective_tok_s": eff_ceil or None,
+            "efficiency_effective": (
+                (measured_base_tok_s / eff_ceil) if eff_ceil > 0 else None
+            ),
         }
     return report
 

@@ -112,12 +112,19 @@ struct RooflinePredictionDTO: Codable, Equatable, Sendable {
     let mtpProfitable: Bool?
     let marginTokPerCycle: Double?
     let explanation: String?
+    // F2: measured-bytes/token ceiling + wall-clock verdict.
+    let ceilingEffectiveTokS: Double?
+    let bytesPerTokenBase: Double?
+    let measuredMtpSlowdown: Double?
+    let measuredMtpPays: Bool?
 }
 
 struct RooflineCalibrationDTO: Codable, Equatable, Sendable {
     let measuredBaseTokS: Double?
     let predictedCeilingBaseTokS: Double?
     let efficiency: Double?
+    let predictedCeilingEffectiveTokS: Double?
+    let efficiencyEffective: Double?
 }
 
 

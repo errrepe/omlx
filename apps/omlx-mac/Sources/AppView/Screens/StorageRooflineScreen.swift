@@ -405,12 +405,46 @@ private struct ReportSections: View {
                     Text(String(format: "%.2f tok/s", prediction.ceilingMtpTokS ?? 0))
                         .font(.omlxMono(12))
                 }
+                if let eff = prediction.ceilingEffectiveTokS, eff > 0 {
+                    Row(
+                        label: String(localized: "bench.storage.pred.ceiling_effective",
+                                      defaultValue: "Effective ceiling",
+                                      comment: "Row label for the measured-bytes/token ceiling"),
+                        sublabel: String(localized: "bench.storage.pred.ceiling_effective.sub",
+                                         defaultValue: "Measured bytes/token ÷ this volume's random-read bandwidth",
+                                         comment: "Sublabel: cold ceiling already nets out locality/prefetch"),
+                        isLast: false
+                    ) {
+                        Text(String(format: "%.2f tok/s", eff))
+                            .font(.omlxMono(12))
+                    }
+                }
+                if let slow = prediction.measuredMtpSlowdown, slow > 0 {
+                    Row(
+                        label: String(localized: "bench.storage.pred.measured_wallclock",
+                                      defaultValue: "Measured wall-clock",
+                                      comment: "Row label for the measured MTP slowdown"),
+                        sublabel: String(localized: "bench.storage.pred.measured_wallclock.sub",
+                                         defaultValue: "tok/s base ÷ tok/s MTP from this machine's bench pair — below 1× pays",
+                                         comment: "Sublabel for the measured slowdown row"),
+                        isLast: false
+                    ) {
+                        Text(String(format: "%.2f×", slow))
+                            .font(.omlxMono(12))
+                            .foregroundStyle((prediction.measuredMtpPays == true)
+                                             ? Color.green : Color.orange)
+                    }
+                }
                 Row(
                     label: String(localized: "bench.storage.pred.verdict",
                                   defaultValue: "MTP verdict"),
                     isLast: report.calibration == nil
                 ) {
-                    Text(prediction.mtpProfitable == true
+                    // Wall-clock measurement wins over the byte model when
+                    // a real bench pair exists (the byte model can miss
+                    // non-I/O costs like verify-batch compute).
+                    let effectivePays = prediction.measuredMtpPays ?? prediction.mtpProfitable
+                    Text(effectivePays == true
                          ? String(localized: "bench.storage.pred.profitable",
                                   defaultValue: "Pays — enable",
                                   comment: "Verdict when MTP is structurally profitable")
@@ -418,8 +452,7 @@ private struct ReportSections: View {
                                   defaultValue: "Loses structurally — keep OFF",
                                   comment: "Verdict when MTP is structurally unprofitable"))
                         .font(.omlxText(12, weight: .semibold))
-                        .foregroundStyle((prediction.mtpProfitable == true)
-                                         ? Color.green : Color.orange)
+                        .foregroundStyle(effectivePays == true ? Color.green : Color.orange)
                 }
             }
             HintLine(text: prediction.explanation ?? "")
@@ -453,10 +486,24 @@ private struct ReportSections: View {
                     label: String(localized: "bench.storage.calib.efficiency",
                                   defaultValue: "Ceiling efficiency"),
                     sublabel: calibrationSublabel(calibration),
-                    isLast: true
+                    isLast: calibration.efficiencyEffective == nil
                 ) {
                     Text(String(format: "%.0f%%", (calibration.efficiency ?? 0) * 100))
                         .font(.omlxMono(12))
+                }
+                if let effEff = calibration.efficiencyEffective, effEff > 0 {
+                    Row(
+                        label: String(localized: "bench.storage.calib.efficiency_effective",
+                                      defaultValue: "Effective-ceiling efficiency",
+                                      comment: "Row label: measured tok/s over the effective (measured bytes/token) ceiling"),
+                        sublabel: String(localized: "bench.storage.calib.efficiency_effective.sub",
+                                         defaultValue: "Should be near 100% — the effective ceiling already contains the locality/prefetch dividend",
+                                         comment: "Sublabel for the effective-ceiling efficiency row"),
+                        isLast: true
+                    ) {
+                        Text(String(format: "%.0f%%", effEff * 100))
+                            .font(.omlxMono(12))
+                    }
                 }
             }
         }
