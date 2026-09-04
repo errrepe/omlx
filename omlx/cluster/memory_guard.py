@@ -355,17 +355,30 @@ def current_usage_bytes() -> int:
     the kernel ledger catches up. Neither alone is the whole truth mid-load.
     """
 
+    # Fase M: discount external-wired (fullbank mmap artifacts) at the
+    # sample site -- they count in mx.get_active_memory() but not in the
+    # phys/working-set budget this guard compares against.
+    try:
+        from omlx.utils.proc_memory import (
+            discount_external_wired,
+            get_phys_footprint,
+        )
+    except Exception:  # pragma: no cover - non-Darwin or libproc unavailable
+        discount_external_wired = None
+        get_phys_footprint = None
+
     active = 0
     try:
         import mlx.core as mx
 
-        active = int(mx.get_active_memory())
+        if discount_external_wired is not None:
+            active = discount_external_wired(int(mx.get_active_memory()))
+        else:
+            active = int(mx.get_active_memory())
     except Exception:  # pragma: no cover - MLX absent or too old
         pass
     try:
-        from omlx.utils.proc_memory import get_phys_footprint
-
-        phys = max(0, get_phys_footprint())
+        phys = max(0, get_phys_footprint()) if get_phys_footprint else 0
     except Exception:  # pragma: no cover - non-Darwin or libproc unavailable
         phys = 0
     return max(active, phys)

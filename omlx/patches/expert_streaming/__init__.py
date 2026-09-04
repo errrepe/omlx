@@ -17,6 +17,7 @@ _APPLIED = False
 # estimate checked the checkpoint, so a mismatch forced streaming without the
 # lazy load and materialized the full MoE banks). Both names stay importable
 # from the package root; there is exactly one definition.
+from .fullbank import fullbank_enabled
 from .residency import SUPPORTED_TYPES, normalize_model_type
 
 
@@ -927,6 +928,12 @@ def convert_model_to_streaming(
                 "boundary_active": False,
                 "projections": 3,
                 "activation_bytes_per_token": 2 * _hidden_size,
+                # Fase M: fullbank (zero-copy wrapped bank) removes the
+                # mini-bank Metal transient entirely on prefill — the scheduler
+                # guard consults backing.fullbank() and zeroes the bank charge
+                # when it is active. Populated lazily (the attach is itself
+                # lazy), so the value here is just the capability hint.
+                "fullbank_capable": bool(fullbank_enabled()),
             }
             backing_kind = "mmap"
         except Exception as e:

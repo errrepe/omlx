@@ -110,6 +110,11 @@ omlx/_engine_commits.json
 # Generated build info (build-time artifact)
 omlx/_build_info.py
 
+# Fullbank repack artifacts (Fase M2): multi-GB, reproducible from the
+# checkpoint via tools/repack_fullbank.py -- never committed.
+bench/fullbank_artifacts/
+*.artifact
+
 # Tailwind CSS standalone CLI binary (download on demand via build_css.py)
 omlx/admin/tailwindcss-*
 

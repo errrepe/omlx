@@ -79,7 +79,7 @@ from .utils.metal_sync import (
     _sync_and_clear_cache,
     should_clear_cache,
 )
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import discount_external_wired, get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.tokenizer import create_streaming_detokenizer
 
@@ -1916,6 +1916,11 @@ class Scheduler:
         # Last mx.get_active_memory() sample taken on this scheduler's MLX
         # executor thread. The background memory enforcer reads this cached
         # value during active decode instead of touching MLX/Metal directly.
+        # NOTE (Fase M): this value is EXTERNAL-WIRED-DISCOUNTED at the sample
+        # site (see _current_usage_bytes) -- it excludes mmap'd externally-wired
+        # bytes (e.g. fullbank expert-streaming artifacts) that
+        # mx.get_active_memory() counts but phys_footprint does not. Consumers
+        # must NOT discount it again.
         self._last_mlx_active_memory_bytes: int = 0
         # Component ceilings — propagated alongside the hard limit so the
         # rejection-path error message can identify which constraint is
@@ -4024,6 +4029,18 @@ class Scheduler:
             info = self._resolve_streaming_guard_info()
         if not info:
             return 0
+        # Fase M (fullbank, adapted from jundot/omlx PR #3437): with the
+        # zero-copy wrapped full bank the mini-bank term vanishes — the bank
+        # is external mmap pages, never a Metal transient. Only the (small)
+        # activation charge remains when a boundary is active; without one,
+        # the activation still fits inside one layer's bank-equivalent, so we
+        # keep the boundary formula rather than the per-layer charge.
+        if info.get("fullbank_capable") and self._fullbank_active():
+            projections = max(1, int(info.get("projections") or 1))
+            activation = int(info.get("activation_bytes_per_token") or 0) * max(
+                0, n_tokens
+            )
+            return activation
         uniq = min(
             int(info["experts_per_layer"]),
             int(self._STREAMING_BANK_TOKEN_RATIO * max(0, n_tokens)),
@@ -4045,6 +4062,31 @@ class Scheduler:
             )
             return min(2, projections) * tile_bytes + activation
         return int(info["num_moe_layers"]) * tile_bytes
+
+    def _fullbank_active(self) -> bool:
+        """True when the model's streaming backing has a live fullbank (Fase M).
+
+        Resolves the backing the same way the guard info does; the attach is
+        idempotent (backing.fullbank() caches), so calling this per chunk is
+        one attribute read after the first time.
+        """
+        cur: Any = getattr(self, "model", None)
+        seen = 0
+        while cur is not None and seen < 5:
+            backing = getattr(cur, "_expert_streaming_backing", None)
+            if backing is not None and hasattr(backing, "fullbank"):
+                try:
+                    return backing.fullbank() is not None
+                except Exception:
+                    return False
+            cur = (
+                getattr(cur, "language_model", None)
+                or getattr(cur, "model", None)
+                or getattr(cur, "_vlm_model", None)
+                or getattr(cur, "_language_model", None)
+            )
+            seen += 1
+        return False
 
     def _resolve_streaming_guard_info(self) -> dict:
         """Find the streaming backing's guard metadata on the model tree.
@@ -4740,7 +4782,13 @@ class Scheduler:
         """
         active = self._last_mlx_active_memory_bytes
         if refresh_mlx_active:
-            active = max(0, int(mx.get_active_memory()))
+            # Fase M (contract adapted from jundot/omlx PR #3437): discount
+            # external-wired bytes (mmap'd fullbank artifacts) AT THE SAMPLE
+            # SITE -- mx.get_active_memory() counts them but phys_footprint /
+            # the real budget do not. The cache below thus stores a
+            # PRE-DISCOUNTED value; consumers of _last_mlx_active_memory_bytes
+            # must NOT discount again.
+            active = discount_external_wired(max(0, int(mx.get_active_memory())))
             self._last_mlx_active_memory_bytes = active
         if self._streaming_guard_info is None:
             # Lazy-resolve so even the first guard/throttle call (before any
@@ -4967,7 +5015,11 @@ class Scheduler:
         if self._streaming_guard_info is None:
             self._resolve_streaming_guard_info()
         if self._streaming_guard_info:
-            return max(0, int(mx.get_active_memory()))
+            # Fase M: pread-banked transients live in the Metal allocator, but
+            # fullbank wrapped banks are external mmap pages -- discount them
+            # here (sample site) so the high-water reflects what a chunk really
+            # commits in Metal, not the whole mapped artifact.
+            return discount_external_wired(max(0, int(mx.get_active_memory())))
         return get_phys_footprint()
 
     def _record_chunk_transient(

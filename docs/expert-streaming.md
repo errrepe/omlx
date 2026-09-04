@@ -1527,6 +1527,49 @@ Code-only line (no bench runs; the machine never freed up):
 - **Follow-up (needs real multi-GB checkpoints)**: Etapa L bit-exact validation gate on real weights for the four widened types; autotune knee measurement on a free machine.
 
 
+## Fase M2 — full-bank external wrap (ported from jundot/omlx#3437)
+
+Ported with credit from [jundot/omlx PR #3437](https://github.com/jundot/omlx/pull/3437) ("feat(qwen4-exp): stream MoE routed-expert weights off the wired/phys budget", by @alytaphoenix, Apache-2.0) — the idea of binding expert banks as page-aligned, mmap-backed MLX arrays over a repacked side-car artifact via `newBufferWithBytesNoCopy`, feeding the **stock** `gather_qmm` unchanged. That design deletes, by construction, the assembly/promote/remap pipeline our own profile measured at ~94% of streaming wall time (`docs/spike-slot-bank.md`: load 43% + stack 28% + gate_eval 22%). It also keeps expert bytes out of the MLX Metal allocator, breaking the post-machine re-sweep spiral measured in Fase F.
+
+### What we ported
+
+- `omlx/custom_kernels/expert_bank_wrap/` — native `_ext` (mmap + page-aligned `mx.array` wrap over `make_buffer`, **refcounted deferred `munmap`**, `NB_DOMAIN mlx` ABI canary).
+- `tools/repack_fullbank.py` — the artifact producer/format authority (adapted from their `repack.py`).
+- The **external-wired accounting contract** in `omlx/utils/proc_memory.py` (name-keyed provider registry, discount-once-at-the-sample-site), applied at the budget/guard sample sites in scheduler/engine_pool/enforcer/memory_guard/oq/dflash.
+
+### What we deliberately changed (and why)
+
+| Aspect | PR #3437 | This port |
+|---|---|---|
+| Staleness | not handled (shape/dtype match; canary is self-referential) | **content fingerprint** (config sha + shard sizes/mtimes) + **independent canary** reading the ORIGINAL shard via `pread` — corruption/staleness cannot serve wrong bytes silently |
+| Default | ON when artifact present (silent behavior change) | **opt-in** env `OMLX_EXPERT_STREAMING_FULLBANK=1`; default OFF (slot-bank discipline) |
+| Coverage | `qwen4_exp` only | generic over all `SUPPORTED_TYPES` (any `.switch_mlp.` keys incl. MTP stages) |
+| Regime | everything (decode too) | **prefill-shaped calls only** (`positions > _DECODE_UNION_MAX_ROWS`); decode keeps the pread QD16 demand path — sparse decode favors pread (10.6 GB/s) over page faults (0.35 GB/s) |
+| Tiers | n/a | refused while a HOBBIT/cold-tier split is active (packing ≠ source would change outputs) |
+| Partial coverage | `expect_all` hard-fail at load | per-linear: a linear missing coverage stays on demand; mixed across linears is logged, never fatal |
+| Canary failure | load dies | fullbank disabled for the model + warning; requests continue on the demand path |
+| Tests | require the real 46.87 GB artifact | fake checkpoint built in `tmp_path` (`tests/test_expert_fullbank.py`), incl. bit-exact fullbank vs demand-path `gather_qmm` |
+
+### Accounting contract (load-bearing)
+
+External-wired bytes (mmap'd artifacts wrapped via `bytesNoCopy`) ARE counted by `mx.get_active_memory()` but NOT by `phys_footprint`. Consumers comparing an active sample against a phys/ceiling budget over-report unless they discount. The contract (as in the PR, adapted): **discount once, at the sample site, wrapping only the `mx.get_active_memory()` term** — never `phys_footprint`, which already excludes external bytes. Caches (e.g. the scheduler's `_last_mlx_active_memory_bytes`) store the PRE-DISCOUNTED value; consumers must not discount again. `tests/test_expert_fullbank.py` asserts the no-double-discount property.
+
+### Artifact format
+
+`<model>/fullbank_experts.artifact`: `[8B LE manifest_len][manifest JSON, zero-pad to PAGE][tensor data, each zero-pad to PAGE]` with manifest `{"page_size", "fingerprint", "tensors": {key: {offset,length,dtype,shape,bits,group_size,mode}}}`. Page size defaults to 16384 (M-series 16 KiB); distinct filename from the PR's `moe_experts_streaming.artifact`, so the two mechanisms cannot collide on disk. If the PR merges upstream, a mutual-exclusion rule (fullbank takes precedence; qwen4_moe_stream must not engage for the same model) is required — noted here as the contract.
+
+### Bench — measured null (2026-09-04, JANG 4S, 2k prompt, single request, budget 0)
+
+| arm | TTFT | decode tok/s | notes |
+|---|---|---|---|
+| demand (baseline) | **34.9 s** | 3.855 | prefill chunked 1897→1280 by the guard once, pread QD16 |
+| fullbank | 420.8 s (**~12x worse**) | 1.366 (-65%) | canary passed, engagement confirmed (prefill guard boundary accounting on; no chunk throttle — the zeroed mini-bank charge let the whole 1897-token prompt run in one chunk) |
+
+**Gate FAILED decisively; the feature stays default-off.** Post-mortem: the wrapped bank serves every prefill qmm from mmap'd file pages — at 46.53 GiB over 48 layers, the GPU page-faults those pages in at the mapped-file rate (~0.35 GB/s class, the sparse-fault regime we measured in the roofline work), not the dense pread rate (2.3–10.6 GB/s). The demand path's assembly cost (~94% of wall at peak) is still cheaper than faulting the whole bank through the VM. The decode regression (-65%) is second-order: the 46 GB of artifact pages evicted the checkpoint's hot page-cache between prefill and decode (cache misses 190,792 → 24,480 — the LRU was skipped by design — but the working-set shuffle hurt decode more than the LRU skip helped).
+
+What survives from this port regardless of the null: the external-wired accounting contract (proc_memory registry + discount sites — load-bearing the day any external wrap engages, and already used by the PLE SSD offload surface), the refcounted deferred-munmap native wrapper pattern, the content-fingerprint + independent-canary discipline (both now tested), and the artifact format with byte-verified repack (432/432 tensors). A future engagement regime worth testing before reopening: **pinned/mlocked artifact pages** (turn faults into RAM hits — the PR's own mlock-pinning idea) or a **hybrid tier** that keeps only the top-k hottest layers fullbank-wrapped and the rest on pread. Reopen only with one of those levers; the raw mmap regime is measured dead on this box.
+
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.

@@ -363,12 +363,23 @@ async def run(
     knobs: list[str] | None = None,
     mtp_depth: int | None = None,
     arm_telemetry: bool = False,
+    fullbank: bool = False,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
     from omlx.scheduler import SchedulerConfig
     from omlx.utils.proc_memory import get_phys_footprint
     import mlx.core as mx
+
+    # Fase M2 (fullbank arm, adapted from jundot/omlx PR #3437): the env flag
+    # must be set BEFORE the engine loads (the converter attaches the artifact
+    # at model-construction time). Knob declaration keeps A/B comparison
+    # honest (Fase M5 discipline).
+    if fullbank:
+        os.environ["OMLX_EXPERT_STREAMING_FULLBANK"] = "1"
+        knobs = list(knobs or []) + ["fullbank_enabled"]
+    else:
+        os.environ.pop("OMLX_EXPERT_STREAMING_FULLBANK", None)
 
     # Storage-roofline derivation support: arm demand-read telemetry in
     # runtime (no env-var restart needed) so read_stats carries decode-phase
@@ -1090,6 +1101,14 @@ def main():
         help="arm demand-read telemetry in runtime (storage-roofline "
              "derivation: decode-phase byte ratio + MTP accept stats)",
     )
+    ap.add_argument(
+        "--fullbank",
+        action="store_true",
+        help="engage the full-bank external wrap (Fase M2, ported from "
+             "jundot/omlx#3437): zero-copy mmap'd banks for prefill-shaped "
+             "calls; requires <model>/fullbank_experts.artifact "
+             "(tools/repack_fullbank.py)",
+    )
     args = ap.parse_args()
     try:
         import psutil
@@ -1131,6 +1150,7 @@ def main():
             pin_regime=args.pin_regime,
             knobs=args.knob,
             arm_telemetry=args.arm_read_telemetry,
+            fullbank=args.fullbank,
         )
     )
 

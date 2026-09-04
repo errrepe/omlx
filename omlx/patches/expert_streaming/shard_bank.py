@@ -1107,6 +1107,43 @@ class ExpertBackingStore:
             import weakref
             _ARM_REGISTRY = weakref.WeakSet()
         _ARM_REGISTRY.add(self)
+        # Fase M (fullbank, adapted from jundot/omlx PR #3437): optional
+        # page-aligned full-bank artifact for zero-copy prefill. Attached
+        # lazily on the first eligibility check; None = not eligible (env
+        # off / artifact missing / fingerprint stale), False = canary-failed
+        # (disabled for the model's lifetime).
+        self.fullbank_artifact: Any = None
+        self._fullbank_tried = False
+
+    def fullbank(self) -> Any:
+        """Return the active FullbankArtifact, or None (attach once, lazily).
+
+        The heavy checks (fingerprint, native ext) happen on first call per
+        backing; later calls are a single attribute read. Canary failure
+        poisons the slot to False (demand path for the whole model)."""
+        if self._fullbank_tried:
+            return self.fullbank_artifact or None
+        self._fullbank_tried = True
+        try:
+            from .fullbank import maybe_attach_fullbank
+
+            art = maybe_attach_fullbank(self)
+            self.fullbank_artifact = art
+        except Exception:
+            logger.warning("fullbank attach failed", exc_info=True)
+            self.fullbank_artifact = None
+        return self.fullbank_artifact
+
+    def disable_fullbank(self) -> None:
+        """Canary failed / artifact unusable: drop it and stay on demand."""
+        art = self.fullbank_artifact
+        self.fullbank_artifact = None
+        self._fullbank_tried = True
+        if art is not None:
+            try:
+                art.close()
+            except Exception:
+                pass
 
     def _roots(self) -> list[Path]:
         return [self.model_path, *self._extra_roots]
@@ -1844,3 +1881,13 @@ each key to its shard filename, so stacked banks spilled outside the
                     pass
             readers.clear()
         self._key_to_reader.clear()
+        # Fase M: release the fullbank mmap. The native refcounted deferred
+        # unmap keeps this safe even if a wrapped array outlives this point.
+        _fb = getattr(self, "fullbank_artifact", None)
+        if _fb is not None:
+            self.fullbank_artifact = None
+            self._fullbank_tried = True
+            try:
+                _fb.close()
+            except Exception:
+                pass
