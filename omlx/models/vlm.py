@@ -123,21 +123,28 @@ class VLMModelAdapter(nn.Module):
         The chain's ``_chain_rollback`` looks for this method on the host
         model when the forward produced no ``gdn_states``; the adapter is
         that host for mlx-vlm builds, so pass it through verbatim.
+        Models without the hook (qwen4_exp Lightning MTP) report False
+        so the caller falls back to the standard non-MTP step instead of
+        crashing the request — a missing rollback is recoverable, and the
+        chain already treats False as fallback.
         """
         fn = getattr(self._language_model, "mtp_partial_rollback", None)
         if not callable(fn):
-            raise AttributeError(
-                f"{type(self._language_model).__name__} has no mtp_partial_rollback"
-            )
+            return False
         return fn(caches, accepted, num_drafts)
 
     def mtp_clamp_accept(self, cache, accepted, num_drafts):
-        """Delegate the accept-count clamp (layers bound what rolls back)."""
+        """Delegate the accept-count clamp (layers bound what rolls back).
+
+        The hook is optional (batch_generator skips a missing clamp); when
+        the inner model has no bound to enforce (qwen4_exp rolls any prefix
+        back via ``rollback_speculative_cache``), return ``accepted``
+        unchanged rather than raising — raising here turned every partial
+        draft rejection into a hard request failure.
+        """
         fn = getattr(self._language_model, "mtp_clamp_accept", None)
         if not callable(fn):
-            raise AttributeError(
-                f"{type(self._language_model).__name__} has no mtp_clamp_accept"
-            )
+            return accepted
         return fn(cache, accepted, num_drafts)
 
     # Runtime family patches use this marker to avoid installing an older,
