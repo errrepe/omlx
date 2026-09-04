@@ -7135,6 +7135,26 @@ async def start_storage_benchmark(
                 detail=f"A {label} is already running.",
             )
 
+    # Active-inference guard (roofline F4): a measurement competing with
+    # live decode I/O is a corrupted measurement, not a slow one. Loaded
+    # but IDLE engines stay allowed — they generate no expert reads.
+    try:
+        active = _build_active_models_data()
+        busy = [
+            m.get("name") or m.get("id") or "?"
+            for m in active.get("models", [])
+            if m.get("total_active_requests", 0) > 0
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("active-model check unavailable: %s", exc)
+        busy = []
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail="Inference is active on: " + ", ".join(busy) + ". "
+            "Run the storage measurement with inference idle.",
+        )
+
     try:
         bench_request = StorageBenchRequest(**(await request.json()))
     except Exception as e:
@@ -7154,6 +7174,17 @@ async def start_storage_benchmark(
                 f"(type: {entry.model_type})",
             )
         target_dir = entry.model_path
+        # Spill awareness (roofline F3): when a fresh dsv4-style spill
+        # exists, decode demand-reads page from the SPILL volume, not the
+        # checkpoint volume — measure where decode actually reads.
+        try:
+            from omlx.patches.deepseek_v4.spill import spill_is_valid
+
+            spill_dir = spill_is_valid(entry.model_path)
+            if spill_dir is not None:
+                target_dir = str(spill_dir)
+        except Exception:
+            pass
     else:
         # Volume-only: measure where the checkpoints live. The pool root
         # is not exposed, so fall back to the server working directory.
@@ -7297,15 +7328,43 @@ async def get_storage_prediction(
         raise HTTPException(
             status_code=404, detail=f"Model not supported for roofline: {profile.reason}"
         )
+    # Volume-mismatch warning (roofline F3): when a fresh spill exists,
+    # decode reads page from the spill volume - if the latest measurement
+    # was taken on a DIFFERENT volume (st_dev), the ceiling describes the
+    # wrong disk. Warn, don't fail: re-measuring before/after a move is a
+    # legitimate workflow the caller may be mid-way through.
+    warnings: list[str] = []
+    read_volume = profile.data_source_dir or entry.model_path
+    try:
+        from omlx.utils.storage_roofline import volume_info_for
+
+        meas_st_dev = int(
+            (measurement_dict.get("volume_st_dev") or 0)
+            or volume_info_for(measurement.volume_mount or ".").st_dev
+        )
+        target_st_dev = volume_info_for(read_volume).st_dev
+        if meas_st_dev and target_st_dev and meas_st_dev != target_st_dev:
+            warnings.append(
+                "volume_mismatch: the latest measurement was taken on a "
+                "different volume than the model's expert reads page from "
+                f"({profile.data_source}: {read_volume}). Re-run the "
+                "storage benchmark for a matching ceiling."
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("volume-mismatch check failed: %s", exc)
     prediction = predict_roofline(
         profile, measurement,
         tok_per_cycle=tok_per_cycle, verify_byte_mult=verify_mult,
+        bytes_per_token_base=(auto or {}).get("bytes_per_token_base"),
+        measured_mtp_slowdown=(auto or {}).get("measured_mtp_slowdown"),
     )
     report = build_report(
         volume_info_for_measurement(measurement_dict),
         measurement, profile, prediction,
         measured_base_tok_s=measured_base_tok_s,
     )
+    if warnings:
+        report["warnings"] = warnings
     report["params_source"] = params_source
     report["params_auto"] = auto
     return report
