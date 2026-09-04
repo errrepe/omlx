@@ -117,6 +117,29 @@ class VLMModelAdapter(nn.Module):
             block_size,
         )
 
+    def mtp_partial_rollback(self, caches, accepted, num_drafts):
+        """Delegate to the language model's chain-rollback (glm5_next / qwen35).
+
+        The chain's ``_chain_rollback`` looks for this method on the host
+        model when the forward produced no ``gdn_states``; the adapter is
+        that host for mlx-vlm builds, so pass it through verbatim.
+        """
+        fn = getattr(self._language_model, "mtp_partial_rollback", None)
+        if not callable(fn):
+            raise AttributeError(
+                f"{type(self._language_model).__name__} has no mtp_partial_rollback"
+            )
+        return fn(caches, accepted, num_drafts)
+
+    def mtp_clamp_accept(self, cache, accepted, num_drafts):
+        """Delegate the accept-count clamp (layers bound what rolls back)."""
+        fn = getattr(self._language_model, "mtp_clamp_accept", None)
+        if not callable(fn):
+            raise AttributeError(
+                f"{type(self._language_model).__name__} has no mtp_clamp_accept"
+            )
+        return fn(cache, accepted, num_drafts)
+
     # Runtime family patches use this marker to avoid installing an older,
     # model-specific copy of the same adapter plumbing.
     _omlx_mtp_adapter_patched = True

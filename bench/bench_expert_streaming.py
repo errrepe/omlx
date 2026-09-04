@@ -377,7 +377,28 @@ async def run(
     if mtp:
         try:
             with open(os.path.join(model_path, "config.json")) as f:
-                _mtp_native = json.load(f).get("model_type") == "qwen4_exp"
+                # Native Lightning MTP serves qwen4_exp and glm5_next (the
+                # vendored mlx-vlm GLM-5.3 module gained its JANG draft
+                # head); every other bench type keeps the external-assistant
+                # VLM path. Read from config.json (cheap) so a new model
+                # folder picks the right path without bench edits.
+                _model_type = json.load(f).get("model_type")
+                if _model_type == "glm5_next":
+                    # glm5_next may nest it under text_config.
+                    with open(os.path.join(model_path, "config.json")) as f2:
+                        _cfg = json.load(f2)
+                    _mtp_native = (
+                        _cfg.get("model_type") == "glm5_next"
+                        and int(
+                            (_cfg.get("text_config") or {}).get(
+                                "num_nextn_predict_layers", 0
+                            )
+                            or 0
+                        )
+                        > 0
+                    )
+                else:
+                    _mtp_native = _model_type == "qwen4_exp"
         except Exception:
             _mtp_native = False
     # Fase M5: record the exact code revision of the run.
