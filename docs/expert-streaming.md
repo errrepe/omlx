@@ -147,6 +147,8 @@ All are load-time settings: toggling unloads (and re-loads if pinned) the model.
 
 ## UI
 
+**Tuning com evidência (autotune + knobs):** o `bench/autotune_expert_streaming.py` varre budget/QD/pilot/coalesce/readahead/seed/topk/prior/**cold_tier** (one-factor-at-a-time + head-to-head + validação 8k, watchdog de RAM/swap) e `--apply` persiste o vencedor no per-model profile — o mesmo store que a UI edita. O sweep de cold_tier só aparece quando `<model>/expert_cold/` existe (gate de disponibilidade), e `--sweep-topk/--sweep-prior/--hot-fractions` expõem os outros levers. **A política de qualidade é separada**: topk e cold tier mudam outputs; o gate é `bench/ppl_expert_streaming.py --streaming` (corpus fixo, mesma janela). Medido no JANG 4S: topk 0.85 = **+11.5% tok/s, +3.9% ppl** — opt-in recomendado, não default.
+
 - **WebUI**: card `Advanced → Expert Streaming (SSD)` → toggle + `Cache budget (GiB)` input + `Auto RAM-scaled cache` toggle + pins block (`Pin budget`, `Apply pins synchronously at load`, `Pin profile regime`). Visible only when `supported`; disabled amber hint when `forced`. Lives under the `Experimental Features` header, before the Qwen ANE block.
 - **macOS app**: `Model Settings → Advanced` → same toggle + conditional `Expert LRU budget` and `Auto RAM-scaled cache` rows, pins block with sync toggle + regime field (auto-save, like `qwen4_ple_ssd_offload`). The `GiB` field clears to `null` when empty; values outside `0–64` are rejected; regime accepts `decode`/`prefill`, empty clears.
 
@@ -593,6 +595,35 @@ expert set can pay on GLM too, not only on Qwen. The remaining regime
 difference is within one document (decode), where Qwen keeps reuse (SCH ~34–74%)
 and GLM's continuous-decode reuse stays to be re-measured with this harness
 before any GLM pin-budget default changes.
+
+**Measured (JANG 4S/4M, 2026-09-04 — `bench/results/lrc/`):** same frozen
+protocol, budget 0, short prompt, regimes split by `positions` (decode ≤ 64
+rows). Both quants agree to within 0.3pp — routing is a property of the model
+(512 experts, top-10), not of the quant, matching the 2x3090 Part-2 finding
+("hit rate doesn't depend on the quant, only on slot count"):
+
+- Decode SCH ceiling **77.5–77.8%** from S=64/layer (S=16 already 65%, S=32
+  74%, S=128+ flat) — the knee is 16, everything saturates by 64 slots.
+- Adjacent-call repeat 38.5%/39.3% (4S/4M) — the documented ~35% band, on the
+  trace's own rows. Working set ~104 distinct experts/layer per segment.
+- SRP(G=64) demand coverage 89.6–89.8% — a fixed 64-expert group/layer covers
+  ~90% of decode demand; top-10 experts alone hold 40–41% of demand.
+- Prefill: SCH ceiling **50%** — the prefill call is a near-broadcast union
+  (~199 uniq/call at 570 positions); caching prefill is structurally capped,
+  the seeded page-cache burst is the right mechanism (and it shows: TTFT 9-11s
+  for a 58-token prompt with 1008 slices seeded).
+
+Actionable reading (updated 2026-09-04 by the pin-knee matrix,
+`bench/results/lrc/matrix/`): the SCH knee predicted a pin win, and the matrix
+refuted it — 16-slot/layer pins (4S 1.5 GiB, 4M 2.0 GiB, 3 interleaved reps,
+own v2 profiles) measured **null (−0.3%)** on both. The L2 finding reproduces
+on the JANGs: on this box the page cache already serves the decode working
+set up to the oracle ceiling, so mlock only trades evictable for wired. The
+SCH curve is the sizing answer for **device-side residency (slot-bank)** —
+how many slots a slot-bank must hold per layer to capture ~78% of the hit
+ceiling (16 at the knee, 64 at saturation) — not a page-pin budget. Pin
+profiles do NOT transfer 4S↔4M: the fingerprint gate (config_sha + packing
+`oQ4e3b` vs `oQ4e4b`) rejects cross-model profiles by design.
 
 ### I4 — perplexity harness
 

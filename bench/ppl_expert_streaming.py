@@ -45,6 +45,8 @@ import numpy as np
 
 MODEL_PATHS = {
     "qwen": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-oQ4e-mtp",
+    "qwen-jang": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4S",
+    "qwen-jang4m": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4M",
     "glm": "/Volumes/SSD 4TB/AI Models/GLM-5.3-Flash-oQ4e",
     "dsv4": "/Volumes/SSD 4TB/AI Models/DeepSeek-V4-Flash-0731-oQ4e-mtp",
 }

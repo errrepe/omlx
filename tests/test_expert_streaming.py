@@ -6073,3 +6073,142 @@ class TestCachePrior:
         assert apply_cache_prior_to_logits(logits, set(), 3.0) is logits
         assert apply_cache_prior_to_logits(logits, {99}, 3.0) is logits
 
+
+
+def test_slot_bank_bit_exact_and_multitoken_invariant(monkeypatch):
+    """Slot-bank spike (docs/spike-slot-bank.md).
+
+    1. Bit-exactness: with the arena enabled, outputs equal the legacy
+       path for identical inputs (single- and multi-position calls).
+    2. #27861 invariant: a multi-position batch whose positions route to
+       DISJOINT expert sets must never alias two uncached experts to one
+       slot — outputs equal the per-position reference.
+    3. Counters: full-hit calls take the fast path (stack=0 evidence is
+       in the profile: load=stack=0 on the second identical call).
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    import omlx.patches.expert_streaming.streaming_switch as ss
+    monkeypatch.setattr(ss, "_SLOT_BANK_ENV", True)
+    monkeypatch.setattr(ss, "_SLOT_BANK_SLOTS", 8)
+    monkeypatch.setattr(ss, "_SLOT_BANK_MAX_POSITIONS", 64)
+
+    E, D_in, D_out = 8, 64, 32
+    mx.random.seed(3)
+    dense = mx.random.normal((E, D_out, D_in))
+    w4, s4, b4 = mx.quantize(dense, group_size=32, bits=4)
+
+    class _RP:
+        def __init__(self, shape):
+            self.per_shape = tuple(shape)
+
+    class _Reader:
+        def __init__(self, shapes):
+            self._shapes = shapes
+
+        def _rp_for(self, key):
+            return _RP(self._shapes[key])
+
+    class _ReaderBacking:
+        """Dict backing WITH the reader protocol the slot arena needs.
+
+        mx.quantize returns (w, s, b) as separate arrays — store each
+        component per stacked key, exactly like a real backing reader.
+        """
+
+        def __init__(self):
+            self.bank = {
+                "k.down_proj.weight": w4,
+                "k.down_proj.scales": s4,
+                "k.down_proj.biases": b4,
+            }
+            self.shapes = {
+                "k.down_proj.weight": tuple(w4.shape[1:]),
+                "k.down_proj.scales": tuple(s4.shape[1:]),
+                "k.down_proj.biases": tuple(b4.shape[1:]),
+            }
+            self.dtypes = {
+                "k.down_proj.weight": w4.dtype,
+                "k.down_proj.scales": s4.dtype,
+                "k.down_proj.biases": b4.dtype,
+            }
+
+        def _reader_for_key(self, key, expert_id=None):
+            return _Reader(self.shapes)
+
+        def load_expert(self, key, expert_id):
+            return self.bank[key][int(expert_id)]
+
+    def _make():
+        return ss.StreamingQuantizedSwitchLinear(
+            layer_idx=0,
+            proj_name="down_proj",
+            stacked_weight_key="k.down_proj.weight",
+            stacked_scales_key="k.down_proj.scales",
+            stacked_biases_key="k.down_proj.biases",
+            num_experts=E,
+            input_dims=D_in,
+            output_dims=D_out,
+            backing=_ReaderBacking(),
+            cache=ss.ExpertLRUCache(1 << 26, 1 << 18, num_layers=1),
+            group_size=32,
+            bits=4,
+            mode="affine",
+        )
+
+    rng = np.random.default_rng(11)
+    # --- 1: single-position calls, bit-exact vs arena-off twin ---
+    lin_on = _make()
+    lin_off = _make()
+    for trial in range(3):
+        T = 4 if trial < 2 else 40
+        x = mx.array(rng.standard_normal((T, 1, D_in)).astype(np.float32))
+        idx = mx.array(rng.integers(0, E, size=T).astype(np.int32))
+        out_ref = lin_off(x, idx)
+        out_on = lin_on(x, idx)
+        assert out_on.shape == out_ref.shape
+        assert mx.array_equal(out_ref, out_on), f"trial {trial} mismatch"
+
+    # --- 2: #27861 invariant: disjoint expert sets across positions ---
+    # 8 experts, 8 slots: positions alternate between two disjoint halves.
+    # After the first call populates slots, a second call with the OTHER
+    # half must still be exact (evictions + inserts under load).
+    x2 = mx.array(rng.standard_normal((8, 1, D_in)).astype(np.float32))
+    idx_a = mx.array([0, 2, 4, 6, 0, 2, 4, 6], dtype=mx.int32)  # even
+    idx_b = mx.array([1, 3, 5, 7, 1, 3, 5, 7], dtype=mx.int32)  # odd
+    lin_i = _make()
+    out_a1 = lin_i(x2, idx_a)
+    out_b = lin_i(x2, idx_b)  # disjoint: all misses, evictions happen
+    out_a2 = lin_i(x2, idx_a)  # evicted even set must reload exactly
+    ref_a = lin_off(x2, idx_a)
+    ref_b = lin_off(x2, idx_b)
+    assert mx.array_equal(out_a1, ref_a)
+    assert mx.array_equal(out_b, ref_b)
+    assert mx.array_equal(out_a2, ref_a)
+
+    # --- 3: repeated-slot gather is exact (same expert twice in batch) ---
+    idx_r = mx.array([5, 5, 5, 5, 2, 2, 5, 2], dtype=mx.int32)
+    out_r = lin_i(x2, idx_r)
+    ref_r = lin_off(x2, idx_r)
+    assert mx.array_equal(out_r, ref_r)
+
+    # --- 4: fast-path counters: identical call twice -> full hit ---
+    # Use a demand set that FITS the 8 slots alongside what is resident
+    # (a 4-expert set): no eviction pressure, second call must be full-hit.
+    idx_fit = mx.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=mx.int32)
+    lin_f = _make()
+    lin_f(x2, idx_fit)
+    sb = lin_f._slot_bank()
+    assert sb is not None and sb.slots == 8
+    h0, m0 = sb.hits, sb.misses
+    lin_f(x2, idx_fit)
+    assert sb.misses == m0, "identical demand set should be a full hit"
+    assert sb.hits > h0
+
+    # --- 5: prefill-shaped call bypasses the arena ---
+    xp = mx.array(rng.standard_normal((100, 1, D_in)).astype(np.float32))
+    idx_p = mx.array(rng.integers(0, E, size=100).astype(np.int32))
+    out_p = lin_i(xp, idx_p)
+    ref_p = lin_off(xp, idx_p)
+    assert mx.array_equal(out_p, ref_p)

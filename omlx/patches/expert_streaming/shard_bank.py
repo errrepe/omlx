@@ -1006,15 +1006,21 @@ def load_hot_set_from_profile(
 
 
 def cold_tier_status(model_path: str | Path) -> tuple[bool, str]:
-    """Is a complete cold tier present for *model_path*?
+    """Is a complete cold tier present at <model>/expert_cold?"""
+    model_path = Path(model_path)
+    return _cold_tier_status_dir(model_path / "expert_cold", model_path)
+
+
+def _cold_tier_status_dir(cold_dir: Path, model_path: Path) -> tuple[bool, str]:
+    """Is the tier rooted at *cold_dir* complete for *model_path*?
 
     Complete = every switch_mlp bank weight key of the checkpoint exists in
     some expert_cold/ shard header (partial tiers are rejected: the runtime
-    uniform-packing assumption would silently break)."""
-    model_path = Path(model_path)
-    cold_dir = model_path / "expert_cold"
+    uniform-packing assumption would silently break). The dir may be the
+    default <model>/expert_cold or an OMLX_EXPERT_STREAMING_COLD_ROOT
+    override — same completeness rule either way."""
     if not cold_dir.is_dir():
-        return False, "expert_cold/ missing"
+        return False, f"cold tier dir missing: {cold_dir}"
     index = model_path / "model.safetensors.index.json"
     if not index.is_file():
         return False, "no model.safetensors.index.json"

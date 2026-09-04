@@ -167,6 +167,96 @@ _ADMISSION_WINDOW = 1024
 _RA_ENV = os.environ.get("OMLX_EXPERT_STREAMING_RA", "") != "0"
 _STASH_ENV = os.environ.get("OMLX_EXPERT_STREAMING_STASH", "") == "1"
 _STASH_MAX_ENTRIES = 256
+
+# ---------------------------------------------------------------------------
+# Slot-bank (spike, docs/spike-slot-bank.md). OMLX_EXPERT_STREAMING_SLOT_BANK=1
+# enables a device-side resident bank of S slots per (layer, projection):
+# hits index the bank directly as the gather_qmm operand (zero per-call copy -
+# no take, no stack), misses fill a slot once via row-assign and the slot
+# becomes the resident copy. Sized from the measured SCH curve: 16 slots/layer
+# is the knee (65% of the oracle ceiling), 64 saturates (~77.5-77.8%).
+# The llama.cpp #27861 invariant holds by construction: slot remap is
+# per-distinct-expert (one slot per expert in the demand set) - two uncached
+# experts can never alias to the same slot in the same call.
+# ---------------------------------------------------------------------------
+_SLOT_BANK_ENV = os.environ.get("OMLX_EXPERT_STREAMING_SLOT_BANK", "") == "1"
+_SLOT_BANK_SLOTS = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_SLOT_BANK_SLOTS", "16")))
+# Decode-shaped calls only: the arena serves demand sets at or below this
+# many positions. Prefill unions (~199 uniq) would thrash the slots (SCH
+# ceiling 50% — broadcast); 64 covers decode + MTP verify batches (4-8).
+_SLOT_BANK_MAX_POSITIONS = max(
+    0, int(os.environ.get("OMLX_EXPERT_STREAMING_SLOT_BANK_MAX_POS", "64"))
+)
+
+
+class SlotBank:
+    """Device-resident slot arena for one (layer, projection) quantized linear.
+
+    Layout: one mx.array per tensor kind, shape (S, *per_expert_shape) -
+    the exact shape a stacked mini-bank would have, so the arena itself is
+    the gather_qmm operand on the hit path. expert -> slot map lives on the
+    CPU; eviction is true-LRU over slot order (matches ExpertLRUCache's
+    demand-population: a slot survives only while it keeps being hit).
+
+    Multi-token invariant (llama.cpp #27861 lesson): ``lookup`` returns one
+    slot id PER DISTINCT EXPERT. Positions whose expert maps to the same
+    slot share it (repeated take indices are legal and cheaper); a demand
+    set never maps two uncached experts to one slot because insert assigns
+    distinct slots within a call.
+    """
+
+    __slots__ = ("slots", "w", "s", "b", "order", "_lru", "hits", "misses", "evictions", "inserts")
+
+    def __init__(self, slots: int, w_shape, s_shape, b_shape, w_dtype=mx.uint32, s_dtype=mx.float32, b_dtype=mx.float32):
+        self.slots = int(slots)
+        self.w = mx.zeros((self.slots, *w_shape), dtype=w_dtype)
+        self.s = mx.zeros((self.slots, *s_shape), dtype=s_dtype)
+        self.b = mx.zeros((self.slots, *b_shape), dtype=b_dtype) if b_shape else None
+        # expert_id -> slot index (CPU-side, inference thread only)
+        self.order: dict = {}
+        # slot -> expert_id, LRU order
+        self._lru: "OrderedDict[int, int]" = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.inserts = 0
+
+    def lookup(self, expert_ids):
+        """Split ids into (slot_of: expert->slot) and missing ids."""
+        slot_of: dict = {}
+        missing: list = []
+        for eid in expert_ids:
+            eid = int(eid)
+            sl = self.order.get(eid)
+            if sl is None:
+                self.misses += 1
+                missing.append(eid)
+            else:
+                self.hits += 1
+                slot_of[eid] = sl
+                self._lru.move_to_end(sl)
+        return slot_of, missing
+
+    def _free_slot(self) -> int:
+        if len(self.order) < self.slots:
+            return len(self.order)
+        slot, victim_eid = next(iter(self._lru.items()))
+        del self._lru[slot]
+        del self.order[victim_eid]
+        self.evictions += 1
+        return slot
+
+    def insert(self, expert_id: int, w_row, s_row, b_row=None) -> int:
+        """Fill a slot with one expert bundle (row-assign, one copy)."""
+        slot = self._free_slot()
+        self.w[slot] = w_row
+        self.s[slot] = s_row
+        if self.b is not None and b_row is not None:
+            self.b[slot] = b_row
+        self.order[expert_id] = slot
+        self._lru[slot] = expert_id
+        self.inserts += 1
+        return slot
 # Fase K F2: hard cap on the advisory row set, matching the warmer G2's
 # _MAX_WARM_ROWS (rows > 64 are prefill-shaped, not decode speculation).
 _MAX_ADVISE_ROWS = 64
@@ -1794,6 +1884,43 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 return bundle
         return None
 
+    # -- slot-bank (spike) ------------------------------------------------
+
+    def _slot_bank(self):
+        """Lazily create this linear's slot arena (decode thread only).
+
+        Shapes come from the backing reader protocol so the arena rows
+        match exactly what _slice_view promotes per expert — the arena is
+        then a drop-in gather_qmm operand. Disabled when the env is off or
+        the backing lacks the reader protocol (tests with dict backing use
+        the legacy path).
+        """
+        sb = getattr(self, "_slot_bank_ref", None)
+        if sb is not None:
+            return sb if _SLOT_BANK_ENV else None
+        if not _SLOT_BANK_ENV or _SLOT_BANK_SLOTS <= 0:
+            return None
+        try:
+            reader = self.backing._reader_for_key(self.stacked_weight_key)
+            rp = reader._rp_for(self.stacked_weight_key)
+            sp = reader._rp_for(self.stacked_scales_key)
+            bp = None
+            if self.stacked_biases_key:
+                bp = reader._rp_for(self.stacked_biases_key)
+            sb = SlotBank(
+                _SLOT_BANK_SLOTS,
+                tuple(rp.per_shape),
+                tuple(sp.per_shape),
+                tuple(bp.per_shape) if bp else None,
+                w_dtype=self._slice_dtypes_lazy()[0] or mx.uint32,
+                s_dtype=mx.float32,
+                b_dtype=mx.float32,
+            )
+        except Exception:
+            sb = None
+        self._slot_bank_ref = sb
+        return sb
+
     def _spec_state(self) -> SpeculationState | None:
         """Per-conversion speculation state (Fase K K1).
 
@@ -2038,6 +2165,60 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         missing: list[int] = []
         t_res_start = time.perf_counter()
         context_bundles = None
+        # Slot-bank (spike): decode-shaped calls resolve through the device
+        # arena when possible. The arena lookup precedes the LRU/ctx so a
+        # slot-resident expert is never re-promoted; demand sets beyond
+        # _SLOT_BANK_MAX_POSITIONS (prefill-shaped) skip the arena entirely —
+        # broadcast unions would thrash the S slots (SCH ceiling 50%).
+        slot_of: dict = {}
+        sb = self._slot_bank() if plan.positions <= _SLOT_BANK_MAX_POSITIONS else None
+        if sb is not None:
+            slot_of, sb_missing = sb.lookup(plan.uniq_list)
+            if not sb_missing:
+                # Full hit: the arena IS the gather_qmm operand. Slot remap
+                # is per-distinct-expert (#27861 invariant); repeated slot
+                # indices across positions are legal (cheaper gather).
+                slot_np = np.full((self.num_experts,), -1, dtype=np.int64)
+                for eid, sl in slot_of.items():
+                    slot_np[eid] = sl
+                slot_remapped_np = slot_np[np.asarray(plan.flat_np).reshape(-1)].reshape(plan.indices_shape)
+                w_bank, s_bank, b_bank = sb.w, sb.s, sb.b
+                remapped = mx.array(slot_remapped_np.astype(np.uint32))
+                out = mx.gather_qmm(
+                    x,
+                    w_bank,
+                    s_bank,
+                    b_bank,
+                    rhs_indices=remapped,
+                    transpose=True,
+                    group_size=self.group_size,
+                    bits=self.bits,
+                    mode=self.mode,
+                    sorted_indices=sorted_indices,
+                )
+                if self._bias is not None and self._has_bias:
+                    b_mini = mx.take(self._bias, plan.uniq_mx, axis=0)
+                    out = out + mx.expand_dims(b_mini[remapped], -2)
+                p.record_observed(self.layer_idx, plan.uniq_list)
+                p.add(
+                    self.layer_idx,
+                    gate=plan.gate_s if built else 0.0,
+                    unique=plan.unique_s if built else 0.0,
+                    load=0.0,
+                    stack=0.0,
+                    hits=len(slot_of),
+                    misses=0,
+                    experts=len(plan.uniq_list),
+                    positions=plan.positions,
+                )
+                if _spec_state is not None:
+                    _spec_state.record_prev(self.layer_idx, plan.uniq_list)
+                return out
+            # partial: slot misses fall through to the normal resolution;
+            # the arena insert happens after the bundle resolves (below).
+            missing = list(sb_missing)
+            hits = len(slot_of)
+            misses = len(sb_missing)
         if plan.ctx is not None:
             # Fase K F6 (Etapa B): resolve *this* projection through the
             # layer context; the context prefetches the next one in the
@@ -2064,6 +2245,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     context_bundles = None
                     self.cache._count_ctx_fallback("tier_mismatch")
         if context_bundles is None:
+            # Slot-bank (spike): the arena miss list already seeds
+            # `missing` — dedupe against it so an expert is never read or
+            # slot-inserted twice (the LRU loop below would re-append the
+            # same ids).
+            _sb_missing = set(missing) if sb is not None else set()
             for eid in plan.uniq_list:
                 eid = int(eid)
                 b = self._bundle_cached_or_staged(eid)
@@ -2072,7 +2258,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     hits += 1
                 else:
                     misses += 1
-                    missing.append(eid)
+                    if eid not in _sb_missing:
+                        missing.append(eid)
         banked = None
         if missing:
             # ascending expert id = ascending file offset within the stacked
@@ -2178,6 +2365,27 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 for eid in missing:
                     bundles[eid] = self._load_expert_bundle(eid)
         t_load = time.perf_counter() - t_res_start
+
+        # Slot-bank (spike): fill free slots with the freshly resolved bundles
+        # (arena-first misses). One row-assign copy per expert-load; the slot
+        # becomes the resident copy for subsequent calls. LRU seeding is
+        # skipped for these ids (cache_result already guards prefill; the
+        # arena competes with the LRU for the same demand population).
+        if sb is not None and missing:
+            dt_sb = self._slice_dtypes_lazy()
+            for eid in missing:
+                b_ = bundles.get(int(eid))
+                if b_ is None:
+                    continue
+                try:
+                    sb.insert(
+                        int(eid),
+                        self._promote_np(b_[0]),
+                        self._promote_np(b_[1], dt_sb[0]),
+                        self._promote_np(b_[2], dt_sb[1]) if b_[2] is not None else None,
+                    )
+                except Exception:
+                    pass
 
         if memtrace.enabled:
             memtrace.record(

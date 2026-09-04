@@ -101,6 +101,37 @@ Notes per paper:
 - **MoE-Infinity v3's** insight (batch=1 decode leaves a small reusable hot set) holds
   for Qwen-like routing, not GLM's (0% inter-token reuse at any budget up to 8 GiB).
 
+## Measured: JANG 4S/4M SRP/SCH (2026-09-04, traces in `bench/results/lrc/`)
+
+Traces do protocolo congelado (budget 0, short prompt, 43-46 decode calls/layer,
+`OMLX_EXPERT_STREAMING_TRACE`, 2 regimes separados por `positions`):
+
+| métrica | 4S | 4M | leitura |
+|---|---|---|---|
+| SCH ceiling (S≥64/layer) | 77.8% | 77.5% | teto de hit de qualquer cache, até oráculo |
+| SCH(S=16) | 65.2% | 65.4% | joelho da curva: 16 slots ≈ 2/3 do teto |
+| SCH(S=32) | 74.2% | 74.2% | 42-64 slots ≈ tudo que existe para ganhar |
+| repeat adjacente (decode) | 38.5% | 39.3% | bate o ~35% da doc; GLM era 0% — famílias opostas |
+| distinct experts/layer no segmento | 104/512 | 103/512 | working set real ~20% do banco |
+| top-10 demand share | 40.5% | 41.1% | um grupo fixo pequeno cobre 40% da demanda |
+| SRP(G=64, seg=128) | 89.6% | 89.8% | demand-weighted; pin fixo cobre quase todo o volume |
+| prefill SCH (S≥256) | 50% | 50% | prefill é broadcast de ~199 uniq/call (570 pos × top-10) — cache não ajuda, seeded burst é o caminho certo |
+
+Conclusões:
+
+1. **Pins: predito pelo joelho, refutado pela matriz** — a matriz pin-knee (`bench/results/lrc/matrix/`) testou o exato joelho SCH (16 slots/layer: 4S 1.5 GiB, 4M 2.0 GiB, 3 reps interleaved A/C, profiles v2 próprios) e ambos ficaram **null (−0.3% na mediana)**: 4S 2.862→2.852, 4M 1.977→1.972 tok/s. O L2-null do oQ4e reproduz no JANG: neste box o page cache já serve o working set de decode até o teto de oráculo — mlock só converte evictable em wired (custo sem ganho). O joelho SCH informa **quantos slots valem a pena se o residente for device-side (slot-bank)**, não quanto pin de página comprar. LRU heap além de ~64 slots/layer continua desperdício.
+2. **Slot-bank é o alavanca certa pro hit path**: com hit 78% no teto, o custo per-use (load 43% + stack 28% do wall) cai sobre ~3/4 das chamadas — o bound do spike melhora. O invariante multi-token (#27861) já está no plano (docs/spike-slot-bank.md).
+3. **4S ≈ 4M em routing**: routing é propriedade do modelo (512 experts, top-10), não do quant — igual ao achado do post 2x3090 ("hit rate não depende do quant, só de slot count"). MAS o learned-pin profile NÃO transfere entre eles: o fingerprint gate (config_sha + packing — 4S `oQ4e3b` vs 4M `oQ4e4b`) recusa por design (verificado: load do profile 4S no 4M loga `fingerprint mismatch — profile ignored`, pin degrada para observação in-run). Transferir exigiria remapear byte-ranges entre packings distintos; não é caminho.
+4. **Prefill**: oráculo limita a 50% (broadcast total) — qualquer esforço de cache em prefill tem teto baixo; o seeded burst existente é o mecanismo certo.
+
+## Measured: levers de bytes/token no JANG (2026-09-04, `bench/results/lever_matrix/` + `ppl_topk/`)
+
+**topk 0.85 (4S)**: matriz interleaved v2 (warmup descartado, pares adjacentes ×3): base mediana 2.817 → tk85 **3.142 tok/s (+11.5%)**; o cache-prior 2.0 é **null** em budget 0 (3.147; sem LRU não há o que ranquear — recusa consistente com o design). **Custo ppl**: 1.4848 → 1.5106 (0.9, +1.7%) / 1.5422 (0.85, +3.9%). Trade-off explícito: +11.5% tok/s por +3.9% ppl — **opt-in recomendado**, default por política de qualidade (autotuner mede tok/s; ppl gate separado via `bench/ppl_expert_streaming.py --streaming`).
+
+**Cold tier 3-bit (4M)**: o 4M é o corpo 4-bit uniforme (144 banks 4b/64g), o 4S JÁ É 3-bit no corpo (86×3b + 43×2b + 17×4b) — **a premissa "3-bit no 4S" cai**; requant composto de já-quantizado seria dupla perda. O tier 3-bit no 4M: 56.2→42.2 GiB (**0.75×**, −25% bytes de miss), requant_err≤0.16, `cold_tier_status` completo (144 banks). Tool: `tools/requant_cold_tier.py --out-dir` + runtime `OMLX_EXPERT_STREAMING_COLD_ROOT` (tier fora do dir do modelo; volumes read-only).
+
+**Fixes do requant tool** (necessários p/ JANGs): (a) chaves per-tensor do config sem sufixo `.weight` (JANG quants) — lookup tenta ambas; (b) packing JANG separa weight de scales/biases **entre shards** — o tool agora agrupa pelo shard do peso via `model.safetensors.index.json` global (runtime resolve por header, layout livre).
+
 ## Prioritized opportunities
 
 **P0 — bit-exact (zero quality risk):**

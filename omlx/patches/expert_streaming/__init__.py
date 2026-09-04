@@ -815,9 +815,17 @@ def convert_model_to_streaming(
             cold_root = None
             cold_setting = getattr(model_settings, "expert_streaming_cold_tier", None)
             if cold_setting and str(cold_setting) in ("2", "3"):
-                ok, why = cold_tier_status(model_path)
+                # Deploy-time override: point the tier at an arbitrary
+                # directory (a read-only model volume, a second SSD, a
+                # sandboxed checkout) instead of <model>/expert_cold. The
+                # runtime only requires the tier SHARDS to be complete
+                # (cold_tier_status checks whichever dir is used).
+                cold_root = Path(os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT", "")) \
+                    if os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT") else None
+                cold_dir = cold_root if cold_root is not None else Path(model_path) / "expert_cold"
+                ok, why = _cold_tier_status_dir(cold_dir, model_path)
                 if ok:
-                    cold_root = Path(model_path) / "expert_cold"
+                    cold_root = cold_dir
                     logger.info("Expert streaming: cold tier %s-bit active (%s)", cold_setting, why)
                 else:
                     logger.warning(

@@ -384,3 +384,34 @@ class TestBudgetKnee:
         assert data["version"] == 1
         assert data["knee_gib"] == 2.5
         assert data["model"] == "qwen"
+
+
+class TestColdTierSweep:
+    def test_gated_off_without_tier(self):
+        """No cold_tier arms when the model has no expert_cold/ dir."""
+        cands = at.screen_candidates(
+            at.Knobs(), budgets=[0.0], depths=[16], sweep_topk=False,
+            cold_tier_available=False, hot_fractions=[0.25, 0.5],
+        )
+        assert all(knob != "cold_tier" for knob, _ in cands)
+
+    def test_arms_with_tier_and_hot_fractions(self):
+        """Available tier → one arm per hot_fraction candidate (None kept)."""
+        cands = at.screen_candidates(
+            at.Knobs(), budgets=[0.0], depths=[16], sweep_topk=False,
+            cold_tier_available=True, hot_fractions=[0.25, 0.5],
+        )
+        arms = [cfg for knob, cfg in cands if knob == "cold_tier"]
+        assert len(arms) == 2
+        assert all(cfg.cold_tier == "3" for cfg in arms)
+        assert {cfg.hot_fraction for cfg in arms} == {0.25, 0.5}
+        # profile_kwargs carries both knobs for --apply persistence
+        kw = arms[0].profile_kwargs()
+        assert kw["expert_streaming_cold_tier"] == "3"
+        assert kw["expert_streaming_hot_fraction"] in (0.25, 0.5)
+
+    def test_label_and_env(self):
+        """The label names the tier + fraction; env() adds nothing new."""
+        cfg = at.Knobs(cold_tier="3", hot_fraction=0.5)
+        assert "ct3" in cfg.label() and "hf0.5" in cfg.label()
+        assert "expert_streaming_cold_tier" in cfg.profile_kwargs()
