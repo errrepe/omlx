@@ -112,7 +112,9 @@ Protocolo: `--model glm-jang --budget 1.0 --decode 96 --min-free-gb 6 --single-r
 
 **Gap-2 fechado por inspeção (sem código)**: o `switch_mlp` do JANG **já é 2-bit gs64 em todas as 43 camadas** (gate/up/down `(288,2048,256)` + scales `(288,2048,64)`); o resto é 8-bit gs64 e o embed 6-bit. Não há tier abaixo de 2-bit no formato — cold tier para o JANG não existe (o `expert_cold/` era do oQ4e, deletado do disco).
 
-### DeepSeek V4 Flash (oQ4e-mtp)
+### DeepSeek V4 Flash (oQ4e-mtp — não confundir com o JANG)
+
+> Nota: o checkpoint `DeepSeek-V4-Flash-0731-JANG` em disco **não tem draft heads** (censo das 102 shards: só `layers.0–42`, nenhuma chave `mtp/dspark/draft/nextn`) — MTP nativo é impossível nele; o texto abaixo descreve o antigo checkpoint oQ4e-mtp (deletado).
 
 `deepseek_v4` nests the MoE under `layer.ffn` (not `mlp`) and keeps one routed bank per **MTP/DSpark stage** under `mtp.<stage>[.block].ffn.switch_mlp`. The converter walks both: 43 main layers + 3 draft stages (layer ids `43..45` share the same LRU). Notes:
 
