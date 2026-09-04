@@ -68,6 +68,21 @@ class VLMModelAdapter(nn.Module):
         self._uid_rope_deltas: Dict[int, float] = {}
         self._batch_rope_deltas: Optional[mx.array] = None
 
+        # MTP accept telemetry for the storage-roofline verdict: the
+        # chain calls mtp_clamp_accept once per verify cycle with the
+        # number of accepted positions, and mtp_partial_rollback with
+        # False meaning 'fall back to a non-MTP step' (a wasted draft).
+        # Native Lightning MTP (single-stage forward inside the model)
+        # does not pass through these hooks, so native runs leave these
+        # zeros - the derivator treats that as 'no data', never as a
+        # zero-accept measurement.
+        self.mtp_stats: Dict[str, int] = {
+            'cycles': 0,
+            'accepted': 0,
+            'drafted': 0,
+            'fallbacks': 0,
+        }
+
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
         close = getattr(self._vlm_model, "close", None)
@@ -130,6 +145,7 @@ class VLMModelAdapter(nn.Module):
         """
         fn = getattr(self._language_model, "mtp_partial_rollback", None)
         if not callable(fn):
+            self.mtp_stats["fallbacks"] += 1
             return False
         return fn(caches, accepted, num_drafts)
 
@@ -143,9 +159,22 @@ class VLMModelAdapter(nn.Module):
         draft rejection into a hard request failure.
         """
         fn = getattr(self._language_model, "mtp_clamp_accept", None)
+        self._record_mtp_accept(int(accepted), int(num_drafts))
         if not callable(fn):
             return accepted
-        return fn(cache, accepted, num_drafts)
+        clamped = fn(cache, accepted, num_drafts)
+        # The hook may clamp below the chain's provisional accept - count
+        # the clamped value, which is what actually rolls forward.
+        if int(clamped) < int(accepted):
+            self.mtp_stats["accepted"] -= int(accepted) - int(clamped)
+        return clamped
+
+    def _record_mtp_accept(self, accepted: int, drafted: int) -> None:
+        """One verify cycle: accepted positions out of drafted proposals."""
+        stats = self.mtp_stats
+        stats["cycles"] += 1
+        stats["accepted"] += max(0, accepted)
+        stats["drafted"] += max(0, drafted)
 
     # Runtime family patches use this marker to avoid installing an older,
     # model-specific copy of the same adapter plumbing.

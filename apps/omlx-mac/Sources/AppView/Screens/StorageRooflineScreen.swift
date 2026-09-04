@@ -41,6 +41,7 @@ struct StorageRooflineScreen: View {
                 tokPerCycleText: $vm.tokPerCycleText,
                 verifyMultText: $vm.verifyMultText,
                 measuredBaseText: $vm.measuredBaseText,
+                autoParams: vm.autoParams,
                 running: vm.running,
                 canRun: vm.canRun,
                 canPredict: vm.canPredict,
@@ -75,6 +76,7 @@ private struct ConfigurationSection: View {
     @Binding var tokPerCycleText: String
     @Binding var verifyMultText: String
     @Binding var measuredBaseText: String
+    let autoParams: StorageAutoParamsDTO?
     let running: Bool
     let canRun: Bool
     let canPredict: Bool
@@ -132,6 +134,26 @@ private struct ConfigurationSection: View {
             ) {
                 TextInput(text: $verifyMultText, mono: true, width: 80)
             }
+            if let auto = autoParams {
+                Row(
+                    label: String(localized: "bench.storage.config.params_source",
+                                  defaultValue: "Parameters",
+                                  comment: "Row label for where verdict params come from"),
+                    sublabel: paramsSourceText(auto),
+                    isLast: false
+                ) {
+                    Text(paramsSourceBadge(auto))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(auto.available == true ? Color.green : Color.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(
+                            (auto.available == true ? Color.green : Color.secondary)
+                                .opacity(0.12),
+                            in: Capsule()
+                        )
+                }
+            }
             Row(
                 label: String(localized: "bench.storage.config.measured_base",
                               defaultValue: "Measured base tok/s",
@@ -161,6 +183,41 @@ private struct ConfigurationSection: View {
         .padding(.horizontal, 18)
         .padding(.top, 6)
     }
+}
+
+
+// MARK: - Auto-params badge helpers
+
+/// Short badge text: "measured <date>" or "default".
+private func paramsSourceBadge(_ auto: StorageAutoParamsDTO) -> String {
+    if auto.available == true, let at = auto.derivedAt {
+        let day = String(at.prefix(10))
+        return String(localized: "bench.storage.badge.measured",
+                      defaultValue: "measured \(day)",
+                      comment: "Badge: params derived on this date")
+    }
+    return String(localized: "bench.storage.badge.default",
+                  defaultValue: "default",
+                  comment: "Badge: default params in use")
+}
+
+/// Longer sublabel explaining where each number came from.
+private func paramsSourceText(_ auto: StorageAutoParamsDTO) -> String {
+    if auto.available == true {
+        var bits: [String] = []
+        if let t = auto.tokPerCycle {
+            bits.append(String(format: "tok/cycle %.2f", t))
+        }
+        if let v = auto.verifyByteMult {
+            bits.append(String(format: "mult %.2f", v))
+        }
+        return String(localized: "bench.storage.config.params_source.auto",
+                      defaultValue: "Derived from this machine's bench pairs (\(bits.joined(separator: ", "))).",
+                      comment: "Sublabel when params are auto-derived")
+    }
+    return String(localized: "bench.storage.config.params_source.none",
+                  defaultValue: "No bench pair with telemetry yet — defaults in use (1.0 / 2.3).",
+                  comment: "Sublabel when no auto params exist")
 }
 
 // MARK: - Progress
@@ -366,6 +423,13 @@ private struct ReportSections: View {
                 }
             }
             HintLine(text: prediction.explanation ?? "")
+            if let src = report.paramsSource, !src.isEmpty {
+                HintLine(text: String(
+                    localized: "bench.storage.pred.params_source",
+                    defaultValue: "Verdict parameters: \(src)",
+                    comment: "Which params produced this verdict (explicit/auto/default)"
+                ))
+            }
         }
 
         if let calibration = report.calibration {

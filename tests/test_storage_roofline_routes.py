@@ -158,3 +158,116 @@ class TestStoragePredict:
         r = client.get("/admin/api/bench/storage/predict",
                        params={"model_id": "nope"})
         assert r.status_code == 404
+
+
+class TestStorageAutoParams:
+    def test_auto_params_empty_when_nothing_derived(self, client):
+        import omlx.utils.storage_roofline as sr
+
+        # No auto file on disk (fresh tmp results dir) and no usable runs.
+        with patch.object(sr, "load_auto_params", return_value=None), \
+             patch.object(sr, "_bench_results_dirs", return_value=[]), \
+             patch.object(sr, "derive_verify_mult", return_value=None), \
+             patch.object(sr, "derive_tok_per_cycle", return_value=None), \
+             patch.object(sr, "derive_bytes_per_token_base", return_value=None):
+            r = client.get("/admin/api/bench/storage/auto-params",
+                           params={"model_id": "local-model"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["available"] is False
+
+    def test_auto_params_returns_derived(self, client):
+        import omlx.utils.storage_roofline as sr
+
+        auto = {
+            "version": 1,
+            "model_dir": "/fake",
+            "derived_at": "2026-09-04T09:00:00",
+            "tok_per_cycle": 1.79,
+            "verify_byte_mult": 2.31,
+            "bytes_per_token_base": 12345.6,
+            "source": {},
+        }
+        with patch.object(sr, "load_auto_params", return_value=auto):
+            r = client.get("/admin/api/bench/storage/auto-params",
+                           params={"model_id": "local-model"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["available"] is True
+        assert body["tok_per_cycle"] == 1.79
+        assert body["verify_byte_mult"] == 2.31
+
+    def test_auto_params_unknown_model_404(self, client):
+        r = client.get("/admin/api/bench/storage/auto-params",
+                       params={"model_id": "nope"})
+        assert r.status_code == 404
+
+    def test_predict_uses_auto_when_params_omitted(self, client):
+        import omlx.utils.storage_roofline as sr
+
+        job = storage_bench.StorageBenchJob(
+            job_id="storage_auto", status="completed",
+            request=storage_bench.StorageBenchRequest(model_id="local-model"),
+            target_dir="/tmp",
+            report={"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "measurement": _tiny_measurement()},
+        )
+        storage_bench._jobs[job.job_id] = job
+        auto = {
+            "version": 1,
+            "tok_per_cycle": 1.79,
+            "verify_byte_mult": 2.31,
+            "bytes_per_token_base": None,
+            "source": {},
+        }
+        with patch.object(sr, "load_auto_params", return_value=auto):
+            r = client.get("/admin/api/bench/storage/predict",
+                           params={"model_id": "local-model"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["params_source"] == "auto"
+        assert body["prediction"]["tok_per_cycle"] == 1.79
+        assert body["prediction"]["verify_byte_mult"] == 2.31
+
+    def test_predict_params_source_default_when_no_auto(self, client):
+        import omlx.utils.storage_roofline as sr
+
+        job = storage_bench.StorageBenchJob(
+            job_id="storage_def", status="completed",
+            request=storage_bench.StorageBenchRequest(model_id="local-model"),
+            target_dir="/tmp",
+            report={"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "measurement": _tiny_measurement()},
+        )
+        storage_bench._jobs[job.job_id] = job
+        with patch.object(sr, "load_auto_params", return_value=None):
+            r = client.get("/admin/api/bench/storage/predict",
+                           params={"model_id": "local-model"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["params_source"] == "default"
+        assert body["prediction"]["tok_per_cycle"] == 1.0
+
+    def test_predict_explicit_overrides_auto(self, client):
+        import omlx.utils.storage_roofline as sr
+
+        job = storage_bench.StorageBenchJob(
+            job_id="storage_expl", status="completed",
+            request=storage_bench.StorageBenchRequest(model_id="local-model"),
+            target_dir="/tmp",
+            report={"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "measurement": _tiny_measurement()},
+        )
+        storage_bench._jobs[job.job_id] = job
+        auto = {"tok_per_cycle": 1.79, "verify_byte_mult": 2.31}
+        with patch.object(sr, "load_auto_params", return_value=auto):
+            r = client.get("/admin/api/bench/storage/predict",
+                           params={"model_id": "local-model",
+                                   "tok_per_cycle": 2.6, "verify_mult": 2.0})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["params_source"] == "explicit"
+        assert body["prediction"]["tok_per_cycle"] == 2.6
+        assert body["prediction"]["verify_byte_mult"] == 2.0
+        # Auto rides along for inspection either way.
+        assert body["params_auto"]["tok_per_cycle"] == 1.79

@@ -47,6 +47,8 @@ struct StorageRooflineReportDTO: Codable, Equatable, Sendable {
     let profile: MoEStepProfileDTO?
     let prediction: RooflinePredictionDTO?
     let calibration: RooflineCalibrationDTO?
+    let paramsSource: String?
+    let paramsAuto: StorageAutoParamsDTO?
     let path: String?
 }
 
@@ -116,4 +118,35 @@ struct RooflineCalibrationDTO: Codable, Equatable, Sendable {
     let measuredBaseTokS: Double?
     let predictedCeilingBaseTokS: Double?
     let efficiency: Double?
+}
+
+
+/// Response from `GET /admin/api/bench/storage/auto-params`.
+/// `available == false` means defaults are in use (normal first-run state).
+struct StorageAutoParamsDTO: Codable, Equatable, Sendable {
+    let available: Bool?
+    let modelDir: String?
+    let derivedAt: String?
+    let tokPerCycle: Double?
+    let verifyByteMult: Double?
+    let bytesPerTokenBase: Double?
+    let source: AutoParamsSourceDTO?
+}
+
+/// Per-derivation bookkeeping (which bench runs produced the numbers).
+struct AutoDerivationDTO: Codable, Equatable, Sendable {
+    let tokPerCycle: Double?
+    let verifyByteMult: Double?
+    let bytesPerToken: Double?
+    let cycles: Int?
+    let accepted: Int?
+    let drafted: Int?
+    let decodeBytes: Int64?
+    let decodeTokens: Int?
+}
+
+struct AutoParamsSourceDTO: Codable, Equatable, Sendable {
+    let verifyMult: AutoDerivationDTO?
+    let tokPerCycle: AutoDerivationDTO?
+    let bytesPerToken: AutoDerivationDTO?
 }

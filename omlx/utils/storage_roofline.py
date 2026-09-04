@@ -658,3 +658,248 @@ def build_report(
             "efficiency": (measured_base_tok_s / ceil) if ceil > 0 else 0.0,
         }
     return report
+
+
+# ===========================================================================
+# Auto-derived verdict parameters (Fase 1: close the loop)
+# ===========================================================================
+#
+# The verdict needs two numbers a cold storage bench cannot produce:
+#   tok_per_cycle  - MTP accept economics (1 + accept rate for depth-1)
+#   verify_byte_mult - verify reads this many times the base step's bytes
+#
+# Both come from a bench pair (base + mtpd1) run with --arm-read-telemetry:
+# the ReadTelemetry summary carries decode-phase bytes per arm, and the
+# VLMModelAdapter carries {cycles, accepted, drafted} per MTP arm. Old runs
+# have read_stats=null and are skipped transparently - a missing derivation
+# degrades to defaults, never fabricates.
+
+
+def _bench_results_dirs() -> list[Path]:
+    """Where bench result JSONs live (repo bench/results by convention)."""
+    root = Path(__file__).resolve().parent.parent.parent / "bench" / "results"
+    if not root.is_dir():
+        return []
+    return [root, *sorted(d for d in root.iterdir() if d.is_dir())]
+
+
+def _decode_bytes(read_stats: object) -> int | None:
+    """Decode-phase bytes from a bench run read_stats block, or None."""
+    if not isinstance(read_stats, dict):
+        return None
+    dec = read_stats.get("decode")
+    if not isinstance(dec, dict):
+        return None
+    try:
+        b = int(dec.get("bytes") or 0)
+        return b if b > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_bench_runs(results_dir: str | Path) -> list[dict]:
+    """Parsed bench result JSONs under results_dir, newest first."""
+    root = Path(results_dir)
+    runs: list[tuple[float, dict]] = []
+    for fp in root.glob("*.json"):
+        try:
+            data = json.loads(fp.read_text())
+        except Exception:
+            continue
+        if not isinstance(data, dict) or "model" not in data:
+            continue
+        runs.append((fp.stat().st_mtime, data))
+    runs.sort(key=lambda t: t[0], reverse=True)
+    return [d for _, d in runs]
+
+
+def _run_matches_model(run: dict, model_dir: Path, key_hints: tuple[str, ...]) -> bool:
+    """Does a bench run belong to model_dir? Explicit hints first, then
+    slug basename (bench short-keys are stable per MODEL_PATHS)."""
+    raw = str(run.get("model") or "")
+    if not raw:
+        return False
+    if raw in key_hints or raw == model_dir.name:
+        return True
+    try:
+        if Path(raw).resolve() == model_dir.resolve():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _auto_params_path(model_dir: str | Path) -> Path:
+    return _results_dir() / "auto_params" / f"{Path(model_dir).name}.json"
+
+
+def _is_depth1_mtp(run: dict) -> bool:
+    if run.get("mtp") is not True:
+        return False
+    depth = run.get("mtp_depth")
+    return depth in (None, 1, "1")
+
+
+def derive_verify_mult(
+    results_dirs: list[str | Path],
+    model_dir: str | Path,
+    key_hints: tuple[str, ...] = (),
+) -> dict | None:
+    """Measured verify/base byte ratio from the newest usable arm pair.
+
+    A usable pair is a base run and a depth-1 MTP run of the same model,
+    both with decode-phase read_stats bytes. Returns the ratio plus source
+    bookkeeping, or None when no usable pair exists.
+    """
+    mdir = Path(model_dir)
+    newest_base = None
+    newest_mtp = None
+    for rdir in results_dirs:
+        for run in _iter_bench_runs(rdir):
+            if not _run_matches_model(run, mdir, key_hints):
+                continue
+            if run.get("mtp") is True:
+                if _is_depth1_mtp(run) and newest_mtp is None:
+                    newest_mtp = run
+            elif newest_base is None:
+                newest_base = run
+        if newest_base is not None and newest_mtp is not None:
+            break
+    if newest_base is None or newest_mtp is None:
+        return None
+    b_base = _decode_bytes(newest_base.get("read_stats"))
+    b_mtp = _decode_bytes(newest_mtp.get("read_stats"))
+    if not b_base or not b_mtp:
+        return None
+    mult = b_mtp / b_base
+    if not 0.5 <= mult <= 16.0:
+        # Implausible ratio: unbalanced pair (different decode lengths) -
+        # treat as unusable rather than poisoning the verdict.
+        return None
+    return {
+        "verify_byte_mult": round(mult, 3),
+        "bytes_base": b_base,
+        "bytes_mtp": b_mtp,
+        "decode_tokens_base": newest_base.get("decode_tokens"),
+        "decode_tokens_mtp": newest_mtp.get("decode_tokens"),
+    }
+
+
+def derive_tok_per_cycle(
+    results_dirs: list[str | Path],
+    model_dir: str | Path,
+    key_hints: tuple[str, ...] = (),
+) -> dict | None:
+    """Measured tok/cycle from the newest MTP arm with accept counters."""
+    mdir = Path(model_dir)
+    for rdir in results_dirs:
+        for run in _iter_bench_runs(rdir):
+            if not _run_matches_model(run, mdir, key_hints):
+                continue
+            if not _is_depth1_mtp(run):
+                continue
+            acc = run.get("mtp_accept_stats")
+            if not isinstance(acc, dict):
+                continue
+            cycles = int(acc.get("cycles") or 0)
+            accepted = int(acc.get("accepted") or 0)
+            if cycles <= 0 or accepted < 0:
+                continue
+            # tok/cycle = generated tokens per verify cycle. decode_tokens
+            # is the authoritative count; the accept rate is the fallback.
+            dtok = run.get("decode_tokens")
+            try:
+                dtok = int(dtok)
+            except (TypeError, ValueError):
+                dtok = None
+            tpc = (dtok / cycles) if dtok else (1.0 + accepted / cycles)
+            if not 0.5 <= tpc <= 4.0:
+                continue
+            return {
+                "tok_per_cycle": round(tpc, 3),
+                "cycles": cycles,
+                "accepted": accepted,
+                "drafted": int(acc.get("drafted") or 0),
+                "fallbacks": int(acc.get("fallbacks") or 0),
+                "decode_tokens": dtok,
+            }
+    return None
+
+
+def derive_bytes_per_token_base(
+    results_dirs: list[str | Path],
+    model_dir: str | Path,
+    key_hints: tuple[str, ...] = (),
+) -> dict | None:
+    """Measured cold bytes per generated token on the base arm.
+
+    This is the effective-ceiling denominator: measured decode bytes over
+    measured tokens already nets out hit-rate and prefetch dividends.
+    """
+    mdir = Path(model_dir)
+    for rdir in results_dirs:
+        for run in _iter_bench_runs(rdir):
+            if not _run_matches_model(run, mdir, key_hints):
+                continue
+            if run.get("mtp") is True:
+                continue
+            b = _decode_bytes(run.get("read_stats"))
+            dtok = run.get("decode_tokens")
+            try:
+                dtok = int(dtok)
+            except (TypeError, ValueError):
+                continue
+            if not b or dtok <= 0:
+                continue
+            return {
+                "bytes_per_token": b / dtok,
+                "decode_bytes": b,
+                "decode_tokens": dtok,
+            }
+    return None
+
+
+def update_auto_params(
+    model_dir: str | Path,
+    key_hints: tuple[str, ...] = (),
+    results_dirs: list[str | Path] | None = None,
+) -> dict | None:
+    """Derive + persist the auto parameters for one model. None when no
+    usable bench data exists (callers keep defaults and say so)."""
+    mdir = Path(model_dir)
+    if results_dirs is None:
+        results_dirs = _bench_results_dirs()
+    vm = derive_verify_mult(results_dirs, mdir, key_hints)
+    tpc = derive_tok_per_cycle(results_dirs, mdir, key_hints)
+    bpt = derive_bytes_per_token_base(results_dirs, mdir, key_hints)
+    if vm is None and tpc is None and bpt is None:
+        return None
+    out = {
+        "version": 1,
+        "model_dir": str(mdir),
+        "derived_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "tok_per_cycle": (tpc or {}).get("tok_per_cycle"),
+        "verify_byte_mult": (vm or {}).get("verify_byte_mult"),
+        "bytes_per_token_base": (bpt or {}).get("bytes_per_token"),
+        "source": {
+            "verify_mult": vm,
+            "tok_per_cycle": tpc,
+            "bytes_per_token": bpt,
+        },
+    }
+    path = _auto_params_path(mdir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2))
+    return out
+
+
+def load_auto_params(model_dir: str | Path) -> dict | None:
+    """Latest persisted auto parameters for a model, or None."""
+    path = _auto_params_path(model_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None

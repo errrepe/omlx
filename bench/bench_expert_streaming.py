@@ -362,12 +362,23 @@ async def run(
     pin_regime: str = "decode",
     knobs: list[str] | None = None,
     mtp_depth: int | None = None,
+    arm_telemetry: bool = False,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
     from omlx.scheduler import SchedulerConfig
     from omlx.utils.proc_memory import get_phys_footprint
     import mlx.core as mx
+
+    # Storage-roofline derivation support: arm demand-read telemetry in
+    # runtime (no env-var restart needed) so read_stats carries decode-phase
+    # bytes for both base and MTP arms. The tiny per-call bookkeeping only
+    # exists while armed.
+    if arm_telemetry:
+        from omlx.patches.expert_streaming.shard_bank import arm_read_telemetry
+
+        _prev_arm = arm_read_telemetry(True)
+        print("read telemetry armed (runtime)")
 
     model_path = MODEL_PATHS[model_key]
     entry_name = DEFAULT_ENTRIES[model_key]
@@ -794,19 +805,34 @@ async def run(
             profile = cache.profile.report()
             print(f"profile totals {profile['totals']}")
         # PILOT prefetcher stats (attached on language_model.model or wrapper)
+        # Two independent walks: a holder can carry the prefetcher, the
+        # MTP accept counters, both, or neither - breaking on the first
+        # match of either would hide the other.
         pf = None
-        for holder in (
+        mtp_adapter_stats = None
+        _holders = (
             getattr(vlm_model, "language_model", None),
             getattr(getattr(vlm_model, "language_model", None), "model", None),
             vlm_model,
-        ):
-            cand = getattr(holder, "_expert_prefetcher", None)
-            if cand is not None:
-                pf = cand
+        )
+        for holder in _holders:
+            if pf is None:
+                cand = getattr(holder, "_expert_prefetcher", None)
+                if cand is not None:
+                    pf = cand
+            if mtp_adapter_stats is None:
+                # VLMModelAdapter (omlx/models/vlm.py) carries the accept
+                # counters; native Lightning MTP does not, leaving None.
+                cand2 = getattr(holder, "mtp_stats", None)
+                if isinstance(cand2, dict) and cand2.get("cycles", 0) > 0:
+                    mtp_adapter_stats = dict(cand2)
+            if pf is not None and mtp_adapter_stats is not None:
                 break
         if pf is not None:
             pf_stats = dict(pf.stats)
             print(f"prefetcher {pf_stats}")
+        if mtp_adapter_stats is not None:
+            print(f"mtp accept {mtp_adapter_stats}")
         # Fase K F3: export the O2 F_RDADVISE/stash speculation counters so
         # the readahead coverage is measurable (advised experts, stash hits).
         # K1: the counters live on the per-conversion SpeculationState.
@@ -938,6 +964,7 @@ async def run(
             "prefetcher": pf_stats,
             "advise_stats": advise_stats,
             "read_stats": _read_stats_out,
+            "mtp_accept_stats": mtp_adapter_stats,
             "run_pool": _pool_after,
             "memtrace_summary": _memtrace_summary,
             "ctx_fallback_to_legacy": _ctx_fb,
@@ -1029,6 +1056,12 @@ def main():
         action="store_true",
         help="measure TTFT and decode from one streaming request (avoids a second prefill; B6)",
     )
+    ap.add_argument(
+        "--arm-read-telemetry",
+        action="store_true",
+        help="arm demand-read telemetry in runtime (storage-roofline "
+             "derivation: decode-phase byte ratio + MTP accept stats)",
+    )
     args = ap.parse_args()
     try:
         import psutil
@@ -1069,6 +1102,7 @@ def main():
             pin_gib=args.pin_gib,
             pin_regime=args.pin_regime,
             knobs=args.knob,
+            arm_telemetry=args.arm_read_telemetry,
         )
     )
 

@@ -19,6 +19,8 @@ final class StorageRooflineScreenVM {
     /// Completed-run report (also repopulated on screen load from the
     /// predict endpoint so past runs survive navigation/restart).
     private(set) var report: StorageRooflineReportDTO?
+    /// Derived verdict params for the selected model (auto-params endpoint).
+    private(set) var autoParams: StorageAutoParamsDTO?
     var lastError: String?
 
     @ObservationIgnored
@@ -49,10 +51,7 @@ final class StorageRooflineScreenVM {
     }
 
     var canPredict: Bool {
-        !selectedModelId.isEmpty
-            && !running
-            && (parsedTokPerCycle ?? 0) > 0
-            && (parsedVerifyMult ?? 0) > 0
+        !selectedModelId.isEmpty && !running
     }
 
     // MARK: Lifecycle
@@ -60,10 +59,11 @@ final class StorageRooflineScreenVM {
     func start(client: OMLXClient) async {
         self.client = client
         await loadModels()
-        // If a measurement already exists (this process or a previous one),
-        // surface the prediction immediately so the screen is not empty on
-        // revisit. 404 (no measurement yet) is the normal first-run case.
+        // Auto-fill the verdict params from the model's derived values so
+        // the first prediction needs no manual input; the user can still
+        // edit them afterwards (which flips to explicit params).
         if !selectedModelId.isEmpty {
+            await loadAutoParams()
             await predict()
         }
     }
@@ -88,12 +88,29 @@ final class StorageRooflineScreenVM {
         }
     }
 
+    @MainActor
+    func loadAutoParams() async {
+        guard let client, !selectedModelId.isEmpty else { return }
+        do {
+            let auto = try await client.getStorageAutoParams(modelId: selectedModelId)
+            self.autoParams = auto
+            if auto.available == true {
+                if let tok = auto.tokPerCycle {
+                    tokPerCycleText = String(format: "%.2f", tok)
+                }
+                if let mult = auto.verifyByteMult {
+                    verifyMultText = String(format: "%.2f", mult)
+                }
+            }
+        } catch {
+            // No derived params yet: defaults stay, badge says so. The
+            // server returns 200-empty here; anything else is not fatal.
+        }
+    }
+
     // MARK: Actions
 
     func runBenchmark(client: OMLXClient) {
-        guard canRun,
-              let tok = parsedTokPerCycle,
-              let mult = parsedVerifyMult else { return }
         let body = StorageBenchStartRequest(
             modelId: selectedModelId,
             fileGb: 2.0,
@@ -125,25 +142,23 @@ final class StorageRooflineScreenVM {
         }
         // tok/mult are for the post-run prediction — hold them for the poll
         // completion handler without storing as properties the UI binds to.
-        pendingTokPerCycle = tok
-        pendingVerifyMult = mult
+        // Empty fields mean "use the server's auto-derived params".
+        pendingTokPerCycle = parsedTokPerCycle
+        pendingVerifyMult = parsedVerifyMult
     }
 
     @ObservationIgnored
-    private var pendingTokPerCycle: Double = 1.0
+    private var pendingTokPerCycle: Double?
     @ObservationIgnored
-    private var pendingVerifyMult: Double = 2.3
+    private var pendingVerifyMult: Double?
 
     func predict() async {
-        guard canPredict,
-              let tok = parsedTokPerCycle,
-              let mult = parsedVerifyMult,
-              let client else { return }
+        guard canPredict, let client else { return }
         do {
             report = try await client.getStoragePrediction(
                 modelId: selectedModelId,
-                tokPerCycle: tok,
-                verifyMult: mult,
+                tokPerCycle: parsedTokPerCycle,
+                verifyMult: parsedVerifyMult,
                 measuredBaseTokS: parsedMeasuredBase
             )
             lastError = nil
@@ -181,6 +196,13 @@ final class StorageRooflineScreenVM {
                         }
                         if resp.isTerminal {
                             self.running = false
+                            // A fresh bench pair may have changed the
+                            // derived params; refresh badge + fields, then
+                            // re-predict with the freshest numbers.
+                            Task { [weak self] in
+                                await self?.loadAutoParams()
+                                await self?.predict()
+                            }
                         }
                         return resp.isTerminal
                     }

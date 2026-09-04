@@ -7179,19 +7179,71 @@ async def get_storage_benchmark_results(
     return job_to_response(job)
 
 
+@router.get("/api/bench/storage/auto-params")
+async def get_storage_auto_params(
+    model_id: str,
+    refresh: bool = False,
+    is_admin: bool = Depends(require_admin),
+):
+    """Auto-derived verdict parameters for a model (tok/cycle, verify byte
+    mult, measured bytes/token). Empty-but-200 when nothing is derived yet
+    — the UI treats it as "defaults in use", never as an error.
+
+    refresh=1 re-derives from the newest bench results instead of reading
+    the persisted auto_params file (the results scan is milliseconds).
+    """
+    from omlx.utils.storage_roofline import (
+        _bench_results_dirs,
+        derive_bytes_per_token_base,
+        derive_tok_per_cycle,
+        derive_verify_mult,
+        load_auto_params,
+        update_auto_params,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    if refresh:
+        data = update_auto_params(entry.model_path)
+    else:
+        data = load_auto_params(entry.model_path)
+    if data is None:
+        # No usable pairs: also report the raw per-derivation outcome so
+        # the UI can say WHY (e.g. benches exist but ran without telemetry).
+        dirs = _bench_results_dirs()
+        return {
+            "available": False,
+            "model_dir": entry.model_path,
+            "verify_mult": derive_verify_mult(dirs, entry.model_path),
+            "tok_per_cycle": derive_tok_per_cycle(dirs, entry.model_path),
+            "bytes_per_token": derive_bytes_per_token_base(dirs, entry.model_path),
+        }
+    data = dict(data)
+    data["available"] = True
+    return data
+
+
 @router.get("/api/bench/storage/predict")
 async def get_storage_prediction(
     model_id: str,
-    tok_per_cycle: float = 1.0,
-    verify_mult: float = 2.3,
+    tok_per_cycle: float | None = None,
+    verify_mult: float | None = None,
     measured_base_tok_s: float | None = None,
     is_admin: bool = Depends(require_admin),
 ):
     """Roofline prediction for a model from the latest measurement.
 
     Fresh profile, reused measurement: profiling headers is milliseconds,
-    measuring the SSD is minutes. 404 when the model is unknown, the
-    profile is unsupported, or no measurement exists yet.
+    measuring the SSD is minutes. Missing tok_per_cycle/verify_mult fall
+    back to the model's auto-derived parameters (bench pairs run with
+    --arm-read-telemetry) and then to documented defaults; the report's
+    params_source says which. 404 when the model is unknown, the profile
+    is unsupported, or no measurement exists yet.
     """
     from .storage_bench import latest_measurement
     from omlx.utils.storage_roofline import (
@@ -7207,6 +7259,27 @@ async def get_storage_prediction(
     entry = engine_pool.get_entry(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    # Parameter resolution: explicit query > auto-derived > default. The
+    # auto file also carries bytes_per_token_base (Fase 2 effective
+    # ceiling) even when the explicit query params are the final ones.
+    from omlx.utils.storage_roofline import load_auto_params
+
+    auto = load_auto_params(entry.model_path)
+    params_source = "explicit"
+    if tok_per_cycle is None or verify_mult is None:
+        if auto is not None and (
+            auto.get("tok_per_cycle") or auto.get("verify_byte_mult")
+        ):
+            params_source = "auto"
+        else:
+            params_source = "default"
+        if tok_per_cycle is None:
+            tok_per_cycle = (auto or {}).get("tok_per_cycle") or 1.0
+        if verify_mult is None:
+            verify_mult = (auto or {}).get("verify_byte_mult") or 2.3
+    tok_per_cycle = float(tok_per_cycle)
+    verify_mult = float(verify_mult)
 
     measurement_dict = latest_measurement()
     if measurement_dict is None:
@@ -7228,11 +7301,14 @@ async def get_storage_prediction(
         profile, measurement,
         tok_per_cycle=tok_per_cycle, verify_byte_mult=verify_mult,
     )
-    return build_report(
+    report = build_report(
         volume_info_for_measurement(measurement_dict),
         measurement, profile, prediction,
         measured_base_tok_s=measured_base_tok_s,
     )
+    report["params_source"] = params_source
+    report["params_auto"] = auto
+    return report
 
 
 def volume_info_for_measurement(measurement_dict: dict):

@@ -517,15 +517,27 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.storageBenchResults(jobId))
     }
 
+    func getStorageAutoParams(modelId: String) async throws -> StorageAutoParamsDTO {
+        try await get(AdminAPI.storageBenchAutoParams, query: [
+            URLQueryItem(name: "model_id", value: modelId),
+        ])
+    }
+
+    /// Explicit params go to the server; nil leaves them to the server's
+    /// auto-derived values (params_source rides in the report).
     func getStoragePrediction(modelId: String,
-                              tokPerCycle: Double = 1.0,
-                              verifyMult: Double = 2.3,
+                              tokPerCycle: Double? = nil,
+                              verifyMult: Double? = nil,
                               measuredBaseTokS: Double? = nil) async throws -> StorageRooflineReportDTO {
         var query: [URLQueryItem] = [
             URLQueryItem(name: "model_id", value: modelId),
-            URLQueryItem(name: "tok_per_cycle", value: String(format: "%g", tokPerCycle)),
-            URLQueryItem(name: "verify_mult", value: String(format: "%g", verifyMult)),
         ]
+        if let tok = tokPerCycle {
+            query.append(URLQueryItem(name: "tok_per_cycle", value: String(format: "%g", tok)))
+        }
+        if let mult = verifyMult {
+            query.append(URLQueryItem(name: "verify_mult", value: String(format: "%g", mult)))
+        }
         if let measured = measuredBaseTokS {
             query.append(URLQueryItem(name: "measured_base_tok_s", value: String(format: "%g", measured)))
         }
