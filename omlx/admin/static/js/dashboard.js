@@ -91,7 +91,7 @@
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
-    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
+    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context', 'storage']);
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
 
@@ -759,6 +759,16 @@
             ctxBenchResult: null,
             ctxBenchError: '',
             ctxBenchEventSource: null,
+
+            // Storage roofline state
+            storageBenchModelId: '',
+            storageBenchRunning: false,
+            storageBenchJobId: null,
+            storageBenchProgress: null,  // { phase, done, total }
+            storagePrediction: null,
+            storageBenchError: '',
+            storageAutoParams: null,
+            storageBenchPollTimer: null,
 
             // Accuracy benchmark state
             accModelId: '',
@@ -9606,6 +9616,95 @@
             },
 
             // Context benchmark functions
+            // ---- Storage roofline ----
+
+            async loadStorageAutoParams() {
+                if (!this.storageBenchModelId) { this.storageAutoParams = null; return; }
+                try {
+                    const response = await fetch('/admin/api/bench/storage/auto-params?model_id=' + encodeURIComponent(this.storageBenchModelId));
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) return;
+                    this.storageAutoParams = await response.json();
+                } catch (err) {
+                    console.error('Failed to load storage auto params:', err);
+                }
+            },
+
+            async storagePredict() {
+                if (!this.storageBenchModelId || this.storageBenchRunning) return;
+                this.storageBenchError = '';
+                try {
+                    const response = await fetch('/admin/api/bench/storage/predict?model_id=' + encodeURIComponent(this.storageBenchModelId));
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) {
+                        const data = await response.json();
+                        this.storageBenchError = data.detail || '';
+                        return;
+                    }
+                    this.storagePrediction = await response.json();
+                } catch (err) {
+                    console.error('Failed to predict storage roofline:', err);
+                }
+            },
+
+            async startStorageBench() {
+                if (!this.storageBenchModelId || this.storageBenchRunning) return;
+                this.storageBenchRunning = true;
+                this.storageBenchProgress = null;
+                this.storageBenchError = '';
+                this.storageBenchJobId = null;
+                try {
+                    const response = await fetch('/admin/api/bench/storage/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model_id: this.storageBenchModelId }),
+                    });
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) {
+                        const data = await response.json();
+                        this.storageBenchError = data.detail || window.t('js.error.start_bench_failed');
+                        this.storageBenchRunning = false;
+                        return;
+                    }
+                    const data = await response.json();
+                    this.storageBenchJobId = data.job_id;
+                    this.pollStorageBench();
+                } catch (err) {
+                    console.error('Failed to start storage benchmark:', err);
+                    this.storageBenchError = window.t('js.error.start_bench_failed');
+                    this.storageBenchRunning = false;
+                }
+            },
+
+            pollStorageBench() {
+                if (this.storageBenchPollTimer) clearTimeout(this.storageBenchPollTimer);
+                const poll = async () => {
+                    if (!this.storageBenchJobId) return;
+                    try {
+                        const response = await fetch('/admin/api/bench/storage/' + this.storageBenchJobId + '/results');
+                        if (response.status === 401) { window.location.href = '/admin'; return; }
+                        if (response.ok) {
+                            const data = await response.json();
+                            if (data.progress) this.storageBenchProgress = data.progress;
+                            if (data.status === 'completed' || data.status === 'failed') {
+                                this.storageBenchRunning = false;
+                                if (data.status === 'failed') {
+                                    this.storageBenchError = data.error || window.t('js.error.start_bench_failed');
+                                } else if (data.report) {
+                                    this.storagePrediction = data.report;
+                                    this.loadStorageAutoParams();
+                                }
+                                return; // terminal: stop polling
+                            }
+                        }
+                    } catch (err) {
+                        console.error('Storage bench poll failed:', err);
+                    }
+                    this.storageBenchPollTimer = setTimeout(poll, 1000);
+                };
+                poll();
+            },
+
             async startContextBenchmark() {
                 if (!this.ctxBenchModelId || this.ctxBenchRunning) return;
 
@@ -10093,6 +10192,12 @@
                     // refresh in case it changed on the Settings tab or in
                     // another window.
                     this.loadGlobalSettings();
+                }
+                if (tab === 'storage') {
+                    // Lazy-load derived params + the latest report so the
+                    // tab is never empty on revisit.
+                    this.loadStorageAutoParams();
+                    this.storagePredict();
                 }
             },
 
