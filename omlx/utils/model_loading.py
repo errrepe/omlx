@@ -225,6 +225,35 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 extras[variant] = val
         if extras:
             quant.update(extras)
+        # Nextn-style draft heads (GLM-5.3 JANG): the checkpoint stores the
+        # draft as extra trunk-indexed layers (model.layers.<n_main+i>.*)
+        # but the runtime tree nests them under language_model.mtp.<i>.
+        # Without these variants nn.quantize falls back to the global bits
+        # and builds e.g. a 2-bit draft MoE bank as 8-bit, failing the
+        # strict load with a shape error.
+        cfgs = (cfg, cfg.get("text_config") or {})
+        n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
+        n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
+        if n_mtp > 0 and n_main > 0:
+            for key, val in list(quant.items()):
+                if not isinstance(val, dict):
+                    continue
+                for i in range(n_mtp):
+                    pre = f"model.layers.{n_main + i}."
+                    if not key.startswith(pre):
+                        continue
+                    rest = key[len(pre):]
+                    if rest in ("eh_proj", "enorm", "hnorm"):
+                        nk = f"language_model.mtp.{i}.{rest}"
+                    elif rest == "shared_head.norm":
+                        nk = f"language_model.mtp.{i}.norm"
+                    elif rest.startswith(("shared_head.head", "embed_tokens")):
+                        nk = None
+                    else:
+                        nk = f"language_model.mtp.{i}.block.{rest}"
+                    if nk is not None and nk not in quant:
+                        quant[nk] = val
+                    break
         # Second pass: fused experts.* entries (originals and the prefix
         # variants just added) each need switch_mlp split-half variants.
         # Runs after the merge so every spelling is covered; the added

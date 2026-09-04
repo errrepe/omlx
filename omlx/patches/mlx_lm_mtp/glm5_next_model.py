@@ -773,6 +773,30 @@ def _patch_language_model(glm: Any) -> None:
     cls.mtp_partial_rollback = mtp_partial_rollback
 
 
+def _identity_hc(hc_mult: int):
+    # Parameter-free HyperConnection identity for the MTP draft block.
+    # The JANG draft ships no attn_hc/ffn_hc weights: the reference nextn
+    # head is a plain pre-norm residual layer. Streams are broadcast
+    # identical, so collapse-to-stream-0 plus post=1/comb=I gives
+    # out = branch(norm(x)) + x exactly; the trailing mean is a no-op.
+    import mlx.core as _mx
+    import mlx.nn as _nn
+
+    class _IdentityHC(_nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._h = int(hc_mult)
+
+        def __call__(self, x):
+            b, s, _, d = x.shape
+            xc = _mx.contiguous(x[:, :, 0, :])
+            post = _mx.ones((b, s, self._h), dtype=_mx.float32)
+            comb = _mx.broadcast_to(_mx.eye(self._h, dtype=_mx.float32), (b, s, self._h, self._h))
+            return xc, post, comb
+
+    return _IdentityHC()
+
+
 def _make_mtp_block(glm: Any, layer_config: Any, args: Any):
     import mlx.nn as nn
 
@@ -800,6 +824,8 @@ def _make_mtp_block(glm: Any, layer_config: Any, args: Any):
             self.block = Glm5NextDecoderLayer(
                 layer_config, layer_config.num_hidden_layers
             )
+            self.block.attn_hc = _identity_hc(self._hc_mult)
+            self.block.ffn_hc = _identity_hc(self._hc_mult)
 
         def __call__(self, h, embed_tokens, input_ids, cache):
             import mlx.core as mx

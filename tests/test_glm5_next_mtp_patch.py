@@ -388,5 +388,106 @@ class TestPromptPriming:
         assert mx.allclose(kv_a.state[0], kv_b.state[0], rtol=1e-4, atol=1e-4)
         assert mtp_cache[1].offset == ref_head[1].offset
 
+class TestDraftKvFusion:
+    def test_unquantized_draft_kv_fuses_to_embed_unembed(self, glm, mtp_active):
+        text = _headful_text_config()
+        lm = glm.LanguageModel(text)
+        heads, qk, vd, rank = 2, 8, 8, 8
+        mx.random.seed(7)
+        w = mx.random.normal((heads * (qk + vd), rank))
+        out = lm.sanitize({"mtp.0.block.self_attn.kv_b_proj.weight": w})
+        assert "mtp.0.block.self_attn.kv_b_proj.weight" not in out
+        eq = out["mtp.0.block.self_attn.embed_q.weight"]
+        uo = out["mtp.0.block.self_attn.unembed_out.weight"]
+        assert tuple(eq.shape) == (heads, qk, rank)
+        assert tuple(uo.shape) == (heads, vd, rank)
+        mx.eval(eq, uo, w)
+        v = w.reshape(heads, qk + vd, rank)
+        assert mx.allclose(eq, mx.contiguous(v[:, :qk, :].swapaxes(-1, -2)))
+        assert mx.allclose(uo, mx.contiguous(v[:, qk:, :]))
+
+
+
+class TestDraftIdentityHC:
+    def test_draft_hc_is_parameter_free(self, glm, mtp_active):
+        text = _headful_text_config()
+        lm = glm.LanguageModel(text)
+        for name in ("attn_hc", "ffn_hc"):
+            hc = getattr(lm.mtp[0].block, name)
+            assert type(hc).__name__ == "_IdentityHC"
+            assert dict(hc.parameters()) == {}
+
+    def test_identity_hc_is_plain_residual(self, glm, mtp_active):
+        from omlx.patches.deepseek_v4.hyper_connection import hc_expand
+
+        text = _headful_text_config()
+        lm = glm.LanguageModel(text)
+        hc = lm.mtp[0].block.attn_hc
+        mx.random.seed(13)
+        base = mx.random.normal((1, 3, 32))
+        x = mx.contiguous(mx.broadcast_to(base[:, :, None, :], (1, 3, 2, 32)))
+        xc, post, comb = hc(x)
+        mx.eval(xc, post, comb)
+        assert tuple(xc.shape) == (1, 3, 32)
+        assert mx.allclose(xc, base)
+        r = mx.random.normal((1, 3, 32))
+        y = hc_expand(r, x, post, comb)
+        mx.eval(y)
+        assert tuple(y.shape) == (1, 3, 2, 32)
+        assert mx.allclose(y[:, :, 0, :], r + base)
+        assert mx.allclose(y[:, :, 1, :], r + base)
+
+
+class TestNextnQuantVariants:
+    def test_expand_adds_mtp_runtime_keys(self):
+        from omlx.utils.model_loading import expand_per_layer_quant_keys
+
+        cfg = {
+            "num_hidden_layers": 2,
+            "text_config": {"num_nextn_predict_layers": 1},
+            "quantization": {
+                "group_size": 64,
+                "bits": 8,
+                "model.layers.2.mlp.switch_mlp.gate_proj": {
+                    "group_size": 64,
+                    "bits": 2,
+                },
+                "model.layers.2.eh_proj": {"group_size": 64, "bits": 8},
+                "model.layers.1.mlp.switch_mlp.gate_proj": {
+                    "group_size": 64,
+                    "bits": 2,
+                },
+            },
+        }
+        expand_per_layer_quant_keys(cfg)
+        q = cfg["quantization"]
+        assert q["language_model.mtp.0.block.mlp.switch_mlp.gate_proj"] == {
+            "group_size": 64,
+            "bits": 2,
+            "mode": "affine",
+        }
+        assert "language_model.mtp.0.eh_proj" in q
+        assert not any(k.startswith("language_model.mtp.1.") for k in q)
+        trunk_keys = [k for k in q if "mtp" in k and "layers.1." in k]
+        assert trunk_keys == []
+
+
+class TestDraftStreamingKeys:
+    def test_candidate_keys_include_nextn_layout(self):
+        from omlx.patches.expert_streaming import _mtp_candidate_stacked_keys
+
+        ks = _mtp_candidate_stacked_keys(0, "gate_proj", "weight", trunk_layers=2)
+        assert "model.layers.2.mlp.switch_mlp.gate_proj.weight" in ks
+        assert "language_model.mtp.0.block.mlp.switch_mlp.gate_proj.weight" in ks
+
+    def test_dsv4_candidates_unchanged_without_trunk_layers(self):
+        from omlx.patches.expert_streaming import _mtp_candidate_stacked_keys
+
+        assert _mtp_candidate_stacked_keys(0, "gate_proj", "weight") == [
+            "mtp.0.ffn.switch_mlp.gate_proj.weight",
+            "mtp.0.block.ffn.switch_mlp.gate_proj.weight",
+        ]
+
+
 
 

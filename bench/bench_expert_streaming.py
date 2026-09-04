@@ -361,6 +361,7 @@ async def run(
     pin_gib: float | None = None,
     pin_regime: str = "decode",
     knobs: list[str] | None = None,
+    mtp_depth: int | None = None,
 ):
     from omlx.engine_pool import EnginePool
     from omlx.model_settings import ModelSettings
@@ -427,6 +428,8 @@ async def run(
         mtp, mtp_block, ane, specprefill_draft, specprefill_keep,
         mtp_native=_mtp_native,
     )
+    if mtp_depth is not None:
+        settings.mtp_num_draft_tokens = int(mtp_depth)
     runtime = pool._entry_runtime_resident_size(entry, settings)
     print(f"runtime est {runtime / 1024**3:.2f}G")
     # Structural estimate block: what the tuner sized against (layer geometry
@@ -1007,6 +1010,9 @@ def main():
                          "comparison may differ on (Fase M5)")
     ap.add_argument("--pin-regime", choices=["decode", "prefill"], default="decode",
                     help="regime whose learned profile drives the pin selection (arm E: prefill)")
+    ap.add_argument("--mtp-depth", type=int, default=None, metavar="N",
+                    help="max native-MTP draft depth (mtp_num_draft_tokens); "
+                         "default leaves the model default (glm5_next: 3)")
     ap.add_argument("--min-free-gb", type=float, default=22.0, metavar="GB",
                     help="abort when available memory is below this (memory-starved runs fragment prefill "
                          "into many chunks, re-stream experts, and thrash the page cache)")
@@ -1059,6 +1065,7 @@ def main():
             out_dir=args.out_dir,
             single_request=args.single_request,
             gate_tokens=args.gate_tokens,
+            mtp_depth=args.mtp_depth,
             pin_gib=args.pin_gib,
             pin_regime=args.pin_regime,
             knobs=args.knob,

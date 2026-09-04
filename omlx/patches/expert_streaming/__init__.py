@@ -187,7 +187,11 @@ def _wire_streaming_io_overrides(
     targets = list(layers or []) + list(mtp_stages or [])
     for lyr in targets:
         moe = getattr(lyr, "mlp", None) or getattr(lyr, "ffn", None)
-        sm = getattr(moe, "switch_mlp", None)
+        if moe is None:
+            block = getattr(lyr, "block", None)
+            if block is not None:
+                moe = getattr(block, "mlp", None) or getattr(block, "ffn", None)
+        sm = getattr(moe, "switch_mlp", None) if moe is not None else None
         if sm is None:
             continue
         for proj in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
@@ -223,16 +227,27 @@ def _candidate_stacked_keys(layer_idx: int, proj: str, suffix: str) -> list[str]
     ]
 
 
-def _mtp_candidate_stacked_keys(stage_idx: int, proj: str, suffix: str) -> list[str]:
+def _mtp_candidate_stacked_keys(stage_idx: int, proj: str, suffix: str, trunk_layers: int | None = None) -> list[str]:
     """Bank key candidates for one DeepSeek V4 MTP/DSpark stage.
 
     DSpark checkpoints (0731) store ``mtp.<stage>.ffn.switch_mlp.*``; the
     legacy MTPBlock layout nests one level deeper under ``block``.
+    With trunk_layers set, GLM-5.3 JANG draft keys are appended: the raw
+    export stores the draft as one extra trunk-indexed layer
+    (``model.layers.<n>.mlp.switch_mlp.*``) and sanitize remaps it to
+    ``language_model.mtp.<stage>.block.mlp.switch_mlp.*``.
     """
-    return [
+    keys = [
         f"mtp.{stage_idx}.ffn.switch_mlp.{proj}.{suffix}",
         f"mtp.{stage_idx}.block.ffn.switch_mlp.{proj}.{suffix}",
     ]
+    if trunk_layers is not None:
+        base = int(trunk_layers) + int(stage_idx)
+        keys.append(f"model.layers.{base}.mlp.switch_mlp.{proj}.{suffix}")
+        keys.append(
+            f"language_model.mtp.{stage_idx}.block.mlp.switch_mlp.{proj}.{suffix}"
+        )
+    return keys
 
 
 def _resolve_stacked_key(
@@ -973,24 +988,46 @@ def convert_model_to_streaming(
     # (mtp.<stage>.ffn on DSpark checkpoints, mtp.<stage>.block.ffn on the
     # legacy MTPBlock layout). Streaming them keeps the ~3 GB/stage banks
     # out of RAM on low-memory hosts.
-    mtp_stages = getattr(layers_owner, "mtp", None) if layers_owner is not None else None
-    if not isinstance(mtp_stages, (list, tuple)) or not mtp_stages:
-        mtp_stages = None
+    # MTP stages live next to the decoder stack, but not always on the
+    # same owner that holds it: glm5_next VLM resolves layers through the
+    # root Model.layers property while the draft hangs off
+    # language_model.mtp. Walk nearby owners before giving up.
+    _mtp_owners: list = []
+    for _o in (layers_owner, model):
+        if _o is None:
+            continue
+        for _cand_o in (_o, getattr(_o, "language_model", None), getattr(_o, "model", None)):
+            if _cand_o is not None and all(_cand_o is not _seen for _seen in _mtp_owners):
+                _mtp_owners.append(_cand_o)
+    mtp_stages = None
+    for _o in _mtp_owners:
+        _cand = getattr(_o, "mtp", None)
+        if isinstance(_cand, (list, tuple)) and len(_cand):
+            mtp_stages = _cand
+            break
     mtp_converted = 0
     if mtp_stages:
         for stage_idx, stage in enumerate(mtp_stages):
             if stage is None:
                 continue
             stage_moe = getattr(stage, "ffn", None)
+            if stage_moe is None:
+                stage_moe = getattr(stage, "mlp", None)
+            compile_owner = stage
             if stage_moe is None or getattr(stage_moe, "switch_mlp", None) is None:
                 block = getattr(stage, "block", None)
-                stage_moe = getattr(block, "ffn", None) if block is not None else None
+                if block is not None:
+                    stage_moe = getattr(block, "ffn", None)
+                    if stage_moe is None:
+                        stage_moe = getattr(block, "mlp", None)
+                    if stage_moe is not None and getattr(stage_moe, "switch_mlp", None) is not None:
+                        compile_owner = block
             if stage_moe is None or getattr(stage_moe, "switch_mlp", None) is None:
                 continue
             if _convert_switch_mlp_module(
                 stage_moe,
                 len(layers) + stage_idx,
-                candidates_for=lambda proj, suffix, _s=stage_idx: _mtp_candidate_stacked_keys(_s, proj, suffix),
+                candidates_for=lambda proj, suffix, _s=stage_idx, _n=len(layers): _mtp_candidate_stacked_keys(_s, proj, suffix, trunk_layers=_n),
                 needle=f"mtp.{stage_idx}.",
                 backing=backing,
                 backing_kind=backing_kind,
@@ -998,7 +1035,7 @@ def convert_model_to_streaming(
                 estimate=estimate,
                 hidden=hidden,
                 moe_hidden=moe_hidden,
-                layer=stage,
+                layer=compile_owner,
                 hot_ids=None,
             ):
                 mtp_converted += 1
