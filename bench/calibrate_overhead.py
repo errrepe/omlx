@@ -28,6 +28,9 @@ async def _measure(model_path: str, streaming: bool) -> dict:
 
     est = expert_streaming_estimate(model_path)
     pool = EnginePool()
+    from pathlib import Path
+
+    pool.discover_models(str(Path(model_path).parent))
     settings = ModelSettings(
         expert_streaming_enabled=streaming,
         expert_streaming_budget_gib=(0.0 if streaming else None),
