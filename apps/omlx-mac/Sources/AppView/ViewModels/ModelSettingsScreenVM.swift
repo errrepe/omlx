@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingTopkThreshold, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingColdTier
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingBudgetAuto, expertStreamingTopkThreshold, expertStreamingCachePrior, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingPinSync, expertStreamingPinRegime, expertStreamingColdTier, expertStreamingHotFraction
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -245,12 +245,17 @@ final class ModelSettingsScreenVM {
     var expertStreamingSupported: Bool = false
     var expertStreamingForced: Bool = false
     var expertStreamingBudgetGib: String = ""
+    var expertStreamingBudgetAuto: Bool = false
     var expertStreamingTopkThreshold: String = ""
+    var expertStreamingCachePrior: String = ""
     var expertStreamingPerLayerEval: Bool = true
     var expertStreamingPins: Bool = false
     var expertStreamingPinGib: String = ""
+    var expertStreamingPinSync: Bool = false
+    var expertStreamingPinRegime: String = ""
     var expertStreamingColdTier: String = ""
     var expertStreamingColdTierPresent: Bool = false
+    var expertStreamingHotFraction: String = ""
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -396,9 +401,11 @@ final class ModelSettingsScreenVM {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
-        case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib,
-             .expertStreamingTopkThreshold, .expertStreamingPerLayerEval, .expertStreamingPins, .expertStreamingPinGib,
+        case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib, .expertStreamingBudgetAuto,
+             .expertStreamingTopkThreshold, .expertStreamingCachePrior, .expertStreamingPerLayerEval, .expertStreamingPins, .expertStreamingPinGib,
+             .expertStreamingPinSync, .expertStreamingPinRegime,
              .expertStreamingColdTier,
+             .expertStreamingHotFraction,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
@@ -537,14 +544,19 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingEnabled = self.expertStreamingForced
                     || (s?.expertStreamingEnabled ?? false)
                 self.expertStreamingBudgetGib = s?.expertStreamingBudgetGib.map { String($0) } ?? ""
+                self.expertStreamingBudgetAuto = s?.expertStreamingBudgetAuto ?? true
                 self.expertStreamingTopkThreshold = s?.expertStreamingTopkThreshold.map { String($0) } ?? ""
+                self.expertStreamingCachePrior = s?.expertStreamingCachePrior.map { String($0) } ?? ""
                 // Null means the env/built-in default, which is on — show the
                 // effective state so the toggle is never a lie.
                 self.expertStreamingPerLayerEval = s?.expertStreamingPerLayerEval ?? true
                 self.expertStreamingPins = s?.expertStreamingPins ?? false
                 self.expertStreamingPinGib = s?.expertStreamingPinGib.map { String($0) } ?? ""
+                self.expertStreamingPinSync = s?.expertStreamingPinSync ?? false
+                self.expertStreamingPinRegime = s?.expertStreamingPinRegime ?? ""
                 self.expertStreamingColdTier = s?.expertStreamingColdTier ?? ""
                 self.expertStreamingColdTierPresent = m.expertStreamingColdTierPresent ?? false
+                self.expertStreamingHotFraction = s?.expertStreamingHotFraction.map { String($0) } ?? ""
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -712,6 +724,16 @@ final class ModelSettingsScreenVM {
                 lastError = "Top-k threshold must be between 0.05 and 1.0"
                 return
             }
+        case .expertStreamingCachePrior:
+            guard expertStreamingSupported else { return }
+            if expertStreamingCachePrior.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                patch.expertStreamingCachePrior = nil
+            } else if let v = Double(expertStreamingCachePrior), v >= 0.0, v <= 10.0 {
+                patch.expertStreamingCachePrior = v > 0 ? v : nil
+            } else {
+                lastError = "Cache-prior bonus must be between 0.0 and 10.0"
+                return
+            }
         case .expertStreamingPerLayerEval:
             guard expertStreamingSupported, expertStreamingEnabled else { return }
             patch.expertStreamingPerLayerEval = expertStreamingPerLayerEval
@@ -724,6 +746,20 @@ final class ModelSettingsScreenVM {
                 patch.expertStreamingPinGib = nil
             } else if let v = Double(expertStreamingPinGib), v >= 0, v <= 64 {
                 patch.expertStreamingPinGib = v
+            }
+        case .expertStreamingBudgetAuto:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingBudgetAuto = expertStreamingBudgetAuto
+        case .expertStreamingPinSync:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingPinSync = expertStreamingPinSync
+        case .expertStreamingPinRegime:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            let regime = expertStreamingPinRegime.trimmingCharacters(in: .whitespacesAndNewlines)
+            if regime.isEmpty {
+                patch.expertStreamingPinRegime = nil
+            } else if regime == "decode" || regime == "prefill" {
+                patch.expertStreamingPinRegime = regime
             } else {
                 lastError = "Pin budget must be between 0 and 64 GiB"
                 return
@@ -737,6 +773,17 @@ final class ModelSettingsScreenVM {
                 patch.expertStreamingColdTier = String(Int(v))
             } else {
                 lastError = "Cold tier must be 2 or 3"
+                return
+            }
+        case .expertStreamingHotFraction:
+            guard expertStreamingSupported, expertStreamingEnabled, expertStreamingColdTierPresent else { return }
+            let frac = expertStreamingHotFraction.trimmingCharacters(in: .whitespacesAndNewlines)
+            if frac.isEmpty {
+                patch.expertStreamingHotFraction = nil
+            } else if let v = Double(frac), v >= 0, v <= 1 {
+                patch.expertStreamingHotFraction = v
+            } else {
+                lastError = "Hot fraction must be between 0 and 1"
                 return
             }
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
@@ -1092,18 +1139,14 @@ final class ModelSettingsScreenVM {
             || type.hasPrefix("qwen3_8")
     }
 
-    /// MTP can't co-exist with DFlash or TurboQuant KV. The toggle uses
-    /// this to disable itself and surface the conflict reason.
+    /// Native Lightning MTP can't co-exist with the other speculative
+    /// decoders. TurboQuant KV supports its decode-shaped multi-row verify
+    /// path, so it is intentionally not a conflict here.
     var mtpConflictReason: String? {
         if dflashEnabled {
             return String(localized: "settings.mtp.conflict.dflash",
                           defaultValue: "Disable DFlash before enabling MTP.",
                           comment: "Tooltip / sublabel shown when MTP can't be enabled because DFlash is on")
-        }
-        if turboquantKvEnabled {
-            return String(localized: "settings.mtp.conflict.turboquant",
-                          defaultValue: "Disable TurboQuant KV before enabling MTP.",
-                          comment: "Tooltip / sublabel shown when MTP can't be enabled because TurboQuant KV is on")
         }
         if vlmMtpEnabled {
             return String(localized: "settings.mtp.conflict.vlm_mtp",

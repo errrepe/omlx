@@ -12,9 +12,41 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_PRIOR_DIR = Path(os.environ.get("OMLX_PREFILL_PRIOR_DIR", "") or Path.home() / ".cache" / "omlx")
+
+
+def _prior_path(model_id: str, model_path: str | Path | None = None) -> Path | None:
+    if not model_id:
+        return None
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in model_id)[:80]
+    # Fase K F10: resolve from the REAL model path the scheduler already
+    # knows (no hardcoded device roots, no iterdir scan per load). The
+    # .omlx dir next to the model is created on save; a read-only model
+    # dir falls back to the env/cache dir below.
+    if model_path:
+        try:
+            base = Path(model_path)
+            if base.is_dir():
+                cand = base / ".omlx" / "prefill_transient_prior.json"
+                try:
+                    if cand.parent.is_dir():
+                        return cand
+                    # writable check: can we create parent? best-effort probe
+                    cand.parent.mkdir(parents=True, exist_ok=True)
+                    if cand.parent.is_dir():
+                        return cand
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return _PRIOR_DIR / f"prefill_prior_{safe}.json"
 
 
 class PrefillTransientTracker:
@@ -45,8 +77,10 @@ class PrefillTransientTracker:
     # observed outlier.
     _EWMA_OUTLIER_RATIO = 8.0
 
-    def __init__(self, model_id: str = "") -> None:
+    def __init__(self, model_id: str = "", model_path: str | Path | None = None) -> None:
         self._model_id = model_id
+        # Fase K F10: real model dir used by _prior_path (no hardcoded roots).
+        self._model_path = model_path
         self._ewma_per_token: float = 0.0
         self._samples: int = 0
         # Last observed delta for debug log inspection.
@@ -199,3 +233,58 @@ class PrefillTransientTracker:
         self._last_n_tokens = 0
         self._observed_max_bytes = 0
         self._recent_reclaim_bytes = 0
+
+    def save_prior(self) -> None:
+        if not self._model_id or self._samples == 0 or self._ewma_per_token <= 0:
+            return
+        path = _prior_path(self._model_id, self._model_path)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            data = {
+                "model_id": self._model_id,
+                "bytes_per_token": self._ewma_per_token,
+                "samples": self._samples,
+                "observed_max_bytes": self._observed_max_bytes,
+                "last_delta_bytes": self._last_delta_bytes,
+                "last_n_tokens": self._last_n_tokens,
+            }
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(path)
+            logger.info("PrefillTransientTracker(%s): saved prior %.1f B/tok to %s", self._model_id, self._ewma_per_token, path)
+        except Exception as e:
+            logger.debug("save_prior failed %s: %s", path, e)
+
+    def load_prior(self) -> bool:
+        path = _prior_path(self._model_id, self._model_path)
+        if path is None or not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text())
+            bpt = float(data.get("bytes_per_token", 0))
+            if bpt <= 0 or bpt > 100 * 1024 * 1024:  # sanity: 100 MB/tok max
+                return False
+            self._ewma_per_token = bpt
+            # Fase K F10/K3: seed the EWMA but do NOT inherit the prior's
+            # sample count — a regime change (e.g. cold tier toggled on/off,
+            # which shifts bytes/token by ~2x) must not need dozens of
+            # chunks to move the EWMA. Samples are clamped to 0 so the
+            # first measured chunk of the new session REPLACES the prior
+            # (update() seeds when samples == 0). K3: the restored prior is
+            # NOT measurement — last_delta_bytes/last_n_tokens are zeroed so
+            # the scheduler cannot price the first chunk from a stale prior
+            # (a changed regime would underestimate the first chunk and
+            # risk the Metal peak/OOM the throttle exists to prevent). The
+            # first chunk sizes against the static estimate — the exact
+            # pre-prior fallback — until the first real update().
+            self._samples = 0
+            self._observed_max_bytes = int(data.get("observed_max_bytes", 0))
+            self._last_delta_bytes = 0
+            self._last_n_tokens = 0
+            logger.info("PrefillTransientTracker(%s): loaded prior %.1f B/tok from %s", self._model_id, bpt, path)
+            return True
+        except Exception as e:
+            logger.debug("load_prior failed %s: %s", path, e)
+            return False

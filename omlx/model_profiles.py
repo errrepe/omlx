@@ -106,7 +106,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "qwen4_ple_ssd_offload",
         "expert_streaming_enabled",
         "expert_streaming_budget_gib",
+        "expert_streaming_budget_auto",
         "expert_streaming_topk_threshold",
+        "expert_streaming_cache_prior",
         # Machine/IO-tuned streaming knobs (autotune) — hardware-specific.
         "expert_streaming_io_depth",
         "expert_streaming_coalesce",
@@ -116,7 +118,10 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "expert_streaming_per_layer_eval",
         "expert_streaming_pins",
         "expert_streaming_pin_gib",
+        "expert_streaming_pin_sync",
+        "expert_streaming_pin_regime",
         "expert_streaming_cold_tier",
+        "expert_streaming_hot_fraction",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

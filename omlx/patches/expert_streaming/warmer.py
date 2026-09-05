@@ -53,15 +53,37 @@ SEED_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_SEED", "1") != "0"
 SEED_BYTES = int(
     float(os.environ.get("OMLX_EXPERT_STREAMING_SEED_GIB", "2.0")) * 1024**3
 )
+# Fase L: start the pin budget small (256 MiB) — the L2 matrix tests
+# 256 MiB / 512 MiB / 1.25 GiB before any default is promoted.
 PIN_BUDGET_BYTES = int(
-    float(os.environ.get("OMLX_EXPERT_STREAMING_PIN_GIB", "1.25")) * 1024**3
+    float(os.environ.get("OMLX_EXPERT_STREAMING_PIN_GIB", "0.25")) * 1024**3
 )
 PIN_OBSERVE_CALLS = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_TOKENS", "8")))
 # Learned pin store (colibri-style): persist observed per-layer frequencies
 # to this JSON and reload them on the next load, skipping the observation
 # window so the hot set is wired from token 1.
 PIN_PROFILE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_PIN_PROFILE", "") or None
-_PIN_PROFILE_KEEP = 64
+# Fase I6: the profile feeds the HOBBIT top-fraction split, so it must cover
+# the model's full expert width (GLM: 288 experts/layer) — 64 truncated it
+# and made the fraction's denominator meaningless. Env-tunable, JSON format
+# unchanged (a list of [expert, count] pairs per layer).
+_PIN_PROFILE_KEEP = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_KEEP", "512")))
+
+# Fase L: profile format version. v2 splits the learned frequencies into
+# per-regime counters (decode vs prefill) and refuses to apply a profile
+# whose model fingerprint does not match the loaded model. v1 (merged freq)
+# migrates to the decode regime on load. Both regimes also persist the
+# legacy top-level "freq" (= decode regime) so older consumers keep working.
+PROFILE_VERSION = 2
+# Fase L: which regime drives the pin selection. Env override for the bench
+# matrix (arm E: prefill profile applied to decode).
+PIN_REGIME = os.environ.get("OMLX_EXPERT_STREAMING_PIN_REGIME", "decode")
+# Fase L: pin synchronously at engine load when 1. Bench arms need the
+# mlock pass finished before the first request; the server default stays
+# async (pins must never delay the request path).
+PIN_SYNC_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_PIN_SYNC", "") == "1"
+
+_PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
 
 _WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="omlx-expert-warm")
 
@@ -192,7 +214,16 @@ class PageCacheWarmer:
 
 
 class PinController:
-    """Observe routing for N calls, then mlock the hot experts per layer."""
+    """Observe routing per regime, then mlock the hot experts per layer.
+
+    Fase L: the learned profile is version 2 and regime-split — decode rows
+    (<= _MAX_WARM_ROWS positions, the union fast-path shape) accrue under
+    regimes["decode"] and prefill rows under regimes["prefill"].
+    The pin selection reads one regime (pin_regime, default decode), the
+    budget is distributed proportionally to each layer's usage mass with a
+    minimum of one expert per layer, and the unique page ranges of the
+    chosen experts are deduped before the budget is enforced.
+    """
 
     def __init__(
         self,
@@ -203,40 +234,112 @@ class PinController:
         observe_calls: int = PIN_OBSERVE_CALLS,
         per_expert_bytes: int = 0,
         profile_path: str | None = None,
+        num_experts: int = 0,
+        model_fingerprint: Dict[str, Any] | None = None,
+        packing: str | None = None,
+        pin_regime: str | None = None,
+        pin_sync: bool | None = None,
     ):
         self.linears_by_layer = linears_by_layer
         self.backing = backing
         self.budget_bytes = budget_bytes
         self.observe_calls = observe_calls
         self.per_expert_bytes = per_expert_bytes
-        self.freq: Dict[int, Counter] = {}
+        # Fase I6: expert width of the routed layers — lets on_layer_plan
+        # size per-token bincounts (and validate counts payloads) without
+        # another call. 0 = unknown (tests / legacy wiring); the counts
+        # payload then defines its own width.
+        self.num_experts = int(num_experts)
+        # Fase L: per-regime learned frequencies. decode = routing calls at
+        # or below _MAX_WARM_ROWS positions; prefill = larger calls.
+        self.regimes: Dict[str, Dict[int, Counter]] = {"decode": {}, "prefill": {}}
+        # Fase M1: explicit wiring wins; the env constant is the fallback
+        # when the caller passes None (server defaults, tests).
+        if pin_regime is None:
+            pin_regime = PIN_REGIME
+        if pin_sync is None:
+            pin_sync = PIN_SYNC_ENABLED
+        self.pin_regime = pin_regime if pin_regime in ("decode", "prefill") else "decode"
+        self.pin_sync = bool(pin_sync)
+        self.model_fingerprint = (dict(model_fingerprint) if model_fingerprint else None)
+        self.packing = packing
+        # None = no fingerprint to verify; True/False after a v2 load.
+        self.fingerprint_match: bool | None = None
+        self.profile_regime = self.pin_regime
         self.calls = 0
         self.pinned = False
         self.pin_jobs = 0
+        self.pin_load_time_ms = 0.0
+        self.pinned_pages_estimate = 0
         # Server wiring passes a per-model path (<model>/.omlx/...); the env
         # path stays the explicit bench/override opt-in and wins when set.
         self.profile_path = PIN_PROFILE_PATH or profile_path
         if self.profile_path and self._load_profile():
             # Learned hot set available: pin immediately, no observation.
-            self._pin_all()
+            # Sync only when the effective wiring says so — the server
+            # default keeps pins off the request path.
+            self._pin_all(sync=self.pin_sync)
+        # Fase M1: truthful load-time flags for the bench JSON — a profile
+        # was loaded at engine load, and the wired pins were applied before
+        # the first request when the effective sync is on.
+        self.pins_applied_at_load = self.pinned
+
+    @property
+    def freq(self) -> Dict[int, Counter]:
+        """The active regime's frequencies (legacy name kept for tests)."""
+        return self.regimes[self.pin_regime]
+
+    @freq.setter
+    def freq(self, value: Dict[int, Counter]) -> None:
+        self.regimes[self.pin_regime] = value
 
     def _load_profile(self) -> bool:
         try:
             import json
 
             data = json.loads(open(self.profile_path).read())
-            freq = data.get("freq") or {}
-            if not freq:
-                return False
-            self.freq = {
-                int(layer): Counter({int(e): int(c) for e, c in pairs})
-                for layer, pairs in freq.items()
-            }
+            version = int(data.get("version", 1))
+            if version >= 2:
+                fp = data.get("model_fingerprint")
+                if self.model_fingerprint and fp != self.model_fingerprint:
+                    logger.warning(
+                        "Expert streaming: pin profile %s fingerprint mismatch "
+                        "(loaded %s, model %s) — profile ignored",
+                        self.profile_path,
+                        fp,
+                        self.model_fingerprint,
+                    )
+                    self.fingerprint_match = False
+                    return False
+                self.fingerprint_match = True
+                regimes = data.get("regimes") or {}
+                for regime in ("decode", "prefill"):
+                    freq = (regimes.get(regime) or {}).get("freq") or {}
+                    self.regimes[regime] = {
+                        int(layer): Counter({int(e): int(c) for e, c in pairs})
+                        for layer, pairs in freq.items()
+                    }
+                self.packing = data.get("packing") or self.packing
+            else:
+                # v1 migration (documented): the merged freq was decode-driven
+                # (the pin pass fired only from decode rows), so it becomes
+                # the decode regime; prefill starts empty.
+                freq = data.get("freq") or {}
+                if not freq:
+                    return False
+                self.regimes["decode"] = {
+                    int(layer): Counter({int(e): int(c) for e, c in pairs})
+                    for layer, pairs in freq.items()
+                }
+                self.regimes["prefill"] = {}
+                self.packing = data.get("packing") or self.packing
             if data.get("per_expert_bytes"):
                 self.per_expert_bytes = int(data["per_expert_bytes"])
             logger.info(
-                "Expert streaming: loaded learned pin profile (%d layers) from %s",
-                len(self.freq),
+                "Expert streaming: loaded learned pin profile (%d layers, "
+                "regime %s) from %s",
+                len(self.regimes[self.pin_regime]),
+                self.pin_regime,
                 self.profile_path,
             )
             return True
@@ -245,19 +348,36 @@ class PinController:
             return False
 
     def save_profile(self) -> None:
-        if not self.profile_path or not self.freq:
+        if not self.profile_path:
             return
         try:
             import json
             from pathlib import Path
 
+            if not (self.regimes["decode"] or self.regimes["prefill"]):
+                return
             Path(self.profile_path).parent.mkdir(parents=True, exist_ok=True)
+            # Plan format: regimes.<regime>.freq.<layer> -> [[expert, count]].
+            regimes = {
+                regime: {
+                    "freq": {
+                        str(layer): counter.most_common(_PIN_PROFILE_KEEP)
+                        for layer, counter in sorted(counters.items())
+                    }
+                }
+                for regime, counters in self.regimes.items()
+            }
             data = {
+                "version": PROFILE_VERSION,
+                "model_fingerprint": self.model_fingerprint,
+                "packing": self.packing,
                 "per_expert_bytes": self.per_expert_bytes,
-                "freq": {
-                    str(layer): counter.most_common(_PIN_PROFILE_KEEP)
-                    for layer, counter in sorted(self.freq.items())
-                },
+                "regimes": regimes,
+                # Legacy top-level freq = the decode regime, so v1 consumers
+                # (older tooling reading only "freq") keep working.
+                "freq": regimes["decode"].get("freq", {})
+                if isinstance(regimes["decode"], dict)
+                else {},
             }
             tmp = self.profile_path + ".tmp"
             with open(tmp, "w") as f:
@@ -267,55 +387,144 @@ class PinController:
         except Exception as e:
             logger.debug("Failed to save pin profile %s: %s", self.profile_path, e)
 
-    def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
-        if self.pinned or positions > _MAX_WARM_ROWS:
+    @staticmethod
+    def _counts_payload(counts, num_experts: int) -> Dict[int, int] | None:
+        # Coerce a per-token usage histogram into {expert: count}. counts
+        # is either the np.bincount(plan.flat_np, minlength=E) vector from
+        # the streaming switch (Fase I6's hotness signal: usage per token,
+        # not presence per plan) or a plain mapping expert -> usage. None
+        # when the payload is unusable so callers fall back to the
+        # presence-based uniq_list signal (old wiring / tests).
+        if counts is None:
+            return None
+        try:
+            if hasattr(counts, "tolist"):  # np.ndarray / mx.array-like
+                counts = counts.tolist()
+            if isinstance(counts, dict):
+                return {int(e): int(c) for e, c in counts.items()}
+            if isinstance(counts, (list, tuple)):
+                if num_experts > 0 and len(counts) > num_experts:
+                    counts = counts[:num_experts]
+                return {i: int(c) for i, c in enumerate(counts) if int(c) > 0}
+        except Exception:
+            return None
+        return None
+
+    def on_layer_plan(
+        self,
+        layer_idx: int,
+        uniq_list: list[int],
+        positions: int,
+        counts=None,
+    ) -> None:
+        # Fase L: keep recording the regime this call belongs to even after
+        # the pin pass, so the profile refreshes during the session and the
+        # stop() save reflects the latest usage. The mlock pass itself still
+        # fires only from the decode observe window or at load time.
+        usage = self._counts_payload(counts, self.num_experts)
+        regime = "decode" if positions <= _MAX_WARM_ROWS else "prefill"
+        if usage is not None:
+            self.regimes[regime].setdefault(layer_idx, Counter()).update(usage)
+        else:
+            self.regimes[regime].setdefault(layer_idx, Counter()).update(
+                int(e) for e in uniq_list
+            )
+        if regime != "decode" or self.pinned:
             return
-        self.freq.setdefault(layer_idx, Counter()).update(int(e) for e in uniq_list)
         # One decode token = one plan per layer; pin after the window.
         self.calls += 1
         if self.calls >= self.observe_calls * max(len(self.linears_by_layer), 1):
             self._pin_all()
 
-    def _pin_all(self) -> None:
+    def _plan_page_ranges(self, jobs: list[tuple[str, int]]) -> int:
+        """Unique page count across the chosen experts (page-aligned dedupe).
+
+        Experts are contiguous in the stacked bank, so consecutive ids share
+        the boundary page; the budget must count unique pages only.
+        """
+        intervals: Dict[tuple[str, str], list[tuple[int, int]]] = {}
+        for key, eid in jobs:
+            try:
+                reader = self.backing._reader_for_key(key, int(eid))
+                off, end = reader.expert_byte_range(key, int(eid))
+            except Exception:
+                continue
+            sp = off // _PAGE_SIZE
+            ep = (end + _PAGE_SIZE - 1) // _PAGE_SIZE
+            if ep > sp:
+                intervals.setdefault((str(reader.path), key), []).append((sp, ep))
+        total = 0
+        for ivs in intervals.values():
+            ivs.sort()
+            cur_s, cur_e = ivs[0]
+            for s, e in ivs[1:]:
+                if s <= cur_e:
+                    cur_e = max(cur_e, e)
+                else:
+                    total += cur_e - cur_s
+                    cur_s, cur_e = s, e
+            total += cur_e - cur_s
+        return total
+
+    def _pin_all(self, sync: bool = False) -> None:
         self.pinned = True
-        num_layers = max(len(self.freq), 1)
         per_expert = self.per_expert_bytes
         if per_expert <= 0:
             per_expert = max(
                 (getattr(l, "_per_expert_hint", 0) for ls in self.linears_by_layer.values() for l in ls),
                 default=0,
             )
-        slots_per_layer = 0
-        if per_expert > 0:
-            slots_per_layer = max(0, self.budget_bytes // (num_layers * per_expert))
-        jobs = []
-        for layer_idx, counter in self.freq.items():
+        freq = self.regimes[self.pin_regime]
+        if not freq or per_expert <= 0:
+            return
+        budget = self.budget_bytes
+        # Fase L: per-layer budget proportional to usage mass, minimum one
+        # expert per layer with a valid frequency.
+        total_mass = sum(c.total() for c in freq.values()) or 1
+        ranked: list[tuple[float, str, int]] = []
+        for layer_idx, counter in freq.items():
+            if counter.total() <= 0:
+                continue
+            layer_budget = budget * counter.total() / total_mass
+            n = max(1, int(layer_budget // per_expert))
             linears = self.linears_by_layer.get(layer_idx) or []
             keys = [k for lin in linears for k in _proj_keys(lin)]
             if not keys:
                 continue
-            top = [e for e, _ in counter.most_common(slots_per_layer)] if slots_per_layer else []
-            for eid in top:
+            for eid, count in counter.most_common(n):
                 for key in keys:
-                    jobs.append((key, eid))
+                    ranked.append((float(count), key, int(eid)))
 
         def _run():
             t0 = time.perf_counter()
-            for key, eid in jobs:
+            jobs = sorted(set(ranked), key=lambda j: -j[0])
+            total_pages = self._plan_page_ranges([(k, e) for _, k, e in jobs])
+            # Trim least-hot until the unique pinned pages fit the budget.
+            while total_pages * _PAGE_SIZE > budget and len(jobs) > 1:
+                jobs.pop()
+                total_pages = self._plan_page_ranges([(k, e) for _, k, e in jobs])
+            self.pinned_pages_estimate = total_pages
+            for _count, key, eid in jobs:
                 try:
                     self.backing.pin_expert(key, eid)
                 except Exception:
                     pass
             self.pin_jobs = len(jobs)
+            self.pin_load_time_ms = (time.perf_counter() - t0) * 1000.0
             self.save_profile()
             logger.info(
-                "Expert streaming: pinned %d expert slices (%.2f GiB wired) in %.1fs",
+                "Expert streaming: pinned %d expert slices (%.2f GiB unique "
+                "pages, regime %s) in %.1fms",
                 self.backing.pinned_count,
-                self.backing.pinned_bytes / 1024**3,
-                time.perf_counter() - t0,
+                (self.pinned_pages_estimate * _PAGE_SIZE) / 1024**3,
+                self.pin_regime,
+                self.pin_load_time_ms,
             )
 
-        _WARM_POOL.submit(_run)
+        if sync:
+            _run()
+        else:
+            _WARM_POOL.submit(_run)
 
 
 def _infer_per_expert_bytes(linears_by_layer: Dict[int, list], backing: Any) -> int:
@@ -422,16 +631,28 @@ class PrefillHotnessRecorder:
         self.seeded_s = 0.0
         self.seed_done = threading.Event()
 
-    def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
+    def on_layer_plan(
+        self,
+        layer_idx: int,
+        uniq_list: list[int],
+        positions: int,
+        counts=None,
+    ) -> None:
         if self.seeded:
             return
         if positions > _MAX_WARM_ROWS:
             # Prefill-sized call: accumulate frequency (decode rows are
-            # top_k * batch and would bias toward the first token).
+            # top_k * batch and would bias toward the first token). With a
+            # per-token counts payload (I6) the accumulation is true usage;
+            # the uniq_list fallback is presence-per-plan (legacy wiring).
             self.saw_prefill = True
-            self.freq.setdefault(layer_idx, Counter()).update(
-                int(e) for e in uniq_list
-            )
+            usage = PinController._counts_payload(counts, 0)
+            if usage is not None:
+                self.freq.setdefault(layer_idx, Counter()).update(usage)
+            else:
+                self.freq.setdefault(layer_idx, Counter()).update(
+                    int(e) for e in uniq_list
+                )
 
     def maybe_seed(self, layer_idx: int, positions: int) -> None:
         """Fire once, at the first decode-sized call after a prefill."""
@@ -606,18 +827,35 @@ class WarmPinHook:
         self.pinner = pinner
         self.recorder = recorder
 
+    @property
+    def wants_usage_counts(self) -> bool:
+        # Fase I6: only the pin/recorder consumers use the per-token usage
+        # histogram, so the switch only pays the np.bincount when at least
+        # one of them is attached. The readahead warmer keeps the plain
+        # uniq_list contract (contiguous-run F_RDADVISE grouping).
+        return self.pinner is not None or self.recorder is not None
+
     def on_layer_start(self, layer_idx: int, positions: int) -> None:
         if self.recorder is not None:
             self.recorder.maybe_seed(layer_idx, positions)
         if self.warmer is not None:
             self.warmer.on_layer_start(layer_idx, positions)
 
-    def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
+    def on_layer_plan(
+        self,
+        layer_idx: int,
+        uniq_list: list[int],
+        positions: int,
+        counts=None,
+    ) -> None:
         if self.warmer is not None:
+            # Warmer (readahead/discarded reads) keeps the uniq-list signal:
+            # its predictions are set-based (contiguous-run grouping), and a
+            # histogram adds nothing there.
             self.warmer.on_layer_plan(layer_idx, uniq_list, positions)
         if self.pinner is not None:
-            self.pinner.on_layer_plan(layer_idx, uniq_list, positions)
+            self.pinner.on_layer_plan(layer_idx, uniq_list, positions, counts)
         if self.recorder is not None:
-            self.recorder.on_layer_plan(layer_idx, uniq_list, positions)
+            self.recorder.on_layer_plan(layer_idx, uniq_list, positions, counts)
 
 

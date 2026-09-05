@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 # Current settings file format version
 SETTINGS_VERSION = 2
 
+# The Lightning MTP runtime clamps deeper requests to this global ceiling.
+# Keep API validation and runtime normalization on the same contract.
+MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
+
 
 def vlm_mtp_processor_conflicts(data: dict) -> list:
     """Names of settings that need per-request logits processors and
@@ -227,11 +231,24 @@ class ModelSettings:
     # GiB app-level LRU.
     expert_streaming_enabled: bool = False
     expert_streaming_budget_gib: Optional[float] = None
+    expert_streaming_budget_auto: Optional[bool] = True
+    # Default-on RAM-scaled expert cache: size the app-level LRU from the
+    # memory ceiling (more RAM = more cached experts) instead of streaming
+    # everything. An explicit budget_gib (including 0 = page-cache only)
+    # always wins; auto only applies when the budget is unset. None follows
+    # the default (on); False opts back out to page-cache only.
+    # Machine-specific: never propagated via model profiles.
     # Opt-in approximate MoE routing: keep the smallest score-descending
     # prefix of the top-k experts whose cumulative mass reaches this
     # threshold. None/1.0 = exact routing (bit-identical to the reference
     # path); <1.0 trades output fidelity for fewer streamed expert bytes.
     expert_streaming_topk_threshold: Optional[float] = None
+    # Opt-in cache-conditional MoE routing: logit bonus for LRU-resident
+    # experts before top-k. None/0.0 = exact routing (bit-identical);
+    # >0 trades output fidelity for fewer SSD re-reads (Fase 3: hit
+    # 9.2%->19.3%, +10.8% tok/s at 1.0 on Qwen-JANG_4M short).
+    # Machine-specific: never propagated via model profiles.
+    expert_streaming_cache_prior: Optional[float] = None
     # Per-model overrides for the expert-streaming IO layer. None keeps the
     # env-var / built-in default behavior (see patches/expert_streaming).
     # Autotune (bench/autotune_expert_streaming.py) writes the winning values
@@ -264,7 +281,16 @@ class ModelSettings:
         # load so the hot set is wired from token 1. Zero output change.
     )
     expert_streaming_pin_gib: Optional[float] = (
-        None  # Pin budget in GiB (default env OMLX_EXPERT_STREAMING_PIN_GIB or 1.25)
+        None  # Pin budget in GiB (default env OMLX_EXPERT_STREAMING_PIN_GIB or 0.25)
+    )
+    expert_streaming_pin_sync: Optional[bool] = (
+        None  # Fase M1: apply the learned pins synchronously at engine load
+        # (default env OMLX_EXPERT_STREAMING_PIN_SYNC or off). Bench arms set
+        # it so the mlock pass provably completes before the first request.
+    )
+    expert_streaming_pin_regime: Optional[str] = (
+        None  # Fase M1: profile regime that drives the pin selection —
+        # "decode" or "prefill" (default env OMLX_EXPERT_STREAMING_PIN_REGIME).
     )
     expert_streaming_cold_tier: Optional[str] = (
         None  # Cold precision tier for streamed experts: "2"/"3" reads expert
@@ -272,6 +298,10 @@ class ModelSettings:
         # bytes per token on the NVMe I/O floor, at the tier's fidelity
         # (gate with the perplexity harness). None/"" = off.
     )
+    # Fase I6: HOBBIT per-expert hot/cold split — fraction of experts per
+    # layer (top by learned pin-profile frequency) that keep the ORIGINAL
+    # packing while the rest read the cold tier. 0/unset = uniform tier (I5).
+    expert_streaming_hot_fraction: Optional[float] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

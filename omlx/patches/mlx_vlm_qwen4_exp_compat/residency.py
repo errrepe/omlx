@@ -9,7 +9,14 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-_MODEL_OVERHEAD_FACTOR = 1.05
+# P3: single overhead source — expert_streaming.residency owns the value;
+# this module re-exports it so the two estimates cannot drift apart.
+try:
+    from omlx.patches.expert_streaming.residency import (
+        _MODEL_OVERHEAD_FACTOR,
+    )
+except Exception:  # pragma: no cover - import fallback for vendored contexts
+    _MODEL_OVERHEAD_FACTOR = 1.05
 _NGRAM_EMBEDDING_MARKER = ".ngram_embedding."
 
 
@@ -32,28 +39,6 @@ class Qwen4ExpResidencyEstimate:
             and self.resident_bytes > memory_ceiling
             and self.mmap_bytes <= memory_ceiling
         )
-
-
-def _resolve_ple_path(model_path: Path) -> Path:
-    config_path = model_path / "config.json"
-    if not config_path.is_file():
-        return model_path
-    try:
-        config = json.loads(config_path.read_text())
-    except (OSError, ValueError):
-        return model_path
-    artifact = config.get("qwen4_exp_artifact") or {}
-    relative_ple = artifact.get("ple_artifact")
-    if relative_ple is None:
-        return model_path
-    relative_ple = Path(relative_ple)
-    if relative_ple.is_absolute():
-        return model_path
-    candidate = (model_path / relative_ple).resolve()
-    artifact_root = model_path.parent.resolve()
-    if candidate != artifact_root and artifact_root not in candidate.parents:
-        return model_path
-    return candidate
 
 
 def _safetensors_header(path: Path) -> dict:
@@ -118,12 +103,8 @@ def qwen4_exp_residency_estimate(
 ) -> Qwen4ExpResidencyEstimate:
     """Inspect Qwen4 checkpoint headers without materializing tensor data."""
 
-    compute_path = Path(model_path).expanduser().resolve()
-    ple_path = _resolve_ple_path(compute_path)
-    roots = {compute_path, ple_path}
-    checkpoint_files = {
-        path.resolve() for root in roots for path in root.glob("*.safetensors")
-    }
+    ple_path = Path(model_path).expanduser().resolve()
+    checkpoint_files = {path.resolve() for path in ple_path.glob("*.safetensors")}
     signature = tuple(
         sorted(
             (str(path), stat.st_size, stat.st_mtime_ns)

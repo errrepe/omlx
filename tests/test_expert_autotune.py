@@ -61,6 +61,18 @@ class TestTrialScore:
         assert dirty == pytest.approx(0.5 - 0.25)
 
 
+class TestPriorUsable:
+    def test_lru_capacity_gates_prior(self):
+        from types import SimpleNamespace
+
+        from omlx.patches.expert_streaming import _prior_usable
+
+        assert _prior_usable(SimpleNamespace(capacity=1141)) is True
+        assert _prior_usable(SimpleNamespace(capacity=0)) is False
+        assert _prior_usable(None) is False
+        assert _prior_usable(object()) is False
+
+
 class TestWatchdog:
     POLICY = at.WatchdogPolicy(floor_available_gib=5.0, max_swap_growth_gib=2.0, floor_consecutive=2)
 
@@ -119,6 +131,8 @@ class TestKnobs:
         assert env["OMLX_EXPERT_STREAMING_RA"] == "0"
         assert env["OMLX_EXPERT_STREAMING_SEED"] == "1"
         assert env["OMLX_EXPERT_STREAMING_PILOT"] == "1"
+        assert env["OMLX_EXPERT_STREAMING_CACHE_PRIOR"] == "0.0"
+        assert at.Knobs(prior=2.0).env()["OMLX_EXPERT_STREAMING_CACHE_PRIOR"] == "2.0"
 
     def test_profile_kwargs_matches_settings_fields(self):
         kw = at.Knobs(budget_gib=2.0, topk=None).profile_kwargs()
@@ -130,6 +144,80 @@ class TestKnobs:
     def test_label_is_stable_and_filesystem_safe(self):
         label = at.Knobs(budget_gib=4.0, topk=0.85).label()
         assert label == "b4_qd16_c1_ra1_s1_p0_tk0.85"
+
+    def test_prior_knob_label_profile_and_screen(self):
+        assert at.Knobs(prior=1.0).label() == "b0_qd16_c1_ra1_s1_p0_cp1"
+        kw = at.Knobs(prior=1.0).profile_kwargs()
+        s = ModelSettings(**kw)
+        assert s.expert_streaming_cache_prior == 1.0
+        kw0 = at.Knobs().profile_kwargs()
+        assert ModelSettings(**kw0).expert_streaming_cache_prior is None
+        base = at.Knobs()
+        off = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False, sweep_prior=False
+        )
+        assert all(knob != "prior" for knob, _ in off)
+        on = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[0.0, 1.0],
+        )
+        got = [(knob, cfg.prior) for knob, cfg in on if knob == "prior"]
+        assert got == [("prior", 1.0)]
+
+    def test_prior_arms_carried_on_positive_budget(self):
+        """A prior arm on a zero-budget base is refused by the runtime (no
+        LRU to rank with) and re-measures the base. Prior arms must ride a
+        positive budget even when the sweep's budget list is [0]."""
+        base = at.Knobs()
+        on = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[1.0, 2.0],
+            loaded_est_gib=1.0, available_gib=30.0, reserve_gib=4.0,
+        )
+        prior_arms = [cfg for knob, cfg in on if knob == "prior"]
+        assert prior_arms, "prior arms disappeared from the sweep"
+        for cfg in prior_arms:
+            assert cfg.budget_gib > 0.0, (
+                f"prior arm {cfg.label()} carries a dead budget {cfg.budget_gib}"
+            )
+        # Room (30 - 4 - 1 - 2 = 23 GiB) comfortably admits 1 GiB.
+        assert all(cfg.budget_gib == 1.0 for cfg in prior_arms)
+
+    def test_prior_arms_follow_room_when_tight(self):
+        """With almost no room the carry budget shrinks below 1 GiB but the
+        prior arm still rides a positive budget (clamped to the room)."""
+        base = at.Knobs()
+        on = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[2.0],
+            loaded_est_gib=10.0, available_gib=14.0, reserve_gib=1.0,
+        )
+        prior_arms = [cfg for knob, cfg in on if knob == "prior"]
+        assert prior_arms
+        assert all(0.0 < cfg.budget_gib <= 1.0 for cfg in prior_arms)
+
+    def test_prior_arms_survive_zero_room_as_no_candidates(self):
+        """With literally no room for any positive budget the sweep skips
+        prior arms rather than sending refused trials."""
+        base = at.Knobs()
+        on = at.screen_candidates(
+            base, budgets=[0.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[2.0],
+            loaded_est_gib=20.0, available_gib=14.0, reserve_gib=4.0,
+        )
+        assert not [cfg for knob, cfg in on if knob == "prior"]
+
+    def test_prior_arms_untouched_when_base_already_positive(self):
+        """A base that already rides a positive budget keeps it — the carry
+        fix must not rewrite existing arms."""
+        base = at.Knobs(budget_gib=2.0)
+        on = at.screen_candidates(
+            base, budgets=[0.0, 2.0], depths=[16], sweep_topk=False,
+            sweep_prior=True, priors=[1.0],
+        )
+        prior_arms = [cfg for knob, cfg in on if knob == "prior"]
+        assert prior_arms
+        assert all(cfg.budget_gib == 2.0 for cfg in prior_arms)
 
 
 class TestScreenCandidates:
@@ -266,3 +354,73 @@ class TestBuildRecommendation:
         assert rec["applied_to_profile"] is True
         assert rec["machine"]["metal_cap_gib"] == 36.0
         assert rec["notes"] == ["n1"]
+        assert rec["budget_knee_gib"] is None
+
+
+class TestBudgetKnee:
+    def test_empty_is_none(self):
+        assert at.budget_knee_gib([]) is None
+
+    def test_all_failed_is_none(self):
+        assert at.budget_knee_gib([(0.0, float("-inf")), (2.0, float("-inf"))]) is None
+
+    def test_best_at_zero_is_zero(self):
+        # The LRU adds nothing: knee 0 caps budget_auto at page-cache.
+        assert at.budget_knee_gib([(0.0, 0.0), (2.0, -0.1), (4.0, -0.2)]) == 0.0
+
+    def test_smallest_budget_at_95pct(self):
+        # best 1.0 at 8 GiB; 2 GiB already reaches 0.96 -> knee 2.
+        pairs = [(0.0, 0.0), (1.0, 0.5), (2.0, 0.96), (4.0, 0.99), (8.0, 1.0)]
+        assert at.budget_knee_gib(pairs) == 2.0
+
+    def test_plateau_picks_first(self):
+        pairs = [(1.0, 0.5), (2.0, 0.5), (4.0, 0.5)]
+        assert at.budget_knee_gib(pairs) == 1.0
+
+    def test_write_budget_knee(self, tmp_path):
+        dest = at.write_budget_knee(tmp_path, "qwen", 2.5)
+        assert dest == tmp_path / ".omlx" / "expert_budget_knee.json"
+        data = json.loads(dest.read_text())
+        assert data["version"] == 1
+        assert data["knee_gib"] == 2.5
+        assert data["model"] == "qwen"
+
+
+class TestColdTierSweep:
+    def test_gated_off_without_tier(self):
+        """No cold_tier arms when the model has no expert_cold/ dir."""
+        cands = at.screen_candidates(
+            at.Knobs(), budgets=[0.0], depths=[16], sweep_topk=False,
+            cold_tier_available=False, hot_fractions=[0.25, 0.5],
+        )
+        assert all(knob != "cold_tier" for knob, _ in cands)
+
+    def test_arms_need_explicit_sweep_flag(self):
+        """--sweep-cold-tier + tier on disk → one arm per hot_fraction.
+        Quality lever (non-bit-exact): the flag alone is not enough — it
+        must never sweep automatically (project policy: defaults bit-exact)."""
+        cands = at.screen_candidates(
+            at.Knobs(), budgets=[0.0], depths=[16], sweep_topk=False,
+            cold_tier_available=True, hot_fractions=[0.25, 0.5],
+            sweep_cold_tier=True,
+        )
+        arms = [cfg for knob, cfg in cands if knob == "cold_tier"]
+        assert len(arms) == 2
+        # without the explicit flag: no cold_tier arms even with the dir present
+        cands2 = at.screen_candidates(
+            at.Knobs(), budgets=[0.0], depths=[16], sweep_topk=False,
+            cold_tier_available=True, hot_fractions=[0.25, 0.5],
+        )
+        assert all(knob != "cold_tier" for knob, _ in cands2)
+        assert all(cfg.cold_tier == "3" for cfg in arms)
+        assert {cfg.hot_fraction for cfg in arms} == {0.25, 0.5}
+        # profile_kwargs carries both knobs for --apply persistence
+        kw = arms[0].profile_kwargs()
+        assert kw["expert_streaming_cold_tier"] == "3"
+        assert kw["expert_streaming_hot_fraction"] in (0.25, 0.5)
+
+    def test_label_and_env(self):
+        """The label names the tier + fraction; env() adds nothing new."""
+        cfg = at.Knobs(cold_tier="3", hot_fraction=0.5)
+        assert "ct3" in cfg.label() and "hf0.5" in cfg.label()
+        assert "expert_streaming_cold_tier" in cfg.profile_kwargs()

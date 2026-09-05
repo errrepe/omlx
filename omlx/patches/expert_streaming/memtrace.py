@@ -63,6 +63,36 @@ logger = logging.getLogger(__name__)
 _TRACE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_MEMTRACE", "") or None
 _SAMPLE_EVERY = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_MEMTRACE_EVERY", "1")))
 
+# Fase L1: numeric fields whose per-event aggregates land in summary() so a
+# bench run can report, e.g., the mean/max positions and bank bytes per
+# ctx.ensure event without post-processing the JSONL. Keep this set small and
+# fixed: aggregation is per-record overhead on the traced path only.
+_TRACKED_NUMERIC = frozenset(
+    {
+        "positions",
+        "uniq",
+        "miss",
+        "hits",
+        "misses",
+        "bank_bytes",
+        "ctx_bank_bytes",
+        "ctx_inflight_bytes",
+        "ctx_prefetch_count",
+        "inflight",
+        "inflight_bytes",
+        "hot_positions",
+        "cold_positions",
+        "hot_bank_bytes",
+        "cold_bank_bytes",
+        "experts",
+        "bytes",
+        "n_proj",
+        "n_loaded",
+        "segments",
+        "call_s",
+    }
+)
+
 
 def _phys_footprint() -> int:
     """Best-effort mach phys_footprint (includes IOAccelerator/Metal)."""
@@ -112,6 +142,12 @@ class _NullTracer:
     def record(self, event: str, **fields: Any) -> None:
         return None
 
+    def set_context(self, **ctx: Any) -> None:
+        return None
+
+    def clear_context(self) -> None:
+        return None
+
     @contextmanager
     def scope(self, event: str, **fields: Any) -> Iterator[None]:
         yield None
@@ -141,11 +177,18 @@ class MemTracer:
         self.path = path
         self.sample_every = max(1, int(sample_every))
         self._lock = threading.Lock()
+        # Fase M6: ambient context (phase, request_id, engine_id) attached
+        # to every row, and a per-(layer, proj) event sequence counter so
+        # ordering can be reconstructed without timestamp resolution.
+        self._context: dict[str, Any] = {}
+        self._event_seq: dict[tuple, int] = {}
         self._file = None
         self._seq = 0
         self._rows: list[dict[str, Any]] = []
         self._t0 = time.perf_counter()
         self._peaks: dict[str, int] = {}
+        # Fase L1: {event: {field: {sum, n, max}}} over _TRACKED_NUMERIC fields.
+        self._agg: dict[str, dict[str, dict[str, float]]] = {}
         # Keep at most this many rows in memory when no path is given, so an
         # unattended long run cannot grow unbounded.
         self._max_rows = 200_000
@@ -179,8 +222,23 @@ class MemTracer:
                 "t": round(time.perf_counter() - self._t0, 6),
                 "event": event,
             }
+            if self._context:
+                row.update(self._context)
             row.update(fields)
+            # Fase M6: monotone per-(layer, proj) event sequence.
+            if "layer" in fields and "proj" in fields:
+                k = (fields.get("layer"), fields.get("proj"))
+                self._event_seq[k] = self._event_seq.get(k, 0) + 1
+                row["event_seq"] = self._event_seq[k]
             row.update(self._sample())
+            for key, val in fields.items():
+                if key in _TRACKED_NUMERIC and isinstance(val, (int, float)) and not isinstance(val, bool):
+                    acc = self._agg.setdefault(event, {}).setdefault(
+                        key, {"sum": 0.0, "n": 0, "max": float("-inf")}
+                    )
+                    acc["sum"] += float(val)
+                    acc["n"] += 1
+                    acc["max"] = max(acc["max"], float(val))
             for key in ("active", "cache", "peak", "footprint", "rss", "bank_bytes"):
                 val = row.get(key)
                 if isinstance(val, int) and val > self._peaks.get(key, 0):
@@ -191,6 +249,16 @@ class MemTracer:
                 self._file.write(json.dumps(row, default=str) + "\n")
             elif len(self._rows) < self._max_rows:
                 self._rows.append(row)
+
+    def set_context(self, **ctx: Any) -> None:
+        """Fase M6: ambient fields (phase, request_id...) appended to every
+        subsequent row until clear_context()."""
+        with self._lock:
+            self._context.update(ctx)
+
+    def clear_context(self) -> None:
+        with self._lock:
+            self._context.clear()
 
     @contextmanager
     def scope(self, event: str, **fields: Any) -> Iterator[None]:
@@ -222,6 +290,18 @@ class MemTracer:
         }
         for key, val in peaks.items():
             out[f"peak_{key}_gib"] = round(val / 1024**3, 3)
+        if self._agg:
+            agg_out: dict[str, dict[str, dict[str, float]]] = {}
+            for event, fields_ in self._agg.items():
+                agg_out[event] = {}
+                for field, acc in fields_.items():
+                    if acc["n"] <= 0:
+                        continue
+                    agg_out[event][field] = {
+                        "mean": round(acc["sum"] / acc["n"], 1),
+                        "max": round(acc["max"], 1),
+                    }
+            out["event_aggregates"] = agg_out
         return out
 
     def reset(self) -> None:
@@ -229,6 +309,7 @@ class MemTracer:
         with self._lock:
             self._peaks.clear()
             self._rows.clear()
+            self._agg.clear()
             self._seq = 0
             self._t0 = time.perf_counter()
 

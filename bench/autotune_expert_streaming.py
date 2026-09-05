@@ -58,6 +58,9 @@ class Knobs:
     seed: bool = True
     pilot: bool = False
     topk: float | None = None
+    prior: float = 0.0
+    cold_tier: str | None = None
+    hot_fraction: float | None = None
 
     def label(self) -> str:
         parts = [
@@ -70,6 +73,12 @@ class Knobs:
         ]
         if self.topk is not None:
             parts.append(f"tk{self.topk:g}")
+        if self.prior > 0:
+            parts.append(f"cp{self.prior:g}")
+        if self.cold_tier is not None:
+            parts.append(f"ct{self.cold_tier}")
+        if self.hot_fraction is not None:
+            parts.append(f"hf{self.hot_fraction:g}")
         return "_".join(parts)
 
     def env(self) -> dict[str, str]:
@@ -80,6 +89,9 @@ class Knobs:
             "OMLX_EXPERT_STREAMING_RA": "1" if self.readahead else "0",
             "OMLX_EXPERT_STREAMING_SEED": "1" if self.seed else "0",
             "OMLX_EXPERT_STREAMING_PILOT": "1" if self.pilot else "0",
+            # Hermeticity: pin the fidelity fallback per trial so an ambient
+            # shell export cannot leak into base/calibration trials (audit).
+            "OMLX_EXPERT_STREAMING_CACHE_PRIOR": str(float(self.prior)),
         }
 
     def profile_kwargs(self) -> dict:
@@ -92,11 +104,14 @@ class Knobs:
             "expert_streaming_seed": bool(self.seed),
             "expert_streaming_pilot": bool(self.pilot),
             "expert_streaming_topk_threshold": self.topk,
+            "expert_streaming_cache_prior": (float(self.prior) if self.prior > 0 else None),
+            "expert_streaming_cold_tier": self.cold_tier,
+            "expert_streaming_hot_fraction": self.hot_fraction,
         }
 
 
 # Coordinate-descent sweep order: biggest measured lever first.
-KNOB_SWEEP_ORDER = ("budget_gib", "io_depth", "pilot", "coalesce", "readahead", "seed", "topk")
+KNOB_SWEEP_ORDER = ("budget_gib", "io_depth", "pilot", "coalesce", "readahead", "seed", "topk", "prior", "cold_tier")
 
 KNOB_ATTRS = {
     "budget_gib": "budget_gib",
@@ -106,6 +121,8 @@ KNOB_ATTRS = {
     "readahead": "readahead",
     "seed": "seed",
     "topk": "topk",
+    "prior": "prior",
+    "cold_tier": "cold_tier",
 }
 
 
@@ -132,6 +149,46 @@ def trial_score(result: "TrialResult", ref: "TrialResult") -> float:
         result.ttft_s or 0.0, result.tok_s or 0.0, ref.ttft_s or 0.0, ref.tok_s or 0.0
     )
     return score - 0.25 * max(0.0, result.swap_growth_gib)
+
+
+def budget_knee_gib(budget_scores: list[tuple[float, float]]) -> float | None:
+    """Smallest budget reaching >=95% of the best score (the LRU knee).
+
+    Input is (budget_gib, score) pairs for completed same-context trials.
+    Empty/all-failed input returns None (no knee data). Best-at-zero
+    returns 0.0: the bench measured the LRU as adding nothing. The runtime
+    caps ``expert_streaming_budget_auto`` at min(8 GiB, knee).
+    """
+    if not budget_scores:
+        return None
+    best = max(s for _, s in budget_scores)
+    if best == float("-inf"):
+        return None
+    target = 0.95 * best if best > 0 else best
+    cands = sorted(b for b, s in budget_scores if s >= target)
+    return float(cands[0]) if cands else None
+
+
+def write_budget_knee(model_path: Path, model_key: str, knee_gib: float) -> Path:
+    """Persist the knee next to the checkpoint for budget_auto to read."""
+    dest = Path(model_path) / ".omlx" / "expert_budget_knee.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "model": model_key,
+                "knee_gib": round(float(knee_gib), 3),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "note": (
+                    "smallest budget reaching ~95% of the best autotune "
+                    "score; caps expert_streaming_budget_auto"
+                ),
+            },
+            indent=2,
+        )
+    )
+    return dest
 
 
 @dataclass(frozen=True)
@@ -204,6 +261,11 @@ def screen_candidates(
     budgets: list[float],
     depths: list[int],
     sweep_topk: bool,
+    sweep_prior: bool = False,
+    priors: list[float] | None = None,
+    cold_tier_available: bool = False,
+    hot_fractions: list[float] | None = None,
+    sweep_cold_tier: bool = False,
     loaded_est_gib: float | None = None,
     available_gib: float | None = None,
     reserve_gib: float = 10.0,
@@ -218,6 +280,8 @@ def screen_candidates(
     for knob in KNOB_SWEEP_ORDER:
         if knob == "topk" and not sweep_topk:
             continue
+        if knob == "prior" and not sweep_prior:
+            continue
         if knob == "budget_gib":
             cands: list = list(budgets)
             # A positive budget lives in RSS: only sweep values that fit
@@ -229,6 +293,39 @@ def screen_candidates(
             cands = list(depths)
         elif knob == "topk":
             cands = [None, 0.85]
+        elif knob == "prior":
+            cands = list(priors) if priors else [0.0, 1.0, 2.0]
+            # The reranker is refused at budget 0 (no LRU to rank with), so
+            # a prior arm on a zero-budget base is a no-op re-measurement of
+            # the base. Carry prior arms on a positive budget that fits
+            # alongside the loaded runtime, mirroring how the budget knob
+            # itself picks candidates; with no room at all, skip the arms.
+            if getattr(base, "budget_gib", 0.0) <= 0.0:
+                room = None
+                if loaded_est_gib is not None and available_gib is not None:
+                    room = available_gib - reserve_gib - loaded_est_gib - 2.0
+                if room is None:
+                    carry_budget = 1.0
+                else:
+                    carry_budget = 1.0 if room >= 1.0 else room
+                if carry_budget <= 0.0:
+                    cands = []
+                else:
+                    base = replace(base, budget_gib=carry_budget)
+        elif knob == "cold_tier":
+            # Only sweep when the model has a materialized expert_cold/ dir
+            # (the tier must exist before the runtime can route to it).
+            # Opt-in quality lever: requantizing to a cold tier is
+            # near-lossless, NOT bit-exact. Never sweep it automatically —
+            # only when --sweep-cold-tier is passed AND the tier is on disk
+            # (project policy: defaults stay bit-exact).
+            if not (sweep_cold_tier and cold_tier_available):
+                continue
+            hf = replace(base, cold_tier="3", hot_fraction=(hot_fractions[0] if hot_fractions else None))
+            trials.append(("cold_tier", hf))
+            for frac in hot_fractions[1:] if hot_fractions else []:
+                trials.append(("cold_tier", replace(base, cold_tier="3", hot_fraction=frac)))
+            continue
         else:
             cands = [True, False]
         for value in cands:
@@ -325,6 +422,12 @@ def bench_command(
     ]
     if cfg.topk is not None:
         cmd += ["--topk", str(cfg.topk)]
+    if cfg.prior > 0:
+        cmd += ["--cache-prior", str(cfg.prior)]
+    if cfg.cold_tier is not None:
+        cmd += ["--cold-tier", str(cfg.cold_tier)]
+        if cfg.hot_fraction is not None:
+            cmd += ["--hot-fraction", str(cfg.hot_fraction)]
     return cmd
 
 
@@ -592,6 +695,7 @@ def build_recommendation(
     validate_context: str,
     applied: bool,
     notes: list[str] | None = None,
+    budget_knee: float | None = None,
 ) -> dict:
     return {
         "version": 1,
@@ -602,7 +706,8 @@ def build_recommendation(
         "machine": machine.dict(),
         "screen_context": screen_context,
         "validate_context": validate_context,
-        "winner": winner.profile_kwargs() | {"label": winner.label()},
+        "budget_knee_gib": budget_knee,
+        "winner": winner.profile_kwargs() | {"label": winner.label()}, 
         "winner_score": round(winner_score, 4) if winner_score == winner_score else None,
         "trials": [t.row() for t in trials],
         "applied_to_profile": applied,
@@ -640,6 +745,11 @@ def run_session(opts: argparse.Namespace) -> int:
 
     model_path = Path(MODEL_PATHS[opts.model])
     model_id = DEFAULT_ENTRIES[opts.model]
+    # Cold-tier autotuning is gated on a materialized tier: only sweep
+    # expert_streaming_cold_tier when this checkpoint actually has
+    # <model>/expert_cold/ on disk (generated by tools/requant_cold_tier.py).
+    cold_tier_available = (model_path / "expert_cold").is_dir()
+    hot_fractions = [float(x) for x in str(opts.hot_fractions).split(",") if x.strip()] if getattr(opts, "hot_fractions", None) else []
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_dir = Path(opts.out_root) / f"{opts.model}_{stamp}"
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -751,6 +861,11 @@ def run_session(opts: argparse.Namespace) -> int:
             budgets=budgets,
             depths=depths,
             sweep_topk=opts.sweep_topk,
+            sweep_prior=opts.sweep_prior,
+            priors=opts.priors,
+            cold_tier_available=cold_tier_available,
+        sweep_cold_tier=opts.sweep_cold_tier,
+            hot_fractions=hot_fractions,
             loaded_est_gib=None,
             available_gib=baseline_available,
             reserve_gib=reserve,
@@ -792,6 +907,10 @@ def run_session(opts: argparse.Namespace) -> int:
         budgets=budgets,
         depths=depths,
         sweep_topk=opts.sweep_topk,
+        sweep_prior=opts.sweep_prior,
+        priors=opts.priors,
+        cold_tier_available=cold_tier_available,
+        hot_fractions=hot_fractions,
         loaded_est_gib=loaded_est,
         available_gib=baseline_available,
         reserve_gib=reserve,
@@ -832,6 +951,16 @@ def run_session(opts: argparse.Namespace) -> int:
             )
 
     print(f"=== Winner: {best_cfg.label()} ===", flush=True)
+    # LRU knee from same-context screening scores: caps budget_auto so the
+    # cache stops growing where the bench stopped paying off.
+    knee_gib = budget_knee_gib(
+        [
+            (t.cfg.budget_gib, trial_score(t, calib))
+            for t in trials
+            if t.ok and t.context == opts.screen_context
+        ]
+    )
+    print(f"Budget knee: {knee_gib if knee_gib is not None else 'n/a'} GiB", flush=True)
     applied = False
     if opts.apply:
         try:
@@ -840,6 +969,12 @@ def run_session(opts: argparse.Namespace) -> int:
             print(f"Applied to per-model profile: {path}", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: --apply failed: {exc}", flush=True)
+        if knee_gib is not None:
+            try:
+                knee_path = write_budget_knee(model_path, opts.model, knee_gib)
+                print(f"Wrote budget knee: {knee_path}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: knee write failed: {exc}", flush=True)
 
     rec = build_recommendation(
         model_key=opts.model,
@@ -854,6 +989,7 @@ def run_session(opts: argparse.Namespace) -> int:
         validate_context=opts.validate_context,
         applied=applied,
         notes=notes,
+        budget_knee=knee_gib,
     )
     (session_dir / "recommendation.json").write_text(json.dumps(rec, indent=2))
     (session_dir / "trials.json").write_text(json.dumps([t.row() for t in trials], indent=2))
@@ -874,6 +1010,13 @@ def main() -> int:
     ap.add_argument("--qd", type=int, nargs="+", default=[8, 16, 32], help="IO depth candidates")
     ap.add_argument("--sweep-topk", action="store_true",
                     help="also sweep expert_streaming_topk_threshold (trades output fidelity)")
+    ap.add_argument("--sweep-cold-tier", action="store_true",
+                    help="sweep expert_streaming_cold_tier (requires <model>/expert_cold/; gated automatically)")
+    ap.add_argument("--hot-fractions", default="0.25,0.5",
+                    help="comma-separated hot_fraction candidates for the cold-tier arm")
+    ap.add_argument("--sweep-prior", action="store_true",
+                    help="also sweep expert_streaming_cache_prior (trades output fidelity)")
+    ap.add_argument("--priors", default="0.0,1.0,2.0", help="comma-separated cache_prior candidates (calibration: 2.0 short+2k winner, 4.0 degenerates)")
     ap.add_argument("--reserve-gib", type=float, default=10.0,
                     help="memory kept away from the bench ceiling: your apps + KV + headroom")
     ap.add_argument("--min-free-gb", type=float, default=22.0)
@@ -890,6 +1033,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="probe the machine, print the plan, run nothing")
     opts = ap.parse_args()
     opts.budgets = [float(b) for b in opts.budgets.split(",")]
+    opts.priors = [float(p) for p in opts.priors.split(",")]
     return run_session(opts)
 
 

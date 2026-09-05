@@ -763,7 +763,7 @@ private struct AdvancedTab: View {
                                           defaultValue: "Expert LRU budget",
                                           comment: "Row label for the expert cache budget field"),
                             sublabel: String(localized: "settings.advanced.expert_streaming.budget.sub",
-                                             defaultValue: "Optional app-level expert LRU. Empty or 0 = page-cache only (default; measured faster with less RAM). >0 pins a fixed GiB cache.",
+                                             defaultValue: "Fixed app-level expert LRU. Empty = automatic RAM-scaled cache (default); 0 = page-cache only; >0 pins a fixed GiB cache.",
                                              comment: "Sublabel for the expert cache budget field")) {
                             TextInput(text: vm.bind(
                                 $vm.expertStreamingBudgetGib,
@@ -773,6 +773,23 @@ private struct AdvancedTab: View {
                                     }
                                 }
                             ), mono: true, suffix: "GiB", width: 110)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.budget_auto.label",
+                                          defaultValue: "Auto RAM-scaled cache",
+                                          comment: "Row label for the automatic expert cache budget toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.budget_auto.sub",
+                                             defaultValue: "Size the expert cache from this machine's memory ceiling (more RAM = more cached experts). A fixed budget above always wins. Takes effect after reload.",
+                                             comment: "Sublabel for the automatic expert cache budget toggle")) {
+                            Toggle("", isOn: vm.bind(
+                                $vm.expertStreamingBudgetAuto,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingBudgetAuto, client: client)
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
                         }
                     }
                     if vm.expertStreamingEnabled {
@@ -787,6 +804,23 @@ private struct AdvancedTab: View {
                                 save: {
                                     Task {
                                         await vm.save(.expertStreamingTopkThreshold, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.cacheprior.label",
+                                          defaultValue: "Cache-prior bonus",
+                                          comment: "Row label for the cache-prior routing bonus field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.cacheprior.sub",
+                                             defaultValue: "Opt-in approximate routing: resident experts get this logit bonus before top-k. 0.0 or empty = exact.",
+                                             comment: "Sublabel for the cache-prior routing bonus field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingCachePrior,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingCachePrior, client: client)
                                     }
                                 }
                             ), mono: true, width: 110)
@@ -842,6 +876,40 @@ private struct AdvancedTab: View {
                             }
                         }
                     }
+                    if vm.expertStreamingEnabled && vm.expertStreamingPins {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.pin_sync.label",
+                                          defaultValue: "Apply pins synchronously at load",
+                                          comment: "Row label for the synchronous pinning toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.pin_sync.sub",
+                                             defaultValue: "Bench arms set this so the mlock pass provably completes before the first request. Off = pin in the background.",
+                                             comment: "Sublabel for the synchronous pinning toggle")) {
+                            Toggle("", isOn: vm.bind(
+                                $vm.expertStreamingPinSync,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingPinSync, client: client)
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.pin_regime.label",
+                                          defaultValue: "Pin profile regime",
+                                          comment: "Row label for the pin regime field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.pin_regime.sub",
+                                             defaultValue: "Which routing sample the pin selection reads: decode or prefill. Empty = decode.",
+                                             comment: "Sublabel for the pin regime field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingPinRegime,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingPinRegime, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
                     if vm.expertStreamingEnabled && vm.expertStreamingColdTierPresent {
                         Row(label: String(localized: "settings.advanced.expert_streaming.cold_tier.label",
                                           defaultValue: "Cold expert tier (bits)",
@@ -854,6 +922,21 @@ private struct AdvancedTab: View {
                                 save: {
                                     Task {
                                         await vm.save(.expertStreamingColdTier, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.hot_fraction.label",
+                                          defaultValue: "Hot expert fraction (HOBBIT split)",
+                                          comment: "Row label for the hot fraction field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.hot_fraction.sub",
+                                             defaultValue: "0–1. With a cold tier and a learned pin profile, this fraction of each layer's most-used experts keeps the original 4-bit; the rest read the cold tier. Empty = uniform tier.",
+                                             comment: "Sublabel for the hot fraction field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingHotFraction,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingHotFraction, client: client)
                                     }
                                 }
                             ), mono: true, width: 110)

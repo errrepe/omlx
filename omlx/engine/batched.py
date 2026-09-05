@@ -26,19 +26,6 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-def _read_config_model_type(model_path: str) -> str | None:
-    """Read ``model_type`` from a local checkpoint's config.json (None if absent)."""
-    import json
-    from pathlib import Path
-
-    try:
-        cfg = json.loads((Path(model_path) / "config.json").read_text())
-        model_type = cfg.get("model_type")
-        return str(model_type) if model_type else None
-    except Exception:
-        return None
-
-
 # Optional Harmony adapter import
 try:
     from ..adapter.harmony import preprocess_harmony_messages
@@ -281,10 +268,23 @@ class BatchedEngine(BaseEngine):
 
             load_kwargs: dict[str, Any] = {}
             if getattr(self._model_settings, "expert_streaming_enabled", False):
-                from ..patches.expert_streaming import is_supported_model_type
+                # One predicate for "this checkpoint can stream", shared with
+                # EnginePool (which forces streaming) and the converter below
+                # (which does the conversion): the structural estimate.
+                #
+                # This used to test the model_type allowlist instead, which
+                # disagreed with the estimate: any checkpoint with stacked
+                # switch_mlp banks outside the list was forced into streaming
+                # by EnginePool while this gate declined the lazy load, so
+                # mlx_lm materialized the full multi-hundred-GB MoE banks and
+                # the process was OOM-killed before the converter ran. The
+                # estimate itself now requires the allowlist (residency.py),
+                # so a single check cannot diverge from itself.
+                from ..patches.expert_streaming.residency import (
+                    expert_streaming_estimate,
+                )
 
-                model_type = _read_config_model_type(self._model_name)
-                if model_type and is_supported_model_type(model_type):
+                if expert_streaming_estimate(self._model_name).supported:
                     # Lazy-load so giant MoE checkpoints (DeepSeek V4 Flash
                     # oQ4e ~166G) stream from SSD instead of materializing
                     # fully in RAM; expert streaming replaces the MoE banks
@@ -722,9 +722,20 @@ class BatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         # Persist the learned expert-pin profile while the backing is still
         # reachable (teardown below drops it with the model).
-        from omlx.patches.expert_streaming import save_expert_pin_profile
+        from omlx.patches.expert_streaming import (
+            save_expert_pin_profile,
+            shutdown_expert_streaming,
+        )
 
         save_expert_pin_profile(self)
+        try:
+            shutdown_expert_streaming(getattr(self, "_expert_streaming_backing", None))
+        except Exception:
+            pass
+        try:
+            self._expert_streaming_backing = None
+        except Exception:
+            pass
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
@@ -968,6 +979,10 @@ class BatchedEngine(BaseEngine):
         )
 
         text = clean_special_tokens(output.output_text)
+        self._log_streaming_summary(
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+        )
 
         return GenerationOutput(
             text=text,
@@ -978,6 +993,55 @@ class BatchedEngine(BaseEngine):
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
         )
+
+    def _log_streaming_summary(
+        self, *, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        """P2: one-line MoE streaming health log per completed request.
+
+        No-op unless expert streaming is active. Uses the counters the
+        implementation already keeps (see expert_streaming_summary).
+        """
+        try:
+            backing = getattr(self, "_expert_streaming_backing", None)
+            if backing is None:
+                return
+            # Dynamic residency: revisit cache capacity from free memory
+            # once per request boundary (opt-in; never raises).
+            governor = getattr(backing, "governor", None)
+            if governor is not None:
+                governor.observe()
+            from ..patches.expert_streaming import expert_streaming_summary
+
+            cache = getattr(backing, "_streaming_cache", None)
+            summary = expert_streaming_summary(cache, backing)
+            if not summary:
+                return
+            logger.info(
+                "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
+                "(h=%d m=%d evict=%d size=%d/%d) prefetch_prec=%.3f "
+                "(sub=%d con=%d drop=%d) stash_hit=%.3f (h=%d m=%d adv=%d) "
+                "ctx_fallbacks=%s",
+                prompt_tokens,
+                completion_tokens,
+                summary.get("lru_hit_rate", 0.0),
+                summary.get("lru_hits", 0),
+                summary.get("lru_misses", 0),
+                summary.get("lru_evictions", 0),
+                summary.get("lru_size", 0),
+                summary.get("lru_capacity", 0),
+                summary.get("prefetch_precision", 0.0),
+                summary.get("prefetch_submissions", 0),
+                summary.get("prefetch_consumed", 0),
+                summary.get("prefetch_dropped", 0),
+                summary.get("stash_hit_rate", 0.0),
+                summary.get("stash_hits", 0),
+                summary.get("stash_misses", 0),
+                summary.get("advised", 0),
+                summary.get("ctx_fallbacks", {}),
+            )
+        except Exception:
+            pass
 
     async def stream_generate(
         self,
@@ -1106,6 +1170,7 @@ class BatchedEngine(BaseEngine):
                 logger.debug(
                     f"[stream_generate] Request {request_id} finished normally"
                 )
+                self._log_streaming_summary()
 
     async def chat(
         self,
