@@ -1,5 +1,5 @@
 class Omlx < Formula
-  CUSTOM_KERNELS = %w[bonsai glm_moe_dsa minimax_m3 qwen35_prefill].freeze
+  CUSTOM_KERNELS = %w[bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill].freeze
 
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
@@ -10,7 +10,7 @@ class Omlx < Formula
   head "https://github.com/jundot/omlx.git", branch: "main"
 
   option "with-custom-kernel",
-         "Build native custom kernels for Bonsai, GLM-5.2, MiniMax M3 and Qwen3.5/3.6 acceleration"
+         "Build native custom kernels for Bonsai, GLM-5.2, MiniMax M3 and Qwen3.5/3.6/4 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build

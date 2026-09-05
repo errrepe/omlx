@@ -33,6 +33,11 @@ class TestModelSettings:
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
 
+    def test_qwen4_ple_ssd_offload_default(self):
+        """SSD mmap is the default PLE residency; opt-out keeps it resident."""
+        settings = ModelSettings()
+        assert settings.qwen4_ple_ssd_offload is True
+
     def test_trust_remote_code_roundtrip(self):
         """Test trust_remote_code field survives to_dict -> from_dict roundtrip."""
         original = ModelSettings(trust_remote_code=True)
@@ -331,6 +336,35 @@ class TestModelSettingsManager:
             assert settings.temperature == 0.7
             assert settings.is_pinned is True
             assert settings.is_default is True
+
+    def test_v1_file_coerces_ple_ssd_offload_default(self):
+        """v1 blobs persisted qwen4_ple_ssd_offload=False because False was
+        the field default; loading coerces them to the new SSD-mmap default."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({
+                "version": 1,
+                "models": {
+                    "qwen4-a": {"qwen4_ple_ssd_offload": False},
+                    "qwen4-b": {"temperature": 0.5},
+                },
+            }))
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            assert manager.get_settings("qwen4-a").qwen4_ple_ssd_offload is True
+            assert manager.get_settings("qwen4-b").qwen4_ple_ssd_offload is True
+
+    def test_v2_file_keeps_explicit_ple_ssd_offload_opt_out(self):
+        """An opt-out saved on v2 stays resident across loads."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({
+                "version": 2,
+                "models": {"qwen4-a": {"qwen4_ple_ssd_offload": False}},
+            }))
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            assert manager.get_settings("qwen4-a").qwen4_ple_ssd_offload is False
 
     def test_set_settings(self):
         """Test setting and saving settings."""
@@ -752,3 +786,50 @@ class TestVlmMtpProcessorExclusivity:
             assert loaded.max_context_window == 8192
             assert loaded.is_pinned is True
             assert loaded.vlm_mtp_draft_model == "gemma-assistant"
+
+
+class TestStreamingIoFields:
+    """Fase H: expert-streaming IO knobs persist per model (autotune)."""
+
+    def test_defaults_are_none(self):
+        s = ModelSettings()
+        assert s.expert_streaming_io_depth is None
+        assert s.expert_streaming_coalesce is None
+        assert s.expert_streaming_readahead is None
+        assert s.expert_streaming_seed is None
+        assert s.expert_streaming_pilot is None
+
+    def test_roundtrip_through_dict(self, tmp_path):
+        s = ModelSettings(
+            expert_streaming_io_depth=8,
+            expert_streaming_coalesce=False,
+            expert_streaming_readahead=True,
+            expert_streaming_seed=False,
+            expert_streaming_pilot=True,
+        )
+        d = s.to_dict()
+        assert d["expert_streaming_io_depth"] == 8
+        assert d["expert_streaming_coalesce"] is False
+        r = ModelSettings.from_dict(dict(d))
+        assert r.expert_streaming_io_depth == 8
+        assert r.expert_streaming_coalesce is False
+        assert r.expert_streaming_readahead is True
+        assert r.expert_streaming_seed is False
+        assert r.expert_streaming_pilot is True
+
+    def test_none_values_dropped_from_dict(self):
+        d = ModelSettings().to_dict()
+        for field in (
+            "expert_streaming_io_depth",
+            "expert_streaming_coalesce",
+            "expert_streaming_readahead",
+            "expert_streaming_seed",
+            "expert_streaming_pilot",
+        ):
+            assert field not in d
+
+    def test_unknown_keys_ignored_on_load(self):
+        r = ModelSettings.from_dict(
+            {"expert_streaming_io_depth": 16, "bogus_future_field": 1}
+        )
+        assert r.expert_streaming_io_depth == 16

@@ -47,7 +47,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
-from .cache.observability import CacheRateTracker
+from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
@@ -77,6 +77,7 @@ from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
     _sync_and_clear_cache,
+    should_clear_cache,
 )
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -992,6 +993,13 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
     ):
         return cache_obj.merge([cache_obj])
+    # Model-owned singletons (e.g. qwen4_exp QSAKVCache) declare their batch
+    # conversion via to_batch, which _patched_make_cache honors at creation;
+    # honor it on the continuous-batching join path too, or extend() hits a
+    # singleton without the method. A warm singleton is one unpadded row.
+    to_batch = getattr(cache_obj, "to_batch", None)
+    if callable(to_batch):
+        return to_batch([0])
     return cache_obj
 
 
@@ -1224,6 +1232,10 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "BatchTurboQuantKVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
+        # Both QSA handlers support block slicing, so their growing KV and
+        # index state must not be copied into every boundary snapshot.
+        "QSAKVCache",
+        "QSAQuantizedKVCache",
     }
 )
 
@@ -1382,6 +1394,8 @@ def _seed_text_only_mrope_delta_for_cached_prefill(model: Any, request: Any) -> 
     if lm is None or not hasattr(lm, "_rope_deltas"):
         return
     lm._rope_deltas = mx.zeros((1, 1), dtype=mx.int64)
+    # Keep the restore-only seed concrete before the engine-stream graph uses it.
+    mx.eval(lm._rope_deltas)
 
 
 def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
@@ -1498,6 +1512,18 @@ def _model_declares_llama4(model: Any) -> bool:
     return False
 
 
+def _model_uses_expert_streaming(model: Any) -> bool:
+    """Return True if the model was converted to MoE expert streaming.
+
+    The converter attaches the ExpertBackingStore to both the engine and the
+    model object, so its presence is the ground truth — not the per-model
+    setting (which EnginePool may force on, and which the conversion may have
+    declined). Read at Scheduler construction, which happens after the
+    conversion in both engine/batched.py and engine/vlm.py.
+    """
+    return getattr(model, "_expert_streaming_backing", None) is not None
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -1519,7 +1545,7 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
-    prefill_step_size: int = 2048
+    prefill_step_size: int = 4096
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
     # reduces TTFT for concurrent requests but adds per-step overhead.
@@ -1749,6 +1775,17 @@ class Scheduler:
                 "Llama 4 detected; serializing requests because ChunkedKVCache "
                 "does not support multi-row batching yet"
             )
+        # Expert streaming serves one request at a time: the LRU is budgeted
+        # for a single stream's working set and the IO pool is a
+        # process-wide singleton. Both the webUI and the doc promised this
+        # already; until now nothing enforced it, so a concurrent second
+        # request thrashed the cache instead of being queued.
+        self._serialize_streaming_requests = _model_uses_expert_streaming(model)
+        if self._serialize_streaming_requests and self.config.max_num_seqs > 1:
+            logger.info(
+                "Expert streaming detected; serializing requests because the "
+                "expert LRU is budgeted for a single stream"
+            )
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -1960,11 +1997,19 @@ class Scheduler:
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
+        _tracker_model_path = None
         if config is not None and config.model_name:
             _tracker_model_id = config.model_name
+            _tracker_model_path = getattr(config, "model_path", None) or None
         self._prefill_transient_tracker = PrefillTransientTracker(
-            model_id=_tracker_model_id
+            model_id=_tracker_model_id,
+            model_path=_tracker_model_path,
         )
+        # B3: seed EWMA from per-model persisted prior (same infra as pin profile)
+        try:
+            self._prefill_transient_tracker.load_prior()
+        except Exception:
+            pass
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
         # and taken after the first prefill chunk's eval.
@@ -1990,8 +2035,21 @@ class Scheduler:
         # can log their divergence point at INFO (#2333).
         self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(maxlen=4)
 
+        # Hybrid models whose recurrent state is REBOUND per decode step
+        # (ArraysCache/SizedArraysCache: MiniMax, Qwen3.5-Next, GLM-5.3, ...)
+        # never materialize those states through mx.async_eval alone. The
+        # unevaluated per-step chain pins every intermediate Metal buffer,
+        # and the allocator's per-process resource count (499,000 buffers)
+        # is exhausted long before any byte limit — the
+        # "[metal::malloc] Resource limit (499000) exceeded" failure (#3226).
+        # Periodic materialization collapses the chain; enable it for every
+        # ArraysCache hybrid, not just MiniMax.
         model_name_lower = (self.config.model_name or "").lower()
-        default_kv_eval_interval = 256 if "minimax" in model_name_lower else 0
+        default_kv_eval_interval = (
+            256
+            if "minimax" in model_name_lower or self._model_has_arrays_cache()
+            else 0
+        )
         self._decode_eval_kv_cache_interval: int = max(
             0,
             _env_int(
@@ -2061,12 +2119,14 @@ class Scheduler:
         self._boundary_snapshot_required: bool | None = None
         # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
         self._boundary_snapshot_store: BoundarySnapshotSSDStore | None = None
+        self._boundary_snapshot_diagnostics = BoundarySnapshotDiagnostics()
 
         # paged SSD cache for KV state persistence (oMLX only supports paged SSD-based caching)
         self.paged_cache_manager: PagedCacheManager | None = None
         self.block_aware_cache: BlockAwarePrefixCache | None = None
         self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
         self._cache_rate_tracker = CacheRateTracker()
+        self._last_prefix_cache_lookup: dict[str, Any] | None = None
         # Prefill-peak estimator used by ``_preflight_memory_check`` /
         # ``preflight_or_raise``. Only the estimator path is exercised
         # here (it reads head_dim / num_layers / num_kv_heads via
@@ -2285,9 +2345,18 @@ class Scheduler:
         the entire MLX buffer pool in one batch; gating it on accumulated
         bytes avoids producing IOGPUFamily refcount bursts when the pool
         is already small.
+
+        The memory_limit/3 term is additionally capped at 16 GiB: on
+        large-memory machines (soft limit ~438 GB on a 512 GB Studio) an
+        uncapped threshold (~146 GB) meant the periodic clear effectively
+        never fired, letting the pool hoard buffer *handles* against the
+        Metal per-process resource count even while byte usage stayed
+        modest (#3226).
         """
+        cap = 16 * 1024**3
         if self._memory_limit_bytes > 0:
-            return max(self._memory_limit_bytes // 3, 2 * 1024**3)
+            return min(max(self._memory_limit_bytes // 3, 2 * 1024**3), cap)
+
         return 2 * 1024**3
 
     def _should_periodic_clear_cache(self) -> bool:
@@ -2302,6 +2371,83 @@ class Scheduler:
         if interval <= 0 or self._step_counter % interval != 0:
             return False
         return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
+
+    def _clear_cache_if_pool_large(self) -> bool:
+        """Trim the MLX pool, but only once it is big enough to be worth it.
+
+        Fase J Etapa D. Prefill clears the pool at every chunk boundary; on
+        a long streaming prefill that is dozens of unconditional walks of the
+        allocator, and the re-reads they force on the mmap'd expert shards
+        are what Fase G measured as ~8x full-bank re-reads at a 30.4 GiB
+        pool. Gating on pool size keeps the reclaim without the thrash — the
+        threshold (OMLX_EXPERT_STREAMING_CACHE_THRESH, 2 GiB) bounds the
+        steady-state pool.
+
+        The clear itself still goes through _sync_and_clear_cache, so this
+        module keeps one patchable sync-before-clear choke point.
+        Returns True when a clear ran.
+        """
+        if not should_clear_cache():
+            return False
+        _sync_and_clear_cache(self._stream)
+        return True
+
+    def _should_release_streaming_pool(self) -> bool:
+        """Byte-threshold pool release for expert-streaming models.
+
+        Streaming prefills/decodes leave a large freed-but-retained MLX
+        buffer pool (server.py sizes it to total memory) that the 512-step
+        periodic gate never reaches: a <512-step prefill plus a short
+        decode can end without a single release. That pool is real wired
+        memory the OS cannot otherwise reclaim, and on budget-0 expert
+        streaming it evicts the page cache the demand loads depend on
+        (measured 30.4 GiB pool, ~8x full-bank re-reads on an 8k prefill —
+        Fase G). Streaming models therefore release whenever the pool
+        exceeds the same threshold, off the step boundary.
+
+        The threshold (>= 2 GiB) bounds the clear frequency, and every
+        release still goes through ``_sync_and_clear_cache`` (sync before
+        clear, ``_mx_buffer_access_lock``), so the #978/#1040 panic-class
+        gating semantics are preserved.
+        """
+        info = self._streaming_guard_info
+        if info is None:
+            info = self._resolve_streaming_guard_info()
+        pool = mx.get_cache_memory()
+        if not info:
+            # Diagnostic: the streaming hooks are inert without the backing's
+            # guard info — surface it (rate-limited) whenever the tail runs.
+            now = time.monotonic()
+            if now - getattr(self, "_last_streaming_skip_log", 0.0) > 30.0:
+                self._last_streaming_skip_log = now
+                logger.info(
+                    "Streaming pool release skipped: no streaming guard info "
+                    "on the model tree (pool %.1f GiB)",
+                    pool / 1024**3,
+                )
+            return False
+        if not getattr(self, "_streaming_release_armed_logged", False):
+            self._streaming_release_armed_logged = True
+            logger.info(
+                "Streaming pool release armed: layers=%s experts/layer=%s "
+                "threshold=%.1f GiB (pool %.1f GiB)",
+                info.get("num_moe_layers"),
+                info.get("experts_per_layer"),
+                self._periodic_clear_threshold_bytes() / 1024**3,
+                pool / 1024**3,
+            )
+        return pool > self._periodic_clear_threshold_bytes()
+
+    def _note_streaming_release(self) -> None:
+        """Rate-limited log (30s) for the off-boundary streaming release."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_streaming_release_log", 0.0) < 30.0:
+            return
+        self._last_streaming_release_log = now
+        logger.info(
+            "Streaming pool release: %.1f GiB MLX buffer pool (off-boundary)",
+            mx.get_cache_memory() / 1024**3,
+        )
 
     @staticmethod
     def _collect_arrays_from_extracted_cache(
@@ -2686,22 +2832,29 @@ class Scheduler:
             self.config.paged_cache_block_size = target_block_size
 
     def _detect_qwen35_prefill_floor(self) -> int:
-        """Return the wide-prefill floor for the Qwen3.5 architecture family."""
+        """Return the wide-prefill floor for Qwen hybrid architectures."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            if model_type.startswith("qwen3_5"):
+            is_qwen35 = model_type.startswith("qwen3_5")
+            is_qwen4 = model_type.startswith("qwen4_exp")
+            if is_qwen4:
+                from .custom_kernels.glm_moe_dsa import fast
+
+                if not fast.is_native_available() or not fast.has_symbol(
+                    "qwen4_qsa_sparse_gqa_attention"
+                ):
+                    return 0
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
                 if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Measured on the 27B (M3 Ultra, 2026-08-17): chunk 4096
-                    # beats the 2048 default +3.2% at 4k prompts / +1.0% at
-                    # 16k; 8192 is flat versus 4096. Keep 2048 on NAX/M5,
-                    # where wider prefill regresses throughput (#2880).
+                    # Qwen4 needs its sparse native path before wider chunks
+                    # are safe. NAX/M5 stays at 2048 for both model families.
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
@@ -2767,6 +2920,21 @@ class Scheduler:
             target,
         )
         self.config.paged_cache_block_size = target
+
+    def _model_has_arrays_cache(self) -> bool:
+        """Whether the model's cache layout contains ArraysCache layers."""
+        if not hasattr(self.model, "make_cache"):
+            return False
+        try:
+            cache_list = self.model.make_cache()
+        except Exception:
+            return False
+        if not cache_list:
+            return False
+
+        return any(
+            self._cache_tree_has_arrays_cache(cache_obj) for cache_obj in cache_list
+        )
 
     @staticmethod
     def _cache_tree_has_arrays_cache(cache_obj: Any) -> bool:
@@ -3484,7 +3652,8 @@ class Scheduler:
             n_to_process = min(prefill_step_size, remaining)
 
             if processed_tokens == 0:
-                _sync_and_clear_cache(self._stream)
+                # Etapa D: gated — see _clear_cache_if_pool_large.
+                self._clear_cache_if_pool_large()
 
             # Boundary-limited step size
             if boundary_enabled and block_size > 0:
@@ -3524,7 +3693,7 @@ class Scheduler:
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
 
-            _throttle_pre = get_phys_footprint()
+            _throttle_pre = self._throttle_probe_bytes()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
@@ -3558,7 +3727,7 @@ class Scheduler:
                     if extra_kwargs:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
-            _throttle_post = get_phys_footprint()
+            _throttle_post = self._throttle_probe_bytes()
             self._record_chunk_transient(
                 n_to_process,
                 _throttle_pre,
@@ -3690,7 +3859,12 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            _sync_and_clear_cache(self._stream)
+            # Etapa D: gated on pool size — a long prefill runs this once per
+            # chunk and an unconditional clear each time is what produced the
+            # 30.4 GiB pool / ~8x full-bank re-read pattern of Fase G. The
+            # end-of-prefill clear below stays unconditional so decode always
+            # starts from a trimmed pool.
+            self._clear_cache_if_pool_large()
             if getattr(request, "benchmark_trace", False):
                 _trace_total_ms = (
                     time.perf_counter() - _trace_chunk_start
@@ -3737,6 +3911,10 @@ class Scheduler:
                     request, prompt_cache, total_tokens
                 )
 
+        # Etapa D: deliberately UNGATED. This is the one clear a prefill is
+        # guaranteed to reach, and it is the handoff point to decode — the
+        # steady-state pool must not carry the whole prefill's working set
+        # into the decode loop. Every other clear in this loop is gated.
         _sync_and_clear_cache(self._stream)
 
         # Restore _rope_deltas after cached VLM prefill (for decode capture)
@@ -3788,8 +3966,114 @@ class Scheduler:
     # scales with query_len * kv_len, so per-token cost grows with context
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
+
+    # Fase K F4 (port of faseJ 061d8b9): when measured samples exist, the
+    # static SDPA+KV estimate may only RAISE the per-token prediction up to
+    # this multiple of the measured rate. A static estimate that is wildly
+    # higher (e.g. a generic dense / head-count formula over-predicting a
+    # 4-bit MoE model by ~40x) is treated as untrustworthy and capped, so it
+    # cannot force every chunk to the floor and inflate TTFT (8k Qwen3.8:
+    # predicted ~67 GB vs actual ~11.6 GiB peak, throttled 2048 -> 512, ~7x
+    # slower). A static that is modestly higher than the measured rate
+    # (legitimate kv_len-growth the EWMA lags) still wins, preserving the
+    # MAX-of-signals safety backstop. Env-overridable.
+    _PREFILL_STATIC_MAX_OVER_MEASURED: float = float(
+        os.environ.get("OMLX_PREFILL_STATIC_MAX_OVER_MEASURED", "") or 3.0
+    )
+
+    # Streaming expert mini-banks: predicted unique experts touched per layer
+    # per chunk, as a fraction of chunk tokens. Measured ~0.145 on qwen4_exp
+    # (215 uniq experts/layer at 1488-token chunks — real-text expert selection
+    # follows a power law and saturates far below 512); 0.2 keeps ~40%
+    # headroom without over-predicting mid-size chunks into guard rejection.
+    # Env-overridable.
+    _STREAMING_BANK_TOKEN_RATIO: float = float(
+        os.environ.get("OMLX_STREAMING_BANK_TOKEN_RATIO", "") or 0.10
+    )
+    # Fase J Etapa E: when a per-layer eval boundary is live the lazy graph
+    # no longer retains one streaming mini-bank per MoE layer, and charging
+    # all of them makes the guard reject/undersize chunks that would actually
+    # fit (the 26 GB term on qwen4_exp). Off restores the pre-Etapa-E charge.
+    #
+    # DEFAULT OFF — faseJ measured that with E on the generated text differs
+    # from the boundary-off baseline (the admitted chunk sizes change, hence
+    # GEMM shapes/reduction order, hence logits), while the memory win is
+    # identical with E off (phys 37.03 -> 11.09 GiB, pool 30.46 -> 2.37 GiB,
+    # boundary running, conservative charge kept). E is available behind the
+    # env var for whoever wants the TTFT win and accepts the re-base.
+    _STREAMING_BANK_BOUNDARY_ACCOUNT: bool = (
+        os.environ.get("OMLX_STREAMING_BANK_BOUNDARY_ACCOUNT", "0") != "0"
+    )
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
+
+    _streaming_guard_info: dict | None = None
+
+    def _streaming_bank_bytes(self, n_tokens: int) -> int:
+        """Predicted live expert mini-bank bytes for one streaming chunk.
+
+        The chunk forward is lazy: every MoE layer's assembled mini-bank stays
+        referenced by the graph until the chunk-end eval, so the peak carries
+        roughly one bank per layer simultaneously. The static transient model
+        (SDPA + KV) cannot see this term — without it the guard admits 400+
+        token chunks whose real peak reaches ~26 GB on qwen4_exp (48 layers x
+        ~215 uniq experts x ~2.5 MB) and starves the machine (F1 finding).
+        """
+        info = self._streaming_guard_info
+        if info is None:
+            info = self._resolve_streaming_guard_info()
+        if not info:
+            return 0
+        uniq = min(
+            int(info["experts_per_layer"]),
+            int(self._STREAMING_BANK_TOKEN_RATIO * max(0, n_tokens)),
+        )
+        tile_bytes = uniq * int(info["per_expert_bytes"])
+        # Fase J Etapa E: with a live per-layer eval boundary the decoder
+        # layer's output is evaluated as soon as the layer returns, so layer
+        # N's bank is freed before layer N+1 assembles its own: the live set
+        # collapses from one bank per layer to the bank under construction
+        # plus at most one rolling prefetch (min(2, projections)), plus one
+        # layer's materialized activation. On qwen4_exp that is ~1.1 GB
+        # instead of ~26 GB. The flag is set by the converter only when a
+        # boundary is actually installed, so models that never got one keep
+        # the conservative per-layer charge. Default OFF (re-base trade).
+        if self._STREAMING_BANK_BOUNDARY_ACCOUNT and info.get("boundary_active"):
+            projections = max(1, int(info.get("projections") or 1))
+            activation = int(info.get("activation_bytes_per_token") or 0) * max(
+                0, n_tokens
+            )
+            return min(2, projections) * tile_bytes + activation
+        return int(info["num_moe_layers"]) * tile_bytes
+
+    def _resolve_streaming_guard_info(self) -> dict:
+        """Find the streaming backing's guard metadata on the model tree.
+
+        The scheduler's model may be a bare language model, a VLM wrapper, or
+        the VLMModelAdapter (which holds the VLM under ``_vlm_model`` /
+        ``_language_model``) — walk whichever exists. The backing lives on
+        the converted model (engine/vlm.py sets ``_expert_streaming_backing``).
+        """
+        self._streaming_guard_info = {}
+        cur: Any = getattr(self, "model", None)
+        seen = 0
+        while cur is not None and seen < 5:
+            backing = getattr(cur, "_expert_streaming_backing", None)
+            info = getattr(backing, "streaming_guard_info", None)
+            if info:
+                self._streaming_guard_info = dict(info)
+                break
+            cur = (
+                getattr(cur, "language_model", None)
+                or getattr(cur, "model", None)
+                or getattr(cur, "_vlm_model", None)
+                or getattr(cur, "_language_model", None)
+            )
+            # VLMModelAdapter._vlm_model IS the model the engine set the
+            # backing on — but its .model property chain could loop; each hop
+            # above moves to a distinct object, and the depth cap bounds it.
+            seen += 1
+        return self._streaming_guard_info
 
     def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
@@ -3798,38 +4082,103 @@ class Scheduler:
         the per-token cost GROWS with context length. A long-run EWMA average
         lags that growth and underestimates the next chunk — the cause of the
         Metal command-buffer OOM crash at large kv_len. We therefore take the
-        MAX of three signals and apply a safety factor:
+        MAX of the available signals and apply a safety factor:
           - the most recently MEASURED per-token growth (last_delta / last_n)
-            — anchored on reality at the current kv_len regime,
+            — anchored on reality at the current kv_len regime (used only
+            once the tracker has real samples; a restored prior with
+            samples == 0 is NOT measurement — Fase K K3),
           - the long-run EWMA (model-specific constants the static misses),
           - the kv_len-aware static estimate (SDPA transient + this chunk's
-            newly allocated KV).
+            newly allocated KV), used ONLY as a fallback for the first chunk
+            of a freshly loaded model, before any measurement exists.
+
+        Once the tracker has samples the measured signals dominate: a static
+        estimate can be off by an order of magnitude for some model classes
+        (a generic dense formula over-predicts a 4-bit MoE model by ~40x), so
+        letting it win the MAX permanently would throttle every chunk to the
+        floor and inflate TTFT (Fase K F4 — the 8k Qwen3.8 case: predicted
+        ~67 GB vs actual ~11.6 GiB peak, throttled 2048 -> 512).
         Returns 0 only when nothing is known (first chunk, no model info).
         """
         if n_tokens <= 0:
             return 0.0
-        per_token = 0.0
-        static_per_token = 0.0
+        measured_signal = 0.0
+        effective_static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
         if tracker is not None:
-            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                per_token = max(
-                    per_token, tracker.last_delta_bytes / tracker.last_n_tokens
-                )
-            if tracker.bytes_per_token > 0:
-                per_token = max(per_token, tracker.bytes_per_token)
+            # The reclaim ledger is not measurement: it charges whatever
+            # footprint a chunk released until the next chunk confirms
+            # reallocation, so it is priced even before any sample exists.
             recent_reclaim = tracker.recent_reclaim_bytes
-        if self.memory_monitor is not None:
-            static = self.memory_monitor.estimate_chunk_transient_bytes(
-                n_tokens, kv_len + n_tokens
-            )
-            static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
-            static_per_token = float(static) / n_tokens
-            per_token = max(per_token, static_per_token)
+            if tracker.samples > 0:
+                # K3: measured signal exists ONLY after real chunk updates.
+                # A restored prior has samples == 0 (and zeroed deltas), so
+                # it never acts as measurement — the first chunk prices the
+                # static estimate instead of a stale prior that could
+                # underestimate the Metal peak under a changed regime.
+                if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
+                    measured_signal = max(
+                        measured_signal, tracker.last_delta_bytes / tracker.last_n_tokens
+                    )
+                if tracker.bytes_per_token > 0:
+                    measured_signal = max(measured_signal, tracker.bytes_per_token)
+
+        # Static SDPA+KV estimate. Model-specific by construction: a generic
+        # dense / head-count formula can over-predict a quantized MoE model
+        # by an order of magnitude (observed ~34.5 MB/token vs ~0.9 MB/token
+        # measured on Qwen3.8-Flash-Next-oQ4e). Wrapped so a monitor failure
+        # can never break chunk sizing — the measured signal (or the caller's
+        # watermark fallback) still applies.
+        static_total = 0.0
+        try:
+            if self.memory_monitor is not None:
+                static_total = float(
+                    self.memory_monitor.estimate_chunk_transient_bytes(
+                        n_tokens, kv_len + n_tokens
+                    )
+                )
+                static_total += float(
+                    self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
+                )
+        except Exception:  # noqa: BLE001
+            static_total = 0.0
+        bank_bytes = 0
+        try:
+            bank_bytes = self._streaming_bank_bytes(n_tokens)
+        except Exception:  # noqa: BLE001
+            bank_bytes = 0
+
+        # Fase K F4 (port of faseJ 061d8b9): reconcile the static estimate
+        # with the measured signal.
+        #  - NO measured samples yet (first chunk of a freshly loaded model,
+        #    or a loaded prior whose samples were clamped to 0 — K3: the
+        #    prior is not measurement until the first real chunk): the
+        #    static estimate is the conservative fallback.
+        #  - measured samples exist: the static may only RAISE the per-token
+        #    prediction up to _PREFILL_STATIC_MAX_OVER_MEASURED x the
+        #    measured rate. A static that is modestly higher (legitimate
+        #    kv_len-growth the EWMA lags) still wins the MAX, preserving the
+        #    safety backstop; a static that is wildly higher (a generic dense
+        #    formula over-predicting a 4-bit MoE model by ~40x) is treated as
+        #    untrustworthy and capped, so it cannot permanently dominate the
+        #    MAX and force every chunk to the floor, inflating TTFT.
+        per_token = 0.0
+        if bank_bytes > 0 or static_total > 0:
+            raw_static_per_token = (static_total + bank_bytes) / n_tokens
+            if measured_signal <= 0:
+                effective_static_per_token = raw_static_per_token
+                per_token = max(measured_signal, raw_static_per_token)
+            else:
+                cap = measured_signal * self._PREFILL_STATIC_MAX_OVER_MEASURED
+                effective_static_per_token = min(raw_static_per_token, cap)
+                per_token = max(measured_signal, effective_static_per_token)
+        else:
+            per_token = measured_signal
+
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
-            static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+            effective_static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
             + recent_reclaim
         )
         return max(base_prediction, reallocation_prediction)
@@ -3857,7 +4206,16 @@ class Scheduler:
         bound = self._predicted_chunk_transient(n_tokens, kv_len)
         tracker = self._prefill_transient_tracker
         if tracker is not None:
-            bound = max(bound, float(tracker.observed_max_bytes))
+            floor = float(tracker.observed_max_bytes)
+            if floor > 0 and self._streaming_bank_bytes(n_tokens) > 0:
+                # Streaming bank transients scale ~linearly with chunk size
+                # (uniq experts per layer grows with tokens), so a large
+                # chunk's measured transient must not floor-limit smaller
+                # chunks — otherwise the guard rejects every shrunken chunk
+                # and the prefill dies with PrefillMemoryExceededError.
+                n_obs = max(int(tracker.last_n_tokens), 1)
+                floor = min(floor, floor * n_tokens / n_obs)
+            bound = max(bound, floor)
         return bound
 
     def _prefill_abort_cap(self) -> int:
@@ -4371,11 +4729,26 @@ class Scheduler:
         Scheduler steps run on the MLX executor thread, so they can refresh
         mx.get_active_memory() safely. Event-loop callers such as early
         preflight use the cached executor sample and phys_footprint instead.
+
+        Streaming models (budget-0 page-cache mode): the phys footprint also
+        carries the clean, evictable file pages of every expert slice read
+        from the mmap'd shards — pages the OS drops under pressure without
+        swapping, not a memory commitment. Charging them makes the guard
+        reject every long prompt once enough experts have streamed through
+        (measured: phys 21.5GB while Metal active stayed 4.5GB). For a
+        streaming backing, only the live Metal allocation counts.
         """
         active = self._last_mlx_active_memory_bytes
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
             self._last_mlx_active_memory_bytes = active
+        if self._streaming_guard_info is None:
+            # Lazy-resolve so even the first guard/throttle call (before any
+            # _streaming_bank_bytes invocation) sees the streaming model.
+            self._resolve_streaming_guard_info()
+        if self._streaming_guard_info:
+            # Streaming backing resolved: active Metal is the real commitment.
+            return active
         hot_cache_cpu_bytes = getattr(self, "_hot_cache_cpu_bytes", None)
         if callable(hot_cache_cpu_bytes):
             hot_cache_bytes = hot_cache_cpu_bytes()
@@ -4579,6 +4952,24 @@ class Scheduler:
             return False
         return current >= self._memory_limit_bytes
 
+    def _throttle_probe_bytes(self) -> int:
+        """Footprint probe for the per-chunk transient tracker.
+
+        The phys footprint delta is the legacy signal, but on streaming models
+        it also carries the mmap'd shard's clean file pages that ride along
+        with every expert read — evictable cache, not a commitment (measured:
+        a 512-token chunk "grew" 20GB of phys while Metal active grew ~5GB).
+        That poisons the tracker into charging the page cache at admission
+        and rejecting every later chunk. For a streaming backing, track the
+        Metal active high-water instead: exactly the banks + activations the
+        chunk really commits.
+        """
+        if self._streaming_guard_info is None:
+            self._resolve_streaming_guard_info()
+        if self._streaming_guard_info:
+            return max(0, int(mx.get_active_memory()))
+        return get_phys_footprint()
+
     def _record_chunk_transient(
         self,
         n_tokens: int,
@@ -4665,6 +5056,11 @@ class Scheduler:
         self._prefill_transient_tracker.update(
             n_tokens, delta, floor_sample=n_tokens <= min_chunk
         )
+        # B3: persist the updated prior immediately (best-effort)
+        try:
+            self._prefill_transient_tracker.save_prior()
+        except Exception:
+            pass
         logger.debug(
             "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
             loop_label,
@@ -5071,7 +5467,8 @@ class Scheduler:
         n = min(prefill_step_size, remaining)
 
         if state.tokens_processed == 0:
-            _sync_and_clear_cache(self._stream)
+            # Etapa D: gated, same rationale as the external prefill path.
+            self._clear_cache_if_pool_large()
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:
@@ -5106,7 +5503,7 @@ class Scheduler:
             state.request.benchmark_prefill_chunks.append(int(n))
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
-        _throttle_pre = get_phys_footprint()
+        _throttle_pre = self._throttle_probe_bytes()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
@@ -5121,7 +5518,7 @@ class Scheduler:
                 self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
-        _throttle_post = get_phys_footprint()
+        _throttle_post = self._throttle_probe_bytes()
         self._record_chunk_transient(
             n,
             _throttle_pre,
@@ -5225,7 +5622,9 @@ class Scheduler:
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                 )
 
-        if self._should_clear_after_chunk():
+        if self._should_clear_after_chunk() or self._should_release_streaming_pool():
+            if not self._should_clear_after_chunk():
+                self._note_streaming_release()
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
         if getattr(state.request, "benchmark_trace", False):
@@ -5450,6 +5849,7 @@ class Scheduler:
                 logger.error("Chunked prefill capacity rejected for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
+                self._drop_boundary_snapshots_for_request(rid)
                 self.requests.pop(rid, None)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
@@ -5460,6 +5860,7 @@ class Scheduler:
                 logger.error("Chunked prefill failed for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
+                self._drop_boundary_snapshots_for_request(rid)
                 self.requests.pop(rid, None)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
@@ -5492,6 +5893,8 @@ class Scheduler:
             # Prefill complete — emit final boundary snapshot and insert.
             self._prefill_states.pop(rid, None)
             self._emit_final_boundary_if_needed(state)
+            # Etapa D: deliberately UNGATED — same handoff-to-decode role as
+            # the external prefill path's end-of-prefill clear.
             _sync_and_clear_cache(self._stream)
 
             # Ensure a BatchGenerator exists (may not if all requests were
@@ -6211,14 +6614,45 @@ class Scheduler:
         ``BatchGenerator`` yet and the uid mapping does not exist —
         routing through it dropped every snapshot silently (#TBD).
         """
+        block_size = self.config.paged_cache_block_size
+        self._boundary_snapshot_diagnostics.record(
+            "capture_attempt",
+            request_id=request_id,
+            token_count=token_count,
+            block_size=block_size,
+            source="prefill",
+        )
         if self.block_aware_cache is None:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="prefix_cache_disabled",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
-        block_size = self.config.paged_cache_block_size
         if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="unaligned_token_count",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="no_stateful_cache",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         if request_id not in self._boundary_cache_snapshots:
@@ -6226,6 +6660,14 @@ class Scheduler:
 
         # Skip if we already have a snapshot at this token count
         if token_count in self._boundary_cache_snapshots[request_id]:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="duplicate_boundary",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         # Offload snapshot to SSD if store is available, keeping only a
@@ -6247,7 +6689,17 @@ class Scheduler:
                 )
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
+                storage = "ssd"
             else:
+                self._boundary_snapshot_diagnostics.record(
+                    "ssd_fallback",
+                    reason="ssd_save_failed",
+                    request_id=request_id,
+                    token_count=token_count,
+                    block_size=block_size,
+                    source="prefill",
+                    storage="memory",
+                )
                 self._boundary_cache_snapshots[request_id][token_count] = (
                     _compact_boundary_snapshot_value(
                         self._prefill_snapshot_value(snapshot_cache),
@@ -6256,6 +6708,7 @@ class Scheduler:
                         self._stream,
                     )
                 )
+                storage = "memory"
         else:
             self._boundary_cache_snapshots[request_id][token_count] = (
                 _compact_boundary_snapshot_value(
@@ -6265,13 +6718,23 @@ class Scheduler:
                     self._stream,
                 )
             )
+            storage = "memory"
 
         self._boundary_snapshot_required = True
         self._enable_mtp_boundary_alignment()
+        self._boundary_snapshot_diagnostics.record(
+            "capture_success",
+            request_id=request_id,
+            token_count=token_count,
+            block_size=block_size,
+            source="prefill",
+            storage=storage,
+        )
         logger.debug(
-            "Captured prefill boundary cache snapshot for %s at %s tokens",
+            "Captured prefill boundary cache snapshot for %s at %s tokens (%s)",
             request_id,
             token_count,
+            storage,
         )
 
     _PREFILL_SNAPSHOT_MARKER = "__prefill_extracted__"
@@ -6495,7 +6958,10 @@ class Scheduler:
             pass
 
     def _extract_boundary_snapshot(
-        self, uid: int, expected_tokens: int | None = None
+        self,
+        uid: int,
+        expected_tokens: int | None = None,
+        request_id: str | None = None,
     ) -> list[Any] | None:
         """Extract a per-request prompt cache snapshot via extract_cache().
 
@@ -6513,7 +6979,20 @@ class Scheduler:
         on hybrid models; skipping the capture merely costs a reuse
         opportunity.
         """
+        block_size = self.config.paged_cache_block_size
+
+        def record_skip(reason: str) -> None:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason=reason,
+                request_id=request_id,
+                token_count=expected_tokens,
+                block_size=block_size,
+                source="decode",
+            )
+
         if self.batch_generator is None:
+            record_skip("batch_generator_unavailable")
             return None
 
         try:
@@ -6525,6 +7004,7 @@ class Scheduler:
                 with mx.stream(self._stream):
                     result = self.batch_generator.extract_cache([uid])
                     if uid not in result:
+                        record_skip("uid_not_found")
                         return None
                     cache_list, _tokens = result[uid]
                     if expected_tokens is not None:
@@ -6545,11 +7025,12 @@ class Scheduler:
                                     offset,
                                     expected_tokens,
                                 )
+                                record_skip("cache_offset_mismatch")
                                 return None
                             break
                     # Only extract non-sliceable layers to avoid costly
                     # deep-copy accumulation (same rationale as prefill path).
-                    return [
+                    snapshot = [
                         (
                             c
                             if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
@@ -6557,10 +7038,15 @@ class Scheduler:
                         )
                         for c in cache_list
                     ]
+                    if not snapshot:
+                        record_skip("empty_snapshot")
+                        return None
+                    return snapshot
         except Exception as e:
             logger.debug(
                 f"Failed to extract boundary cache snapshot for uid={uid}: {e}"
             )
+            record_skip("extract_error")
             return None
 
     def _maybe_capture_boundary_snapshot(self, request: Request, uid: int) -> None:
@@ -6579,8 +7065,17 @@ class Scheduler:
         if not self._detect_boundary_snapshot_need():
             return
 
+        self._boundary_snapshot_diagnostics.record(
+            "capture_attempt",
+            request_id=request.request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+            source="decode",
+        )
         snapshot_cache = self._extract_boundary_snapshot(
-            uid, expected_tokens=total_tokens
+            uid,
+            expected_tokens=total_tokens,
+            request_id=request.request_id,
         )
         if not snapshot_cache:
             return
@@ -6600,7 +7095,17 @@ class Scheduler:
                 )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
+                storage = "ssd"
             else:
+                self._boundary_snapshot_diagnostics.record(
+                    "ssd_fallback",
+                    reason="ssd_save_failed",
+                    request_id=request.request_id,
+                    token_count=total_tokens,
+                    block_size=block_size,
+                    source="decode",
+                    storage="memory",
+                )
                 # In-memory fallback: the store-cache worker slices this snapshot
                 # off-thread (via _BoundarySnapshotProvider -> _extract_cache_states).
                 # MLX streams are thread-local, so force the leaves concrete now on
@@ -6612,16 +7117,26 @@ class Scheduler:
                         snapshot_cache, total_tokens, block_size
                     )
                 )
+                storage = "memory"
         else:
             self._boundary_cache_snapshots[request.request_id][total_tokens] = (
                 self._decode_boundary_snapshot_value(
                     snapshot_cache, total_tokens, block_size
                 )
             )
+            storage = "memory"
 
+        self._boundary_snapshot_diagnostics.record(
+            "capture_success",
+            request_id=request.request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+            source="decode",
+            storage=storage,
+        )
         logger.debug(
             f"Captured boundary cache snapshot for {request.request_id} at "
-            f"{total_tokens} tokens"
+            f"{total_tokens} tokens ({storage})"
         )
 
     def _get_boundary_store_override(
@@ -6645,12 +7160,33 @@ class Scheduler:
             intermediate_snapshots) where intermediate_snapshots maps
             token_count -> extracted cache states for per-block storage.
         """
-        snapshots = self._boundary_cache_snapshots.get(request_id)
-        if not snapshots:
-            return None
-
         total_tokens = len(full_token_sequence)
         block_size = self.config.paged_cache_block_size
+        self._boundary_snapshot_diagnostics.record(
+            "override_attempt",
+            request_id=request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+        )
+
+        def miss(reason: str, available_boundaries: int = 0) -> None:
+            self._boundary_snapshot_diagnostics.record(
+                "override_miss",
+                reason=reason,
+                request_id=request_id,
+                token_count=total_tokens,
+                block_size=block_size,
+                available_boundaries=available_boundaries,
+            )
+
+        snapshots = self._boundary_cache_snapshots.get(request_id)
+        if not snapshots:
+            miss("no_snapshots")
+            return None
+
+        if block_size <= 0:
+            miss("invalid_block_size", len(snapshots))
+            return None
 
         # Find all valid boundary-aligned snapshot token counts
         valid_counts = sorted(
@@ -6659,6 +7195,7 @@ class Scheduler:
             if 0 < tc <= total_tokens and tc % block_size == 0
         )
         if not valid_counts:
+            miss("no_aligned_snapshots", len(snapshots))
             return None
 
         # Find the latest snapshot that leaves trailing partial tokens
@@ -6672,6 +7209,7 @@ class Scheduler:
             # provide intermediate snapshots for per-block storage.
             latest_tc = total_tokens
         else:
+            miss("latest_snapshot_not_usable", len(valid_counts))
             return None
 
         # Load latest snapshot — may be on SSD (None marker) or in memory.
@@ -6686,6 +7224,7 @@ class Scheduler:
             # Offloaded to SSD — load back.
             extracted_cache = self._boundary_snapshot_store.load(request_id, latest_tc)
             if not extracted_cache:
+                miss("ssd_load_failed", len(valid_counts))
                 return None
             # Build model_cache_config from the main request cache config
             # since the SSD snapshot doesn't carry it.
@@ -6709,8 +7248,10 @@ class Scheduler:
                     latest_snapshot
                 )
             if not extracted_cache:
+                miss("snapshot_extract_failed", len(valid_counts))
                 return None
         else:
+            miss("snapshot_value_unavailable", len(valid_counts))
             return None
 
         # Build provider for intermediate snapshots. SSD-backed snapshots remain
@@ -6754,6 +7295,13 @@ class Scheduler:
             else full_token_sequence
         )
 
+        self._boundary_snapshot_diagnostics.record(
+            "override_hit",
+            request_id=request_id,
+            token_count=latest_tc,
+            block_size=block_size,
+            available_boundaries=len(valid_counts),
+        )
         return (
             token_sequence,
             extracted_cache,
@@ -7651,7 +8199,35 @@ class Scheduler:
         logs.
         """
         prompt = request.prompt_token_ids or []
-        if not prompt or not self._cache_probe_seqs:
+        cached = request.cached_tokens or 0
+        block = max(1, self.config.paged_cache_block_size)
+        base_observation: dict[str, Any] = {
+            "request_id": request.request_id,
+            "prompt_tokens": len(prompt),
+            "reused_kv_tokens": cached,
+            "reprefill_tokens": max(0, len(prompt) - cached),
+            "block_size": block,
+            "matched_blocks": cached // block,
+        }
+        if not prompt:
+            self._last_prefix_cache_lookup = {
+                **base_observation,
+                "reason": "empty_prompt",
+                "closest_request_id": None,
+                "common_prefix_tokens": 0,
+                "comparable_tokens": 0,
+                "unreused_common_prefix_tokens": 0,
+            }
+            return
+        if not self._cache_probe_seqs:
+            self._last_prefix_cache_lookup = {
+                **base_observation,
+                "reason": "no_recent_store_probe",
+                "closest_request_id": None,
+                "common_prefix_tokens": 0,
+                "comparable_tokens": 0,
+                "unreused_common_prefix_tokens": 0,
+            }
             return
         best_id, best_seq, best_p = None, None, -1
         for ref_id, seq in list(self._cache_probe_seqs):
@@ -7660,10 +8236,16 @@ class Scheduler:
                 best_id, best_seq, best_p = ref_id, seq, p
         if best_seq is None:
             return
-        cached = request.cached_tokens or 0
         reusable = min(len(prompt), len(best_seq))
-        block = max(1, self.config.paged_cache_block_size)
         reprefill = len(prompt) - cached
+        self._last_prefix_cache_lookup = {
+            **base_observation,
+            "reason": "closest_recent_store",
+            "closest_request_id": best_id,
+            "common_prefix_tokens": best_p,
+            "comparable_tokens": reusable,
+            "unreused_common_prefix_tokens": max(0, best_p - cached),
+        }
         if reprefill >= self._REPREFILL_INFO_MIN_TOKENS and best_p >= block:
             logger.info(
                 "prefix cache: request %s re-prefills %d of %d tokens "
@@ -7995,6 +8577,32 @@ class Scheduler:
         else:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
+
+        # Lightning-MTP has a small prompt-history cache separate from the
+        # backbone KV restored above.  Bind an exact full-block sidecar (when
+        # one exists) to this singleton timeline before any uncached suffix is
+        # forwarded.  The hook is intentionally best-effort/fail-closed:
+        # ordinary inference and prefix reuse stay valid if MTP is disabled,
+        # the sidecar was evicted, or this model family does not support it.
+        try:
+            from .patches.mlx_lm_mtp import prompt_priming
+
+            prompt_priming.prepare_prefix_context(
+                self.model,
+                request_id=request.request_id,
+                prompt_tokens=request.prompt_token_ids,
+                cached_tokens=request.cached_tokens,
+                prefix_cache=self.block_aware_cache,
+                extra_keys=request.vlm_extra_keys_for_cache,
+                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+            )
+        except Exception as exc:
+            logger.debug(
+                "MTP prefix-history preparation failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
 
         # Trace where this prompt diverges from recently stored cache
         # sequences: one INFO line for large re-prefills (#2333/#2349
@@ -9125,9 +9733,33 @@ class Scheduler:
     def _effective_max_num_seqs(self) -> int:
         """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
+        if (
+            self._serialize_llama4_requests
+            or self._serialize_streaming_requests
+            or self._generation_overflow_recovery_ids
+        ):
             return 1
         return max(1, self.config.max_num_seqs)
+
+    def _drop_boundary_snapshots_for_request(self, request_id: str) -> None:
+        """Release a failed request's boundary snapshots (RAM and SSD).
+
+        The in-memory dict values can hold live mx.arrays (the SSD-store
+        fallback path), and the store keeps a per-request snapshot dir on
+        disk. Both are normally released in _cleanup_finished; error paths
+        must do the same or every failure strands a snapshot set until
+        process exit (#3226).
+        """
+        self._boundary_cache_snapshots.pop(request_id, None)
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.cleanup_request(request_id)
+            except Exception as e:
+                logger.debug(
+                    "Boundary snapshot store cleanup failed for %s: %s",
+                    request_id,
+                    e,
+                )
 
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -9205,6 +9837,16 @@ class Scheduler:
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
         self._generation_overflow_recovery_ids.difference_update(failed_ids)
+        # Drop boundary snapshots and paged-cache reservations for every
+        # failed request. Without this, each engine-loop failure strands a
+        # full per-request snapshot set (live mx.arrays for the in-memory
+        # fallback, orphaned snapshot dirs on SSD) and its block refs until
+        # process exit — a Metal buffer/byte ratchet across failures (#3226).
+        # failed_ids excludes _inflight_store_futures ids, so snapshots the
+        # async store worker still reads are left intact.
+        for rid in failed_ids:
+            self._drop_boundary_snapshots_for_request(rid)
+            self._release_paged_cache_for_request(rid)
         # Reset batch generator only (cache is not corrupted). Every row dies
         # with it; survivors re-register at re-insert.
         _unregister_uid_rows_for_model(self.model)
@@ -11017,13 +11659,27 @@ class Scheduler:
                                 f"{len(request.output_token_ids)} output)"
                             )
                         except _BoundaryStoreUnavailable:
-                            logger.debug(
-                                "Skipping cache store for %s: no boundary-aligned "
-                                "snapshot for non-sliceable cache state (all "
-                                "captures skipped, e.g. by the speculative-decode "
-                                "skew guard); storing live state would corrupt "
+                            available_boundaries = len(
+                                self._boundary_cache_snapshots.get(request_id, {})
+                            )
+                            self._boundary_snapshot_diagnostics.record(
+                                "store_skip",
+                                reason="boundary_snapshot_unavailable",
+                                request_id=request_id,
+                                token_count=len(cacheable_sequence),
+                                block_size=self.config.paged_cache_block_size,
+                                available_boundaries=available_boundaries,
+                            )
+                            logger.info(
+                                "Skipping cache store for %s: reason=%s "
+                                "tokens=%d block_size=%d available_boundaries=%d; "
+                                "storing live non-sliceable state would corrupt "
                                 "later prefix hits",
                                 request_id,
+                                "boundary_snapshot_unavailable",
+                                len(cacheable_sequence),
+                                self.config.paged_cache_block_size,
+                                available_boundaries,
                             )
                             block_table = None
                             if self.paged_cache_manager:
@@ -11203,6 +11859,8 @@ class Scheduler:
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
+        self._boundary_snapshot_diagnostics.clear()
+        self._last_prefix_cache_lookup = None
 
         # Clear UID mappings
         _unregister_uid_rows_for_model(self.model)
@@ -11714,6 +12372,13 @@ class Scheduler:
                     if self._tokens_since_clear_cache >= 1024:
                         _sync_and_clear_cache(self._stream)
                         self._tokens_since_clear_cache = 0
+                        # Refresh the executor-owned MLX active-memory sample.
+                        # The background enforcer reads this cached value
+                        # during active decode; without a decode-side refresh
+                        # it stays frozen at the last prefill's reading for
+                        # the whole generation, blinding the hard-watermark
+                        # abort to decode-time growth (#3226).
+                        self._current_usage_bytes()
 
         except _PrefillAbortedError:
             # Prefill was interrupted by a pending abort.
@@ -11806,6 +12471,14 @@ class Scheduler:
         # Periodic Metal cache cleanup
         self._step_counter += 1
         should_clear = self._should_periodic_clear_cache()
+        # Streaming pool release: expert-streaming prefills/decodes leave a
+        # large freed-but-retained pool that the step-boundary gate above
+        # never reaches (a <512-step prefill + short decode can end without
+        # a single release). Release it off-boundary once it crosses the
+        # byte threshold — Fase G.
+        if not should_clear and self._should_release_streaming_pool():
+            should_clear = True
+            self._note_streaming_release()
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
         if (
@@ -11955,6 +12628,8 @@ class Scheduler:
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
+        self._boundary_snapshot_diagnostics.clear()
+        self._last_prefix_cache_lookup = None
 
         # Clear detokenizers
         self._request_detokenizers.clear()
@@ -11994,6 +12669,7 @@ class Scheduler:
                     layer.self_attn.cache = None
 
         # Release model and tokenizer references for GC
+        self._streaming_guard_info = None
         self.model = None
         self.tokenizer = None
 
@@ -12936,6 +13612,13 @@ class Scheduler:
         if self.block_aware_cache is not None:
             prefix_stats = self.block_aware_cache.get_stats_dict()
             stats["prefix_cache"] = prefix_stats
+            stats["boundary_snapshots"] = (
+                self._boundary_snapshot_diagnostics.snapshot()
+            )
+            if self._last_prefix_cache_lookup is not None:
+                stats["last_prefix_lookup"] = dict(
+                    self._last_prefix_cache_lookup
+                )
             specprefill_cache_stats = {
                 "target_static_hits": prefix_stats["exact_prefix_hits"],
                 "target_static_misses": prefix_stats["exact_prefix_misses"],

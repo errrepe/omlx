@@ -195,9 +195,13 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
 </p>
 
+### Expert Streaming (SSD)
+
+Run huge Mixture-of-Experts models on small Macs. Dense weights (attention, shared experts) stay resident; routed expert banks are memory-mapped from the checkpoint and a per-layer LRU keeps only the hot experts in RAM (one `Cache budget (GiB)` knob, default `~2 GiB`, auto-enabled when the resident model would not fit). Trades decode speed for up to ~10× memory saving; the model runs single-stream while streaming (one request at a time). Prefill reuses the existing paged SSD KV cache, so repeated prompts restore in milliseconds. Supported `model_type`: `glm_moe_dsa` (GLM-5.2). See [docs/expert-streaming.md](docs/expert-streaming.md).
+
 ### Continuous Batching
 
-Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.
+Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel. Streaming MoE models run single-stream while the feature is active.
 
 ### Claude Code Optimization
 
@@ -435,5 +439,5 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
