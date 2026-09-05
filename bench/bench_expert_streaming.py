@@ -211,6 +211,9 @@ def _effective_config(
         "memtrace_enabled": bool(_mt.enabled),
         "read_sampling_mode": "profile" if _prof else "off",
         "cache_cool_protocol": "warm-page-cache",
+        "cache_policy": str(getattr(_ss, "_CACHE_POLICY_ENV", "lru")),
+        "pilot_enabled": os.environ.get("OMLX_EXPERT_STREAMING_PILOT", "0") == "1",
+        "transition_overfetch": os.environ.get("OMLX_EXPERT_STREAMING_TRANSITION", "1") != "0",
         "experiment_knobs": list(knobs or []),
         "active_engines": int(
             os.environ.get("OMLX_EXPERT_STREAMING_ACTIVE_ENGINES", "1")
@@ -809,6 +812,11 @@ async def run(
             "hit_rate": cache.stats.hit_rate(),
             "size": cache.size,
             "capacity": cache.capacity,
+            # FU2: policy + transition-table state for A/B arms.
+            "policy": getattr(cache, "policy", "lru"),
+            "trans_updates": int(getattr(getattr(cache, "spec_state", None), "trans_updates", 0) or 0),
+            "trans_sources": len(getattr(getattr(cache, "spec_state", None), "trans", {}) or {}),
+            "trans_overfetch": int((getattr(getattr(cache, "spec_state", None), "stats", {}) or {}).get("trans_overfetch", 0)),
         }
         print(f"cache {stats}")
         if cache.profile.enabled:
@@ -1090,7 +1098,30 @@ def main():
         help="arm demand-read telemetry in runtime (storage-roofline "
              "derivation: decode-phase byte ratio + MTP accept stats)",
     )
+    ap.add_argument(
+        "--cache-policy", choices=["lru", "s3fifo"], default="lru",
+        help="FU2: LRU eviction policy for the app-level cache "
+             "(page-cache-only budgets ignore it). A/B vs lru.",
+    )
+    ap.add_argument(
+        "--pilot", action="store_true",
+        help="FU3: enable PILOT router-lookahead prefetch (glm5_next hook; "
+             "no-op where no model-loop hook exists). A/B vs off.",
+    )
+    ap.add_argument(
+        "--no-transition", action="store_true",
+        help="FU1: disable the transition-table k+1 overfetch in the RA "
+             "advisor (A/B arm).",
+    )
     args = ap.parse_args()
+    # FU1/FU2/FU3: env must be set before any omlx import (singletons are
+    # read at import time). All omlx imports in this file are lazy, so
+    # main-time mutation is in time.
+    os.environ["OMLX_EXPERT_STREAMING_CACHE"] = args.cache_policy
+    if args.pilot:
+        os.environ["OMLX_EXPERT_STREAMING_PILOT"] = "1"
+    if args.no_transition:
+        os.environ["OMLX_EXPERT_STREAMING_TRANSITION"] = "0"
     try:
         import psutil
 

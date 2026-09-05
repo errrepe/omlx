@@ -721,6 +721,32 @@ def test_pilot_staging_equivalence_and_fused_wiring():
         pf.stop()
 
 
+def test_transition_table_predicts_and_overfetches():
+    """FU1: temporal transitions accumulate (EWMA) and predict_next
+    returns the top candidate excluding the demand set."""
+    from omlx.patches.expert_streaming.streaming_switch import SpeculationState
+
+    st = SpeculationState()
+    # Cold table: no prediction.
+    assert st.predict_next(0, [1, 2]) == []
+    # Temporal credit prev -> now; repeated 2->3 wins over 2->1.
+    st.record_prev(0, [1, 2])
+    st.record_prev(0, [2, 3])
+    st.record_prev(0, [2, 3])  # repeat to strengthen 2->3 over 2->2
+    preds = st.predict_next(0, [2])
+    assert 3 in preds  # strongest transition from expert 2
+    assert 2 not in preds  # demand set excluded
+    assert len(preds) <= 1  # default k=1
+    # Other layers unaffected.
+    assert st.predict_next(7, [2]) == []
+    assert st.trans_updates == 2  # first record has no prev to credit
+    # Bounded rows.
+    st2 = SpeculationState()
+    st2.record_prev(0, [0])
+    st2.record_prev(0, list(range(20)))
+    assert len(st2.trans.get((0, 0), {})) <= 8
+
+
 def test_s3fifo_cache_equivalence_and_scan_resistance():
     """P2: S3-FIFO honors the same interface; one-hit scans don't evict hot."""
     from omlx.patches.expert_streaming.streaming_switch import (

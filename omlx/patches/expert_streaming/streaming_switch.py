@@ -285,6 +285,13 @@ _MAX_ADVISE_ROWS = 64
 # the owning store, and close() drains the speculation workers the same
 # way ExpertBackingStore.close drains its readers.
 _STASH_MAX_PENDING = 2 * _STASH_MAX_ENTRIES
+# FU1: transition-table overfetch. The (layer, expert) -> next-token expert
+# distribution (EWMA, temporal: same layer, token t-1 -> t) feeds the RA
+# advisor with one extra candidate per demanded expert (k+1 overfetch).
+# Hints only (F_RDADVISE/stash), never changes output. 0 disables.
+_TRANSITION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_TRANSITION", "1") != "0"
+_TRANSITION_TOP = 8  # entries kept per (layer, expert) source
+_TRANSITION_OVERFETCH = 1  # extra candidates per demanded expert
 
 
 class SpeculationState:
@@ -323,6 +330,12 @@ class SpeculationState:
         self.pending: set[Any] = set()
         # Fase 5: pending slots reserved before the executor hand-off.
         self._pending_reserved = 0
+        # FU1: transition table (layer, expert) -> {next_expert: weight}.
+        # Temporal only (same layer, token t-1 -> t); cross-layer same-token
+        # transitions are not observable without a model-loop hook (PILOT
+        # covers glm5_next). Bounded: TOP entries per source, pruned on write.
+        self.trans: Dict[Tuple[int, int], Dict[int, float]] = {}
+        self.trans_updates = 0
 
     # -- registry / history ----------------------------------------------
 
@@ -336,8 +349,46 @@ class SpeculationState:
 
     def record_prev(self, layer_idx: int, ids: list[int]) -> None:
         """Remember this layer's routing for the next token's speculation."""
+        now = [int(e) for e in ids]
         with self.lock:
-            self.prev_uniq_by_layer[int(layer_idx)] = [int(e) for e in ids]
+            prev = self.prev_uniq_by_layer.get(int(layer_idx))
+            if _TRANSITION_ENV and prev and now:
+                # Credit temporal transitions prev -> now (EWMA without a
+                # global decay pass: w = 1 + 0.9*w, normalized on read).
+                for ep in prev:
+                    row = self.trans.setdefault((int(layer_idx), int(ep)), {})
+                    for en in now:
+                        row[int(en)] = 1.0 + 0.9 * float(row.get(int(en), 0.0))
+                    if len(row) > _TRANSITION_TOP:
+                        for k in sorted(row, key=row.get)[: len(row) - _TRANSITION_TOP]:  # type: ignore[arg-type]
+                            del row[k]
+                self.trans_updates += 1
+            self.prev_uniq_by_layer[int(layer_idx)] = now
+
+    def predict_next(self, layer_idx: int, ids: list[int], k: int = _TRANSITION_OVERFETCH) -> list[int]:
+        """FU1: top-k next-token candidates for this layer's demand set.
+
+        Scores sum the transition rows of the demanded experts; the demanded
+        ids themselves are excluded (the demand path already loads them).
+        Returns at most k ids, possibly fewer (cold table). Lock-guarded.
+        """
+        if not _TRANSITION_ENV or k <= 0 or not ids:
+            return []
+        try:
+            scores: Dict[int, float] = {}
+            now = {int(e) for e in ids}
+            with self.lock:
+                for e in now:
+                    row = self.trans.get((int(layer_idx), int(e)))
+                    if not row:
+                        continue
+                    for cand, w in row.items():
+                        if cand not in now:
+                            scores[int(cand)] = scores.get(int(cand), 0.0) + float(w)
+            ranked = sorted(scores, key=scores.get, reverse=True)  # type: ignore[arg-type]
+            return [int(c) for c in ranked[: max(1, int(k))]]
+        except Exception:
+            return []
 
     # -- stash ring (K7: all mutations under one lock) --------------------
 
@@ -2235,6 +2286,24 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             sorted_prev = sorted(int(e) for e in prev)
             if not sorted_prev:
                 return
+            # FU1: k+1 overfetch — union the transition-table candidates
+            # for the next layer's prev set into the advisory. Same caps
+            # and dedup as the base set; hints only, never output.
+            try:
+                _extra = state.predict_next(next_layer, sorted_prev)
+            except Exception:
+                _extra = []
+            if _extra:
+                _have = set(sorted_prev)
+                for _c in _extra:
+                    if _c not in _have and len(sorted_prev) < _MAX_ADVISE_ROWS:
+                        sorted_prev.append(int(_c))
+                        _have.add(int(_c))
+                sorted_prev.sort()
+                try:
+                    state.bump("trans_overfetch", len(sorted_prev) - len(prev))
+                except Exception:
+                    pass
             # Fase K K2: one shared segmentation with the demand path —
             # consecutive ids within one resolved reader become one run for
             # a single F_RDADVISE (tier boundaries break the run).

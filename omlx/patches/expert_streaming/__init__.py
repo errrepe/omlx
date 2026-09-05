@@ -19,6 +19,13 @@ _APPLIED = False
 # from the package root; there is exactly one definition.
 from .residency import SUPPORTED_TYPES, normalize_model_type
 
+try:
+    # P2 follow-up: public cache-policy API at the package root.
+    from .streaming_switch import S3FIFOExpertCache, make_expert_cache
+except Exception:  # pragma: no cover - streaming_switch imports mlx
+    S3FIFOExpertCache = None  # type: ignore[assignment]
+    make_expert_cache = None  # type: ignore[assignment]
+
 
 def is_supported_model_type(model_type: str | None) -> bool:
     if not model_type:
@@ -1541,6 +1548,16 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
 
         out["slotbank_on"] = bool(_slot_on)
         out["cache_policy"] = getattr(cache, "policy", "lru")
+    except Exception:
+        pass
+    try:
+        spec = getattr(cache, "spec_state", None)
+        if spec is not None:
+            out["trans_updates"] = int(getattr(spec, "trans_updates", 0) or 0)
+            out["trans_sources"] = len(getattr(spec, "trans", {}) or {})
+            sstats = getattr(spec, "stats", None) or {}
+            if isinstance(sstats, dict) and sstats.get("trans_overfetch"):
+                out["trans_overfetch"] = int(sstats["trans_overfetch"])
     except Exception:
         pass
     return out
