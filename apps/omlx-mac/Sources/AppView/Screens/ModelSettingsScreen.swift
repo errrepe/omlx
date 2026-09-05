@@ -942,6 +942,63 @@ private struct AdvancedTab: View {
                             ), mono: true, width: 110)
                         }
                     }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.cache_policy.label",
+                                          defaultValue: "Expert cache policy",
+                                          comment: "Row label for the expert cache policy field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.cache_policy.sub",
+                                             defaultValue: "Eviction policy for resident experts. LRU is the tested default; S3-FIFO resists scans (A/B tied on real traces).",
+                                             comment: "Sublabel for the expert cache policy field")) {
+                            Picker("", selection: vm.bind(
+                                $vm.expertStreamingCachePolicy,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingCachePolicy, client: client)
+                                    }
+                                }
+                            )) {
+                                Text("Default (LRU)").tag("")
+                                Text("LRU").tag("lru")
+                                Text("S3-FIFO").tag("s3fifo")
+                            }.pickerStyle(.menu).frame(width: 140)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.dynamic.label",
+                                          defaultValue: "Dynamic expert residency (governor)",
+                                          comment: "Row label for the dynamic residency governor"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.dynamic.sub",
+                                             defaultValue: "Let oMLX resize the resident-expert cache from free memory: grow with headroom, shrink under pressure. Needs a cache budget above 0.",
+                                             comment: "Sublabel for the dynamic residency governor")) {
+                            Picker("", selection: vm.bind(
+                                $vm.expertStreamingDynamic,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingDynamic, client: client)
+                                    }
+                                }
+                            )) {
+                                Text("Default (off)").tag(Optional<Bool>.none)
+                                Text("On").tag(Optional<Bool>.some(true))
+                                Text("Off").tag(Optional<Bool>.some(false))
+                            }.pickerStyle(.menu).frame(width: 140)
+                        }
+                        if vm.expertStreamingEnabled && vm.expertStreamingDynamic == true {
+                            Row(label: String(localized: "settings.advanced.expert_streaming.dynamic_max.label",
+                                              defaultValue: "Governor max (GiB)",
+                                              comment: "Row label for the governor ceiling field"),
+                                sublabel: String(localized: "settings.advanced.expert_streaming.dynamic_max.sub",
+                                                 defaultValue: "Ceiling the governor may grow the expert cache to. Empty = 6 GiB.",
+                                                 comment: "Sublabel for the governor ceiling field")) {
+                                TextInput(text: vm.bind(
+                                    $vm.expertStreamingDynamicMaxGib,
+                                    save: {
+                                        Task {
+                                            await vm.save(.expertStreamingDynamicMaxGib, client: client)
+                                        }
+                                    }
+                                ), mono: true, width: 110)
+                            }
+                        }
+                    }
                 }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",

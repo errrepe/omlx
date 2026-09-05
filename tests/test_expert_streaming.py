@@ -2752,9 +2752,13 @@ def test_io_overrides_resolution_and_clamping():
         "expert_streaming_pin_gib": None,
         "expert_streaming_pin_sync": None,
         "expert_streaming_pin_regime": None,
+        "expert_streaming_cache_policy": None,
+        "expert_streaming_dynamic": None,
+        "expert_streaming_dynamic_max_gib": None,
     }
 
-    # Depth clamping and boolean pass-through
+    # Depth clamping and boolean pass-through; the new UX knobs normalize:
+    # cache policy lowercases, governor ceiling clamps to the 0..64 window.
     ov = _io_overrides(
         ModelSettings(
             expert_streaming_io_depth=999,
@@ -2765,6 +2769,9 @@ def test_io_overrides_resolution_and_clamping():
             expert_streaming_per_layer_eval=False,
             expert_streaming_pins=True,
             expert_streaming_pin_gib=3.0,
+            expert_streaming_cache_policy="S3FIFO",
+            expert_streaming_dynamic=True,
+            expert_streaming_dynamic_max_gib=8.0,
         )
     )
     assert ov["expert_streaming_io_depth"] == 64
@@ -2775,11 +2782,23 @@ def test_io_overrides_resolution_and_clamping():
     assert ov["expert_streaming_per_layer_eval"] is False
     assert ov["expert_streaming_pins"] is True
     assert ov["expert_streaming_pin_gib"] == 3.0
+    assert ov["expert_streaming_cache_policy"] == "s3fifo"
+    assert ov["expert_streaming_dynamic"] is True
+    assert ov["expert_streaming_dynamic_max_gib"] == 8.0
 
-    # Invalid depth → None (env default); None settings object → all None
+    # Invalid depth → None (env default); None settings object → all None.
+    # Invalid policy and out-of-range ceiling fall back the same way.
     ov = _io_overrides(ModelSettings(expert_streaming_io_depth=0))
     assert ov["expert_streaming_io_depth"] is None
     assert _io_overrides(None)["expert_streaming_io_depth"] is None
+    ov = _io_overrides(
+        ModelSettings(
+            expert_streaming_cache_policy="arc",
+            expert_streaming_dynamic_max_gib=100.0,
+        )
+    )
+    assert ov["expert_streaming_cache_policy"] is None
+    assert ov["expert_streaming_dynamic_max_gib"] is None
 
 
 def test_convert_applies_io_overrides():

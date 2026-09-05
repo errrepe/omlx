@@ -21969,6 +21969,30 @@
         }
       }
     },
+    "settings.advanced.expert_streaming.cache_policy.label" : {
+      "comment" : "Row label for the expert cache policy field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Expert cache policy"
+          }
+        }
+      }
+    },
+    "settings.advanced.expert_streaming.cache_policy.sub" : {
+      "comment" : "Sublabel for the expert cache policy field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Eviction policy for resident experts. LRU is the tested default; S3-FIFO resists scans (A/B tied on real traces)."
+          }
+        }
+      }
+    },
     "settings.advanced.expert_streaming.cold_tier.label" : {
       "comment" : "Row label for the cold precision tier field",
       "extractionState" : "extracted_with_value",
@@ -21989,6 +22013,54 @@
           "stringUnit" : {
             "state" : "new",
             "value" : "Requires tools/requant_cold_tier.py (expert_cold/ present). Reads streamed experts from the low-precision tier — fewer bytes per token. Approximate: gate with the perplexity harness. Empty = off."
+          }
+        }
+      }
+    },
+    "settings.advanced.expert_streaming.dynamic.label" : {
+      "comment" : "Row label for the dynamic residency governor",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Dynamic expert residency (governor)"
+          }
+        }
+      }
+    },
+    "settings.advanced.expert_streaming.dynamic.sub" : {
+      "comment" : "Sublabel for the dynamic residency governor",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Let oMLX resize the resident-expert cache from free memory: grow with headroom, shrink under pressure. Needs a cache budget above 0."
+          }
+        }
+      }
+    },
+    "settings.advanced.expert_streaming.dynamic_max.label" : {
+      "comment" : "Row label for the governor ceiling field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Governor max (GiB)"
+          }
+        }
+      }
+    },
+    "settings.advanced.expert_streaming.dynamic_max.sub" : {
+      "comment" : "Sublabel for the governor ceiling field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Ceiling the governor may grow the expert cache to. Empty = 6 GiB."
           }
         }
       }

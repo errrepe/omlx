@@ -302,6 +302,19 @@ class ModelSettings:
     # layer (top by learned pin-profile frequency) that keep the ORIGINAL
     # packing while the rest read the cold tier. 0/unset = uniform tier (I5).
     expert_streaming_hot_fraction: Optional[float] = None
+    # Expert cache eviction policy: "lru" (default) or "s3fifo" (scan
+    # resistant; A/B verdict on real traces: LRU stays default — see
+    # docs/expert-streaming.md). None keeps env OMLX_EXPERT_STREAMING_CACHE
+    # ("lru"). Machine-specific: never propagated via model profiles.
+    expert_streaming_cache_policy: Optional[str] = None
+    # Dynamic expert-residency governor: revisits the LRU capacity at
+    # request boundaries from system free memory (grow with headroom,
+    # halve under pressure, clear when desperate). None keeps env
+    # OMLX_EXPERT_STREAMING_DYNAMIC (off). Requires budget > 0.
+    expert_streaming_dynamic: Optional[bool] = None
+    # Ceiling (GiB) the governor may grow the cache to. None keeps env
+    # OMLX_EXPERT_STREAMING_DYNAMIC_MAX_GIB (6.0).
+    expert_streaming_dynamic_max_gib: Optional[float] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

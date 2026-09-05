@@ -156,6 +156,9 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_pin_regime: str | None = None
     expert_streaming_cold_tier: str | None = None
     expert_streaming_hot_fraction: float | None = None
+    expert_streaming_cache_policy: str | None = None
+    expert_streaming_dynamic: bool | None = None
+    expert_streaming_dynamic_max_gib: float | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -494,6 +497,41 @@ def _parse_hot_cache_max_size(value: str) -> int:
 
 
 _PAROQUANT_REASON = "Not supported on paroquant models yet (compatibility not verified)"
+
+
+def _expert_streaming_health(engine_pool: Any, model_id: str) -> dict | None:
+    """Runtime MoE streaming health for a *loaded* engine, or None.
+
+    Aggregates the counters the streaming implementation already keeps
+    (LRU hit-rate, prefetch precision, stash, governor state) plus the
+    effective cache policy, so the dashboard and the Mac app can show
+    live health next to each loaded streaming model. Cheap: reads dicts
+    that are maintained anyway; never raises.
+    """
+    try:
+        entries = getattr(engine_pool, "_entries", None) or {}
+        entry = entries.get(model_id)
+        engine = getattr(entry, "engine", None) if entry is not None else None
+        # Loaded engines expose the streaming backing set at convert time.
+        for eng in (engine, getattr(engine, "engine", None)):
+            backing = getattr(eng, "_expert_streaming_backing", None)
+            if backing is not None:
+                cache = getattr(backing, "_streaming_cache", None)
+                from ..patches.expert_streaming import expert_streaming_summary
+
+                health = expert_streaming_summary(cache, backing) or {}
+                health["cache_policy"] = str(
+                    getattr(cache, "policy", "lru") or "lru"
+                )
+                health["dynamic_enabled"] = getattr(backing, "governor", None) is not None
+                return health or None
+    except Exception:
+        logger.debug(
+            "Could not collect expert streaming health for %s",
+            model_id,
+            exc_info=True,
+        )
+    return None
 
 
 def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -2111,6 +2149,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "per_expert_bytes_effective": int(
                 getattr(_est, "per_expert_bytes_effective", 0) or 0
             ),
+            # Runtime health for loaded streaming engines: LRU hit-rate,
+            # prefetch precision, stash, transition table, governor state.
+            # Cheap (dict already maintained); null when not applicable.
+            "expert_streaming_health": _expert_streaming_health(
+                engine_pool, model_id
+            ),
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2538,10 +2582,10 @@ async def update_model_settings(
         v = request.expert_streaming_cold_tier
         if v is None or str(v).strip() == "":
             current_settings.expert_streaming_cold_tier = None
-        elif str(v) in ("2", "3"):
-            current_settings.expert_streaming_cold_tier = str(v)
+        elif str(v).isdigit() and 2 <= int(v) <= 8:
+            current_settings.expert_streaming_cold_tier = str(int(v))
         else:
-            raise HTTPException(status_code=400, detail="expert_streaming_cold_tier must be '2' or '3'")
+            raise HTTPException(status_code=400, detail="expert_streaming_cold_tier must be 2..8")
     if "expert_streaming_hot_fraction" in sent:
         v = request.expert_streaming_hot_fraction
         if v is None:
@@ -2552,6 +2596,34 @@ async def update_model_settings(
             raise HTTPException(
                 status_code=400,
                 detail="expert_streaming_hot_fraction must be a number between 0 and 1",
+            )
+    if "expert_streaming_cache_policy" in sent:
+        v = request.expert_streaming_cache_policy
+        if v is None or str(v).strip() == "":
+            current_settings.expert_streaming_cache_policy = None
+        elif str(v).strip().lower() in ("lru", "s3fifo"):
+            current_settings.expert_streaming_cache_policy = str(v).strip().lower()
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expert_streaming_cache_policy must be 'lru' or 's3fifo'",
+            )
+    if "expert_streaming_dynamic" in sent:
+        current_settings.expert_streaming_dynamic = (
+            bool(request.expert_streaming_dynamic)
+            if request.expert_streaming_dynamic is not None
+            else None
+        )
+    if "expert_streaming_dynamic_max_gib" in sent:
+        v = request.expert_streaming_dynamic_max_gib
+        if v is None:
+            current_settings.expert_streaming_dynamic_max_gib = None
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < float(v) <= 64:
+            current_settings.expert_streaming_dynamic_max_gib = float(v)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expert_streaming_dynamic_max_gib must be a number between 0 and 64",
             )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
@@ -5717,6 +5789,11 @@ def _build_active_models_data() -> dict:
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "dflash": dflash_info,
+                # Live MoE streaming health (LRU hit-rate, prefetch
+                # precision, governor) when this loaded model streams experts.
+                "expert_streaming_health": _expert_streaming_health(
+                    engine_pool, model_id
+                ),
             }
         )
 

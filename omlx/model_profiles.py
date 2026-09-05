@@ -122,6 +122,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "expert_streaming_pin_regime",
         "expert_streaming_cold_tier",
         "expert_streaming_hot_fraction",
+        "expert_streaming_cache_policy",
+        "expert_streaming_dynamic",
+        "expert_streaming_dynamic_max_gib",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

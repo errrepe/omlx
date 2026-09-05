@@ -1177,9 +1177,19 @@ class S3FIFOExpertCache(ExpertLRUCache):
         return len(self._small) + len(self._store)
 
 
-def make_expert_cache(budget_bytes: int, per_slot: int, num_layers: int | None = None) -> ExpertLRUCache:
-    """P2: build the configured eviction policy (default LRU)."""
-    if _CACHE_POLICY_ENV == "s3fifo":
+def make_expert_cache(
+    budget_bytes: int,
+    per_slot: int,
+    num_layers: int | None = None,
+    policy: str | None = None,
+) -> ExpertLRUCache:
+    """P2: build the configured eviction policy (default LRU).
+
+    ``policy`` (per-model setting) wins over the env default; None keeps
+    OMLX_EXPERT_STREAMING_CACHE ("lru").
+    """
+    eff = (policy or _CACHE_POLICY_ENV or "lru").strip().lower()
+    if eff == "s3fifo":
         return S3FIFOExpertCache(budget_bytes, per_slot, num_layers=num_layers)
     return ExpertLRUCache(budget_bytes, per_slot, num_layers=num_layers)
 
