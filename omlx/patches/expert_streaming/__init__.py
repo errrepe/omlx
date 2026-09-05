@@ -21,6 +21,11 @@ from .residency import SUPPORTED_TYPES, normalize_model_type
 
 try:
     # P2 follow-up: public cache-policy API at the package root.
+    from .governor import dynamic_residency_enabled
+except Exception:  # pragma: no cover - governor has no mlx dependency
+    dynamic_residency_enabled = lambda: False  # type: ignore[assignment]
+
+try:
     from .streaming_switch import S3FIFOExpertCache, make_expert_cache
 except Exception:  # pragma: no cover - streaming_switch imports mlx
     S3FIFOExpertCache = None  # type: ignore[assignment]
@@ -828,6 +833,32 @@ def convert_model_to_streaming(
     per_slot = max(1, per_expert // 3) if per_expert else 0
     cache = make_expert_cache(budget_bytes, per_slot, num_layers=estimate.num_moe_layers)
 
+    # Dynamic residency governor: opt-in (env), positive budget only. It
+    # revisits capacity at request boundaries from system free memory; a
+    # budget-0 run is page-cache-only by operator choice and stays so.
+    _governor = None
+    if dynamic_residency_enabled() and budget_bytes > 0 and per_slot > 0:
+        try:
+            from .governor import (
+                ExpertResidencyGovernor,
+                _max_dynamic_budget_bytes,
+            )
+
+            _governor = ExpertResidencyGovernor(
+                cache,
+                per_slot,
+                estimate.num_moe_layers,
+                max(_max_dynamic_budget_bytes(), int(budget_bytes)),
+            )
+            logger.info(
+                "Expert streaming: dynamic residency governor armed (budget %.2f GiB, max %.2f GiB)",
+                budget_bytes / 1024**3,
+                _governor.max_budget_bytes / 1024**3,
+            )
+        except Exception:
+            logger.debug("governor arming failed", exc_info=True)
+            _governor = None
+
     # IO overrides (settings/env resolution) are read before the backing
     # block: the HOBBIT split (I6) consumes expert_streaming_hot_fraction
     # while building the backing store, and the later wiring reuses the
@@ -1035,8 +1066,14 @@ def convert_model_to_streaming(
 
     _spec_state = SpeculationState()
     cache.spec_state = _spec_state  # type: ignore[attr-defined]
+    if _governor is not None:
+        # Same reachability path as the cache: the engine finds the governor
+        # through the backing at request boundaries.
+        cache.governor = _governor  # type: ignore[attr-defined]
     if not isinstance(backing, dict):
         backing.spec_state = _spec_state  # type: ignore[attr-defined]
+        if _governor is not None:
+            backing.governor = _governor  # type: ignore[attr-defined]
         # Reload the learned transition table so the k+1 overfetch is
         # warm from token 1 (fingerprintMismatch -> ignored, never silent).
         try:
@@ -1615,6 +1652,12 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
         out["ctx_fallbacks"] = dict(getattr(cache, "ctx_fallback_stats", lambda: {})())
     except Exception:
         out["ctx_fallbacks"] = {}
+    try:
+        gov = getattr(backing, "governor", None) if backing is not None else None
+        if gov is not None:
+            out["governor"] = gov.summary()
+    except Exception:
+        pass
     try:
         from .streaming_switch import _SLOT_BANK_ENV as _slot_on
 

@@ -3818,6 +3818,10 @@ class VLMBatchedEngine(BaseEngine):
             backing = getattr(self, "_expert_streaming_backing", None)
             if backing is None:
                 return
+            # Dynamic residency: parity with BatchedEngine (opt-in).
+            governor = getattr(backing, "governor", None)
+            if governor is not None:
+                governor.observe()
             from ..patches.expert_streaming import expert_streaming_summary
 
             cache = getattr(backing, "_streaming_cache", None)

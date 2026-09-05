@@ -857,6 +857,67 @@ def test_transition_profile_round_trip_with_fingerprint(tmp_path=None):
         assert load_transition_profile(_B(), SpeculationState()) == 0
 
 
+def test_residency_governor_hysteresis_and_bounds():
+    """Dynamic residency: shrink/clear/grow from free memory, with floors."""
+    import omlx.patches.expert_streaming.governor as gov_mod
+    from omlx.patches.expert_streaming.governor import ExpertResidencyGovernor
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    G = 1024**3
+    cache = ExpertLRUCache(int(2 * G), 696888, num_layers=48)
+    g = ExpertResidencyGovernor(
+        cache, 696888, 48, int(6 * G),
+        low_free_bytes=6 * G, target_free_bytes=12 * G, high_free_bytes=24 * G,
+        cooldown_s=0.0, min_cap=32,
+    )
+    start_cap = cache.capacity
+    assert start_cap > 0
+
+    # Fill the cache beyond a shrink target to see evictions on _apply.
+    for l in range(48):
+        for e in range(8):
+            cache.put((l, e, "g"), ("w", "s", None))
+    # Pressure: free between LOW and TGT -> halve, evict down to new cap.
+    gov_mod._free_bytes = lambda: 8 * G
+    act = g.observe(force=True)
+    assert "shrink" in act and cache.capacity < start_cap
+    assert len(cache._store) <= cache.capacity
+    total = sum(cache._layer_counts.values())
+    assert total == len(cache._store)
+    # Critical: free below LOW -> clear.
+    gov_mod._free_bytes = lambda: 4 * G
+    act = g.observe(force=True)
+    assert "clear" in act and len(cache._store) == 0
+    # Abundance: free above HIGH -> grow, ceiling max_budget.
+    gov_mod._free_bytes = lambda: 40 * G
+    caps = []
+    for _ in range(6):
+        g.observe(force=True)
+        caps.append(cache.capacity)
+    assert caps == sorted(caps)  # monotone growth
+    # Ceiling: capacity * per_slot <= max_budget (+1 slot rounding).
+    assert cache.capacity * g.per_slot <= int(6 * G) + g.per_slot
+    # Cooldown suppresses action.
+    g2 = ExpertResidencyGovernor(
+        cache, 696888, 48, int(6 * G), cooldown_s=3600.0,
+    )
+    gov_mod._free_bytes = lambda: 8 * G
+    assert g2.observe() == ""  # inside cooldown
+    assert g2.observe(force=True) != ""  # forced bypasses cooldown
+    # Stable band: free between TGT and HIGH must not act (hysteresis).
+    gov_mod._free_bytes = lambda: 8 * G
+    g.observe(force=True)
+    mid = (g.target_free_bytes + g.high_free_bytes) // 2
+    gov_mod._free_bytes = lambda: mid
+    cap_before = cache.capacity
+    assert g.observe(force=True) == ""
+    assert cache.capacity == cap_before
+
+    # Summary carries governor state.
+    s = g.summary()
+    assert s["actions"] >= 1 and "capacity" in s
+
+
 def test_s3fifo_cache_equivalence_and_scan_resistance():
     """P2: S3-FIFO honors the same interface; one-hit scans don't evict hot."""
     from omlx.patches.expert_streaming.streaming_switch import (

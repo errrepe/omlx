@@ -76,6 +76,31 @@ Conclusão: neste workload o teto é volume (1.6 GB/tok) + granularidade (200k p
 
 3 reps por braço (Fase 3: 3 reps prior + 2 exact — terceira exact abortada pelo guarda de RAM do box), page cache warm, checkpoint `Qwen3.8-Flash-Next-JANG_4M`.
 
+### Governador dinâmico de residência (N1, LANDED opt-in)
+
+Budget fixo é decidido no load e nunca revisitado; a memória livre do sistema continua
+se movendo (observado na matriz 36-cell: pico de RSS ~25-27G em 51G com o decode rodando
+a maior parte do tempo abaixo de 50% de uso). O governador revisita a capacidade do LRU
+nos boundaries de request a partir da memória disponível (`psutil.available`, com
+fallback `vm_stat`):
+
+- livre < 10% da RAM → `clear()` do cache (desespero; páginas são re-legíveis do SSD)
+- livre < 20% da RAM → reduz a capacidade à metade (piso `min_cap`)
+- livre > 40% da RAM → dobra a capacidade (teto `max_budget`)
+- entre 20% e 40% → estável (histerese; zero churn de resize)
+
+Cooldown de 30s entre ações. Opt-in: `OMLX_EXPERT_STREAMING_DYNAMIC=1` com budget > 0
+(um budget-0 é page-cache-only por escolha operacional e fica intocado). Teto do
+crescimento: `OMLX_EXPERT_STREAMING_DYNAMIC_MAX_GIB` (default 6). Roda na thread de
+inferência no mesmo ponto do summary por request — sem corrida com put/get. Estado no
+`expert_streaming_summary` (`governor.actions/last_action/last_free_gib/capacity`);
+ações logam uma linha `expert_streaming governor: ...`.
+
+Nota honesta de calibragem: sob carga de bench com 4 requests concorrentes + page cache
+sujo, `available` fica ~16G (entre 20% e 40% de 48G) e o governador deliberadamente
+não age — histerese fazendo o trabalho dela. Em máquina descansada ele cresce (provado:
+3077→6162 slots no primeiro boundary). Thresholds relativos à RAM total, não absolutos.
+
 ### Knob aproximado: cache-prior rerank (Fase 3, LANDED opt-in)
 
 `expert_streaming_cache_prior` (per-model settings + WebUI + app macOS; env `OMLX_EXPERT_STREAMING_CACHE_PRIOR` como fallback; excluído de profiles como os demais knobs de hardware; entra na runtime signature). Default `0.0`/nulo = roteamento exato, bit-idêntico. Bônus em logit-space para experts residentes no LRU antes do top-k (Qualcomm 2412.00099). Aproximado por desenho — muda outputs; saídas inspecionadas sãs. Sweep no autotuner (`--sweep-prior`, candidatos `--priors`).
