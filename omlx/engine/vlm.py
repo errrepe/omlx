@@ -3803,6 +3803,52 @@ class VLMBatchedEngine(BaseEngine):
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
                 await engine.abort_request(request_id)
+            else:
+                self._log_streaming_summary()
+
+    def _log_streaming_summary(
+        self, *, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        """Parity with BatchedEngine: one-line MoE streaming health log.
+
+        No-op unless expert streaming is active (VLM wrappers serve the
+        largest streaming checkpoints — qwen4_exp/glm5_next).
+        """
+        try:
+            backing = getattr(self, "_expert_streaming_backing", None)
+            if backing is None:
+                return
+            from ..patches.expert_streaming import expert_streaming_summary
+
+            cache = getattr(backing, "_streaming_cache", None)
+            summary = expert_streaming_summary(cache, backing)
+            if not summary:
+                return
+            logger.info(
+                "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
+                "(h=%d m=%d evict=%d size=%d/%d) prefetch_prec=%.3f "
+                "(sub=%d con=%d drop=%d) stash_hit=%.3f (h=%d m=%d adv=%d) "
+                "ctx_fallbacks=%s",
+                prompt_tokens,
+                completion_tokens,
+                summary.get("lru_hit_rate", 0.0),
+                summary.get("lru_hits", 0),
+                summary.get("lru_misses", 0),
+                summary.get("lru_evictions", 0),
+                summary.get("lru_size", 0),
+                summary.get("lru_capacity", 0),
+                summary.get("prefetch_precision", 0.0),
+                summary.get("prefetch_submissions", 0),
+                summary.get("prefetch_consumed", 0),
+                summary.get("prefetch_dropped", 0),
+                summary.get("stash_hit_rate", 0.0),
+                summary.get("stash_hits", 0),
+                summary.get("stash_misses", 0),
+                summary.get("advised", 0),
+                summary.get("ctx_fallbacks", {}),
+            )
+        except Exception:
+            pass
 
     async def chat(
         self,

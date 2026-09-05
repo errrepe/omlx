@@ -747,6 +747,116 @@ def test_transition_table_predicts_and_overfetches():
     assert len(st2.trans.get((0, 0), {})) <= 8
 
 
+def test_stash_ring_fifo_bound_and_hits():
+    """Gap §7.3: the speculation stash ring is FIFO-bounded and hit-counted."""
+    from omlx.patches.expert_streaming.streaming_switch import (
+        _STASH_MAX_ENTRIES,
+        SpeculationState,
+    )
+
+    st = SpeculationState()
+    assert st.stash_get((0, 1, "w")) is None
+    assert st.stats["stash_misses"] == 0  # get is pure; misses counted by caller
+    for eid in range(_STASH_MAX_ENTRIES + 10):
+        assert st.stash_insert((0, eid, "w"), ("w", "s", None)) is True
+    assert len(st.stash) <= _STASH_MAX_ENTRIES
+    assert st.stats["stash_evictions"] >= 10
+    # Fresh insert hits; evicted old entry misses.
+    assert st.stash_get((0, _STASH_MAX_ENTRIES + 9, "w")) is not None
+    assert st.stats["stash_hits"] == 1
+    assert st.stash_get((0, 0, "w")) is None
+    # Closed state refuses inserts.
+    st.close()
+    assert st.stash_insert((0, 999, "w"), ("w", "s", None)) is False
+
+
+def test_layer_context_rolling_union_equivalence():
+    """Gap §7.3: rolling and union modes resolve identical bundles."""
+    import numpy as np
+
+    from omlx.patches.expert_streaming.streaming_switch import (
+        _LayerLoadContext,
+        ExpertLRUCache,
+    )
+
+    class _FakeLinear:
+        def __init__(self, layer_idx, name):
+            self.layer_idx = layer_idx
+            self.proj_name = name
+            self._io_pool_override = None
+
+        def bundle_key(self, eid):
+            return (self.layer_idx, int(eid), self.proj_name)
+
+        def _tier_bank_bytes_for(self, ids):
+            return len(ids) * 16
+
+        def _load_expert_bank_np(self, ids):
+            return [(np.full((4,), float(e), dtype=np.float32), None, None) for e in ids]
+
+        def _load_expert_bank_np_full(self, ids):
+            rows = self._load_expert_bank_np(ids)
+            return ([(list(ids), [np.empty((len(ids), 16), dtype=np.uint8)])], rows)
+
+    def _run(mode):
+        cache = ExpertLRUCache(1 << 20, 4096, num_layers=1)
+        lins = [_FakeLinear(0, f"p{i}") for i in range(3)]
+        ctx = _LayerLoadContext(lins, cache, mode=mode)
+        for lin in lins:
+            ctx.ensure(lin, [2, 5, 7])
+        return {
+            lin.proj_name: {e: float(np.asarray(b[0]).ravel()[0]) for e, b in ctx.bundles[id(lin)].items()}
+            for lin in lins
+        }, dict(ctx.hits), dict(ctx.misses)
+
+    rolling, rh, rm = _run("rolling")
+    union, uh, um = _run("union")
+    assert rolling == union
+    for lin_bundles in rolling.values():
+        assert lin_bundles == {2: 2.0, 5: 5.0, 7: 7.0}
+
+
+def test_transition_profile_round_trip_with_fingerprint(tmp_path=None):
+    """Transition payload survives save/load; mismatch is ignored."""
+    import json
+
+    from omlx.patches.expert_streaming import load_transition_profile
+    from omlx.patches.expert_streaming.streaming_switch import SpeculationState
+
+    st = SpeculationState()
+    st.record_prev(0, [1, 2])
+    st.record_prev(0, [2, 3])
+    payload = st.to_payload()
+    assert payload["updates"] == 1
+    st2 = SpeculationState()
+    assert st2.load_payload(payload) >= 1
+    assert 3 in st2.predict_next(0, [2])
+    # Fingerprint mismatch path: wrong model name ignored.
+    import tempfile
+    from pathlib import Path
+
+    from omlx.patches.expert_streaming import save_transition_profile
+
+    with tempfile.TemporaryDirectory() as td:
+        model = Path(td) / "m"
+        (model / ".omlx").mkdir(parents=True)
+        (model / "config.json").write_text("{}")
+
+        class _B:
+            model_path = model
+            spec_state = st
+
+        save_transition_profile(_B())
+        raw = json.loads((model / ".omlx" / "expert_transition.json").read_text())
+        assert raw["model"] == "m"
+        st3 = SpeculationState()
+        assert load_transition_profile(_B(), st3) >= 1
+        # Tamper the model name -> ignored.
+        raw["model"] = "other"
+        (model / ".omlx" / "expert_transition.json").write_text(json.dumps(raw))
+        assert load_transition_profile(_B(), SpeculationState()) == 0
+
+
 def test_s3fifo_cache_equivalence_and_scan_resistance():
     """P2: S3-FIFO honors the same interface; one-hit scans don't evict hot."""
     from omlx.patches.expert_streaming.streaming_switch import (

@@ -865,7 +865,12 @@ def convert_model_to_streaming(
             # build on would silently break.
             cold_root = None
             cold_setting = getattr(model_settings, "expert_streaming_cold_tier", None)
-            if cold_setting and str(cold_setting) in ("2", "3"):
+            # Gap fix: accept any 2..8-bit label and validate against the
+            # tier's own __metadata__ (omlx_cold_bits) — the old ("2","3")
+            # tuple rejected tiers the requant tool can already produce.
+            # Mismatch disables with a warning, never silently.
+            _cold_bits_label = str(cold_setting).strip() if cold_setting else ""
+            if cold_setting and _cold_bits_label.isdigit() and 2 <= int(_cold_bits_label) <= 8:
                 # Deploy-time override: point the tier at an arbitrary
                 # directory (a read-only model volume, a second SSD, a
                 # sandboxed checkout) instead of <model>/expert_cold. The
@@ -876,8 +881,29 @@ def convert_model_to_streaming(
                 cold_dir = cold_root if cold_root is not None else Path(model_path) / "expert_cold"
                 ok, why = _cold_tier_status_dir(cold_dir, Path(model_path))
                 if ok:
+                    # Validate the requested label against the tier metadata.
+                    try:
+                        from .shard_bank import _safetensors_header as _cold_hdr
+
+                        _meta_bits: set[str] = set()
+                        for _shard in cold_dir.glob("*.safetensors"):
+                            try:
+                                _meta = (_cold_hdr(_shard).get("__metadata__") or {})
+                                if _meta.get("omlx_cold_bits") is not None:
+                                    _meta_bits.add(str(_meta["omlx_cold_bits"]))
+                            except Exception:
+                                continue
+                        if _meta_bits and _cold_bits_label not in _meta_bits:
+                            ok = False
+                            why = (
+                                f"tier holds bits {sorted(_meta_bits)}, "
+                                f"requested {_cold_bits_label}"
+                            )
+                    except Exception:
+                        pass
+                if ok:
                     cold_root = cold_dir
-                    logger.info("Expert streaming: cold tier %s-bit active (%s)", cold_setting, why)
+                    logger.info("Expert streaming: cold tier %s-bit active (%s)", _cold_bits_label, why)
                 else:
                     # Failed completeness: reset to None so the backing
                     # never engages a partial tier (the env path would leak
@@ -885,9 +911,16 @@ def convert_model_to_streaming(
                     cold_root = None
                     logger.warning(
                         "Expert streaming: cold tier %s requested but %s — disabled",
-                        cold_setting,
+                        _cold_bits_label,
                         why,
                     )
+            elif cold_setting:
+                # Gap fix: an unparsable label used to fall through silently.
+                logger.warning(
+                    "Expert streaming: cold tier %r not understood "
+                    "(want 2..8) — disabled",
+                    cold_setting,
+                )
             backing = ExpertBackingStore(model_path, extra_roots=extra_roots, cold_root=cold_root)
             # dsv4 spill-stacking: per-expert JANGQ checkpoints serve
             # their stacked banks from spill shards outside the model
@@ -1004,6 +1037,12 @@ def convert_model_to_streaming(
     cache.spec_state = _spec_state  # type: ignore[attr-defined]
     if not isinstance(backing, dict):
         backing.spec_state = _spec_state  # type: ignore[attr-defined]
+        # Reload the learned transition table so the k+1 overfetch is
+        # warm from token 1 (fingerprintMismatch -> ignored, never silent).
+        try:
+            load_transition_profile(backing, _spec_state)
+        except Exception:
+            pass
         # P2: the engine reaches the shared cache through the backing it
         # already holds (for the per-request summary log).
         try:
@@ -1144,6 +1183,39 @@ def convert_model_to_streaming(
     if converted and cache.num_layers != converted and cache.capacity > 0:
         cache.num_layers = converted
         cache._per_layer_cap = max(1, cache.capacity // converted)  # type: ignore[attr-defined]
+
+    # Gap fix: validate the resolved (hidden, moe_hidden) against the
+    # converted GLUs' real dims. _resolve_moe_dims falls back to family
+    # guesses (1407/640/2048) when the config lacks moe_intermediate_size;
+    # a wrong guess silently mis-sizes every streaming linear. The GLUs
+    # carry their construction dims — a mismatch fails loudly here.
+    if converted:
+        try:
+            _dim_mismatch = []
+            for _layer in layers or ():
+                _moe = getattr(_layer, "mlp", None) or getattr(_layer, "ffn", None)
+                _sm = getattr(_moe, "switch_mlp", None)
+                if _sm is None or not hasattr(_sm, "_input_dims"):
+                    continue
+                if int(getattr(_sm, "_input_dims", hidden)) != int(hidden) or int(
+                    getattr(_sm, "_hidden_dims", moe_hidden)
+                ) != int(moe_hidden):
+                    _dim_mismatch.append(
+                        (
+                            getattr(_sm, "layer_idx", "?"),
+                            getattr(_sm, "_input_dims", "?"),
+                            getattr(_sm, "_hidden_dims", "?"),
+                        )
+                    )
+                    break
+            if _dim_mismatch:
+                logger.warning(
+                    "Expert streaming: resolved dims (hidden=%d, moe=%d) disagree "
+                    "with converted GLU %s — check _resolve_moe_dims fallbacks",
+                    hidden, moe_hidden, _dim_mismatch[0],
+                )
+        except Exception:
+            pass
 
     # P0: reconcile cache slots with the converted projection layout. The
     # cache was sized for 3 projections/expert (split); every converted
@@ -1563,6 +1635,72 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
     return out
 
 
+def save_transition_profile(backing: Any) -> None:
+    """Persist the learned (layer, expert) transition table, if any.
+
+    Writes ``<model>/.omlx/expert_transition.json`` with a config-sha
+    fingerprint; a mismatch on load ignores the profile (never a silent
+    apply). Best-effort; failures only debug-log.
+    """
+    try:
+        if backing is None or isinstance(backing, dict):
+            return
+        spec = getattr(backing, "spec_state", None)
+        if spec is None or not getattr(spec, "trans_updates", 0):
+            return
+        import hashlib
+        import json
+
+        model_path = Path(getattr(backing, "model_path", "") or "")
+        if not model_path.is_dir():
+            return
+        cfg = model_path / "config.json"
+        try:
+            sha = hashlib.sha256(cfg.read_bytes()).hexdigest()[:16]
+        except Exception:
+            sha = None
+        payload = spec.to_payload()
+        payload["model"] = model_path.name
+        payload["config_sha"] = sha
+        dest = model_path / ".omlx" / "expert_transition.json"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(json.dumps(payload))
+        except Exception:
+            logger.debug("expert transition save failed", exc_info=True)
+    except Exception:
+        pass
+
+
+def load_transition_profile(backing: Any, spec: Any) -> int:
+    """Load a persisted transition table into *spec*; returns sources."""
+    try:
+        import hashlib
+        import json
+
+        if backing is None or isinstance(backing, dict) or spec is None:
+            return 0
+        model_path = Path(getattr(backing, "model_path", "") or "")
+        src = model_path / ".omlx" / "expert_transition.json"
+        if not src.is_file():
+            return 0
+        payload = json.loads(src.read_text())
+        cfg = model_path / "config.json"
+        try:
+            sha = hashlib.sha256(cfg.read_bytes()).hexdigest()[:16]
+        except Exception:
+            sha = None
+        if payload.get("config_sha") != sha or payload.get("model") != model_path.name:
+            logger.info("expert transition profile fingerprint mismatch — ignored")
+            return 0
+        n = spec.load_payload(payload)
+        if n:
+            logger.info("expert transition profile loaded (%d sources)", n)
+        return n
+    except Exception:
+        return 0
+
+
 def shutdown_expert_streaming(backing: Any) -> None:
     """Release MoE streaming resources held by *backing* (P0).
 
@@ -1574,6 +1712,11 @@ def shutdown_expert_streaming(backing: Any) -> None:
     """
     if backing is None or isinstance(backing, dict):
         return
+    # Persist the learned transition table before threads/fds die.
+    try:
+        save_transition_profile(backing)
+    except Exception:
+        pass
     try:
         prefetcher = getattr(backing, "_expert_prefetcher", None)
         if prefetcher is not None:

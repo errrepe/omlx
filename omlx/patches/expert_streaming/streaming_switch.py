@@ -365,6 +365,41 @@ class SpeculationState:
                 self.trans_updates += 1
             self.prev_uniq_by_layer[int(layer_idx)] = now
 
+    def to_payload(self) -> dict:
+        """Serialize the transition table (fingerprint filled by caller)."""
+        try:
+            with self.lock:
+                layers: dict[str, dict[str, dict[str, float]]] = {}
+                for (layer, expert), row in self.trans.items():
+                    layers.setdefault(str(int(layer)), {})[str(int(expert))] = {
+                        str(int(k)): float(v) for k, v in row.items()
+                    }
+                return {"version": 1, "updates": int(self.trans_updates), "trans": layers}
+        except Exception:
+            return {"version": 1, "updates": 0, "trans": {}}
+
+    def load_payload(self, payload: dict) -> int:
+        """Load a transition payload; returns sources restored."""
+        try:
+            raw = (payload or {}).get("trans") or {}
+            n = 0
+            with self.lock:
+                for layer_s, experts in raw.items():
+                    for expert_s, row in (experts or {}).items():
+                        clean = {
+                            int(k): float(v)
+                            for k, v in (row or {}).items()
+                        }
+                        if clean:
+                            self.trans[(int(layer_s), int(expert_s))] = dict(
+                                sorted(clean.items(), key=lambda kv: kv[1], reverse=True)[:_TRANSITION_TOP]
+                            )
+                            n += 1
+                self.trans_updates += int((payload or {}).get("updates", 0) or 0)
+            return n
+        except Exception:
+            return 0
+
     def predict_next(self, layer_idx: int, ids: list[int], k: int = _TRANSITION_OVERFETCH) -> list[int]:
         """FU1: top-k next-token candidates for this layer's demand set.
 
@@ -1000,7 +1035,16 @@ class S3FIFOExpertCache(ExpertLRUCache):
         self._small: OrderedDict = OrderedDict()
         self._ghost: OrderedDict = OrderedDict()
         cap = max(1, self.capacity)
-        self._small_cap = max(1, min(cap - 1, cap // 10))
+        # A/B offline finding (traces jang4m/jang4s, 2026-09): a 10% small
+        # FIFO holds ~300 slots against a ~1440-key decode working set, so
+        # every small entry churns before its re-reference and main stays
+        # empty (hit ~0 vs LRU ~0.43-0.75). Small must cover a full decode
+        # token across all layers: per_layer_cap slots x num_layers. With
+        # per-layer caps active this approaches capacity (documented limit
+        # of S3-FIFO under per-layer quotas — see A/B note in docs).
+        per_layer = max(1, self._per_layer_cap) if self.num_layers > 0 else 0
+        working = per_layer * max(1, self.num_layers) if self.num_layers > 0 else cap // 10
+        self._small_cap = max(1, min(cap - 1, max(cap // 10, working)))
         self._ghost_cap = max(self._small_cap, cap // 10)
 
     @property
