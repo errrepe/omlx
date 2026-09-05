@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -111,6 +112,10 @@ class PageCacheWarmer:
 
     def __init__(self, linears_by_layer: Dict[int, list], *, advise_only: bool = False):
         self.linears_by_layer = linears_by_layer
+        self.keys_by_layer: Dict[int, dict[int, list[str]]] = {
+            layer: {id(lin): _proj_keys(lin) for lin in linears}
+            for layer, linears in linears_by_layer.items()
+        }
         self.last_uniq: Dict[int, list[int]] = {}
         self.warmed = 0
         self.warm_s = 0.0
@@ -130,20 +135,24 @@ class PageCacheWarmer:
         if prev:
             linears = self.linears_by_layer.get(nxt)
             if linears:
-                self._submit(prev, linears)
+                self._submit(prev, linears, nxt)
 
     def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
         """Record this token's expert set for the next token's warm pass."""
         self.last_uniq[layer_idx] = [] if positions > _MAX_WARM_ROWS else list(uniq_list)
 
-    def _submit(self, eids: list[int], linears: list) -> None:
+    def _submit(self, eids: list[int], linears: list, layer_idx: int) -> None:
         backing = getattr(linears[0], "backing", None)
         if backing is None:
             return
         if self.advise_only:
             if not hasattr(backing, "advise_expert_run"):
                 return
-            jobs = [(key, eids) for lin in linears for key in _proj_keys(lin)]
+            jobs = [
+                (key, eids)
+                for lin in linears
+                for key in self.keys_by_layer.get(layer_idx, {}).get(id(lin), [])
+            ]
             if not jobs:
                 return
 
@@ -171,7 +180,7 @@ class PageCacheWarmer:
             return
         jobs = []
         for lin in linears:
-            for key in _proj_keys(lin):
+            for key in self.keys_by_layer.get(layer_idx, {}).get(id(lin), []):
                 for eid in eids:
                     jobs.append((key, eid))
         if not jobs:
@@ -603,8 +612,16 @@ class PrefillHotnessRecorder:
         seed_bytes: int = SEED_BYTES,
     ):
         self.linears_by_layer = linears_by_layer
+        self.keys_by_layer: Dict[int, dict[int, list[str]]] = {
+            layer: {id(lin): _proj_keys(lin) for lin in linears}
+            for layer, linears in linears_by_layer.items()
+        }
         self.backing = backing
         self.cache = cache
+        if self.cache is not None and getattr(self.cache, "capacity", 0) > 0:
+            # C4: avoid filling the LRU with the final prefill chunk; C5's
+            # hotness seed repopulates it after routing frequencies are known.
+            setattr(self.cache, "prefill_bypass", True)
         self.per_expert_bytes = per_expert_bytes
         self.seed_bytes = seed_bytes
         self.freq: Dict[int, Counter] = {}
@@ -612,6 +629,7 @@ class PrefillHotnessRecorder:
         self.seeded = False
         self.seeded_experts = 0
         self.seeded_s = 0.0
+        self.seed_done = threading.Event()
 
     def on_layer_plan(
         self,
@@ -641,7 +659,10 @@ class PrefillHotnessRecorder:
         if self.seeded or not self.saw_prefill or positions > _MAX_WARM_ROWS:
             return
         self.seeded = True
+        if self.cache is not None:
+            setattr(self.cache, "prefill_bypass", False)
         if not self.freq:
+            self.seed_done.set()
             return
         t0 = time.perf_counter()
         try:
@@ -671,30 +692,71 @@ class PrefillHotnessRecorder:
         per_layer_cap = getattr(self.cache, "_per_layer_cap", 0) or 0
         if per_layer_cap <= 0:
             return 0
-        # Slots hold one projection slice (~per_expert/3 bytes), bundles hold
-        # all three: hot experts per layer = per-layer slots / 3.
+        # Retain the known hot entries synchronously so the first decode call
+        # never evicts useful prompt-wide entries. Missing bundles are read on
+        # the warm pool; the C3 cache lock makes worker-side raw bundle puts
+        # safe, and quantized linears promote them on the inference thread.
         hot = self._hot_top(max(1, per_layer_cap // 3))
         hot_pairs = {(layer, eid) for layer, eids in hot.items() for eid in eids}
         retain = getattr(self.cache, "retain_hot", None)
         if callable(retain):
             retain(hot_pairs)
-        n = 0
+        jobs: list[tuple[int, Any, Any, int]] = []
+        ready = 0
         for layer, eids in hot.items():
             for lin in self.linears_by_layer.get(layer) or []:
                 loader = getattr(lin, "_load_expert_bundle", None)
-                if loader is None:
-                    continue
                 for eid in eids:
                     key = (layer, eid, getattr(lin, "stacked_weight_key", None))
                     if self.cache.get(key) is not None:
-                        n += 1
-                        continue
+                        ready += 1
+                    elif loader is not None:
+                        jobs.append((layer, lin, loader, eid))
+        if not jobs:
+            self.seed_done.set()
+            return ready
+
+        def _run() -> None:
+            warmed = 0
+            try:
+                for layer, lin, loader, eid in jobs:
                     try:
-                        loader(eid)
-                        n += 1
+                        # Quantized streamers expose raw slice keys. Read plain
+                        # NumPy buffers off-thread; never allocate MLX arrays here.
+                        weight_key = getattr(lin, "stacked_weight_key", None)
+                        scales_key = getattr(lin, "stacked_scales_key", None)
+                        if (
+                            weight_key
+                            and scales_key
+                            and hasattr(self.backing, "load_expert_slice")
+                        ):
+                            w = self.backing.load_expert_slice(weight_key, eid)
+                            s = self.backing.load_expert_slice(scales_key, eid)
+                            b = None
+                            bias_key = getattr(lin, "stacked_biases_key", None)
+                            if bias_key:
+                                try:
+                                    b = self.backing.load_expert_slice(bias_key, eid)
+                                except Exception:
+                                    b = None
+                            self.cache.put((layer, eid, weight_key), (w, s, b))
+                        else:
+                            # Non-quantized test/backing path: retain correctness
+                            # with its existing loader contract.
+                            loader(eid)
+                        warmed += 1
                     except Exception:
-                        pass
-        return n
+                        continue
+            finally:
+                self.seed_done.set()
+            logger.debug(
+                "Expert streaming: async LRU seed warmed %d/%d bundles",
+                warmed,
+                len(jobs),
+            )
+
+        _WARM_POOL.submit(_run)
+        return ready + len(jobs)
 
     def _seed_page_cache(self) -> int:
         """Budget-0: discarded reads of the hot set into the page cache.
@@ -714,18 +776,34 @@ class PrefillHotnessRecorder:
         def _run():
             t0 = time.perf_counter()
             n = 0
-            for layer, eids in hot.items():
-                for lin in self.linears_by_layer.get(layer) or []:
-                    b = getattr(lin, "backing", None)
-                    for key in _proj_keys(lin):
-                        # ids from Counter.most_common — sort for run grouping.
-                        for eid in sorted(eids):
+            try:
+                for layer, eids in hot.items():
+                    sorted_ids = sorted(eids)
+                    runs: list[tuple[int, int]] = []
+                    for eid in sorted_ids:
+                        if runs and eid == runs[-1][0] + runs[-1][1]:
+                            first, count = runs[-1]
+                            runs[-1] = (first, count + 1)
+                        else:
+                            runs.append((eid, 1))
+                    for lin in self.linears_by_layer.get(layer) or []:
+                        b = getattr(lin, "backing", None)
+                        keys = self.keys_by_layer.get(layer, {}).get(id(lin), []) or _proj_keys(lin)
+                        for key in keys:
                             try:
-                                b.load_expert_slice(key, eid)
-                                n += 1
+                                if hasattr(b, "load_expert_run"):
+                                    for first, count in runs:
+                                        b.load_expert_run(key, first, count)
+                                        n += count
+                                else:
+                                    for eid in sorted_ids:
+                                        b.load_expert_slice(key, eid)
+                                        n += 1
                             except Exception:
                                 pass
-            self.seeded_s = time.perf_counter() - t0
+            finally:
+                self.seeded_s = time.perf_counter() - t0
+                self.seed_done.set()
             logger.info(
                 "Expert streaming: page-cache seed burst done: %d slices in %.2fs",
                 n,

@@ -1683,7 +1683,7 @@ class _SafeTensorMMap:
             buffer=self._mapping,
             offset=self._data_start + start,
         )
-        copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
+        copied = np.asarray(view[np.asarray(rows, dtype=np.intp)])
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)

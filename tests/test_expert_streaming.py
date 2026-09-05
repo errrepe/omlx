@@ -2489,6 +2489,10 @@ def test_prefill_hotness_recorder_seeds_lru():
         # Decode-sized call triggers the one-shot seed.
         rec.maybe_seed(0, 8)
         assert rec.seeded is True
+        assert rec.seeded_experts >= 0
+        # The main-lineage seed warms the LRU on a worker thread; wait for
+        # it before asserting cache contents (seed_done is the contract).
+        assert rec.seed_done.wait(timeout=10)
         assert rec.seeded_experts > 0
 
         # Non-hot entries evicted (layer 0 expert 0 was seen but 1,2 rank higher
@@ -2528,6 +2532,13 @@ def test_prefill_hotness_recorder_budget0_page_cache_seed():
             ExpertBackingStore,
             "load_expert_slice",
             side_effect=lambda key, eid: reads.append((key, eid)) or b"\0" * 8,
+        ), patch.object(
+            ExpertBackingStore,
+            "load_expert_run",
+            side_effect=lambda key, first, count: reads.extend(
+                (key, e) for e in range(first, first + count)
+            )
+            or [b"\0" * 8] * count,
         ):
             rec.maybe_seed(0, 8)
             deadline = time.time() + 5
