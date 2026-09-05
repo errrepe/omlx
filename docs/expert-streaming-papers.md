@@ -126,11 +126,16 @@ Conclusões:
 
 ## Measured: levers de bytes/token no JANG (2026-09-04, `bench/results/lever_matrix/` + `ppl_topk/`)
 
-**topk 0.85 (4S)**: matriz interleaved v2 (warmup descartado, pares adjacentes ×3): base mediana 2.817 → tk85 **3.142 tok/s (+11.5%)**; o cache-prior 2.0 é **null** em budget 0 (3.147; sem LRU não há o que ranquear — recusa consistente com o design). **Custo ppl**: 1.4848 → 1.5106 (0.9, +1.7%) / 1.5422 (0.85, +3.9%). Trade-off explícito: +11.5% tok/s por +3.9% ppl — **opt-in recomendado**, default por política de qualidade (autotuner mede tok/s; ppl gate separado via `bench/ppl_expert_streaming.py --streaming`).
+**topk 0.85 (4S)**: matriz interleaved v2 (warmup descartado, pares adjacentes ×3): base mediana 2.817 → tk85 **3.142 tok/s (+11.5%)**; o cache-prior 2.0 é **null** em budget 0 (3.147; sem LRU não há o que ranquear — recusa consistente com o design). **Custo ppl (4S)**: 1.4848 → 1.5106 (0.9, +1.7%) / 1.5422 (0.85, +3.9%). **Custo ppl (4M)**: 1.2075 → 1.2437 (0.85, **+3.0%**). Trade-off explícito: ~+11% tok/s por ~3–4% ppl — **knob opt-in documentado, NÃO default** (política do projeto: defaults bit-exact; autotuner só o varre com `--sweep-topk`; ppl gate separado via `bench/ppl_expert_streaming.py --streaming` — ppl determinístico, 3 reps idênticos ao 4º decimal).
 
-**Cold tier 3-bit (4M)**: o 4M é o corpo 4-bit uniforme (144 banks 4b/64g), o 4S JÁ É 3-bit no corpo (86×3b + 43×2b + 17×4b) — **a premissa "3-bit no 4S" cai**; requant composto de já-quantizado seria dupla perda. O tier 3-bit no 4M: 56.2→42.2 GiB (**0.75×**, −25% bytes de miss), requant_err≤0.16, `cold_tier_status` completo (144 banks). Tool: `tools/requant_cold_tier.py --out-dir` + runtime `OMLX_EXPERT_STREAMING_COLD_ROOT` (tier fora do dir do modelo; volumes read-only).
+**Cold tier 3-bit (4M) — REJEITADO POR POLÍTICA (decisão do mantenedor, 2026-09-04)**: requantizar 4→3 bits é perda de qualidade por construção, e a classe near-lossless **não é aceita** neste projeto — defaults permanecem bit-exact. O que a linha deixou pronto e **dormente** (atrás de knobs opt-in, nunca default):
 
-**Fixes do requant tool** (necessários p/ JANGs): (a) chaves per-tensor do config sem sufixo `.weight` (JANG quants) — lookup tenta ambas; (b) packing JANG separa weight de scales/biases **entre shards** — o tool agora agrupa pelo shard do peso via `model.safetensors.index.json` global (runtime resolve por header, layout livre).
+- Fixes do requant tool p/ JANGs: chaves per-tensor sem sufixo `.weight` + packing que separa weight/scales/biases entre shards (agrupamento via index global; `--out-dir` p/ tier fora do dir do modelo).
+- Runtime: `OMLX_EXPERT_STREAMING_COLD_ROOT` (tier em dir arbitrário; volumes read-only).
+- Autotuner: sweep de cold_tier exige `--sweep-cold-tier` explícito + `expert_cold/` presente (nunca automático; testes travam esse contrato).
+- Encontrado e NÃO corrigido (condição de reabertura): bug de wiring uniform-tier — a linear é construída com bits do source enquanto o backing serve bytes do tier → `gather_qmm` rejeita o shape. A medição ppl/tok/s **nunca foi completada**; a hipótese (−25% bytes de miss, teto ~+33% no trecho miss-bound) permanece não-testada.
+
+Nota factual: o 4S JÁ É 3-bit no corpo (86×3b + 43×2b + 17×4b) — tier nele nunca fez sentido; o 4M é 4-bit uniforme (144 banks) e o requant funcional mediu 56.2→42.2 GiB (0.75×) antes do veto (artefatos removidos).
 
 ## Prioritized opportunities
 

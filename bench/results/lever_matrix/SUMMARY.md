@@ -20,7 +20,16 @@ Protocolo congelado `bench/bench_expert_streaming.py --model qwen-jang|qwen-jang
 
 (ppl determinístico: 3 reps × 3 massas idênticos ao 4º decimal)
 
-Veredito: **+11.5% tok/s por +3.9% ppl (0.85)**. Opt-in recomendado; default decide a política de qualidade (ppl gate separado do autotuner).
+Veredito: **+11.5% tok/s por +3.9% ppl (0.85)**. Knob opt-in documentado; **default permanece bit-exact** (política do projeto — levers de qualidade nunca automáticos).
+
+## 4M ppl gate (topk)
+
+| topk | ppl | Δ |
+|---|---|---|
+| none | 1.2075 | — |
+| 0.85 | 1.2437 | +3.0% |
+
+(3 reps idênticos ao 4º decimal, ambos os modelos — ppl determinístico no streaming path. Custo ppl do 4M < 4S: 3.0% vs 3.9%.)
 
 ## 4M cold tier 3-bit (cold_tier_4M/)
 
@@ -28,4 +37,4 @@ Veredito: **+11.5% tok/s por +3.9% ppl (0.85)**. Opt-in recomendado; default dec
 - Requant: 56.2 → 42.2 GiB (0.75×), requant_err ≤ 0.16, `_cold_tier_status_dir` = complete (144 banks).
 - Fix do tool: chaves per-tensor sem sufixo `.weight` + packing JANG que separa weight/scales/biases entre shards (agrupamento pelo index global).
 - Runtime: `OMLX_EXPERT_STREAMING_COLD_ROOT` aponta o tier a um dir arbitrário (este bench usa bench/results/cold_tier_4M/expert_cold).
-- A/B tok/s + ppl gate: `coldtier_4m.sh` + `ppl_cold.sh` (staged).
+- **REJEITADO POR POLÍTICA (2026-09-04)** antes do A/B: requant é perda por construção; classe near-lossless não é aceita. Tier (42.2 GiB) removido; tool/runtime ficam dormentes atrás de knobs opt-in. Bug uniform-tier conhecido (linear com bits do source + backing servindo tier) documentado como condição de reabertura — medição ppl/tok/s nunca completada.

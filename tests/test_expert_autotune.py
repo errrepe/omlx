@@ -395,14 +395,23 @@ class TestColdTierSweep:
         )
         assert all(knob != "cold_tier" for knob, _ in cands)
 
-    def test_arms_with_tier_and_hot_fractions(self):
-        """Available tier → one arm per hot_fraction candidate (None kept)."""
+    def test_arms_need_explicit_sweep_flag(self):
+        """--sweep-cold-tier + tier on disk → one arm per hot_fraction.
+        Quality lever (non-bit-exact): the flag alone is not enough — it
+        must never sweep automatically (project policy: defaults bit-exact)."""
         cands = at.screen_candidates(
             at.Knobs(), budgets=[0.0], depths=[16], sweep_topk=False,
             cold_tier_available=True, hot_fractions=[0.25, 0.5],
+            sweep_cold_tier=True,
         )
         arms = [cfg for knob, cfg in cands if knob == "cold_tier"]
         assert len(arms) == 2
+        # without the explicit flag: no cold_tier arms even with the dir present
+        cands2 = at.screen_candidates(
+            at.Knobs(), budgets=[0.0], depths=[16], sweep_topk=False,
+            cold_tier_available=True, hot_fractions=[0.25, 0.5],
+        )
+        assert all(knob != "cold_tier" for knob, _ in cands2)
         assert all(cfg.cold_tier == "3" for cfg in arms)
         assert {cfg.hot_fraction for cfg in arms} == {0.25, 0.5}
         # profile_kwargs carries both knobs for --apply persistence

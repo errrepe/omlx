@@ -832,6 +832,10 @@ def convert_model_to_streaming(
                     cold_root = cold_dir
                     logger.info("Expert streaming: cold tier %s-bit active (%s)", cold_setting, why)
                 else:
+                    # Failed completeness: reset to None so the backing
+                    # never engages a partial tier (the env path would leak
+                    # a non-None cold_root into ExpertBackingStore below).
+                    cold_root = None
                     logger.warning(
                         "Expert streaming: cold tier %s requested but %s — disabled",
                         cold_setting,

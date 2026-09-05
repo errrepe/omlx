@@ -265,6 +265,7 @@ def screen_candidates(
     priors: list[float] | None = None,
     cold_tier_available: bool = False,
     hot_fractions: list[float] | None = None,
+    sweep_cold_tier: bool = False,
     loaded_est_gib: float | None = None,
     available_gib: float | None = None,
     reserve_gib: float = 10.0,
@@ -314,7 +315,11 @@ def screen_candidates(
         elif knob == "cold_tier":
             # Only sweep when the model has a materialized expert_cold/ dir
             # (the tier must exist before the runtime can route to it).
-            if not cold_tier_available:
+            # Opt-in quality lever: requantizing to a cold tier is
+            # near-lossless, NOT bit-exact. Never sweep it automatically —
+            # only when --sweep-cold-tier is passed AND the tier is on disk
+            # (project policy: defaults stay bit-exact).
+            if not (sweep_cold_tier and cold_tier_available):
                 continue
             hf = replace(base, cold_tier="3", hot_fraction=(hot_fractions[0] if hot_fractions else None))
             trials.append(("cold_tier", hf))
@@ -859,6 +864,7 @@ def run_session(opts: argparse.Namespace) -> int:
             sweep_prior=opts.sweep_prior,
             priors=opts.priors,
             cold_tier_available=cold_tier_available,
+        sweep_cold_tier=opts.sweep_cold_tier,
             hot_fractions=hot_fractions,
             loaded_est_gib=None,
             available_gib=baseline_available,
