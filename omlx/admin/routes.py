@@ -2019,7 +2019,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             per_expert_bytes = int(_est.per_expert_bytes)
             if _est.supported:
                 try:
-                    expert_streaming_forced = bool(_est.force_streaming(residency_ceiling))
+                    _transient = int(getattr(_est, "per_layer_expert_bytes", 0) or 0)
+                    expert_streaming_forced = bool(
+                        _est.force_streaming(residency_ceiling, _transient)
+                    )
                 except Exception:
                     expert_streaming_forced = False
         except Exception:
@@ -2101,6 +2104,13 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "expert_moe_layers": expert_moe_layers,
             "experts_per_layer": experts_per_layer,
             "per_expert_bytes": per_expert_bytes,
+            # P1: tier-aware effective bytes (what decode reads when a
+            # cold tier is active) + slots under it. "none" == source.
+            "expert_tier": getattr(_est, "tier", "none"),
+            "expert_bytes_effective": int(getattr(_est, "expert_bytes_effective", 0) or 0),
+            "per_expert_bytes_effective": int(
+                getattr(_est, "per_expert_bytes_effective", 0) or 0
+            ),
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }

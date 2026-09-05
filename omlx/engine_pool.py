@@ -482,7 +482,11 @@ class EnginePool:
         ceiling = self._fallback_admission_ceiling()
         if ceiling <= 0:
             ceiling = self._current_ceiling()
-        forced = est.force_streaming(ceiling)
+        # P0: charge one per-layer expert bank as the streaming transient
+        # (the peak the scheduler guard accounts per layer) so a ceiling
+        # that fits streaming_bytes but not its transient is refused.
+        transient = int(getattr(est, "per_layer_expert_bytes", 0) or 0)
+        forced = est.force_streaming(ceiling, transient)
         requested = bool(
             settings is not None and getattr(settings, "expert_streaming_enabled", False)
         )

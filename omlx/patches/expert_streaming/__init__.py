@@ -282,11 +282,19 @@ def _source_packing(src: Any, group_size: int, bits: int, mode: str) -> tuple[in
     JANGQ checkpoints mix precisions inside one layer (e.g. a 2-bit gate
     with 3-bit up/down). Each streaming linear keeps its own source
     projection's packing; the layer-level values stay as fallback only.
+    P1: a projection missing any packing attr fails loudly (same rule
+    as the layer-level detection above) — never inherits silently.
     """
+    for _name in ("group_size", "bits", "mode"):
+        if getattr(src, _name, None) is None:
+            raise ValueError(
+                f"Expert streaming: projection {getattr(src, '__class__', type(src)).__name__} "
+                f"lacks {(_name)!r} — refusing to inherit packing silently"
+            )
     return (
-        int(getattr(src, "group_size", group_size)),
-        int(getattr(src, "bits", bits)),
-        str(getattr(src, "mode", mode)),
+        int(getattr(src, "group_size")),
+        int(getattr(src, "bits")),
+        str(getattr(src, "mode")),
     )
 
 
@@ -403,17 +411,32 @@ def _convert_switch_mlp_module(
     fused = hasattr(switch_mlp, "gate_up_proj")
     inv_scatter = getattr(switch_mlp, "inverse_scatter", False)
 
-    group_size = 64
-    bits = 4
-    mode = "affine"
+    # P1: no silent packing defaults. A quantized projection MUST expose
+    # its group_size/bits/mode — guessing 64/4/affine for an unknown future
+    # quant silently mis-slices every expert bank. Fail loudly instead.
+    group_size: int | None = None
+    bits: int | None = None
+    mode: str | None = None
     if is_quantized:
         for attr in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
             proj = getattr(switch_mlp, attr, None)
             if proj is not None:
-                group_size = getattr(proj, "group_size", 64)
-                bits = getattr(proj, "bits", 4)
-                mode = getattr(proj, "mode", "affine")
+                for _name in ("group_size", "bits", "mode"):
+                    if getattr(proj, _name, None) is None:
+                        raise ValueError(
+                            f"Expert streaming: quantized {attr} of layer "
+                            f"{layer_idx} lacks {(_name)!r} — refusing to guess "
+                            "packing (would mis-slice expert banks)"
+                        )
+                group_size = int(getattr(proj, "group_size"))
+                bits = int(getattr(proj, "bits"))
+                mode = str(getattr(proj, "mode"))
                 break
+        if group_size is None or bits is None or mode is None:
+            raise ValueError(
+                f"Expert streaming: quantized layer {layer_idx} exposes no "
+                "projection to read packing from"
+            )
 
     def _proj_packing(src):
         return _source_packing(src, group_size, bits, mode)
@@ -681,6 +704,16 @@ def _convert_switch_mlp_module(
                 ],
             )
 
+    # P0: per-GLU projection count for cache slot reconciliation. A fused
+    # gate_up GLU holds 2 projections (gate_up + down), a split GLU 3 —
+    # the global cache was sized for the majority layout, so the convert
+    # loop below reconciles any drift (see _reconcile_cache_slots).
+    n_proj = len(
+        [a for a in ("gate_up_proj", "down_proj") if hasattr(streaming_glu, a)]
+        or [a for a in ("gate_proj", "up_proj", "down_proj") if hasattr(streaming_glu, a)]
+    )
+    streaming_glu.n_proj = n_proj  # type: ignore[attr-defined]
+
     # Fase J Etapa E: the per-layer load context's projection list (2 fused
     # gate_up+down, 3 split) — consumed by the scheduler's guard accounting
     # (_glu_projection_count).
@@ -778,6 +811,10 @@ def convert_model_to_streaming(
     # One cache slot holds ONE projection's slice (gate/up/down are separate
     # keys), so slot sizing must divide by the projections per expert —
     # otherwise the LRU holds a third of the budget it was promised (F2).
+    # Per-GLU detection below (P0): fused gate_up GLUs carry 2 projections
+    # (gate_up + down), not 3 — dividing a fused model by 3 over-commits
+    # the budget by 1.5x. The global per_slot uses the majority layout;
+    # _convert_switch_mlp_module reconciles per-GLU drift after conversion.
     per_slot = max(1, per_expert // 3) if per_expert else 0
     cache = ExpertLRUCache(budget_bytes, per_slot, num_layers=estimate.num_moe_layers)
 
@@ -1092,6 +1129,46 @@ def convert_model_to_streaming(
         cache.num_layers = converted
         cache._per_layer_cap = max(1, cache.capacity // converted)  # type: ignore[attr-defined]
 
+    # P0: reconcile cache slots with the converted projection layout. The
+    # cache was sized for 3 projections/expert (split); every converted
+    # GLU records its real n_proj (2 fused, 3 split). A uniform fused
+    # model sized //3 over-commits the budget by 1.5x — resize so
+    # capacity * per_slot <= budget. Mixed layouts keep the majority
+    # sizing (slots are fungible across projections) and log.
+    if converted and per_expert and budget_bytes > 0:
+        try:
+            _n_projs: list[int] = []
+            for _layer in layers or ():
+                _moe = getattr(_layer, "mlp", None) or getattr(_layer, "ffn", None)
+                _sm = getattr(_moe, "switch_mlp", None)
+                _np = getattr(_sm, "n_proj", None)
+                if isinstance(_np, int) and _np > 0:
+                    _n_projs.append(_np)
+            if _n_projs:
+                from collections import Counter as _Counter
+
+                _majority = _Counter(_n_projs).most_common(1)[0][0]
+                _want_slot = max(1, per_expert // _majority)
+                if _want_slot != cache.per_expert_bytes:
+                    cache.per_expert_bytes = _want_slot
+                    cache.capacity = max(1, budget_bytes // _want_slot)
+                    if cache.num_layers > 0:
+                        cache._per_layer_cap = max(1, cache.capacity // cache.num_layers)  # type: ignore[attr-defined]
+                    cache._global_cap = cache.capacity  # type: ignore[attr-defined]
+                    logger.info(
+                        "Expert streaming: cache slots reconciled to %d projections "
+                        "(per_slot=%d B, capacity=%d)",
+                        _majority, _want_slot, cache.capacity,
+                    )
+                if len(set(_n_projs)) > 1:
+                    logger.warning(
+                        "Expert streaming: mixed fused/split layouts %s — "
+                        "cache sized for majority (%d proj)",
+                        sorted(set(_n_projs)), _majority,
+                    )
+        except Exception:
+            logger.debug("Expert streaming: slot reconciliation skipped", exc_info=True)
+
     if converted:
         import mlx.core as mx
 
@@ -1194,11 +1271,13 @@ def convert_model_to_streaming(
                     "Expert streaming: boundary installed but eval off/class "
                     "mismatch — per-layer bank charge kept (conservative)"
                 )
-        # PILOT: async router-lookahead prefetch into the LRU (glm5_next's
-        # Glm5NextModel loop scores the next MoE layer's router against the
-        # current layer output). mmap backing only; off when the RAM dict
-        # fallback is in use, the per-model setting disables it, or
-        # OMLX_EXPERT_STREAMING_PILOT=0.
+        # PILOT: async router-lookahead prefetch into the staging buffer.
+        # The submit hook lives in the glm5_next vendor loop (it scores
+        # the next MoE layer's router against the current layer output) —
+        # other families have no hook, so PILOT is a no-op for them until
+        # one is added. mmap backing only; off when the RAM dict fallback
+        # is in use. Opt in per model (expert_streaming_pilot=True) or
+        # globally with OMLX_EXPERT_STREAMING_PILOT=1.
         import os
 
         pilot_requested = io_ov["expert_streaming_pilot"]
@@ -1228,14 +1307,24 @@ def convert_model_to_streaming(
                         "Expert streaming: PILOT prefetch attach point not found; disabled"
                     )
                 if prefetcher is not None:
+                    # P0: owned by the backing so shutdown_expert_streaming
+                    # can stop its threads on unload/reload (no leak).
+                    try:
+                        backing._expert_prefetcher = prefetcher  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
                     # Wire streaming linears to their prefetcher so the
                     # demand path can drain staged np bundles before a
-                    # synchronous backing read.
+                    # synchronous backing read. P1: fused gate_up_proj
+                    # included — it resolves bundles exactly like split
+                    # projections and was silently left without prefetch.
                     wired = 0
                     for lyr_ in layers:
                         mlp_ = getattr(lyr_, "mlp", None)
+                        if mlp_ is None:
+                            mlp_ = getattr(lyr_, "ffn", None)
                         sm_ = getattr(mlp_, "switch_mlp", None)
-                        for proj_ in ("gate_proj", "up_proj", "down_proj"):
+                        for proj_ in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
                             lin_ = getattr(sm_, proj_, None)
                             if lin_ is not None and hasattr(lin_, "_load_expert_np"):
                                 lin_._prefetcher = prefetcher  # type: ignore[attr-defined]
@@ -1387,6 +1476,90 @@ def convert_model_to_streaming(
     # ram-dict backing is internal only — never part of the public return
     # (existing contract; file-backed store is the only returned backing).
     return model, backing if not isinstance(backing, dict) else None
+
+
+def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
+    """P1: one-line request/bench summary of streaming health.
+
+    Aggregates the counters the implementation already keeps (LRU hits,
+    PILOT staging, stash ring, advisor, ctx fallbacks) into a single
+    dict for per-request logs and the admin payload. Never raises;
+    missing pieces report as None/0.
+    """
+    out: dict = {}
+    try:
+        stats = getattr(cache, "stats", None)
+        hits = int(getattr(stats, "hits", 0) or 0)
+        misses = int(getattr(stats, "misses", 0) or 0)
+        out["lru_hit_rate"] = hits / (hits + misses) if (hits + misses) else 0.0
+        out["lru_hits"] = hits
+        out["lru_misses"] = misses
+        out["lru_evictions"] = int(getattr(stats, "evictions", 0) or 0)
+        out["lru_size"] = int(getattr(cache, "size", 0) or 0)
+        out["lru_capacity"] = int(getattr(cache, "capacity", 0) or 0)
+    except Exception:
+        pass
+    try:
+        pf = getattr(backing, "_expert_prefetcher", None)
+        pstats = getattr(pf, "stats", None) if pf is not None else None
+        if pstats is not None:
+            sub = int(pstats.get("submissions", 0) or 0)
+            con = int(pstats.get("staged_consumed", 0) or 0)
+            out["prefetch_precision"] = con / sub if sub else 0.0
+            out["prefetch_submissions"] = sub
+            out["prefetch_consumed"] = con
+            out["prefetch_dropped"] = int(pstats.get("staged_dropped", 0) or 0)
+    except Exception:
+        pass
+    try:
+        spec = getattr(cache, "spec_state", None)
+        sstats = getattr(spec, "stats", None) if spec is not None else None
+        if sstats is not None:
+            sh = int(sstats.get("stash_hits", 0) or 0)
+            sm = int(sstats.get("stash_misses", 0) or 0)
+            out["stash_hit_rate"] = sh / (sh + sm) if (sh + sm) else 0.0
+            out["stash_hits"] = sh
+            out["stash_misses"] = sm
+            out["advised"] = int(sstats.get("advised", 0) or 0)
+    except Exception:
+        pass
+    try:
+        out["ctx_fallbacks"] = dict(getattr(cache, "ctx_fallback_stats", lambda: {})())
+    except Exception:
+        out["ctx_fallbacks"] = {}
+    return out
+
+
+def shutdown_expert_streaming(backing: Any) -> None:
+    """Release MoE streaming resources held by *backing* (P0).
+
+    Stops the PILOT prefetcher threads, persists nothing (profiles are
+    saved separately), and closes shard fds/mmaps. Idempotent; safe to
+    call with None or a RAM-dict backing. Engines call this in stop()
+    and before replacing the model on reload so threads/fds never leak
+    across model lifetimes.
+    """
+    if backing is None or isinstance(backing, dict):
+        return
+    try:
+        prefetcher = getattr(backing, "_expert_prefetcher", None)
+        if prefetcher is not None:
+            try:
+                prefetcher.stop()
+            except Exception:
+                pass
+            try:
+                backing._expert_prefetcher = None  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        close = getattr(backing, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
 
 
 def save_expert_pin_profile(engine: Any) -> None:

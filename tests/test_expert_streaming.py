@@ -538,10 +538,257 @@ def test_residency_force_streaming():
         assert est.supported is True
         # streaming should be smaller than resident
         assert est.resident_bytes > est.streaming_bytes
-        ceiling = (est.resident_bytes + est.streaming_bytes) // 2
+        # P0: the decision carries a margin + transient, so the ceiling
+        # must clear streaming*margin + transient, not just streaming.
+        ceiling = int(est.streaming_bytes * 1.10) + est.per_layer_expert_bytes
         assert est.force_streaming(ceiling) is True
-        assert est.force_streaming(est.resident_bytes + 1) is False
+        assert est.force_streaming(est.resident_bytes * 2) is False
         assert est.force_streaming(max(0, est.streaming_bytes - 1)) is False
+
+
+def test_residency_force_streaming_margin_and_transient():
+    """P0: a load exactly at the ceiling is refused, never admitted; the
+    per-layer transient is charged on the streaming side."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # Wide experts so resident and streaming differ well beyond the
+        # 10% decision margin (small fixtures overlap and must refuse).
+        _write_fake_glm_checkpoint(tmp, num_layers=4, experts=32, hidden=256, moe_hidden=256)
+        est = expert_streaming_estimate(tmp)
+        assert est.supported is True
+        assert est.resident_bytes > int(est.streaming_bytes * 1.10)
+        # Exactly at resident: margin pushes resident over -> forced.
+        assert est.force_streaming(est.resident_bytes) is True
+        # Exactly at streaming: margin pushes streaming over -> not forced.
+        assert est.force_streaming(est.streaming_bytes) is False
+        # A ceiling that fits streaming_bytes but not its transient refuses.
+        assert est.force_streaming(est.streaming_bytes, est.per_layer_expert_bytes) is False
+        assert (
+            est.force_streaming(
+                int(est.streaming_bytes * 1.10) + est.per_layer_expert_bytes
+            )
+            is True
+        )
+        # Backwards compat: transient defaults to 0, ceiling 0 never forces.
+        assert est.force_streaming(0) is False
+        assert est.force_streaming(-1) is False
+
+
+def _write_fake_cold_tier(model_tmp: Path, scale: float = 0.5):
+    """P1 helper: expert_cold/ mirror with the same keys at ~scale bytes."""
+    import numpy as np
+
+    cold = model_tmp / "expert_cold"
+    cold.mkdir(exist_ok=True)
+    header = {}
+    offset = 0
+    index = json.loads((model_tmp / "model.safetensors.index.json").read_text())["weight_map"]
+    src_hdr = {}
+    for f in model_tmp.glob("*.safetensors"):
+        raw = f.read_bytes()
+        hsize = struct.unpack("<Q", raw[:8])[0]
+        src_hdr.update(json.loads(raw[8:8 + hsize]))
+    for k in sorted(index):
+        if "switch_mlp" not in k:
+            continue
+        entry = src_hdr[k]
+        size = max(8, int((entry["data_offsets"][1] - entry["data_offsets"][0]) * scale))
+        header[k] = {"dtype": entry["dtype"], "shape": entry["shape"], "data_offsets": [offset, offset + size]}
+        offset += size
+    header["__metadata__"] = {"omlx_cold_bits": "2", "omlx_cold_group_size": "64"}
+    hb = json.dumps(header).encode()
+    with (cold / "cold-00001.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+        f.write(b"\x00" * offset)
+    return cold
+
+
+def test_estimate_cold_tier_effective_bytes():
+    """P1: with an active cold tier the estimate reports what decode reads."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_glm_checkpoint(tmp, num_layers=4, experts=16, hidden=64, moe_hidden=64)
+        base = expert_streaming_estimate(tmp)
+        assert base.supported is True
+        assert base.tier == "none"
+        assert base.expert_bytes_effective == base.expert_bytes
+        cold = _write_fake_cold_tier(tmp, scale=0.5)
+        eff = expert_streaming_estimate(tmp, cold_root=cold)
+        assert eff.supported is True
+        assert eff.tier == "uniform"
+        assert 0 < eff.expert_bytes_effective < base.expert_bytes
+        assert 0 < eff.per_expert_bytes_effective < base.per_expert_bytes
+        # HOBBIT blend sits between uniform-cold and source.
+        hob = expert_streaming_estimate(tmp, cold_root=cold, hot_fraction=0.5)
+        assert hob.tier == "hobbit"
+        assert eff.expert_bytes_effective < hob.expert_bytes_effective < base.expert_bytes
+
+
+def test_cache_slots_reconciled_for_fused_layout():
+    """P0: a fused (2-proj) model must not over-commit the budget 1.5x.
+
+    The convert-time reconciliation resizes capacity * per_slot <= budget
+    for the majority projection layout. Unit-level: the invariant the
+    reconciler enforces holds for both layouts.
+    """
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    per_expert = 12 * 1024 * 1024  # 12 MiB across all projections
+    budget = 6 * 1024**3
+    for n_proj, name in ((3, "split"), (2, "fused")):
+        per_slot = max(1, per_expert // n_proj)
+        cache = ExpertLRUCache(budget, per_slot, num_layers=48)
+        assert cache.capacity * cache.per_expert_bytes <= budget, name
+        # The old //3 sizing on a fused model violates the invariant.
+        if n_proj == 2:
+            naive = ExpertLRUCache(budget, max(1, per_expert // 3), num_layers=48)
+            assert naive.capacity * naive.per_expert_bytes <= budget  # global cap holds
+            assert naive.capacity > cache.capacity  # ...but promises 1.5x more slots
+
+
+def test_pilot_staging_equivalence_and_fused_wiring():
+    """P1: staged bundles equal sync loads; fused projs are wired."""
+    import numpy as np
+
+    from omlx.patches.expert_streaming.prefetch import ExpertPrefetcher
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        StreamingQuantizedSwitchLinear,
+    )
+
+    class _FakeBacking:
+        def load_expert_slice(self, key, eid):
+            return np.full((4,), float(eid), dtype=np.float32)
+
+    backing = _FakeBacking()
+    cache = ExpertLRUCache(0, 1, num_layers=1)  # page-cache-only: staging only
+    pf = ExpertPrefetcher(cache, workers=1)
+    pf.start()
+    try:
+        lin = StreamingQuantizedSwitchLinear(
+            layer_idx=0,
+            proj_name="gate_up_proj",
+            stacked_weight_key="w",
+            stacked_scales_key="s",
+            stacked_biases_key=None,
+            num_experts=8,
+            input_dims=16,
+            output_dims=32,
+            backing=backing,
+            cache=cache,
+        )
+        lin._prefetcher = pf  # wiring path under test (fused proj included)
+        assert hasattr(lin, "_load_expert_np")
+        pf.submit(lin, [3, 5])
+        deadline = __import__("time").time() + 10.0
+        got = None
+        while __import__("time").time() < deadline:
+            got = pf.take(lin.bundle_key(3))
+            if got is not None:
+                break
+            __import__("time").sleep(0.02)
+        assert got is not None
+        assert float(np.asarray(got[0]).ravel()[0]) == 3.0
+        # direct load matches staged bytes
+        direct = lin._load_expert_np(5)
+        deadline = __import__("time").time() + 10.0
+        staged5 = None
+        while __import__("time").time() < deadline:
+            staged5 = pf.take(lin.bundle_key(5))
+            if staged5 is not None:
+                break
+            __import__("time").sleep(0.02)
+        assert staged5 is not None
+        assert np.array_equal(np.asarray(staged5[0]), np.asarray(direct[0]))
+    finally:
+        pf.stop()
+
+
+def test_expert_streaming_summary_aggregates_counters():
+    """P1: the one-line summary reflects LRU + prefetch + stash + fallbacks."""
+    from omlx.patches.expert_streaming import expert_streaming_summary
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    cache = ExpertLRUCache(1 << 20, 4096, num_layers=1)
+    cache.put((0, 1, "w"), ("w", "s", None))
+    assert cache.get((0, 1, "w")) is not None
+    assert cache.get((0, 9, "w")) is None
+    cache._count_ctx_fallback("read_failure")
+
+    class _Backing:
+        _expert_prefetcher = None
+
+    s = expert_streaming_summary(cache, _Backing())
+    assert s["lru_hits"] == 1
+    assert s["lru_misses"] == 1
+    assert s["lru_hit_rate"] == 0.5
+    assert s["ctx_fallbacks"] == {"read_failure": 1}
+    # Never raises on empty/None inputs.
+    assert expert_streaming_summary(None, None)["ctx_fallbacks"] == {}
+
+
+def test_shutdown_expert_streaming_is_idempotent_and_safe():
+    """P0: shutdown handles None/dict/partial backings without raising."""
+    from omlx.patches.expert_streaming import shutdown_expert_streaming
+
+    shutdown_expert_streaming(None)
+    shutdown_expert_streaming({})
+
+    class _Partial:
+        pass
+
+    shutdown_expert_streaming(_Partial())
+
+    stopped = []
+    closed = []
+
+    class _Full:
+        class _Pref:
+            def stop(self):
+                stopped.append(True)
+
+        _expert_prefetcher = _Pref()
+
+        def close(self):
+            closed.append(True)
+
+    shutdown_expert_streaming(_Full())
+    assert stopped == [True]
+    assert closed == [True]
+
+
+def test_reload_does_not_leak_prefetch_threads():
+    """P0: PILOT threads are owned by the backing and stopped on shutdown."""
+    import threading
+
+    from omlx.patches.expert_streaming import shutdown_expert_streaming
+    from omlx.patches.expert_streaming.prefetch import ExpertPrefetcher
+
+    # Thread names repeat per prefetcher (expert-prefetch-{i}), so track
+    # thread identities, not names.
+    before = {t.ident for t in threading.enumerate()}
+    prefs = [ExpertPrefetcher(cache=None, workers=2) for _ in range(3)]
+    for p in prefs:
+        p.start()
+    assert all(w.is_alive() for p in prefs for w in p._workers)
+    for p in prefs:
+
+        class _Backing:
+            def close(self):
+                pass
+
+        b = _Backing()
+        b._expert_prefetcher = p  # type: ignore[attr-defined]
+        shutdown_expert_streaming(b)
+    for p in prefs:
+        for w in p._workers:
+            w.join(timeout=5.0)
+    leaked = [
+        t for t in threading.enumerate()
+        if t.ident not in before and t.is_alive() and (t.name or "").startswith("expert-prefetch-")
+    ]
+    assert not leaked
 
 
 def test_model_settings_round_trip():
@@ -658,7 +905,13 @@ def test_engine_pool_forced_streaming_status(monkeypatch):
         est = expert_streaming_estimate(tmp)
         assert est.supported is True
         assert est.resident_bytes > est.streaming_bytes
-        ceiling = (est.resident_bytes + est.streaming_bytes) // 2
+        # P0: the forcing window is [streaming*margin + transient,
+        # resident*margin); the old midpoint may sit below it on small
+        # fixtures, so target the window explicitly.
+        lo = int(est.streaming_bytes * 1.10) + est.per_layer_expert_bytes
+        hi = int(est.resident_bytes * 1.10)
+        assert lo < hi
+        ceiling = (lo + hi) // 2
         monkeypatch.setattr(pool, "_fallback_admission_ceiling", lambda: ceiling)
         monkeypatch.setattr(pool, "_current_ceiling", lambda: ceiling)
         enabled, forced, _ = pool._expert_streaming_status(entry, ModelSettings())
@@ -695,7 +948,10 @@ def test_engine_pool_dflash_blocked_by_expert_streaming(monkeypatch):
 
         # Forced streaming: memory ceiling forces it without an explicit setting.
         est = expert_streaming_estimate(tmp)
-        ceiling = (est.resident_bytes + est.streaming_bytes) // 2
+        _lo = int(est.streaming_bytes * 1.10) + est.per_layer_expert_bytes
+        _hi = int(est.resident_bytes * 1.10)
+        assert _lo < _hi
+        ceiling = (_lo + _hi) // 2
         monkeypatch.setattr(pool, "_fallback_admission_ceiling", lambda: ceiling)
         monkeypatch.setattr(pool, "_current_ceiling", lambda: ceiling)
         unrequested = ModelSettings(
@@ -1188,6 +1444,137 @@ def test_streaming_glu_matches_reference():
         out_s = glu(x, idx)
         assert out_s.shape == out_ref.shape
         assert mx.array_equal(out_ref, out_s), f"mismatch at trial {trial}"
+
+
+def _build_streaming_glu(ref, E, H, D, cache, backing, quantized_linears):
+    """P1 helper: mirror a reference SwitchGLU with streaming linears.
+
+    ``quantized_linears`` maps proj name -> (group_size, bits, mode) for
+    projections built as StreamingQuantizedSwitchLinear; the rest become
+    StreamingSwitchLinear. Returns the wired StreamingSwitchGLU.
+    """
+    import mlx.core as mx
+
+    from omlx.patches.expert_streaming.streaming_switch import (
+        StreamingQuantizedSwitchLinear,
+        StreamingSwitchGLU,
+        StreamingSwitchLinear,
+    )
+
+    glu = StreamingSwitchGLU(
+        input_dims=D,
+        hidden_dims=H,
+        num_experts=E,
+        layer_idx=0,
+        backing=backing,
+        cache=cache,
+        quantized=bool(quantized_linears),
+        activation=None,
+    )
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        ref_lin = getattr(ref, name)
+        if name in quantized_linears:
+            gs, bits, mode = quantized_linears[name]
+            backing[(0, name, "weight")] = ref_lin.weight
+            backing[(0, name, "scales")] = ref_lin.scales
+            backing[(0, name, "biases")] = ref_lin.biases
+            setattr(
+                glu,
+                name,
+                StreamingQuantizedSwitchLinear(
+                    layer_idx=0,
+                    proj_name=name,
+                    stacked_weight_key=f"k.{name}.weight",
+                    stacked_scales_key=f"k.{name}.scales",
+                    stacked_biases_key=f"k.{name}.biases",
+                    num_experts=E,
+                    input_dims=ref_lin.input_dims,
+                    output_dims=ref_lin.output_dims,
+                    backing=backing,
+                    cache=cache,
+                    group_size=gs,
+                    bits=bits,
+                    mode=mode,
+                ),
+            )
+        else:
+            backing[(0, name)] = ref_lin.weight
+            setattr(
+                glu,
+                name,
+                StreamingSwitchLinear(
+                    layer_idx=0,
+                    proj_name=name,
+                    stacked_key=f"k.{name}",
+                    num_experts=E,
+                    input_dims=ref_lin.input_dims,
+                    output_dims=ref_lin.output_dims,
+                    backing=backing,
+                    cache=cache,
+                ),
+            )
+    mx.eval(ref.parameters())
+    return glu
+
+
+@pytest.mark.parametrize(
+    "quantized_linears",
+    [
+        {},  # bf16 everywhere
+        {"down_proj": (32, 4, "affine")},  # f32 gate/up + qmm down
+        {
+            "gate_proj": (32, 4, "affine"),
+            "up_proj": (32, 4, "affine"),
+            "down_proj": (32, 4, "affine"),
+        },  # all-quantized q4
+        {
+            "gate_proj": (64, 8, "affine"),
+            "up_proj": (64, 8, "affine"),
+            "down_proj": (32, 8, "affine"),
+        },  # all-quantized q8
+        {
+            "gate_proj": (32, 2, "affine"),  # JANGQ-style mixed packing
+            "up_proj": (32, 4, "affine"),
+            "down_proj": (32, 4, "affine"),
+        },
+    ],
+    ids=["bf16", "q4-down", "q4-all", "q8-all", "mixed-jangq"],
+)
+def test_streaming_glu_quant_grade_matches_reference(quantized_linears):
+    """P1: streaming-vs-resident bit-identical across the quant grade.
+
+    The contract a new quantization must satisfy: same bytes, same
+    layout, same output — adding a quant means adding a row here.
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    # D=64: gate/up last dim 64 (groups 32/64 valid), down last dim H=32.
+    E, H, D = 8, 32, 64
+    ref = SwitchGLU(D, H, E)
+    for name, (gs, bits, _mode) in quantized_linears.items():
+        proj = getattr(ref, name)
+        ref.__dict__[name] = QuantizedSwitchLinear(
+            proj.input_dims, proj.output_dims, E, bias=False,
+            group_size=gs, bits=bits,
+        )
+    cache = ExpertLRUCache(1 << 26, 1 << 18, num_layers=1)
+    backing: dict = {}
+    glu = _build_streaming_glu(ref, E, H, D, cache, backing, quantized_linears)
+
+    rng = np.random.default_rng(7)
+    for trial in range(2):
+        T = 40 if trial == 0 else 80  # second crosses the sort threshold
+        x = mx.array(rng.standard_normal((1, T, D)).astype(np.float32))
+        idx = mx.array(rng.integers(0, E, size=(1, T, 1)).astype(np.int32))
+        out_ref = ref(x, idx)
+        out_s = glu(x, idx)
+        assert out_s.shape == out_ref.shape
+        assert mx.array_equal(out_ref, out_s), f"mismatch {quantized_linears} trial {trial}"
 
 
 def test_streaming_quantized_glu_matches_reference():
