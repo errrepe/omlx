@@ -687,9 +687,12 @@ def _convert_switch_mlp_module(
                 lin_.set_hobbit_split(hot_ids, hobbit_cold_params[0], hobbit_cold_params[1])
 
     # Fase K F1: register this layer's quantized streaming linears for the
-    # O2 next-layer advisor (main layers only — MTP stages have their own
-    # layer-id space and never feed the streaming decode chain).
-    if needle.startswith("layers."):
+    # O2 next-layer advisor. P3: MTP/DSpark stages register too — they live
+    # in their own layer-id space (len(layers)+stage, no collision with the
+    # trunk), so stage s advises s+1 within the draft chain exactly like
+    # trunk layers do. Trunk->stage cross-talk stays off (separate spaces,
+    # separate routing), which is correct: draft and verify route distinctly.
+    if needle.startswith("layers.") or needle.startswith("mtp."):
         # Fase K K1: register on the per-conversion speculation state — the
         # global registry would let one engine's advisor target another
         # engine's linears.
@@ -805,7 +808,7 @@ def convert_model_to_streaming(
     )
 
     # Import here to avoid circular
-    from .streaming_switch import ExpertLRUCache
+    from .streaming_switch import make_expert_cache
 
     per_expert = estimate.per_expert_bytes or 0
     # One cache slot holds ONE projection's slice (gate/up/down are separate
@@ -816,7 +819,7 @@ def convert_model_to_streaming(
     # the budget by 1.5x. The global per_slot uses the majority layout;
     # _convert_switch_mlp_module reconciles per-GLU drift after conversion.
     per_slot = max(1, per_expert // 3) if per_expert else 0
-    cache = ExpertLRUCache(budget_bytes, per_slot, num_layers=estimate.num_moe_layers)
+    cache = make_expert_cache(budget_bytes, per_slot, num_layers=estimate.num_moe_layers)
 
     # IO overrides (settings/env resolution) are read before the backing
     # block: the HOBBIT split (I6) consumes expert_streaming_hot_fraction
@@ -994,6 +997,12 @@ def convert_model_to_streaming(
     cache.spec_state = _spec_state  # type: ignore[attr-defined]
     if not isinstance(backing, dict):
         backing.spec_state = _spec_state  # type: ignore[attr-defined]
+        # P2: the engine reaches the shared cache through the backing it
+        # already holds (for the per-request summary log).
+        try:
+            backing._streaming_cache = cache  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     converted = 0
     # Walk model.layers — handle LLM (model.model.layers) and VLM wrappers
@@ -1527,6 +1536,13 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
         out["ctx_fallbacks"] = dict(getattr(cache, "ctx_fallback_stats", lambda: {})())
     except Exception:
         out["ctx_fallbacks"] = {}
+    try:
+        from .streaming_switch import _SLOT_BANK_ENV as _slot_on
+
+        out["slotbank_on"] = bool(_slot_on)
+        out["cache_policy"] = getattr(cache, "policy", "lru")
+    except Exception:
+        pass
     return out
 
 

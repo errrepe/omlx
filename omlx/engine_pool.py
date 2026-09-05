@@ -393,7 +393,13 @@ class EnginePool:
                 chk = max(qwen4_estimate.checkpoint_bytes, exp_est.checkpoint_bytes)
                 ple = qwen4_estimate.ple_bytes
                 expert = exp_est.expert_bytes
-                overhead = 1.05
+                # P3: single overhead source (was a 1.05 literal drifting
+                # from residency._MODEL_OVERHEAD_FACTOR).
+                from .patches.expert_streaming.residency import (
+                    _MODEL_OVERHEAD_FACTOR as _OVERHEAD,
+                )
+
+                overhead = _OVERHEAD
                 dense_without_both = max(0, chk - ple - expert)
                 combined = int(dense_without_both * overhead + cache)
                 base = min(base, combined)
@@ -548,12 +554,32 @@ class EnginePool:
             return None
         return int(knee_gib * 1024**3)
 
+    # P3: default knee per family when the autotuner never wrote one —
+    # mid-size checkpoints otherwise all share the 8 GiB cap regardless
+    # of how little cache they can actually use.
+    _AUTO_BUDGET_FAMILY_KNEE_GIB = {
+        "glm_moe_dsa": 6.0,
+        "glm5_next": 6.0,
+        "glm5_next_text": 6.0,
+        "deepseek_v4": 6.0,
+        "deepseek_v4_mtp": 6.0,
+        "deepseek_v3": 4.0,
+        "deepseek_v32": 4.0,
+        "qwen4_exp": 2.0,
+        "qwen4_exp_text": 2.0,
+        "qwen3_moe": 2.0,
+        "qwen2_moe": 1.0,
+        "glm4_moe": 2.0,
+    }
+
     @staticmethod
     def _auto_streaming_budget_bytes(
         manual_gib: object,
         streaming_bytes: int,
         ceiling_bytes: int,
         knee_bytes: int | None = None,
+        reserve_bytes: int | None = None,
+        model_type: str | None = None,
     ) -> int | None:
         """Pure auto-budget formula. None = leave settings untouched.
 
@@ -561,22 +587,31 @@ class EnginePool:
         always wins (explicit operator choice); auto only sizes the cache
         when the budget is unset. A missing ceiling or no post-reserve
         headroom also declines. Otherwise half the headroom past streaming
-        bytes + reserve, capped at min(8 GiB, knee).
+        bytes + reserve, capped at min(8 GiB, knee). P3: the reserve
+        scales with the configured context (activation per token) and the
+        knee falls back to a per-family default when autotune data is
+        absent — both params optional so existing callers/tests hold.
         """
         if manual_gib is not None:
             return None
         if ceiling_bytes <= 0 or streaming_bytes <= 0:
             return None
-        headroom = (
-            ceiling_bytes
-            - streaming_bytes
-            - EnginePool._AUTO_BUDGET_RESERVE_BYTES
+        reserve = (
+            int(reserve_bytes)
+            if reserve_bytes is not None and int(reserve_bytes) > 0
+            else EnginePool._AUTO_BUDGET_RESERVE_BYTES
         )
+        headroom = ceiling_bytes - streaming_bytes - reserve
         if headroom <= 0:
             return None
         cap = EnginePool._AUTO_BUDGET_MAX_BYTES
-        if knee_bytes is not None and knee_bytes >= 0:
-            cap = min(cap, int(knee_bytes))
+        knee = knee_bytes
+        if (knee is None or knee < 0) and model_type:
+            fam = str(model_type).replace("-", "_").lower()
+            if fam in EnginePool._AUTO_BUDGET_FAMILY_KNEE_GIB:
+                knee = int(EnginePool._AUTO_BUDGET_FAMILY_KNEE_GIB[fam] * 1024**3)
+        if knee is not None and knee >= 0:
+            cap = min(cap, int(knee))
         auto = min(int(headroom * EnginePool._AUTO_BUDGET_FRACTION), cap)
         auto = (auto // (1024 * 1024)) * (1024 * 1024)  # whole MiB
         return auto or None
@@ -594,11 +629,29 @@ class EnginePool:
         ceiling = self._fallback_admission_ceiling()
         if ceiling <= 0:
             ceiling = self._current_ceiling()
+        # P3: scale the free reserve with the configured context window —
+        # the fixed 2 GiB ignores long-context KV. Activation per token is
+        # 2*hidden_size (same term the prefill guard charges per token).
+        reserve: int | None = None
+        try:
+            hidden = int(getattr(est, "hidden_size", 0) or 0)
+            max_ctx = int(getattr(settings, "max_tokens", 0) or 0) or int(
+                getattr(settings, "context_length", 0) or 0
+            )
+            if hidden > 0 and max_ctx > 0:
+                reserve = max(
+                    EnginePool._AUTO_BUDGET_RESERVE_BYTES,
+                    2 * hidden * max_ctx * 2,
+                )
+        except Exception:
+            reserve = None
         return self._auto_streaming_budget_bytes(
             getattr(settings, "expert_streaming_budget_gib", None),
             streaming_bytes,
             ceiling,
             self._budget_knee_bytes(getattr(entry, "model_path", "")),
+            reserve,
+            getattr(est, "model_type", None),
         )
 
     def _dflash_blocked_by_expert_streaming(

@@ -521,6 +521,22 @@ def test_unlisted_switch_mlp_type_is_not_supported():
         assert est.reason is not None and "allowlist" in est.reason
 
 
+def test_overhead_factor_is_single_sourced():
+    """P3: the 1.05 overhead lives in residency.py; engine_pool and the
+    Qwen PLE estimate import it instead of carrying literals."""
+    import omlx.patches.expert_streaming.residency as res
+    import omlx.patches.mlx_vlm_qwen4_exp_compat.residency as qres
+
+    assert qres._MODEL_OVERHEAD_FACTOR == res._MODEL_OVERHEAD_FACTOR
+    import inspect
+
+    import omlx.engine_pool as ep
+
+    src = inspect.getsource(ep.EnginePool._entry_runtime_resident_size)
+    assert "overhead = 1.05" not in src
+    assert "_MODEL_OVERHEAD_FACTOR" in src or "_OVERHEAD" in src
+
+
 def test_allowlist_is_single_source_of_truth():
     """The package root must re-export residency.py's set, not keep a copy —
     a second literal is exactly how the gates drifted apart."""
@@ -703,6 +719,49 @@ def test_pilot_staging_equivalence_and_fused_wiring():
         assert np.array_equal(np.asarray(staged5[0]), np.asarray(direct[0]))
     finally:
         pf.stop()
+
+
+def test_s3fifo_cache_equivalence_and_scan_resistance():
+    """P2: S3-FIFO honors the same interface; one-hit scans don't evict hot."""
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        S3FIFOExpertCache,
+        make_expert_cache,
+    )
+
+    assert make_expert_cache(1 << 20, 4096, num_layers=1).policy == "lru"
+    fifo = S3FIFOExpertCache(10 * 4096, 4096, num_layers=1)
+    assert fifo.policy == "s3fifo"
+    # Interface parity: put/get/contains/size/retain_hot/clear. A get
+    # promotes small -> main, so referenced entries survive the small FIFO.
+    for eid in range(5):
+        fifo.put((0, eid, "w"), ("w", "s", None))
+        assert fifo.get((0, eid, "w")) is not None
+    assert fifo.size == 5
+    assert (0, 0, "w") in fifo
+    assert fifo.get((0, 99, "w")) is None
+    assert fifo.stats.hits == 5 and fifo.stats.misses == 1
+    assert fifo.retain_hot({(0, 0)}) == 4
+    assert fifo.size == 1
+    fifo.clear()
+    assert fifo.size == 0
+    # Scan resistance: hot set re-referenced, then a one-hit scan larger
+    # than capacity. LRU loses hot; S3-FIFO keeps it in main.
+    lru = ExpertLRUCache(5 * 4096, 4096, num_layers=1)
+    s3 = S3FIFOExpertCache(5 * 4096, 4096, num_layers=1)
+    # Interleaved put+get builds the hot set (decode-like reuse); a
+    # burst put-then-get would be scan-like and correctly filtered.
+    for c in (lru, s3):
+        for eid in range(3):
+            c.put((0, eid, "w"), ("w", "s", None))
+            assert c.get((0, eid, "w")) is not None
+    for eid in range(10, 20):
+        lru.put((0, eid, "w"), ("w", "s", None))
+        s3.put((0, eid, "w"), ("w", "s", None))
+    lru_hot = sum(1 for eid in range(3) if lru.get((0, eid, "w")) is not None)
+    s3_hot = sum(1 for eid in range(3) if s3.get((0, eid, "w")) is not None)
+    assert s3_hot == 3
+    assert lru_hot < 3
 
 
 def test_expert_streaming_summary_aggregates_counters():

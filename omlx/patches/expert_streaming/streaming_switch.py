@@ -92,6 +92,13 @@ _CTX_UNION_MAX_BYTES = max(
     0,
     int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_UNION_MAX_BYTES", str(1024**3))),
 )
+# P2 note (bank pooling deliberately NOT done): raw uint8 demand banks
+# cannot be pooled because the LRU retains rows as views into them —
+# recycling a bank would corrupt cached experts (aliasing). The real
+# allocation cost (one np.empty per (key, tier) per layer call) is small
+# next to the preadv payload; the per-expert mx.array copies were already
+# eliminated by single-promotion (_BANK_PROMOTE_ENV/_BANK_PROMOTE_CTX_ENV).
+# (reserved knob name kept so a future safe pool does not collide.)
 
 
 def _layer_ctx_mode(positions: int, *, quantized: bool, barrier: bool) -> str | None:
@@ -140,7 +147,12 @@ _PREFILL_DIAG_MIN_ROUTES = 512
 # B5 admission filter (scan-resistant). When OMLX_EXPERT_STREAMING_ADMISSION=1,
 # only experts seen >=2 times in the recent window enter the LRU. Disabled by
 # default; operational default for this model/box is budget=0 (see docs).
+# P3: the window scales with capacity (min 1024, up to 1/4 of slots) so the
+# filter stays meaningful at real budgets — a fixed 1024-entry window is
+# noise next to a 6 GiB working set. OMLX_EXPERT_STREAMING_ADMISSION_WINDOW
+# overrides.
 _ADMISSION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION", "") == "1"
+_ADMISSION_WINDOW_ENV = int(os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION_WINDOW", "0") or 0)
 _ADMISSION_WINDOW = 1024
 
 # O2 cross-layer speculation (G2 F_RDADVISE + stash). RA is default-on (like G2)
@@ -179,6 +191,12 @@ _STASH_MAX_ENTRIES = 256
 # per-distinct-expert (one slot per expert in the demand set) - two uncached
 # experts can never alias to the same slot in the same call.
 # ---------------------------------------------------------------------------
+# P3 verdict (audit): SlotBank stays OPT-IN OFF until an A/B proves >2%
+# median decode gain on 2+ checkpoints (fused + split). Rationale: it is a
+# third resident mechanism competing with the LRU + page cache for the
+# same demand population; when the experiment concludes, either promote
+# (drop the 'spike' marks, document the invariant, add a remap test) or
+# delete the class + its 3 call sites. Do not add a fourth mechanism.
 _SLOT_BANK_ENV = os.environ.get("OMLX_EXPERT_STREAMING_SLOT_BANK", "") == "1"
 _SLOT_BANK_SLOTS = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_SLOT_BANK_SLOTS", "16")))
 # Decode-shaped calls only: the arena serves demand sets at or below this
@@ -771,8 +789,13 @@ class ExpertLRUCache:
         # at the 6 GiB budgets measured net-negative (capacity ~6847): a
         # 1024-entry window is trivial next to the read volume, so drop it.
         self._admission_enabled = bool(_ADMISSION_ENV and self.capacity > 0)
-        self._admission_counts: Dict[Tuple[int, int], int] = {}
-        self._admission_order: deque[Tuple[int, int]] = deque()  # type: ignore[type-arg]
+        # P3: window scales with capacity (fixed 1024 drowns at GiB budgets).
+        if _ADMISSION_WINDOW_ENV > 0:
+            self._admission_window = max(16, _ADMISSION_WINDOW_ENV)
+        else:
+            self._admission_window = max(1024, min(self.capacity // 4, 16384)) if self.capacity > 0 else 1024
+        self._admission_counts: Dict[Tuple[int, int, str], int] = {}
+        self._admission_order: deque[Tuple[int, int, str]] = deque()  # type: ignore[type-arg]
         self.admission_drops = 0
         # Fase M3: per-engine ctx fallback-to-legacy counters (per reason).
         self._ctx_fallbacks: dict[str, int] = {}
@@ -817,12 +840,14 @@ class ExpertLRUCache:
     def _admission_should_insert(self, key: tuple[int, int, str]) -> bool:
         if not self._admission_enabled:
             return True
-        # Frequency >=2 in recent window; count via hashed (layer, expert)
-        lk = (int(key[0]), int(key[1]))
+        # P3: frequency keyed by the FULL bundle key (layer, expert,
+        # stacked_key incl. HOBBIT tier suffix) — the old (layer, expert)
+        # key let a hot gate_proj admit a cold up_proj of the same expert.
+        lk = (int(key[0]), int(key[1]), str(key[2]))
         c = self._admission_counts.get(lk, 0) + 1
         self._admission_counts[lk] = c
         self._admission_order.append(lk)
-        if len(self._admission_order) > _ADMISSION_WINDOW:
+        if len(self._admission_order) > self._admission_window:
             old = self._admission_order.popleft()
             oc = self._admission_counts.get(old, 0) - 1
             if oc <= 0:
@@ -871,6 +896,10 @@ class ExpertLRUCache:
         self._layer_counts.clear()
         self.stats = CacheStats()
 
+    @property
+    def policy(self) -> str:
+        return "lru"
+
     def retain_hot(self, hot_pairs: set) -> int:
         """Keep only entries whose (layer_idx, expert_id) is in hot_pairs.
 
@@ -900,9 +929,193 @@ class ExpertLRUCache:
         return len(self._store)
 
 
+_CACHE_POLICY_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CACHE", "lru").strip().lower()
+
+
+class S3FIFOExpertCache(ExpertLRUCache):
+    """P2: S3-FIFO eviction behind the ExpertLRUCache interface.
+
+    LRU keeps recency; MoE routing is skewed (heavy hitters + scan-like
+    prefill demand), where S3-FIFO's scan resistance wins: a small FIFO
+    filters one-hit wonders, the main queue holds reuse, and a ghost
+    queue promotes re-referenced entries (2nd chance). Per-layer caps,
+    admission filter, retain_hot, stats and the stash/spec hooks are
+    inherited unchanged — only the global eviction order differs.
+    Select with OMLX_EXPERT_STREAMING_CACHE=s3fifo (default lru).
+    """
+
+    def __init__(self, budget_bytes: int, per_expert_bytes: int, num_layers: int | None = None):
+        super().__init__(budget_bytes, per_expert_bytes, num_layers)
+        self._small: OrderedDict = OrderedDict()
+        self._ghost: OrderedDict = OrderedDict()
+        cap = max(1, self.capacity)
+        self._small_cap = max(1, min(cap - 1, cap // 10))
+        self._ghost_cap = max(self._small_cap, cap // 10)
+
+    @property
+    def policy(self) -> str:
+        return "s3fifo"
+
+    def _in(self, key: tuple[int, int, str]) -> int:
+        if key in self._small:
+            return 0
+        if key in self._store:
+            return 1
+        return -1
+
+    def __contains__(self, key: tuple[int, int, str]) -> bool:
+        return key in self._small or key in self._store
+
+    def get(self, key: tuple[int, int, str]) -> Any | None:
+        spec = self.spec_state if _STASH_ENV else None
+        if _RA_ENV and spec is not None:
+            sv = spec.stash_get(key)
+            if sv is not None:
+                return sv
+        if key in self._small:
+            # Promote small -> main on re-reference (frequency signal).
+            val = self._small.pop(key)
+            self._store[key] = val
+            self.stats.hits += 1
+            return val
+        if key in self._store:
+            self._store.move_to_end(key)
+            self.stats.hits += 1
+            return self._store[key]
+        if _RA_ENV and spec is not None:
+            spec.stash_count_miss()
+        self.stats.misses += 1
+        return None
+
+    def put(self, key: tuple[int, int, str], value: Any) -> None:
+        if self.capacity <= 0:
+            return
+        if key in self._small:
+            self._small[key] = value
+            return
+        if key in self._store:
+            self._store.move_to_end(key)
+            self._store[key] = value
+            return
+        if not self._admission_should_insert(key):
+            return
+        layer = self._layer_of(key)
+        if self.num_layers > 0 and self._per_layer_cap:
+            cnt = self._layer_counts.get(layer, 0)
+            if cnt >= self._per_layer_cap:
+                if not self._evict_layer(layer):
+                    self._evict_one_global()
+        # Ghost hit -> main queue (2nd chance); else small queue.
+        target_main = key in self._ghost
+        if key in self._ghost:
+            del self._ghost[key]
+        total = len(self._small) + len(self._store)
+        while total >= self.capacity:
+            self._evict_one_global()
+            total = len(self._small) + len(self._store)
+        if target_main:
+            self._store[key] = value
+        else:
+            if len(self._small) >= self._small_cap:
+                old_k, _ = self._small.popitem(last=False)
+                self.stats.evictions += 1
+                self._layer_counts[self._layer_of(old_k)] = max(
+                    0, self._layer_counts.get(self._layer_of(old_k), 1) - 1
+                )
+                self._ghost[old_k] = None
+                while len(self._ghost) > self._ghost_cap:
+                    self._ghost.popitem(last=False)
+            self._small[key] = value
+        self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
+
+    def _evict_layer(self, layer: int) -> bool:
+        for store in (self._small, self._store):
+            for k in list(store.keys()):
+                if self._layer_of(k) == layer:
+                    store.pop(k)
+                    self.stats.evictions += 1
+                    self._layer_counts[layer] = max(0, self._layer_counts.get(layer, 1) - 1)
+                    return True
+        return False
+
+    def _evict_one_global(self) -> None:
+        if len(self._small):
+            old_k, _ = self._small.popitem(last=False)
+            self._ghost[old_k] = None
+            while len(self._ghost) > self._ghost_cap:
+                self._ghost.popitem(last=False)
+        elif len(self._store):
+            old_k, _ = self._store.popitem(last=False)
+        else:
+            return
+        self.stats.evictions += 1
+        self._layer_counts[self._layer_of(old_k)] = max(
+            0, self._layer_counts.get(self._layer_of(old_k), 1) - 1
+        )
+
+    def clear(self) -> None:
+        super().clear()
+        self._small.clear()
+        self._ghost.clear()
+
+    def retain_hot(self, hot_pairs: set) -> int:
+        if self.capacity <= 0 or (not self._store and not self._small):
+            return 0
+        evicted = 0
+        for store in (self._small, self._store):
+            for key in list(store.keys()):
+                if (key[0], key[1]) not in hot_pairs:
+                    del store[key]
+                    evicted += 1
+        if evicted:
+            counts: Dict[int, int] = {}
+            for store in (self._small, self._store):
+                for key in store:
+                    layer = self._layer_of(key)
+                    counts[layer] = counts.get(layer, 0) + 1
+            self._layer_counts = counts
+            self.stats.evictions += evicted
+        return evicted
+
+    @property
+    def size(self) -> int:
+        return len(self._small) + len(self._store)
+
+
+def make_expert_cache(budget_bytes: int, per_slot: int, num_layers: int | None = None) -> ExpertLRUCache:
+    """P2: build the configured eviction policy (default LRU)."""
+    if _CACHE_POLICY_ENV == "s3fifo":
+        return S3FIFOExpertCache(budget_bytes, per_slot, num_layers=num_layers)
+    return ExpertLRUCache(budget_bytes, per_slot, num_layers=num_layers)
+
+
 # ---------------------------------------------------------------------------
 # Helpers that mirror switch_layers.py
 # ---------------------------------------------------------------------------
+
+def promote_np_array(v: Any, dtype_str: str | None = None):
+    """P3: single promotion rule for numpy -> MLX (QuantHandler registry).
+
+    Centralizes the two call sites that used to duplicate the BF16-as-uint16
+    reinterpret (here and _promote_banks): a new quantization adds one
+    branch here plus a row in the grade test — never a third copy.
+    Handlers keyed by (stored numpy dtype, safetensors dtype string):
+      (uint16, BF16) -> bit-exact reinterpret (matches mx.load; the old
+        shift->f32->astype path flushed subnormals via Metal FTZ and cost
+        ~9x more on 4 MB slices).
+      default -> mx.array copy on this thread.
+    """
+    if v is None:
+        return None
+    if isinstance(v, mx.array):
+        return v
+    try:
+        if dtype_str == "BF16" and getattr(v, "dtype", None) == np.uint16:
+            return mx.array(v).view(mx.bfloat16)
+    except Exception:
+        pass
+    return mx.array(v)  # np.ndarray -> mx.array copy on this thread
+
 
 def _inverse_permutation(order, inverse_scatter=False):
     if inverse_scatter:
@@ -1494,16 +1707,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
 
     def _promote_np(self, v, dtype_str: str | None = None):
         """Promote a cached/staged np.ndarray to mx.array on this thread."""
-        if v is None:
-            return None
-        if isinstance(v, mx.array):
-            return v
-        if dtype_str == "BF16" and v.dtype == np.uint16:
-            # bf16 stored as raw uint16 bits — reinterpret directly (matches
-            # mx.load; the old shift->f32->astype path flushed subnormals via
-            # Metal FTZ and cost ~9x more on 4 MB slices).
-            return mx.array(v).view(mx.bfloat16)
-        return mx.array(v)  # np.ndarray -> mx.array copy on this thread
+        return promote_np_array(v, dtype_str)
     def _slice_bytes(self, key: str) -> int:
         """Per-expert byte size of *key* (truthful: read from the backing reader).
 
@@ -1536,6 +1740,26 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             return 0
         return n_experts * self._per_expert_bytes()
 
+    def _tier_groups(self, ids: list[int]) -> dict[int, list[int]]:
+        """P2: group ids by tier with ONE pass (split-aware segmentation).
+
+        Shared by _tier_bank_bytes_for and the read path so reader
+        resolution happens once per (key, tier-run) instead of once per
+        expert. Without the split everything is tier 0.
+        """
+        groups: Dict[int, list[int]] = {}
+        if not ids:
+            return groups
+        try:
+            if not self._is_split_active():
+                groups[0] = list(ids)
+                return groups
+            for eid in ids:
+                groups.setdefault(self._tier_of(int(eid)), []).append(int(eid))
+            return groups
+        except Exception:
+            return {0: list(ids)}
+
     def _tier_bank_bytes_for(self, ids: list[int]) -> int:
         """True raw-bank bytes for an id set under the HOBBIT split (K6).
 
@@ -1543,7 +1767,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         packing, cold = tier packing). Without the split it reduces to
         _bank_bytes_for. Never raises: a resolution failure falls back to
         the cold-first estimate so the caps stay at least as strict as
-        their pre-K6 behavior for unknown layouts.
+        their pre-K6 behavior for unknown layouts. P2: one reader
+        resolution per (key, tier) via _tier_groups.
         """
         if not ids:
             return 0
@@ -1553,11 +1778,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             keys = [self.stacked_weight_key, self.stacked_scales_key]
             if self.stacked_biases_key:
                 keys.append(self.stacked_biases_key)
-            groups: Dict[int, list[int]] = {}
-            for eid in ids:
-                groups.setdefault(self._tier_of(eid), []).append(eid)
             total = 0
-            for _t, g in groups.items():
+            for _t, g in self._tier_groups(ids).items():
                 per_t = 0
                 for key in keys:
                     reader = self.backing._reader_for_key(key, g[0])
@@ -1614,8 +1836,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             total = 0
             for _t, ids_t in groups:
                 per_bytes = []
+                # P2: resolve each key's reader ONCE per tier-run (all ids
+                # in ids_t share the tier by construction) and reuse it for
+                # the slice views below — was once per expert per key.
+                _readers = []
                 for key in keys:
                     reader = self.backing._reader_for_key(key, ids_t[0])
+                    _readers.append(reader)
                     per_bytes.append(reader._rp_for(key).expert_bytes)
                 if any(size <= 0 for size in per_bytes):
                     return None
@@ -1631,11 +1858,15 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 ):
                     return None
                 segments.append((ids_t, banks))
-                for i, eid in enumerate(ids_t):
-                    w = self._slice_view(keys[0], banks[0][i], eid)
-                    s = self._slice_view(keys[1], banks[1][i], eid)
+                # P2: reinterpret rows with the already-resolved per-tier
+                # readers (same packing for the whole run by contract) —
+                # _slice_view would re-resolve per expert.
+                _rps = [r._rp_for(k) for r, k in zip(_readers, keys)]
+                for i in range(len(ids_t)):
+                    w = np.frombuffer(banks[0][i], dtype=_rps[0].np_dtype).reshape(_rps[0].per_shape)
+                    s = np.frombuffer(banks[1][i], dtype=_rps[1].np_dtype).reshape(_rps[1].per_shape)
                     b = (
-                        self._slice_view(keys[2], banks[2][i], eid)
+                        np.frombuffer(banks[2][i], dtype=_rps[2].np_dtype).reshape(_rps[2].per_shape)
                         if self.stacked_biases_key
                         else None
                     )
@@ -1647,7 +1878,16 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 by_id = {int(e): r for e, r in zip(flat, rows)}
                 rows = [by_id[int(e)] for e in expert_ids]
             return segments, rows
-        except Exception:
+        except Exception as exc:
+            # P2: bank-read failures fall back to per-expert loads — count
+            # them (with the layer) instead of failing silently, so a
+            # rotting backing shows up in the per-request summary.
+            try:
+                self.cache._count_ctx_fallback(f"bank_read_l{self.layer_idx}")
+                if memtrace.enabled:
+                    memtrace.record("bank.read_fail", layer=self.layer_idx, n=len(expert_ids), err=str(exc)[:120])
+            except Exception:
+                pass
             return None
 
     def _load_expert_bank_np(self, expert_ids: list[int]) -> list[tuple] | None:
@@ -1702,17 +1942,29 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     typed = np.frombuffer(banks[i], dtype=rp.np_dtype).reshape(
                         n, *rp.per_shape
                     )
-                    arr = mx.array(typed)
-                    # scales/biases can be bf16 stored as raw uint16 bits.
-                    dtype_str = dt[0] if i == 1 else (dt[1] if i == 2 else None)
-                    if dtype_str == "BF16" and arr.dtype == mx.uint16:
-                        arr = arr.view(mx.bfloat16)
+                    arr = promote_np_array(
+                        typed,
+                        dt[0] if i == 1 else (dt[1] if i == 2 else None),
+                    )
+                    # promote_np_array handles the mx.array fast path, but
+                    # here the input is always numpy; normalize dtypes the
+                    # legacy way when the registry passed through (non-BF16
+                    # stored dtypes keep their mx.array copy).
+                    if not isinstance(arr, mx.array):
+                        arr = mx.array(typed)
                     one.append(arr)
                 while len(one) < 3:
                     one.append(None)
                 promoted.append((one[0], one[1], one[2]))
             return promoted
-        except Exception:
+        except Exception as exc:
+            # P2: same noisy-fallback contract as _read_expert_banks.
+            try:
+                self.cache._count_ctx_fallback("bank_promote_fail")
+                if memtrace.enabled:
+                    memtrace.record("bank.promote_fail", layer=self.layer_idx, err=str(exc)[:120])
+            except Exception:
+                pass
             return None
 
     def _load_expert_bank_mx(self, expert_ids: list[int]):
@@ -1806,7 +2058,24 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 except Exception:
                     b = None
             return (w, s, b)
-        except Exception:
+        except Exception as exc:
+            # P2: repeated per-expert read failures warn once per key
+            # (a rotting shard otherwise degrades silently to fallbacks).
+            try:
+                fails = getattr(self.cache, "_read_failures", None)
+                if fails is None:
+                    fails = {}
+                    self.cache._read_failures = fails  # type: ignore[attr-defined]
+                key = self.bundle_key(int(expert_id))
+                n = int(fails.get(key, 0) or 0) + 1
+                fails[key] = n
+                if n == 3:
+                    logger.warning(
+                        "expert_streaming: repeated read failure layer=%d expert=%d (%d fails): %s",
+                        self.layer_idx, int(expert_id), n, str(exc)[:160],
+                    )
+            except Exception:
+                pass
             return None
 
     def _load_expert_run_np(self, first_id: int, count: int) -> list[tuple] | None:
@@ -2796,6 +3065,20 @@ class StreamingSwitchGLU(nn.Module):
         # One shared routing plan for the whole layer: the first linear
         # invoked builds it (single mx.eval + unique + remap), the rest reuse.
         plan = _RemapPlan()
+        # P3: the RA advisor's prev-token prediction for THIS layer is the
+        # previous token's routing (recorded in spec_state by the last
+        # token). Register it as 'predicted' so profile.report() measures
+        # RA precision/recall with the same machinery as PILOT (observed
+        # is recorded by every linear path below).
+        try:
+            _spec = getattr(getattr(self, "_cache", None), "spec_state", None)
+            _prev = getattr(_spec, "prev_uniq_by_layer", None) if _spec is not None else None
+            if p is not None and p.enabled and _prev:
+                _pp = _prev.get(self.layer_idx)
+                if _pp:
+                    p.record_predicted(self.layer_idx, list(_pp))
+        except Exception:
+            pass
         if self.quantized and _LAYER_BARRIER_ENV:
             projections = (
                 [self.gate_up_proj, self.down_proj]
