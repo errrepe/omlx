@@ -52,7 +52,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .scheduler import SchedulerConfig
-from .utils.proc_memory import discount_external_wired, get_phys_footprint
+from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
@@ -1839,9 +1839,7 @@ class EnginePool:
                     # large model load without evicting the first, over-
                     # committing past the ceiling (#1623).
                     current = max(
-                        # Fase M: fullbank artifacts are external mmap pages;
-                        # discount at the sample site (PR #3437 contract).
-                        discount_external_wired(mx.get_active_memory()),
+                        mx.get_active_memory(),
                         get_phys_footprint(),
                         self._current_model_memory,
                     )
@@ -1892,8 +1890,7 @@ class EnginePool:
                         # keep trusting phys_footprint because it may be
                         # unrelated process pressure rather than model residue.
                         committed = max(
-                            discount_external_wired(mx.get_active_memory()),
-                            self._current_model_memory,
+                            mx.get_active_memory(), self._current_model_memory
                         )
                         committed_projected = committed + admission_size
                         if committed_projected <= ceiling:
@@ -2171,7 +2168,7 @@ class EnginePool:
         async with self._lock:
             while True:
                 current = max(
-                    discount_external_wired(mx.get_active_memory()),
+                    mx.get_active_memory(),
                     get_phys_footprint(),
                     self._current_model_memory,
                 )
@@ -2491,11 +2488,7 @@ class EnginePool:
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         distributed = self._distributed_deployment_for_entry(entry) is not None
         resident_size = self._entry_resident_size(entry)
-        # Fase M: discount external-wired (fullbank mmap) from both ends of
-        # the settle delta so the comparison stays consistent.
-        pre_unload_active = (
-            0 if distributed else discount_external_wired(mx.get_active_memory())
-        )
+        pre_unload_active = 0 if distributed else mx.get_active_memory()
 
         try:
             await entry.engine.stop()
@@ -2597,7 +2590,7 @@ class EnginePool:
         settled = False
         settle_indeterminate = False
         for _settle_round in range(10):
-            active_now = discount_external_wired(mx.get_active_memory())
+            active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
             if actual_freed >= min_expected_freed:
                 settled = True
@@ -2669,7 +2662,7 @@ class EnginePool:
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
                 await asyncio.sleep(1.0)
-            active_after = discount_external_wired(mx.get_active_memory())
+            active_after = mx.get_active_memory()
             if active_after > self._current_model_memory + 5 * 1024**3:
                 logger.error(
                     f"Emergency reclaim failed for '{model_id}': "
@@ -2711,10 +2704,7 @@ class EnginePool:
                     get_mlx_executor(),
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
-                current = max(
-                    discount_external_wired(mx.get_active_memory()),
-                    get_phys_footprint(),
-                )
+                current = max(mx.get_active_memory(), get_phys_footprint())
                 if current <= target:
                     logger.info(
                         f"Reclaimed memory after failed load of '{model_id}': "
@@ -2765,9 +2755,7 @@ class EnginePool:
         entry_detached = False
         entry.abort_loading = False
         resident_size = self._entry_resident_size(entry)
-        pre_load_memory = max(
-            discount_external_wired(mx.get_active_memory()), get_phys_footprint()
-        )
+        pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
             if force_lm and effective_type == "vlm":
@@ -3187,10 +3175,7 @@ class EnginePool:
                 lambda: (mx.synchronize(), mx.clear_cache()),
             )
 
-            post_load_memory = max(
-                discount_external_wired(mx.get_active_memory()),
-                get_phys_footprint(),
-            )
+            post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
             observed_delta = max(0, post_load_memory - pre_load_memory)
             entry.actual_size = observed_delta or resident_size
 

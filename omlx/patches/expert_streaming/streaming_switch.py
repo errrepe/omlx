@@ -1453,89 +1453,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         self._hot_experts: set | None = None
         self._cold_bits: int | None = None
         self._cold_gs: int | None = None
-        # Fase M (fullbank, adapted from jundot/omlx PR #3437): optional
-        # zero-copy wrapped FULL bank for prefill-shaped calls. None = not
-        # attached / not eligible (env off, artifact missing/stale, tier
-        # split active, or native ext absent). _fb_* hold the wrapped arrays
-        # (wrapped ONCE per load; underscore attrs stay out of the parameter
-        # tree).
-        self._fullbank: Any = None
-        self._fb_weight: Any = None
-        self._fb_scales: Any = None
-        self._fb_biases: Any = None
-
-    def _fullbank_try_resolve(self) -> None:
-        """Lazily wrap the full bank once (Fase M, adapted from jundot/omlx
-        PR #3437). One-shot per linear: either all three stacked tensors wrap
-        with matching shape/dtype, or _fullbank is set to a sentinel False and
-        this linear stays on the demand path forever."""
-        if self._fullbank is not None:
-            return
-        self._fullbank = False  # pessimistic default; set True below
-        try:
-            art = self.backing.fullbank()
-        except AttributeError:
-            return
-        if art is None or art is False or self._is_split_active():
-            return
-        try:
-            keys = [self.stacked_weight_key, self.stacked_scales_key]
-            if self.stacked_biases_key:
-                keys.append(self.stacked_biases_key)
-            if art.coverage_for(keys) != len(keys):
-                return
-            w_e, s_e = art.entry(self.stacked_weight_key), art.entry(self.stacked_scales_key)
-            if w_e is None or s_e is None:
-                return
-            # shape/dtype must match what the demand path would load. The
-            # bank is (E, out, in_packed); scales are (E, out) per row (a
-            # mismatch fails loudly in gather_qmm anyway, but refusing here
-            # keeps resolve a clean no-op instead of a mid-request error).
-            w_shape = tuple(w_e["shape"])
-            s_shape = tuple(s_e["shape"])
-            if len(w_shape) != 3 or w_shape[0] != self.num_experts:
-                return
-            if len(s_shape) != 2 or s_shape[0] != self.num_experts or s_shape[1] != w_shape[1]:
-                return
-            if self._output_dims and w_shape[1] != self._output_dims:
-                return
-            if not art.run_canary_once():
-                # canary failed: disable for the whole backing (the bytes are
-                # wrong everywhere, not just here) and stay on demand.
-                try:
-                    self.backing.disable_fullbank()
-                except Exception:
-                    pass
-                return
-            self._fb_weight = art.wrap(self.stacked_weight_key)
-            self._fb_scales = art.wrap(self.stacked_scales_key)
-            self._fb_biases = (
-                art.wrap(self.stacked_biases_key) if self.stacked_biases_key else None
-            )
-            self._fullbank = True
-        except Exception:
-            logger.warning(
-                "fullbank resolve failed for %s; demand path",
-                self.stacked_weight_key,
-                exc_info=True,
-            )
-            self._fullbank = False
-
-    def _fullbank_call(self, x, indices, sorted_indices: bool):
-        """gather_qmm straight over the wrapped full bank — checkpoint order,
-        direct router indices, no remap/readback (the entire point of Fase M)."""
-        return mx.gather_qmm(
-            x,
-            self._fb_weight,
-            self._fb_scales,
-            self._fb_biases,
-            rhs_indices=indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=sorted_indices,
-        )
 
     def set_hobbit_split(self, hot_experts, cold_bits: int, cold_gs: int) -> None:
         """Enable the dual-tier path for this linear (convert-time only)."""
@@ -2233,43 +2150,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         built = plan.flat_np is None
         if built:
             _build_plan_into(plan, indices)
-        # Fase M (fullbank, adapted from jundot/omlx PR #3437): prefill-shaped
-        # calls with a wrapped full bank bypass the entire assembly pipeline —
-        # no LRU, no readback, no mini-bank, no remap: gather_qmm over the
-        # page-cache-backed full bank with the raw router indices. Decode-shaped
-        # calls keep the pread demand path (sparse access favors pread QD16 over
-        # page faults; the hybrid is deliberate).
-        if (
-            self._fullbank is not False
-            and plan.positions > _DECODE_UNION_MAX_ROWS
-            and indices.dtype == mx.uint32
-        ):
-            if self._fullbank is None:
-                self._fullbank_try_resolve()
-            if self._fullbank:
-                p.add(
-                    self.layer_idx,
-                    gate=plan.gate_s if built else 0.0,
-                    unique=0.0,
-                    load=0.0,
-                    stack=0.0,
-                    hits=0,
-                    misses=0,
-                    experts=0,
-                    positions=plan.positions,
-                )
-                try:
-                    return self._fullbank_call(x, indices, sorted_indices)
-                except Exception:
-                    # A wrapped-bank failure must degrade, never fail the
-                    # request: fall back to the untouched demand path below
-                    # and stop engaging for this linear.
-                    logger.warning(
-                        "fullbank call failed for %s; falling back to demand",
-                        self.stacked_weight_key,
-                        exc_info=True,
-                    )
-                    self._fullbank = False
         # C4: while the hotness seeder is active a prefill demand set is not
         # cached — seeding the LRU with prefill-only experts would evict the
         # decode working set.

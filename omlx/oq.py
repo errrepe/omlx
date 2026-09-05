@@ -3516,13 +3516,7 @@ def _metal_available_memory_bytes() -> int:
     if max_working_set <= 0:
         return 0
     try:
-        # Fase M: discount external-wired (fullbank mmap) from the active term
-        # only; the cache term is the MLX allocator pool, already internal.
-        from omlx.utils.proc_memory import discount_external_wired
-
-        active = discount_external_wired(
-            int(mx.get_active_memory())
-        ) + int(mx.get_cache_memory())
+        active = int(mx.get_active_memory()) + int(mx.get_cache_memory())
     except Exception:
         active = 0
     return max(0, max_working_set - active)

@@ -36,7 +36,7 @@ from ..memory_monitor import (
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
-from ..utils.proc_memory import discount_external_wired, get_phys_footprint
+from ..utils.proc_memory import get_phys_footprint
 from ..utils.tokenizer import create_streaming_detokenizer
 from .base import (
     ActivityTrackingMixin,
@@ -715,10 +715,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if guard is None:
             return
         try:
-            # Fase M: record a pre-discounted sample (PR #3437 contract).
-            guard.record_mlx_active_memory(
-                discount_external_wired(mx.get_active_memory())
-            )
+            guard.record_mlx_active_memory(mx.get_active_memory())
         except Exception as exc:
             logger.debug(f"DFlash active-memory sample failed: {exc}")
 
@@ -765,7 +762,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         from ..engine_core import get_mlx_executor
 
         loop = asyncio.get_running_loop()
-        pre_active = discount_external_wired(mx.get_active_memory())
+        pre_active = mx.get_active_memory()
 
         # Release dflash model and cache references
         shutdown_runtime_cache_manager()
@@ -804,7 +801,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         # Poll for actual memory release (same pattern as engine_pool._unload_engine)
         for settle_round in range(10):
-            active_now = discount_external_wired(mx.get_active_memory())
+            active_now = mx.get_active_memory()
             freed = pre_active - active_now
             if freed > 0:
                 logger.info(

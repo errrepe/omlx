@@ -41,11 +41,7 @@ import mlx.core as mx
 from . import settings as _settings
 from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
-from .utils.proc_memory import (
-    discount_external_wired,
-    external_wired_bytes,
-    get_phys_footprint,
-)
+from .utils.proc_memory import get_phys_footprint
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
@@ -787,12 +783,8 @@ class ProcessMemoryEnforcer:
         """
         phys = get_phys_footprint()
         if self._has_active_requests():
-            # cached scheduler sample is ALREADY external-discounted upstream
-            # (Scheduler._current_usage_bytes) -- do NOT discount again.
             return max(self._cached_executor_active_memory_bytes(), phys)
-        # idle path: discount the direct sample here (Fase M, PR #3437
-        # contract: once, at the sample site, active term only).
-        return max(discount_external_wired(mx.get_active_memory()), phys)
+        return max(mx.get_active_memory(), phys)
 
     def _is_emergency_pressure(self, current: int, ceiling: int) -> bool:
         """Return True only for pressure beyond the configured ceiling.
