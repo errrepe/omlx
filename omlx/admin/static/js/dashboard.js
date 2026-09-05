@@ -7406,6 +7406,10 @@
                     expert_streaming_cold_tier_present: model?.expert_streaming_cold_tier_present === true,
                     expert_streaming_cold_tier: s.expert_streaming_cold_tier ?? null,
                     expert_streaming_hot_fraction: s.expert_streaming_hot_fraction ?? null,
+                    expert_streaming_cache_policy: s.expert_streaming_cache_policy ?? null,
+                    expert_streaming_dynamic: s.expert_streaming_dynamic ?? null,
+                    expert_streaming_dynamic_max_gib: s.expert_streaming_dynamic_max_gib ?? null,
+                    expert_streaming_health: model?.expert_streaming_health ?? null,
                     expert_dense_bytes: model?.expert_dense_bytes || 0,
                     expert_total_bytes: model?.expert_total_bytes || 0,
                     expert_moe_layers: model?.expert_moe_layers || 0,
@@ -8354,10 +8358,19 @@
                                     ? this.modelSettings.expert_streaming_pin_regime
                                     : null,
                                 expert_streaming_cold_tier: (this.modelSettings.expert_streaming_cold_tier != null && String(this.modelSettings.expert_streaming_cold_tier).length && Number(this.modelSettings.expert_streaming_cold_tier) >= 2)
-                                    ? String(Math.min(3, Math.floor(Number(this.modelSettings.expert_streaming_cold_tier))))
+                                    ? String(Math.min(8, Math.floor(Number(this.modelSettings.expert_streaming_cold_tier))))
                                     : null,
                                 expert_streaming_hot_fraction: (this.modelSettings.expert_streaming_hot_fraction != null && Number(this.modelSettings.expert_streaming_hot_fraction) > 0)
                                     ? Math.min(1, Number(this.modelSettings.expert_streaming_hot_fraction))
+                                    : null,
+                                expert_streaming_cache_policy: (this.modelSettings.expert_streaming_cache_policy === 'lru' || this.modelSettings.expert_streaming_cache_policy === 's3fifo')
+                                    ? this.modelSettings.expert_streaming_cache_policy
+                                    : null,
+                                expert_streaming_dynamic: (this.modelSettings.expert_streaming_dynamic === true)
+                                    ? true
+                                    : (this.modelSettings.expert_streaming_dynamic === false ? false : null),
+                                expert_streaming_dynamic_max_gib: (this.modelSettings.expert_streaming_dynamic_max_gib != null && Number(this.modelSettings.expert_streaming_dynamic_max_gib) > 0)
+                                    ? Math.min(64, Number(this.modelSettings.expert_streaming_dynamic_max_gib))
                                     : null,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget

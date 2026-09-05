@@ -15,6 +15,38 @@ struct ListModelsResponse: Codable, Sendable {
     let models: [ModelDTO]
 }
 
+/// Live MoE expert-streaming health for a loaded engine: LRU hit-rate,
+/// prefetch precision, stash, governor state and the effective cache
+/// policy. Every field is optional — the server reports what it has.
+struct StreamingHealthDTO: Codable, Equatable, Sendable {
+    let lruHitRate: Double?
+    let lruHits: Int?
+    let lruMisses: Int?
+    let lruEvictions: Int?
+    let lruSize: Int?
+    let lruCapacity: Int?
+    let prefetchPrecision: Double?
+    let prefetchSubmissions: Int?
+    let prefetchConsumed: Int?
+    let prefetchDropped: Int?
+    let stashHitRate: Double?
+    let stashHits: Int?
+    let stashMisses: Int?
+    let advised: Int?
+    let cachePolicy: String?
+    let dynamicEnabled: Bool?
+    let governor: GovernorSummaryDTO?
+}
+
+/// Compact governor snapshot embedded in `StreamingHealthDTO.governor`.
+struct GovernorSummaryDTO: Codable, Equatable, Sendable {
+    let actions: Int?
+    let lastAction: String?
+    let lastFreeGib: Double?
+    let capacity: Int?
+    let perSlot: Int?
+}
+
 struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let id: String
     let displayName: String?
@@ -69,6 +101,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let expertMoeLayers: Int?
     let expertsPerLayer: Int?
     let perExpertBytes: Int64?
+    /// Live MoE streaming health for a loaded engine (nil when not streaming).
+    let expertStreamingHealth: StreamingHealthDTO?
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -114,6 +148,9 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let expertStreamingColdTier: String?
     let expertStreamingColdTierPresent: Bool?
     let expertStreamingHotFraction: Double?
+    let expertStreamingCachePolicy: String?
+    let expertStreamingDynamic: Bool?
+    let expertStreamingDynamicMaxGib: Double?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -213,6 +250,9 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var expertStreamingPinRegime: String? = nil
     var expertStreamingColdTier: String? = nil
     var expertStreamingHotFraction: Double? = nil
+    var expertStreamingCachePolicy: String? = nil
+    var expertStreamingDynamic: Bool? = nil
+    var expertStreamingDynamicMaxGib: Double? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil

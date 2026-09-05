@@ -889,8 +889,15 @@ class EnginePool:
                     "expert_streaming_pin_regime",
                     "expert_streaming_cold_tier",
                     "expert_streaming_hot_fraction",
+                    "expert_streaming_cache_policy",
+                    "expert_streaming_dynamic",
                 ):
                     add(_io_key, data.get(_io_key))
+                if bool(data.get("expert_streaming_dynamic", False)):
+                    add(
+                        "expert_streaming_dynamic_max_gib",
+                        data.get("expert_streaming_dynamic_max_gib"),
+                    )
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)

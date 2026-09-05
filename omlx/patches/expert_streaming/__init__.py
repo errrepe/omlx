@@ -102,6 +102,9 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
         "expert_streaming_pin_gib": None,
         "expert_streaming_pin_sync": None,
         "expert_streaming_pin_regime": None,
+        "expert_streaming_cache_policy": None,
+        "expert_streaming_dynamic": None,
+        "expert_streaming_dynamic_max_gib": None,
     }
     if model_settings is None:
         return raw
@@ -116,6 +119,19 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
         else:
             depth = max(1, min(64, depth)) if depth >= 1 else None
         raw["expert_streaming_io_depth"] = depth
+    policy = raw["expert_streaming_cache_policy"]
+    if policy is not None:
+        p = str(policy).strip().lower()
+        raw["expert_streaming_cache_policy"] = p if p in ("lru", "s3fifo") else None
+    max_gib = raw["expert_streaming_dynamic_max_gib"]
+    if max_gib is not None:
+        try:
+            mg = float(max_gib)
+        except (TypeError, ValueError):
+            mg = None
+        else:
+            mg = mg if 0 < mg <= 64 else None
+        raw["expert_streaming_dynamic_max_gib"] = mg
     return raw
 
 
@@ -831,24 +847,41 @@ def convert_model_to_streaming(
     # the budget by 1.5x. The global per_slot uses the majority layout;
     # _convert_switch_mlp_module reconciles per-GLU drift after conversion.
     per_slot = max(1, per_expert // 3) if per_expert else 0
-    cache = make_expert_cache(budget_bytes, per_slot, num_layers=estimate.num_moe_layers)
+    # IO overrides (settings/env resolution) are resolved before the cache:
+    # the eviction policy setting and the governor arming below read them,
+    # and the later backing-store wiring reuses the same resolved dict.
+    io_ov = _io_overrides(model_settings)
+    cache = make_expert_cache(
+        budget_bytes, per_slot, num_layers=estimate.num_moe_layers,
+        policy=io_ov.get("expert_streaming_cache_policy"),
+    )
 
     # Dynamic residency governor: opt-in (env), positive budget only. It
     # revisits capacity at request boundaries from system free memory; a
     # budget-0 run is page-cache-only by operator choice and stays so.
     _governor = None
-    if dynamic_residency_enabled() and budget_bytes > 0 and per_slot > 0:
+    # Settings > env: a per-model setting overrides the OMLX_EXPERT_STREAMING_DYNAMIC
+    # env (None keeps the env/default).
+    _dyn_setting = io_ov.get("expert_streaming_dynamic")
+    _dyn_on = _dyn_setting if _dyn_setting is not None else dynamic_residency_enabled()
+    if _dyn_on and budget_bytes > 0 and per_slot > 0:
         try:
             from .governor import (
                 ExpertResidencyGovernor,
                 _max_dynamic_budget_bytes,
             )
 
+            _gov_max_gib = io_ov.get("expert_streaming_dynamic_max_gib")
+            _gov_max = (
+                int(_gov_max_gib * 1024**3)
+                if _gov_max_gib is not None
+                else _max_dynamic_budget_bytes()
+            )
             _governor = ExpertResidencyGovernor(
                 cache,
                 per_slot,
                 estimate.num_moe_layers,
-                max(_max_dynamic_budget_bytes(), int(budget_bytes)),
+                max(_gov_max, int(budget_bytes)),
             )
             logger.info(
                 "Expert streaming: dynamic residency governor armed (budget %.2f GiB, max %.2f GiB)",
@@ -858,12 +891,6 @@ def convert_model_to_streaming(
         except Exception:
             logger.debug("governor arming failed", exc_info=True)
             _governor = None
-
-    # IO overrides (settings/env resolution) are read before the backing
-    # block: the HOBBIT split (I6) consumes expert_streaming_hot_fraction
-    # while building the backing store, and the later wiring reuses the
-    # same resolved dict.
-    io_ov = _io_overrides(model_settings)
 
     # Backing store
     backing = None

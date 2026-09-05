@@ -1577,6 +1577,33 @@ Post-mortem (why it loses here): the wrapped bank serves every prefill `gather_q
 
 Credit: the wrapped-bank design and the accounting idea are @alytaphoenix's (jundot/omlx PR #3437, Apache-2.0). Our divergences at port time (opt-in env, prefill-only dispatch, multi-family, content fingerprint, independent canary, canary-fail→demand fallback, tiny fake-checkpoint tests) are listed in the commit message of `aec15cb6`.
 
+## Settings e UI (exposição por modelo, N1 follow-up)
+
+Os três knobs que nasceram env-only agora seguem o caminho completo padrão do oMLX
+(`ModelSettings` → `PUT /admin/models/{id}/settings` → runtime signature → WebUI →
+app Swift), com o env como fallback quando o setting é `None`:
+
+| Setting | Valores | Default (env) | UI |
+|---|---|---|---|
+| `expert_streaming_cache_policy` | `lru` / `s3fifo` | `OMLX_EXPERT_STREAMING_CACHE` (lru) | Select "Cache e memória" no modal + Picker no app |
+| `expert_streaming_dynamic` | tri-state (`None`/on/off) | `OMLX_EXPERT_STREAMING_DYNAMIC` (off) | Toggle no modal + menu Default/On/Off no app |
+| `expert_streaming_dynamic_max_gib` | 0–64 GiB | `OMLX_EXPERT_STREAMING_DYNAMIC_MAX_GIB` (6) | Campo numérico (visível só com governor on) |
+
+A transição FU1 (tabela de transição com overfetch k+1) continua **sem UI**: é
+default-ON e ajuste fino de power-user via `OMLX_EXPERT_STREAMING_TRANSITION`.
+
+**Saúde ao vivo** (`expert_streaming_health` no `GET /admin/models` e no card de
+modelos ativos de `/admin/stats`): LRU hit-rate, política efetiva, estado do
+governador (ações/última ação/capacidade), precisão do prefetch e stash — os
+mesmos números que os logs `expert_streaming req` imprimem por request, agora no
+card "Active Models" da WebUI e do app Swift. `null`/ausente = modelo não faz
+streaming.
+
+Edge cases documentados: `dynamic=true` com `budget=0` não arma o governador
+(page-cache-only é decisão operacional; o hint da UI avisa); mudança de política
+com modelo carregado dispara reload via runtime signature (padrão dos IO knobs);
+cold tier aceita 2–8 bits no PUT (o núcleo já aceitava, a UI alinhou).
+
 ## References
 
 - slipstream thesis + measurements: per-layer cache slots, 6.25 % hot-expert locality, decode attention near roofline, per-layer CPU wake floor.

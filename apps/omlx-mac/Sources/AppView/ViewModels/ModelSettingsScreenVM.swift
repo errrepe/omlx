@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingBudgetAuto, expertStreamingTopkThreshold, expertStreamingCachePrior, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingPinSync, expertStreamingPinRegime, expertStreamingColdTier, expertStreamingHotFraction
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingBudgetAuto, expertStreamingTopkThreshold, expertStreamingCachePrior, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingPinSync, expertStreamingPinRegime, expertStreamingColdTier, expertStreamingHotFraction, expertStreamingCachePolicy, expertStreamingDynamic, expertStreamingDynamicMaxGib
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -256,6 +256,11 @@ final class ModelSettingsScreenVM {
     var expertStreamingColdTier: String = ""
     var expertStreamingColdTierPresent: Bool = false
     var expertStreamingHotFraction: String = ""
+    // Cache policy (lru/s3fifo, empty = default) and the dynamic-residency
+    // governor (nil tri-state: nil = env default, true/false = explicit).
+    var expertStreamingCachePolicy: String = ""
+    var expertStreamingDynamic: Bool? = nil
+    var expertStreamingDynamicMaxGib: String = ""
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -406,6 +411,7 @@ final class ModelSettingsScreenVM {
              .expertStreamingPinSync, .expertStreamingPinRegime,
              .expertStreamingColdTier,
              .expertStreamingHotFraction,
+             .expertStreamingCachePolicy, .expertStreamingDynamic, .expertStreamingDynamicMaxGib,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
@@ -557,6 +563,9 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingColdTier = s?.expertStreamingColdTier ?? ""
                 self.expertStreamingColdTierPresent = m.expertStreamingColdTierPresent ?? false
                 self.expertStreamingHotFraction = s?.expertStreamingHotFraction.map { String($0) } ?? ""
+                self.expertStreamingCachePolicy = s?.expertStreamingCachePolicy ?? ""
+                self.expertStreamingDynamic = s?.expertStreamingDynamic
+                self.expertStreamingDynamicMaxGib = s?.expertStreamingDynamicMaxGib.map { String($0) } ?? ""
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -769,10 +778,10 @@ final class ModelSettingsScreenVM {
             let tier = expertStreamingColdTier.trimmingCharacters(in: .whitespacesAndNewlines)
             if tier.isEmpty {
                 patch.expertStreamingColdTier = nil
-            } else if let v = Double(tier), v >= 2, v <= 3 {
+            } else if let v = Double(tier), v >= 2, v <= 8 {
                 patch.expertStreamingColdTier = String(Int(v))
             } else {
-                lastError = "Cold tier must be 2 or 3"
+                lastError = "Cold tier must be 2 through 8"
                 return
             }
         case .expertStreamingHotFraction:
@@ -784,6 +793,32 @@ final class ModelSettingsScreenVM {
                 patch.expertStreamingHotFraction = v
             } else {
                 lastError = "Hot fraction must be between 0 and 1"
+                return
+            }
+        case .expertStreamingCachePolicy:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            let policy = expertStreamingCachePolicy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if policy.isEmpty {
+                patch.expertStreamingCachePolicy = nil
+            } else if policy == "lru" || policy == "s3fifo" {
+                patch.expertStreamingCachePolicy = policy
+            } else {
+                lastError = "Cache policy must be lru or s3fifo"
+                return
+            }
+        case .expertStreamingDynamic:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            // Tri-state: nil keeps the env default; true/false is explicit.
+            patch.expertStreamingDynamic = expertStreamingDynamic
+        case .expertStreamingDynamicMaxGib:
+            guard expertStreamingSupported, expertStreamingEnabled, expertStreamingDynamic == true else { return }
+            let gib = expertStreamingDynamicMaxGib.trimmingCharacters(in: .whitespacesAndNewlines)
+            if gib.isEmpty {
+                patch.expertStreamingDynamicMaxGib = nil
+            } else if let v = Double(gib), v > 0, v <= 64 {
+                patch.expertStreamingDynamicMaxGib = v
+            } else {
+                lastError = "Governor max must be between 0 and 64 GiB"
                 return
             }
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled

@@ -284,9 +284,17 @@ async def test_expert_streaming_cold_tier_api_validation():
     assert settings.expert_streaming_cold_tier == "2"
     from omlx.admin.routes import HTTPException
 
-    with pytest.raises(HTTPException, match="'2' or '3'"):
+    # The PUT range follows the core (2..8, validated against the tier's
+    # own __metadata__ at load); only impossible bit widths are rejected.
+    settings = ModelSettings()
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(expert_streaming_cold_tier="4")
+    )
+    assert settings.expert_streaming_cold_tier == "4"
+
+    with pytest.raises(HTTPException, match="2..8"):
         await _update_settings(
-            pool, settings, admin_routes.ModelSettingsRequest(expert_streaming_cold_tier="4")
+            pool, settings, admin_routes.ModelSettingsRequest(expert_streaming_cold_tier="9")
         )
 
 

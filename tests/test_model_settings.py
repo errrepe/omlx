@@ -54,6 +54,28 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.is_favorite is True
 
+    def test_expert_streaming_ux_knobs_roundtrip(self):
+        """Cache policy, governor toggle and ceiling survive roundtrip.
+
+        None means "keep the env default" for all three, so the defaults
+        must stay None (not False/0) to preserve env-fallback semantics.
+        """
+        original = ModelSettings(
+            expert_streaming_cache_policy="s3fifo",
+            expert_streaming_dynamic=True,
+            expert_streaming_dynamic_max_gib=8.0,
+        )
+        d = original.to_dict()
+        restored = ModelSettings.from_dict(d)
+        assert restored.expert_streaming_cache_policy == "s3fifo"
+        assert restored.expert_streaming_dynamic is True
+        assert restored.expert_streaming_dynamic_max_gib == 8.0
+
+        defaults = ModelSettings()
+        assert defaults.expert_streaming_cache_policy is None
+        assert defaults.expert_streaming_dynamic is None
+        assert defaults.expert_streaming_dynamic_max_gib is None
+
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""
         settings = ModelSettings()
