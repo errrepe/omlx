@@ -1,0 +1,36 @@
+{
+  "layer_bytes": 28224000,
+  "iters": 300,
+  "arms": {
+    "numpy_memcpy_28MB": {
+      "mean_ms": 0.3224064207946261,
+      "p50_ms": 0.3219580103177577,
+      "p90_ms": 0.33304200042039156
+    },
+    "numpy_alloc_copy_28MB": {
+      "mean_ms": 0.32056820336341235,
+      "p50_ms": 0.3201669896952808,
+      "p90_ms": 0.3321249969303608
+    },
+    "mx_array_3x9.4MB_eval": {
+      "mean_ms": 0.31964336017457146,
+      "p50_ms": 0.3198329941369593,
+      "p90_ms": 0.33029200858436525
+    },
+    "mx_array_3x9.4MB_noeval": {
+      "mean_ms": 0.32214143876141554,
+      "p50_ms": 0.32095800270326436,
+      "p90_ms": 0.3320419928058982
+    },
+    "mx_array_9x3.1MB_eval": {
+      "mean_ms": 0.32323652994818985,
+      "p50_ms": 0.32237498089671135,
+      "p90_ms": 0.3352500207256526
+    }
+  },
+  "zero_copy_probes": {
+    "mx.array(memoryview)": "accepted, dtype=mlx.core.uint8, size=9408000",
+    "mx.array(copy=False)": "rejected: TypeError: __init__(): incompatible function arguments. The following argument types are supported:\n    1. __init__(self: array, val: Union[scalar, list, tuple, DLPackCompatible, array], dtype: Optional[Dtype] = None)\n\nInvoked with types: mlx.core.array, ndarray, kwargs = { copy: bool }"
+  },
+  "profile_load_ms": 2.872
+}

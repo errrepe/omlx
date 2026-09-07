@@ -49,11 +49,15 @@ def test_source_packing_prefers_module_values():
     assert _source_packing(src, 64, 8, "affine") == (64, 2, "affine")
 
 
-def test_source_packing_missing_attrs_fail_loudly():
-    """A projection without packing attrs must raise, never inherit silently."""
-    import pytest
+def test_source_packing_refuses_silent_inheritance():
+    """P1: a projection missing any packing attr fails loudly.
 
-    with pytest.raises(ValueError, match="lacks 'group_size'"):
+    JANGQ checkpoints mix precisions inside one layer (a 2-bit gate with
+    3-bit up/down), so silently inheriting the layer-level packing would
+    quantize against the wrong group/bits. The old fallback-to-layer
+    behavior this test used to assert is exactly what P1 removed.
+    """
+    with pytest.raises(ValueError, match="refusing to inherit packing silently"):
         _source_packing(SimpleNamespace(), 64, 4, "affine")
 
 

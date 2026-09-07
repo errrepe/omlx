@@ -549,6 +549,14 @@ class PrefillHotnessRecorder:
         self.seeded_experts = 0
         self.seeded_s = 0.0
         self.seed_done = threading.Event()
+        # Diagnostic: the exact hot set the seed picked, per layer. Kept so a
+        # post-run comparison can separate "the ranking is bad" from "the
+        # ranking never became resident". The offline replay in
+        # bench/bench_seed_static.py says the top-k by prefill frequency
+        # should hit 0.1935 as a static seed; the e2e measurement is 0.0618.
+        # Deciding which of those two is wrong needs this set.
+        self.last_hot: dict[int, list[int]] = {}
+        self.last_hot_pairs: set[tuple[int, int]] = set()
 
     def on_layer_plan(
         self,
@@ -607,6 +615,19 @@ class PrefillHotnessRecorder:
             for layer, counter in self.freq.items()
         }
 
+    def _projections_per_expert(self) -> int:
+        """Real projections per expert (2 fused gate_up+down, 3 split).
+
+        Cache capacity and ``_per_layer_cap`` are counted in *slots* (one
+        projection each), so converting a slot budget into an expert count
+        needs the actual projection count — a hardcoded 3 silently
+        under-seeds fused models by 1.5x.
+        """
+        for _lins in self.linears_by_layer.values():
+            if _lins:
+                return max(1, len(_lins))
+        return 3
+
     def _seed_lru(self) -> int:
         per_layer_cap = getattr(self.cache, "_per_layer_cap", 0) or 0
         if per_layer_cap <= 0:
@@ -615,8 +636,10 @@ class PrefillHotnessRecorder:
         # never evicts useful prompt-wide entries. Missing bundles are read on
         # the warm pool; the C3 cache lock makes worker-side raw bundle puts
         # safe, and quantized linears promote them on the inference thread.
-        hot = self._hot_top(max(1, per_layer_cap // 3))
+        hot = self._hot_top(max(1, per_layer_cap // self._projections_per_expert()))
         hot_pairs = {(layer, eid) for layer, eids in hot.items() for eid in eids}
+        self.last_hot = hot
+        self.last_hot_pairs = hot_pairs
         retain = getattr(self.cache, "retain_hot", None)
         if callable(retain):
             retain(hot_pairs)
@@ -691,6 +714,10 @@ class PrefillHotnessRecorder:
             return 0
         experts_per_layer = max(1, min(64, self.seed_bytes // (num_layers * per_expert)))
         hot = self._hot_top(experts_per_layer)
+        self.last_hot = hot
+        self.last_hot_pairs = {
+            (layer, eid) for layer, eids in hot.items() for eid in eids
+        }
 
         def _run():
             t0 = time.perf_counter()

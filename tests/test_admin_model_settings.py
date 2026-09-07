@@ -399,6 +399,24 @@ async def test_expert_streaming_ux_knob_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_expert_streaming_cache_policy_accepts_route_frequency():
+    """Trilha A: route_frequency is a first-class policy through the API."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            expert_streaming_cache_policy="Route_Frequency"
+        ),
+    )
+
+    assert settings.expert_streaming_cache_policy == "route_frequency"
+    assert result["settings"]["expert_streaming_cache_policy"] == "route_frequency"
+
+
+@pytest.mark.asyncio
 async def test_expert_streaming_cache_policy_rejects_unknown_value():
     pool, _ = _failed_pool()
 

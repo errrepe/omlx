@@ -179,7 +179,16 @@ class ExpertStreamingEstimate:
         )
 
     def slots_for_budget(self, budget_bytes: int) -> int:
-        """Slots per layer that fit in *budget_bytes*."""
+        """**Experts** per layer that fit in *budget_bytes* — not slots.
+
+        Named for history, but the arithmetic divides by the whole
+        ``per_expert_bytes``, so the result counts complete experts. The
+        ExpertLRUCache counts *slots*, and one slot is one projection
+        (``per_expert_bytes // n_proj``), so slot capacity is ``n_proj`` times
+        this number. Multiplying back by ``per_expert_bytes`` (as
+        ``streaming_bytes_for_budget`` does) is correct for bytes either way;
+        mixing the two units for anything else is the n_proj sizing bug.
+        """
         if not self.supported or self.per_expert_bytes <= 0 or self.num_moe_layers <= 0:
             return 0
         if budget_bytes <= 0:

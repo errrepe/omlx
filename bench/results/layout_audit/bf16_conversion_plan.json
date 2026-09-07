@@ -1,0 +1,4974 @@
+[
+  {
+    "model": "/Volumes/SSD 4TB/AI Models/Jundot/Qwen3.6-35B-A3B-oQ4e-mtp",
+    "name": "Qwen3.6-35B-A3B-oQ4e-mtp",
+    "dry_run": true,
+    "shards_touched": 5,
+    "tensors_converted": 174,
+    "tensors_refused": 72,
+    "bytes_converted": 1459617792,
+    "shards": [
+      {
+        "shard": "model-00001-of-00005.safetensors",
+        "written": "",
+        "n_converted": 17,
+        "n_refused": 9,
+        "bytes_converted": 142606336,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "5792 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 5792
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "11840 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 11840
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "11840 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 11840
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "30464 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 30464
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "68896 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 68896
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "68896 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 68896
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1736224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1736224
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1736224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1736224
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "30464 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 30464
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          }
+        ]
+      },
+      {
+        "shard": "model-00002-of-00005.safetensors",
+        "written": "",
+        "n_converted": 45,
+        "n_refused": 23,
+        "bytes_converted": 377487360,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "960 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 960
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "6784 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 6784
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "20 flushed to zero; 1589 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 20,
+            "n_other_lossy": 1589
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "32 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 32
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "32 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 32
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "928 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 928
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "576 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 576
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "768 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 768
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "268 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 268
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "768 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 768
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "283 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 283
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "960 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 960
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "928 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 928
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "6784 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 6784
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "576 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 576
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "5792 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 5792
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "14 flushed to zero; 1587 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 14,
+            "n_other_lossy": 1587
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          }
+        ]
+      },
+      {
+        "shard": "model-00003-of-00005.safetensors",
+        "written": "",
+        "n_converted": 50,
+        "n_refused": 18,
+        "bytes_converted": 419430400,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "960 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 960
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "960 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 960
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1088 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1088
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1088 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1088
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "32 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 32
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "768 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 768
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "768 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 768
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "928 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 928
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "6784 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 6784
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "928 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 928
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 224
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "32 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 32
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1120 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1120
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1120 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1120
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "6784 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 6784
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 224
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          }
+        ]
+      },
+      {
+        "shard": "model-00004-of-00005.safetensors",
+        "written": "",
+        "n_converted": 51,
+        "n_refused": 17,
+        "bytes_converted": 427819008,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "3136 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 3136
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "3136 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 3136
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "512 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 512
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "160 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 160
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 224
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "96 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 96
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "96 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 96
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "512 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 512
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 224
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1120 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1120
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1120 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1120
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          }
+        ]
+      },
+      {
+        "shard": "model-00005-of-00005.safetensors",
+        "written": "",
+        "n_converted": 11,
+        "n_refused": 5,
+        "bytes_converted": 92274688,
+        "tensors": [
+          {
+            "key": "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.mtp.layers.0.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "512 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 512
+          },
+          {
+            "key": "language_model.mtp.layers.0.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "512 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 512
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "8128 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 8128
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "8128 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 8128
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "160 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 160
+          },
+          {
+            "key": "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "model": "/Volumes/SSD 4TB/AI Models/peculiar-ragdoll/Tiel-Coder-35B-A3B-MLX-oQ4e",
+    "name": "Tiel-Coder-35B-A3B-MLX-oQ4e",
+    "dry_run": true,
+    "shards_touched": 5,
+    "tensors_converted": 170,
+    "tensors_refused": 70,
+    "bytes_converted": 1426063360,
+    "shards": [
+      {
+        "shard": "model-00001-of-00005.safetensors",
+        "written": "",
+        "n_converted": 18,
+        "n_refused": 10,
+        "bytes_converted": 150994944,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "5792 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 5792
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "5792 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 5792
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "11840 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 11840
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "11840 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 11840
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "30464 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 30464
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "68896 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 68896
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "68896 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 68896
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1736224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1736224
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1736224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1736224
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "30464 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 30464
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.3.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.0.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.1.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.2.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          }
+        ]
+      },
+      {
+        "shard": "model-00002-of-00005.safetensors",
+        "written": "",
+        "n_converted": 46,
+        "n_refused": 22,
+        "bytes_converted": 385875968,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "960 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 960
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "14 flushed to zero; 1591 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 14,
+            "n_other_lossy": 1591
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "6784 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 6784
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "19 flushed to zero; 1601 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 19,
+            "n_other_lossy": 1601
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "32 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 32
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.15.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "32 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 32
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "928 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 928
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "576 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 576
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.10.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "768 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 768
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "287 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 287
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.8.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "768 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 768
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "281 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 281
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "960 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 960
+          },
+          {
+            "key": "language_model.model.layers.14.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.7.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.13.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.11.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "6784 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 6784
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "576 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 576
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.9.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "928 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 928
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.6.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.4.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.12.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.5.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          }
+        ]
+      },
+      {
+        "shard": "model-00003-of-00005.safetensors",
+        "written": "",
+        "n_converted": 49,
+        "n_refused": 19,
+        "bytes_converted": 411041792,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "960 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 960
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1088 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1088
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1088 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1088
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "32 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 32
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "928 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 928
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "768 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 768
+          },
+          {
+            "key": "language_model.model.layers.25.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "768 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 768
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "928 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 928
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "6784 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 6784
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.24.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.19.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 224
+          },
+          {
+            "key": "language_model.model.layers.22.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "32 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 32
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1120 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1120
+          },
+          {
+            "key": "language_model.model.layers.26.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "960 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 960
+          },
+          {
+            "key": "language_model.model.layers.21.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1120 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1120
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.17.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.20.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.18.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.23.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "6784 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 6784
+          },
+          {
+            "key": "language_model.model.layers.16.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 224
+          }
+        ]
+      },
+      {
+        "shard": "model-00004-of-00005.safetensors",
+        "written": "",
+        "n_converted": 51,
+        "n_refused": 17,
+        "bytes_converted": 427819008,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "160 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 160
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "3136 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 3136
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "3136 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 3136
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "512 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 512
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "160 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 160
+          },
+          {
+            "key": "language_model.model.layers.34.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 224
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "96 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 96
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "96 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 96
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "64 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 64
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "512 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 512
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.37.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "224 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 224
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.36.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.35.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "288 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 288
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.32.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.33.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.30.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1120 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1120
+          },
+          {
+            "key": "language_model.model.layers.29.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "1120 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 1120
+          },
+          {
+            "key": "language_model.model.layers.27.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.28.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.31.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          }
+        ]
+      },
+      {
+        "shard": "model-00005-of-00005.safetensors",
+        "written": "",
+        "n_converted": 6,
+        "n_refused": 2,
+        "bytes_converted": 50331648,
+        "tensors": [
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.up_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "8128 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 8128
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.down_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.gate_proj.scales",
+            "role": "scales",
+            "n_elems": 4194304,
+            "converted": false,
+            "reason": "8128 lose precision",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 8128
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.gate_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.38.mlp.switch_mlp.down_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          },
+          {
+            "key": "language_model.model.layers.39.mlp.switch_mlp.up_proj.biases",
+            "role": "biases",
+            "n_elems": 4194304,
+            "converted": true,
+            "reason": "",
+            "n_overflow": 0,
+            "n_underflow": 0,
+            "n_other_lossy": 0
+          }
+        ]
+      }
+    ]
+  }
+]

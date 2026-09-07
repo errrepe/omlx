@@ -133,7 +133,7 @@ class TestContendedChunkCap:
     def test_no_cap_without_contention(self):
         s = _make_scheduler()
         assert s._contended_prefill_cap() == 0
-        assert s._prefill_step_size_for_progress(0, 100000) == 2048
+        assert s._prefill_step_size_for_progress(0, 100000) == 4096
 
     def test_cap_with_own_running_decode(self):
         s = _make_scheduler()
@@ -180,7 +180,7 @@ class TestQwen35PrefillFloor:
     def test_non_qwen_model_unaffected(self):
         s = _make_scheduler()
         assert s._qwen35_prefill_floor == 0
-        assert s._prefill_step_size_for_progress(0, 100000) == 2048
+        assert s._prefill_step_size_for_progress(0, 100000) == 4096
 
 
 class TestAdaptiveChunkCap:
@@ -217,7 +217,7 @@ class TestAdaptiveChunkCap:
         s = _make_scheduler()
         s.running = {"r1": MagicMock()}
         s._prefill_tps_best = 100000.0
-        assert s._contended_prefill_cap() == 2048
+        assert s._contended_prefill_cap() == 4096
 
     def test_decode_rate_sampling_solo_vs_contended(self):
         from omlx.prefill_progress import get_prefill_tracker

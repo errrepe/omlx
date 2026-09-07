@@ -28,6 +28,23 @@ import mlx.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def _zero_mtp_stats() -> dict[str, int]:
+    """Fresh MTP accept-telemetry counters.
+
+    Shared by ``__init__`` and by callers that build the adapter without it
+    (tests driving ``__new__`` to isolate hook delegation): the stats dict
+    must exist on every instance the hooks can run on, or MLX's
+    ``Module.__getattr__`` turns the first counter update into an
+    AttributeError that surfaces as a request failure.
+    """
+    return {
+        'cycles': 0,
+        'accepted': 0,
+        'drafted': 0,
+        'fallbacks': 0,
+    }
+
+
 class VLMModelAdapter(nn.Module):
     """
     Adapter wrapping a VLM's language_model for BatchGenerator compatibility.
@@ -84,12 +101,7 @@ class VLMModelAdapter(nn.Module):
         # does not pass through these hooks, so native runs leave these
         # zeros - the derivator treats that as 'no data', never as a
         # zero-accept measurement.
-        self.mtp_stats: Dict[str, int] = {
-            'cycles': 0,
-            'accepted': 0,
-            'drafted': 0,
-            'fallbacks': 0,
-        }
+        self.mtp_stats: Dict[str, int] = _zero_mtp_stats()
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""

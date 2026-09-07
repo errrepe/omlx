@@ -2598,12 +2598,15 @@ async def update_model_settings(
         v = request.expert_streaming_cache_policy
         if v is None or str(v).strip() == "":
             current_settings.expert_streaming_cache_policy = None
-        elif str(v).strip().lower() in ("lru", "s3fifo"):
+        elif str(v).strip().lower() in ("lru", "s3fifo", "route_frequency"):
             current_settings.expert_streaming_cache_policy = str(v).strip().lower()
         else:
             raise HTTPException(
                 status_code=400,
-                detail="expert_streaming_cache_policy must be 'lru' or 's3fifo'",
+                detail=(
+                    "expert_streaming_cache_policy must be "
+                    "'lru', 's3fifo' or 'route_frequency'"
+                ),
             )
     if "expert_streaming_dynamic" in sent:
         current_settings.expert_streaming_dynamic = (

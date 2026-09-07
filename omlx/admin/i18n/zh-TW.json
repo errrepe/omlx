@@ -1158,7 +1158,7 @@
   "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1。開啟冷精度層且有學習到的 pin profile 時，每層使用頻率最高的一部分專家保持原始 4-bit，其餘讀取冷層。留空/0 = 統一冷層。",
   "modal.model_settings.expert_streaming_cache_policy": "專家快取策略",
   "modal.model_settings.expert_streaming_cache_policy_default": "預設（LRU）",
-  "modal.model_settings.expert_streaming_cache_policy_hint": "常駐專家的驅逐策略。LRU 是實測預設值；S3-FIFO 抗掃描（實測打平）。",
+  "modal.model_settings.expert_streaming_cache_policy_hint": "常駐專家的驅逐策略。LRU 是實測預設值；S3-FIFO 抗掃描（實測打平）；route frequency 保留路由最頻繁的專家（實驗性）。",
   "modal.model_settings.expert_streaming_dynamic": "專家動態駐留（調節器）",
   "modal.model_settings.expert_streaming_dynamic_hint": "依可用記憶體自動調整專家快取大小：有餘裕就成長，受壓力就收縮。需要快取預算大於 0。",
   "modal.model_settings.expert_streaming_dynamic_max": "調節器上限（GiB）",
