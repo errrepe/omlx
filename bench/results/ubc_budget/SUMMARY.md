@@ -83,6 +83,34 @@ testadas: (a) as leituras do próprio seeder sendo contabilizadas na fase de
 decode; (b) `trans_updates` maiores com cache (213.120 vs 198.912) puxando
 mais leitura de transição. **Não resolvido — não afirmar mecanismo.**
 
+## 4.1 O hit rate do LRU é estatisticamente igual à cobertura
+
+Achado posterior, e a razão pela qual os 6,2% de hit não compram nada:
+
+```
+cobertura em espaço de slot = 95 / (512 x 3) = 0,061849
+hit rate medido (2 runs)    = 0,062399 e 0,061900
+```
+
+Quatro casas decimais. O conteúdo do cache é indistinguível de uma amostra
+uniforme de 6,2% dos `(camada, slot)` — **zero correlação com roteamento**.
+
+O teto offline para a mesma geometria (`sizing/SUMMARY.md` §2, budget 4 GiB) é
+Belady 0,740 e seed+LRU 0,637. O sistema entrega **10% do atingível**.
+
+Corolário: um hit no LRU não é mais barato que um hit no page cache, porque as
+entradas do LRU *são* views do mmap — páginas de arquivo. O LRU é um segundo
+índice sobre o mesmo page cache, com overhead de dict Python por entrada e
+4 GiB de working set a mais para o kernel considerar. Ele não adiciona
+residência; ele a duplica.
+
+Isso também explica parte do +7 GiB: os dois braços usam seeders diferentes.
+Com budget > 0 o `_seed_lru` semeia `per_layer_cap // n_proj` = 31
+especialistas/camada (~3,9 GiB lidos do disco); com budget 0 o
+`_seed_page_cache` semeia `min(64, SEED_BYTES // (layers * per_expert))` = 15
+especialistas/camada (~1,9 GiB). São ~2 GiB da diferença. O restante segue sem
+explicação.
+
 ## 5. O que fazer com isso
 
 O cache de 4 GiB custa ~27% a mais de disco e rende ~4% a menos de vazão, para
@@ -99,3 +127,38 @@ num default de produção e não foi pedido — fica como recomendação, não m
 
 **Não** é uma alavanca para a meta "decode ≥ 2×": o teto com page cache
 servindo 100% dos bytes é 1,47×.
+
+## 6. Tentativa seguinte (seed de page cache 2 vs 6 GiB) — INCONCLUSIVA
+
+Com budget 0 o único mecanismo ativo é `_seed_page_cache()`, que aquece o page
+cache do kernel com leituras descartadas — o único caminho que dá residência
+aos experts quentes **sem** duplicá-los em user space. O tamanho do conjunto
+quente é `min(64, SEED_BYTES // (layers * per_expert_bytes))`, confirmado nos
+logs: 720 slices semeados = 15 experts/camada com o default de 2 GiB.
+
+A pergunta era se subir para 6 GiB (47 experts/camada) rende vazão. A/B
+alternado, 2 reps, `--min-free-gb 18`:
+
+| rep | seed 2 GiB | seed 6 GiB |
+|---|---|---|
+| 1 | 2,340 tok/s | 1,744 tok/s |
+| 2 | 2,557 tok/s | 2,573 tok/s |
+
+**Sem efeito resolvível, e o experimento não vale nada nesta máquina agora.**
+Dois fatos:
+
+- O spread entre reps do *mesmo* braço (2,34→2,56; 1,74→2,57) chega a 47%,
+  contra ±2,4% medido na seção 1. Efeito de ordem forte: r1 sempre pior.
+- Todos os números estão muito abaixo dos 3,07–3,13 tok/s da seção 1. A caixa
+  está em estado degradado — `vm_stat` mostrava 231 MiB livres com 18,85 GiB
+  inativos, e o bench recusa rodar com o default (`only 20.9 GB available,
+  need 22+`).
+
+Ruído de ±25% não resolve nem o efeito da seção 1 (+3,9%). **Qualquer A/B de
+page cache fica suspenso até a máquina ter folga.** Não afirmar resultado
+nenhum deste experimento — ele está registrado só para que ninguém o repita às
+cegas.
+
+Nota lateral: `trans_updates` variou 326.784 → 340.992 → 355.200 → 369.408,
+exatamente +14.208 por run, em processos distintos. Não é uma métrica por run;
+é estado acumulado. Não usá-la como sinal.
