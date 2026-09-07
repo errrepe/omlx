@@ -1126,6 +1126,15 @@ def required_imports(
         if not guard.matches(model_types, for_vlm):
             continue
         for module in _third_party_imports(patch_module):
+            # ``mlx_vlm`` is the VLM runtime; it is never legitimately required
+            # for *every* model (an empty guard matches all models and flags).
+            # A text rank must not be charged for it. The genuine VLM deps carry
+            # a real model_type / for_vlm guard (e.g. minimax_m3_mlx_lm, the
+            # mlx_vlm_*_compat packages), so they are unaffected; only the
+            # transitive ``mlx_vlm`` that an MTP package pulls in for its
+            # VLM-only glm5_next path leaks through an empty guard and is dropped.
+            if module == "mlx_vlm" and guard.for_vlm is None and not guard.model_types:
+                continue
             sources.setdefault(module, set()).add(patch_module)
 
     return tuple(
