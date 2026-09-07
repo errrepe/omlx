@@ -1197,6 +1197,35 @@ def test_route_frequency_cache_interface_and_reuse_signal():
     assert len(rf2._freq) <= rf2._freq_cap
 
 
+def test_route_frequency_evict_layer_picks_least_routed_not_least_recent():
+    """The governor's shrink path must evict by frequency, not recency.
+
+    ExpertResidencyGovernor._apply shrinks mid-request via
+    ``cache._evict_layer(layer)`` whenever the cache exposes one. Every
+    subclass inherits the base class's override otherwise, and the base
+    version picks the least-RECENTLY-used victim — so a route_frequency
+    cache under memory pressure would silently degrade to LRU exactly
+    when the governor is active. This pins the fix: the per-layer victim
+    under _evict_layer is the least-ROUTED entry of that layer.
+    """
+    from omlx.patches.expert_streaming.streaming_switch import RouteFrequencyCache
+
+    rf = RouteFrequencyCache(4 * 4096, 4096, num_layers=1)
+    # Least-recently-used but heavily routed; must survive the shrink.
+    rf.put((0, 0, "w"), ("w", "s", None))
+    for _ in range(5):
+        rf.get((0, 0, "w"))
+    # Recently put but never routed; must be the victim.
+    rf.put((0, 1, "w"), ("w", "s", None))
+
+    assert rf._evict_layer(0) is True
+    assert rf.size == 1
+    assert (0, 0, "w") in rf
+    assert (0, 1, "w") not in rf
+    assert rf._layer_counts[0] == 1
+    assert rf.stats.evictions == 1
+
+
 def test_route_frequency_decay_halves_and_drops_stale_keys():
     """Aging: counters halve, non-resident keys are pruned."""
     from omlx.patches.expert_streaming.streaming_switch import RouteFrequencyCache

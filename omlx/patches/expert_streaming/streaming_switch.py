@@ -1333,6 +1333,22 @@ class RouteFrequencyCache(ExpertLRUCache):
         self._bump(key)
         return super().get(key)
 
+    def _evict_layer(self, layer: int) -> bool:
+        """Per-layer victim by frequency, for the governor's shrink path.
+
+        The governor (``ExpertResidencyGovernor._apply``) calls
+        ``cache._evict_layer(layer)`` whenever the cache exposes one — and
+        every subclass inherits the base class's, which evicts by *recency*.
+        S3FIFOExpertCache overrides it with its own scan; without this
+        override a route_frequency cache under memory pressure would evict
+        its least-recently-used entries instead of its least-routed ones,
+        silently degrading the policy exactly when the governor is active.
+        Delegates to ``_evict_lowest`` so there is one victim-selection code
+        path, counters and per-layer counts stay coherent, and the
+        ``stats.evictions`` accounting is shared.
+        """
+        return self._evict_lowest(layer)
+
     def _evict_lowest(self, layer: int | None) -> bool:
         """Evict the least-routed entry (oldest wins ties); layer=None is global."""
         victim: tuple[int, int, str] | None = None
