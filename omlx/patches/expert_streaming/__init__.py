@@ -122,7 +122,9 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
     policy = raw["expert_streaming_cache_policy"]
     if policy is not None:
         p = str(policy).strip().lower()
-        raw["expert_streaming_cache_policy"] = p if p in ("lru", "s3fifo") else None
+        raw["expert_streaming_cache_policy"] = (
+            p if p in ("lru", "s3fifo", "route_frequency") else None
+        )
     max_gib = raw["expert_streaming_dynamic_max_gib"]
     if max_gib is not None:
         try:
@@ -739,10 +741,17 @@ def _convert_switch_mlp_module(
     # gate_up GLU holds 2 projections (gate_up + down), a split GLU 3 —
     # the global cache was sized for the majority layout, so the convert
     # loop below reconciles any drift (see _reconcile_cache_slots).
-    n_proj = len(
-        [a for a in ("gate_up_proj", "down_proj") if hasattr(streaming_glu, a)]
-        or [a for a in ("gate_proj", "up_proj", "down_proj") if hasattr(streaming_glu, a)]
-    )
+    # Discriminate on gate_up_proj, NOT on list truthiness: down_proj exists
+    # in BOTH layouts, so the fused tuple is never empty and an `or` fallback
+    # would short-circuit every split GLU to n_proj=1 (3x budget under-fill).
+    if hasattr(streaming_glu, "gate_up_proj"):
+        n_proj = len(
+            [a for a in ("gate_up_proj", "down_proj") if hasattr(streaming_glu, a)]
+        )
+    else:
+        n_proj = len(
+            [a for a in ("gate_proj", "up_proj", "down_proj") if hasattr(streaming_glu, a)]
+        ) or 1
     streaming_glu.n_proj = n_proj  # type: ignore[attr-defined]
 
     # Fase J Etapa E: the per-layer load context's projection list (2 fused
@@ -824,20 +833,6 @@ def convert_model_to_streaming(
     if budget_bytes is None:
         budget_bytes = _get_budget_bytes(model_settings, estimate)
 
-    logger.info(
-        "Expert streaming: converting %s: budget=%.2f GiB (%s), layers=%d, experts/layer=%d, per_expert=%.2f MB, slots/layer=%d",
-        Path(model_path).name,
-        budget_bytes / 1024**3,
-        "page-cache only, no LRU" if budget_bytes <= 0 else "LRU heap",
-        estimate.num_moe_layers,
-        estimate.experts_per_layer,
-        estimate.per_expert_bytes / 1024 / 1024,
-        estimate.slots_for_budget(budget_bytes),
-    )
-
-    # Import here to avoid circular
-    from .streaming_switch import make_expert_cache
-
     per_expert = estimate.per_expert_bytes or 0
     # One cache slot holds ONE projection's slice (gate/up/down are separate
     # keys), so slot sizing must divide by the projections per expert —
@@ -847,6 +842,35 @@ def convert_model_to_streaming(
     # the budget by 1.5x. The global per_slot uses the majority layout;
     # _convert_switch_mlp_module reconciles per-GLU drift after conversion.
     per_slot = max(1, per_expert // 3) if per_expert else 0
+
+    # Report slots and experts separately: `slots_for_budget` counts EXPERTS
+    # (it divides by the whole per_expert_bytes), while the cache counts
+    # SLOTS. Logging the former under the latter's name is what let the
+    # n_proj sizing bug stay invisible — the numbers looked self-consistent.
+    _experts_resident = estimate.slots_for_budget(budget_bytes)
+    _slots_resident = (
+        (budget_bytes // per_slot) if per_slot else 0
+    )
+    _slots_per_layer = (
+        _slots_resident // estimate.num_moe_layers if estimate.num_moe_layers else 0
+    )
+    logger.info(
+        "Expert streaming: converting %s: budget=%.2f GiB (%s), layers=%d, experts/layer=%d, "
+        "per_expert=%.2f MB, per_slot=%.2f MB, slots/layer=%d, experts resident/layer=%d",
+        Path(model_path).name,
+        budget_bytes / 1024**3,
+        "page-cache only, no LRU" if budget_bytes <= 0 else "LRU heap",
+        estimate.num_moe_layers,
+        estimate.experts_per_layer,
+        estimate.per_expert_bytes / 1024 / 1024,
+        per_slot / 1024 / 1024,
+        _slots_per_layer,
+        _experts_resident,
+    )
+
+    # Import here to avoid circular
+    from .streaming_switch import make_expert_cache
+
     # IO overrides (settings/env resolution) are resolved before the cache:
     # the eviction policy setting and the governor arming below read them,
     # and the later backing-store wiring reuses the same resolved dict.
