@@ -556,7 +556,6 @@ class PrefillHotnessRecorder:
         # should hit 0.1935 as a static seed; the e2e measurement is 0.0618.
         # Deciding which of those two is wrong needs this set.
         self.last_hot: dict[int, list[int]] = {}
-        self.last_hot_pairs: set[tuple[int, int]] = set()
 
     def on_layer_plan(
         self,
@@ -637,9 +636,8 @@ class PrefillHotnessRecorder:
         # the warm pool; the C3 cache lock makes worker-side raw bundle puts
         # safe, and quantized linears promote them on the inference thread.
         hot = self._hot_top(max(1, per_layer_cap // self._projections_per_expert()))
-        hot_pairs = {(layer, eid) for layer, eids in hot.items() for eid in eids}
         self.last_hot = hot
-        self.last_hot_pairs = hot_pairs
+        hot_pairs = {(layer, eid) for layer, eids in hot.items() for eid in eids}
         retain = getattr(self.cache, "retain_hot", None)
         if callable(retain):
             retain(hot_pairs)
@@ -715,9 +713,6 @@ class PrefillHotnessRecorder:
         experts_per_layer = max(1, min(64, self.seed_bytes // (num_layers * per_expert)))
         hot = self._hot_top(experts_per_layer)
         self.last_hot = hot
-        self.last_hot_pairs = {
-            (layer, eid) for layer, eids in hot.items() for eid in eids
-        }
 
         def _run():
             t0 = time.perf_counter()

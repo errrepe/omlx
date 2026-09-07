@@ -2313,29 +2313,14 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         Returns the cached bundle (mx or raw np tuple) or None when the expert
         must be fetched from the backing store.
         """
-        key = self.bundle_key(expert_id)
-        cached = self.cache.get(key)
-        if cached is not None:
-            # New format: bundle tuple stored under weight key
-            if isinstance(cached, tuple) and len(cached) == 3:
-                return cached  # type: ignore[return-value]
-            # Legacy: companion keys (weight hit but scales separate) — upgrade to bundle
-            if isinstance(cached, mx.array):
-                s_key = (self.layer_idx, expert_id, self.stacked_scales_key)
-                b_key = (self.layer_idx, expert_id, self.stacked_biases_key) if self.stacked_biases_key else None
-                s = self.cache.get(s_key)
-                b = self.cache.get(b_key) if b_key else None
-                if s is not None:
-                    bundle = (cached, s, b)
-                    # Collapse 3 slots into 1 bundle slot (evict companions)
-                    try:
-                        self.cache._store.pop(s_key, None)  # type: ignore[attr-defined]
-                        if b_key:
-                            self.cache._store.pop(b_key, None)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-                    self.cache.put(key, bundle)  # type: ignore[arg-type]
-                    return bundle  # type: ignore[return-value]
+        cached = self.cache.get(self.bundle_key(expert_id))
+        # Only the bundle format (w, s, b) is ever written under the weight
+        # key — every current writer (warmer seed, ctx writeback, bank
+        # promote, the bundle loader itself) stores 3-tuples, and a raw
+        # mx.array only appears under the non-quantized streamer's own key
+        # namespace, which a quantized reader never resolves.
+        if isinstance(cached, tuple) and len(cached) == 3:
+            return cached  # type: ignore[return-value]
         return None
 
     def _spec_state(self) -> SpeculationState | None:
