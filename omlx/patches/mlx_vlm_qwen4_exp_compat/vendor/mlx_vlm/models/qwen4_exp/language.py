@@ -5,8 +5,10 @@ import math
 import mmap
 import os
 import struct
+import threading
 import weakref
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +39,155 @@ from .qsa_fast import (
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
+
+
+# --- SSD PLE prefault ------------------------------------------------------
+#
+# The PLE table lives in an mmap'd safetensors file mapped MADV_RANDOM, so a
+# prefill that touches most shards at once pays one cold 16 KiB fault per
+# gathered row, serially. Warming the touched byte ranges with preads issued
+# in ascending order first turns that into kernel-readahead bandwidth:
+# 3.3 s -> 0.62 s for an 8k-token prefill on JANG_4S. Decode gathers only a
+# couple of rows per shard, so a row floor keeps the fast path free of extra
+# syscalls. All knobs are opt-out and read per call for testability.
+#
+# Trade-off: when the table is already page-cache resident the warm-up is
+# pure syscall overhead (~2 us per span, ~0.4 s at 8k). Cold is the common
+# case -- the table is 14.9 GiB and cannot stay resident next to the model --
+# but Trilha D (direct publication, no pread) is the real fix for both.
+
+_PLE_PREFAULT_ENV = "OMLX_QWEN4_PLE_PREFAULT"
+_PLE_PREFAULT_WORKERS_ENV = "OMLX_QWEN4_PLE_PREFAULT_WORKERS"
+_PLE_PREFAULT_MIN_ROWS_ENV = "OMLX_QWEN4_PLE_PREFAULT_MIN_ROWS"
+# Measured on an M4 Pro against the 14.9 GiB JANG_4S table: serial
+# ascending preads beat 4 and 16 workers (386 ms vs ~650 ms for 199k
+# spans). The kernel's readahead already pipelines the reads, and extra
+# threads only add GIL contention. The knob stays for other hardware.
+_PLE_PREFAULT_DEFAULT_WORKERS = 1
+_PLE_PREFAULT_MAX_WORKERS = 64
+_PLE_PREFAULT_DEFAULT_MIN_ROWS = 64
+_PLE_PREFAULT_CHUNK_BYTES = 64 * 1024
+_PLE_PREFAULT_MAX_GAP_BYTES = 4096
+
+_SAFETENSORS_NP_DTYPES = {
+    "BF16": (np.dtype("<u2"), 2),
+    "F16": (np.dtype("<f2"), 2),
+    "F32": (np.dtype("<f4"), 4),
+    "U32": (np.dtype("<u4"), 4),
+    "F8_E4M3": (np.dtype("u1"), 1),
+}
+
+_PLE_PREFAULT_POOL: ThreadPoolExecutor | None = None
+_PLE_PREFAULT_POOL_LOCK = threading.Lock()
+
+
+def _ple_prefault_enabled() -> bool:
+    raw = os.environ.get(_PLE_PREFAULT_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _ple_prefault_workers() -> int:
+    raw = os.environ.get(_PLE_PREFAULT_WORKERS_ENV)
+    if raw is None:
+        return _PLE_PREFAULT_DEFAULT_WORKERS
+    try:
+        workers = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _PLE_PREFAULT_DEFAULT_WORKERS
+    return max(1, min(_PLE_PREFAULT_MAX_WORKERS, workers))
+
+
+def _ple_prefault_min_rows() -> int:
+    raw = os.environ.get(_PLE_PREFAULT_MIN_ROWS_ENV)
+    if raw is None:
+        return _PLE_PREFAULT_DEFAULT_MIN_ROWS
+    try:
+        min_rows = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _PLE_PREFAULT_DEFAULT_MIN_ROWS
+    return max(0, min_rows)
+
+
+def _ple_prefault_pool() -> ThreadPoolExecutor:
+    """Process-wide pool: one per reader leaks threads, one per call thrashes."""
+    global _PLE_PREFAULT_POOL
+    if _PLE_PREFAULT_POOL is None:
+        with _PLE_PREFAULT_POOL_LOCK:
+            if _PLE_PREFAULT_POOL is None:
+                _PLE_PREFAULT_POOL = ThreadPoolExecutor(
+                    max_workers=_ple_prefault_workers(),
+                    thread_name_prefix="omlx-ple-prefault",
+                )
+    return _PLE_PREFAULT_POOL
+
+
+def _prefault_page_bytes() -> int:
+    """VM page size: the real unit of a file-backed read, not the row."""
+    try:
+        page = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, ValueError, OSError):
+        page = 0
+    return page if page > 0 else 4096
+
+
+def _align_ranges_to_page(
+    ranges: list[tuple[int, int]], page_bytes: int
+) -> list[tuple[int, int]]:
+    """Widen row spans to whole pages.
+
+    A row is ~50-100 B but a cold read pulls a whole page, so N rows that
+    share a page are one I/O, not N. Without this the warm-up issues an
+    order of magnitude more syscalls than the fault path it replaces and
+    ends up slower than doing nothing.
+    """
+    if page_bytes <= 1:
+        return list(ranges)
+    return [
+        (
+            (start // page_bytes) * page_bytes,
+            ((stop + page_bytes - 1) // page_bytes) * page_bytes,
+        )
+        for start, stop in ranges
+    ]
+
+
+def _merge_byte_ranges(
+    ranges: list[tuple[int, int]], max_gap: int = _PLE_PREFAULT_MAX_GAP_BYTES
+) -> list[tuple[int, int]]:
+    """Sort and coalesce byte ranges into the fewest non-overlapping spans."""
+    ordered = sorted(
+        (int(start), int(stop)) for start, stop in ranges if int(stop) > int(start)
+    )
+    merged: list[list[int]] = []
+    for start, stop in ordered:
+        if merged and start - merged[-1][1] <= max_gap:
+            if stop > merged[-1][1]:
+                merged[-1][1] = stop
+            continue
+        merged.append([start, stop])
+    return [(start, stop) for start, stop in merged]
+
+
+def _prefault_fd_ranges(fd: int, ranges: list[tuple[int, int]]) -> None:
+    """Best-effort warm-up. Every pread runs inline, never as a subtask.
+
+    Jobs share one bounded pool, so a job that waited on queued chunk
+    subtasks would deadlock as soon as readers outnumber workers.
+    Parallelism is one job per reader file, not chunk-level fan-out.
+    """
+    for start, stop in ranges:
+        offset = start
+        while offset < stop:
+            wanted = min(_PLE_PREFAULT_CHUNK_BYTES, stop - offset)
+            try:
+                read = os.pread(fd, wanted, offset)
+            except OSError:
+                return
+            if not read:
+                return
+            offset += len(read)
 
 
 @dataclass(frozen=True)
@@ -1660,18 +1811,39 @@ class _SafeTensorMMap:
         """
         return key in self._header
 
+    def fileno(self) -> int:
+        """File descriptor for the mapped checkpoint, used by prefault preads."""
+        return self._file.fileno()
+
+    def row_byte_ranges(self, key: str, rows: list[int]) -> list[tuple[int, int]]:
+        """Absolute file byte spans covering `rows` of a 2-D tensor.
+
+        Best effort: returns [] for keys, dtypes or layouts the reader
+        cannot gather, so prefault never changes what `rows()` computes.
+        """
+        entry = self._header.get(key)
+        if entry is None:
+            return []
+        dtype_info = _SAFETENSORS_NP_DTYPES.get(str(entry["dtype"]))
+        if dtype_info is None:
+            return []
+        item_size = dtype_info[1]
+        shape = tuple(entry["shape"])
+        start, end = entry["data_offsets"]
+        if len(shape) != 2 or end - start != math.prod(shape) * item_size:
+            return []
+        row_bytes = shape[1] * item_size
+        base = self._data_start + start
+        return [
+            (base + row * row_bytes, base + (row + 1) * row_bytes) for row in rows
+        ]
+
     def rows(self, key: str, rows: list[int]) -> mx.array:
         entry = self._header[key]
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
         dtype = entry["dtype"]
-        dtype_info = {
-            "BF16": (np.dtype("<u2"), 2),
-            "F16": (np.dtype("<f2"), 2),
-            "F32": (np.dtype("<f4"), 4),
-            "U32": (np.dtype("<u4"), 4),
-            "F8_E4M3": (np.dtype("u1"), 1),
-        }.get(dtype)
+        dtype_info = _SAFETENSORS_NP_DTYPES.get(dtype)
         if dtype_info is None:
             raise TypeError(f"SSD-backed Qwen4 PLE does not support {dtype}")
         np_dtype, item_size = dtype_info
@@ -1895,6 +2067,16 @@ class DiskBackedShardedEmbedding(nn.Module):
         touched = tuple(sorted(set(shard_indices)))
         self.last_touched_shards = touched
         self.rows_read = 0
+        local_by_shard: dict[int, list[int]] = {shard: [] for shard in touched}
+        for index, shard_index in zip(host_indices, shard_indices):
+            local_by_shard[shard_index].append(
+                index - self.shard_offsets[shard_index]
+            )
+        # Prefill touches most shards at once; decode gathers a handful of
+        # rows. The row floor keeps the warm-up on the prefill tail instead
+        # of adding syscalls to every decode step.
+        if len(host_indices) >= _ple_prefault_min_rows():
+            self._prefault_touched_rows(local_by_shard)
         result = mx.zeros((len(host_indices), self.dims), dtype=mx.bfloat16)
         for shard_index in touched:
             positions = [
@@ -1902,9 +2084,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                 for i, current_shard in enumerate(shard_indices)
                 if current_shard == shard_index
             ]
-            local = [
-                host_indices[i] - self.shard_offsets[shard_index] for i in positions
-            ]
+            local = local_by_shard[shard_index]
             weight_key, scales_key, biases_key, bits, group_size = self._shard_specs[
                 shard_index
             ]
@@ -1927,6 +2107,45 @@ class DiskBackedShardedEmbedding(nn.Module):
             self.rows_read += len(local)
             result = result.at[mx.array(positions, dtype=mx.int32)].add(values)
         return result.reshape(*shape, self.dims)
+
+    def _prefault_touched_rows(self, local_by_shard: dict[int, list[int]]) -> None:
+        """Warm the byte ranges this gather is about to fault in.
+
+        Grouped by reader, not by key: a shard's weight, scales and biases
+        often share one file, and duplicate spans would serialise behind
+        each other for nothing.
+        """
+        if not _ple_prefault_enabled():
+            return
+        by_reader: dict[_SafeTensorMMap, list[tuple[int, int]]] = {}
+        for shard_index, local in local_by_shard.items():
+            if not local:
+                continue
+            weight_key, scales_key, biases_key, _, _ = self._shard_specs[shard_index]
+            keys = [weight_key]
+            if scales_key is not None:
+                keys.append(scales_key)
+            if biases_key is not None:
+                keys.append(biases_key)
+            for key in keys:
+                reader = self._tensor_readers[key]
+                by_reader.setdefault(reader, []).extend(
+                    reader.row_byte_ranges(key, local)
+                )
+        if not by_reader:
+            return
+        page_bytes = _prefault_page_bytes()
+        pool = _ple_prefault_pool()
+        futures = [
+            pool.submit(
+                _prefault_fd_ranges,
+                reader.fileno(),
+                _merge_byte_ranges(_align_ranges_to_page(ranges, page_bytes)),
+            )
+            for reader, ranges in by_reader.items()
+        ]
+        for future in futures:
+            future.result()
 
     def close(self):
         for reader in self._readers.values():
