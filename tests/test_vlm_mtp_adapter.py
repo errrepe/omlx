@@ -13,10 +13,14 @@ import pytest
 
 
 def _adapter_with(inner):
-    from omlx.models.vlm import VLMModelAdapter
+    from omlx.models.vlm import VLMModelAdapter, _zero_mtp_stats
 
     adapter = VLMModelAdapter.__new__(VLMModelAdapter)
     adapter._language_model = inner
+    # __new__ bypasses __init__, but the hooks update mtp_stats on every
+    # call — without it MLX's Module.__getattr__ raises AttributeError on
+    # the first counter update (the very regression this file guards).
+    adapter.mtp_stats = _zero_mtp_stats()
     return adapter
 
 

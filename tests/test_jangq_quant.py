@@ -49,8 +49,16 @@ def test_source_packing_prefers_module_values():
     assert _source_packing(src, 64, 8, "affine") == (64, 2, "affine")
 
 
-def test_source_packing_falls_back_to_layer_values():
-    assert _source_packing(SimpleNamespace(), 64, 4, "affine") == (64, 4, "affine")
+def test_source_packing_refuses_silent_inheritance():
+    """P1: a projection missing any packing attr fails loudly.
+
+    JANGQ checkpoints mix precisions inside one layer (a 2-bit gate with
+    3-bit up/down), so silently inheriting the layer-level packing would
+    quantize against the wrong group/bits. The old fallback-to-layer
+    behavior this test used to assert is exactly what P1 removed.
+    """
+    with pytest.raises(ValueError, match="refusing to inherit packing silently"):
+        _source_packing(SimpleNamespace(), 64, 4, "affine")
 
 
 def _write_fake_model(tmp_path, *, with_quantization=False):
