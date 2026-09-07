@@ -83,33 +83,61 @@ testadas: (a) as leituras do próprio seeder sendo contabilizadas na fase de
 decode; (b) `trans_updates` maiores com cache (213.120 vs 198.912) puxando
 mais leitura de transição. **Não resolvido — não afirmar mecanismo.**
 
-## 4.1 O hit rate do LRU é estatisticamente igual à cobertura
+## 4.1 ~~O hit rate do LRU é igual à cobertura~~ — RETIFICADO: o hit rate e2e é uma métrica diluída
 
-Achado posterior, e a razão pela qual os 6,2% de hit não compram nada:
+> Esta seção afirmava, com base na coincidência numérica abaixo, que o cache
+> tinha "zero correlação com roteamento". **Estava errado.** A coincidência era
+> exatamente isso, coincidência. A medição instrumentada da seção 7 derrubou a
+> hipótese; o texto correto segue.
+
+A evidência que me enganou:
 
 ```
 cobertura em espaço de slot = 95 / (512 x 3) = 0,061849
-hit rate medido (2 runs)    = 0,062399 e 0,061900
+hit rate e2e medido (2 runs) = 0,062399 e 0,061900
 ```
 
-Quatro casas decimais. O conteúdo do cache é indistinguível de uma amostra
-uniforme de 6,2% dos `(camada, slot)` — **zero correlação com roteamento**.
+Quatro casas decimais — e era acaso. A conta certa fecha o denominador da
+métrica e2e (`hits + misses` = 316.655 numa run de 2k/96):
 
-O teto offline para a mesma geometria (`sizing/SUMMARY.md` §2, budget 4 GiB) é
-Belady 0,740 e seed+LRU 0,637. O sistema entrega **10% do atingível**.
+```
+demanda de decode  : 46.560 experts x 3 projecoes = 139.680 lookups
+demanda de prefill : 29.951 experts x 3 projecoes =  89.853 lookups
+lookups de transicao/especulacao                  =  87.122
+                                                   --------
+                                                   316.655
+```
 
-Corolário: um hit no LRU não é mais barato que um hit no page cache, porque as
-entradas do LRU *são* views do mmap — páginas de arquivo. O LRU é um segundo
-índice sobre o mesmo page cache, com overhead de dict Python por entrada e
-4 GiB de working set a mais para o kernel considerar. Ele não adiciona
-residência; ele a duplica.
+O caminho union faz **um get por projeção** (`for proj in self.linears`), e o
+contador engole prefill e especulação junto. O lado dos *hits* confirma: a
+previsão estática do decode é 20.783 e o medido é 19.878 (−4,4%). Ou seja, o
+cache **está** servindo o que deve servir.
 
-Isso também explica parte do +7 GiB: os dois braços usam seeders diferentes.
-Com budget > 0 o `_seed_lru` semeia `per_layer_cap // n_proj` = 31
-especialistas/camada (~3,9 GiB lidos do disco); com budget 0 o
-`_seed_page_cache` semeia `min(64, SEED_BYTES // (layers * per_expert))` = 15
-especialistas/camada (~1,9 GiB). São ~2 GiB da diferença. O restante segue sem
-explicação.
+**O número certo** (run instrumentada, budget 4 GiB, trace da própria run):
+
+```
+hit de decode, seed estatico da producao : 0,1488
+baseline aleatorio (31/512, mesmo trace) : 0,0634
+                                          2,35x sobre o aleatorio
+```
+
+O seeder funciona: escolhe por uso real (`counts`), 100% do escolhido fica
+residente (§7), e entrega 2,35x o acaso. No trace antigo o replay dava 0,1935.
+
+O que **segue valendo** desta seção:
+
+- Um hit no LRU não é mais barato que um hit no page cache — as entradas são
+  views do mmap, páginas de arquivo. O LRU é um segundo índice sobre o mesmo
+  page cache, com overhead de dict por entrada e 4 GiB de working set a mais
+  para o kernel considerar. Não adiciona residência; duplica.
+- Os dois braços usam seeders diferentes (budget>0: `_seed_lru`, 31
+  experts/camada ≈ 3,9 GiB; budget 0: `_seed_page_cache`, 15/camada ≈ 1,9 GiB)
+  — ~2 GiB do +7 GiB de disco da seção 1. O restante segue sem explicação.
+
+O que **cai**: "zero correlação", "10% do atingível", e qualquer conclusão
+derivada delas. A comparação correta com o offline é seed estático ~0,15–0,19
+vs seed+LRU 0,50–0,64 — o resto do gap é o cache **congelado** (sem write-back),
+não o seed.
 
 ## 5. O que fazer com isso
 
@@ -163,7 +191,7 @@ Nota lateral: `trans_updates` variou 326.784 → 340.992 → 355.200 → 369.408
 exatamente +14.208 por run, em processos distintos. Não é uma métrica por run;
 é estado acumulado. Não usá-la como sinal.
 
-## 7. O seed estático deveria dar 0,1935 — e dá 0,0618
+## 7. Instrumentação seed-vs-residente: as três hipóteses de bug morreram, e a história certa é outra
 
 `bench/bench_seed_static.py` roda offline sobre `bench/results/lrc/jang4m_trace.jsonl`
 e **reproduz os quatro números publicados** em `sizing/SUMMARY.md` §2, o que
@@ -176,41 +204,53 @@ valida o simulador:
 | cold LRU | 0,6287 | 0,629 |
 | working set/camada (mediana, máx) | 103, 193 | ~103, 193 |
 
-A quinta linha é nova. O sistema real **congela** o cache depois de semear
-(sem write-back: `evictions=0`, `puts == size`), então a política dele não é
-`seed+LRU` — é **seed estático**:
+A primeira versão desta seção lia a linha nova (seed estático 0,1935) contra o
+hit rate e2e (0,0618) como um "gap de 3,13x" e apontava três candidatos de bug.
+A instrumentação derrubou os três e a própria leitura:
+
+### O que foi medido (budget 4 GiB, 2k/96, `OMLX_BENCH_SEED_DUMP=1` + `OMLX_EXPERT_STREAMING_TRACE`)
 
 ```
-seed ESTATICO  = 0,1935     <- o que a producao deveria dar
-medido e2e     = 0,0618     <- o que da
-                 32% do potencial, gap de 3,13x
+seed_vs_resident : seed_total=1488, resident_total=1488,
+                   intersection=1488, seed_kept_frac=1.0
 ```
 
-E não é o algoritmo de escolha que é ruim: 48,3% do top-31 por frequência de
-prefill está dentro do working set de decode. O overlap **implicado** pelo hit
-rate medido é 0,154 — *abaixo* do acaso (0,201 = 103/512). Ou seja: o que
-chega ao cache não está correlacionado com o top-31, apesar de o seeder
-escolher por `Counter.most_common`.
+**O conjunto residente é exatamente o escolhido.** Sem chave divergente, sem
+jobs perdidos no `_WARM_POOL`, sem truncamento do cap. As hipóteses 1–3 estão
+mortas.
 
-**Isso localiza o bug.** Não é "frequência de prefill não prevê decode" (ela
-prevê: 48% de overlap). É que o conjunto que efetivamente fica residente não é
-o conjunto escolhido. Candidatos, em ordem do que verificaria primeiro:
+### O replay no trace da própria run (o passo que faltava)
 
-1. Chave: o seeder põe `(layer, eid, stacked_weight_key)`; o caminho union
-   busca por chave de projeção. Se divergirem, o hit é espúrio.
-2. `retain_hot(hot_pairs)` roda antes dos puts assíncronos no `_WARM_POOL` —
-   se o pool perder jobs (exceções são silenciadas com `continue`), o cache
-   fica com o que sobrou. `size=4464` diz que chegou, mas não diz *quais*.
-3. Ordem de chegada: os puts assíncronos não são ordenados por hotness, e o
-   cap por camada (95) pode truncar justamente os mais quentes.
+Replayando o seed **da produção** como estático sobre o routing **desta mesma
+run** (4.752 linhas, decode = 46.560 requests):
 
-Próximo passo concreto: dump dos `(layer, eid)` realmente residentes no fim do
-decode e comparar com o top-31 do seeder. É uma instrumentação pequena e
-responde em uma run — e não depende da máquina estar folgada, ao contrário dos
-A/Bs de vazão.
+```
+seed ESTATICO (producao)  0,1488   <- melhor que o top-k do simulador (0,0875)
+baseline aleatorio        0,0634   <- o seed vale 2,35x o acaso
+seed+LRU (sim)            0,4988   <- o que o LRU atualizando daria
+medido e2e                0,0628   <- metrica diluida (ver 4.1)
+```
+
+### A história correta, em três frases
+
+1. **O seeder funciona de ponta a ponta**: escolhe por uso real (`counts`,
+   não presença — e é por isso que bate o top-k por presença do simulador),
+   100% do escolhido fica residente, e vale 2,35x o acaso.
+2. **O "0,0618 == cobertura" era coincidência**: a métrica e2e mistura no
+   denominador prefill e especulação (§4.1). O hit de decode real é ~0,15.
+3. **O gap que sobra é o cache congelado**: sem write-back o teto é o seed
+   estático (~0,15–0,19); com write-back o simulador dá 0,50–0,64.
+
+### Consequência prática
+
+A alavanca não é consertar o seed — não há o que consertar. É decidir se vale
+destravar o LRU. O comentário em `streaming_switch.py` (~1745) já registra que
+o custo de CPU do write-back caiu para ~3% (dentro do ruído) depois do fix
+O(1) de `b73a0270` — o "-28%" histórico era o scan O(store). O que
+desqualifica é **I/O**: +16% de bytes de disco (27,4 → 31,9 GiB), porque o
+write-back preenche 4 GiB com uma cópia do que o page cache já serve.
 
 **Ressalva, para não supervalorizar o 0,637:** mesmo o seed+LRU cheio não
-converte linearmente em tok/s. O experimento de write-back subiu o hit rate
-para 0,226 e a vazão caiu 3,4% com disco +16%: um hit no LRU de user-space
-ainda paga a promoção numpy→MLX e a entrada é uma view de mmap que pode não
-estar residente. O 0,637 é teto de *bytes evitados*, não de tempo.
+converte linearmente em tok/s. Um hit no LRU de user-space ainda paga a
+promoção numpy→MLX e a entrada é uma view de mmap que pode não estar residente.
+O 0,637 é teto de *bytes evitados*, não de tempo.

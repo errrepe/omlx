@@ -340,6 +340,100 @@ def find_streaming_cache(vlm_model):
     return None
 
 
+def _iter_switch_mlps(vlm_model):
+    """Yield every MoE `switch_mlp` in the model, whatever the wrapper path."""
+    for path in (
+        ("language_model", "model", "layers"),
+        ("language_model", "layers"),
+        ("model", "layers"),
+        ("layers",),
+    ):
+        cur = vlm_model
+        for a in path:
+            if not hasattr(cur, a):
+                cur = None
+                break
+            cur = getattr(cur, a)
+        if cur:
+            for layer in cur:
+                mlp = getattr(layer, "mlp", None)
+                sm = getattr(mlp, "switch_mlp", None) if mlp else None
+                if sm is not None:
+                    yield sm
+            return
+
+
+def collect_seed_vs_resident(vlm_model, cache):
+    """Did the seeder's chosen hot set actually become the resident set?
+
+    bench/bench_seed_static.py replays the captured JANG_4M trace and says a
+    *static* seed of the top-k by prefill frequency should hit 0.1935 at
+    4 GiB, but e2e measures 0.0618 -- which is exactly the slot coverage
+    95/(512*3), i.e. what a uniform random 6.2% sample would give. Those two
+    facts together say the resident set is uncorrelated with the routing, but
+    they cannot say *which* step lost the signal. This splits them:
+
+      resident == seed  -> the ranking itself is wrong (bad frequency oracle)
+      resident != seed  -> the ranking was fine and never became resident
+                           (key mismatch, dropped warm-pool jobs, or the
+                           per-layer cap truncating the hottest first)
+    """
+    seed: dict[int, set[int]] = {}
+    for sm in _iter_switch_mlps(vlm_model):
+        hook = getattr(sm, "_warm_pins", None)
+        rec = getattr(hook, "recorder", None)
+        hot = getattr(rec, "last_hot", None) if rec is not None else None
+        if not hot:
+            continue
+        for lay, eids in hot.items():
+            seed.setdefault(int(lay), set()).update(int(e) for e in eids)
+        break  # one recorder is shared across layers
+
+    resident: dict[int, set[int]] = {}
+    store = getattr(cache, "_store", None)
+    if store:
+        for key in store:
+            try:
+                lay, eid = int(key[0]), int(key[1])
+            except Exception:
+                continue
+            resident.setdefault(lay, set()).add(eid)
+
+    per_layer = []
+    for lay in sorted(set(seed) | set(resident)):
+        s = seed.get(lay, set())
+        r = resident.get(lay, set())
+        per_layer.append(
+            {
+                "layer": lay,
+                "seed_n": len(s),
+                "resident_n": len(r),
+                "intersection": len(s & r),
+                "seed_only": len(s - r),
+                "resident_only": len(r - s),
+            }
+        )
+    tot_seed = sum(p["seed_n"] for p in per_layer)
+    tot_res = sum(p["resident_n"] for p in per_layer)
+    tot_int = sum(p["intersection"] for p in per_layer)
+    summary = {
+        "layers": len(per_layer),
+        "seed_total": tot_seed,
+        "resident_total": tot_res,
+        "intersection": tot_int,
+        "seed_kept_frac": round(tot_int / tot_seed, 4) if tot_seed else None,
+        "resident_from_seed_frac": round(tot_int / tot_res, 4) if tot_res else None,
+    }
+    return {
+        "summary": summary,
+        "per_layer": per_layer,
+        # Actual IDs, so the ranking can be compared against a routing trace
+        # replayed offline (bench/bench_seed_static.py --trace ...).
+        "seed_experts": {str(lay): sorted(s) for lay, s in seed.items()},
+        "resident_experts": {str(lay): sorted(r) for lay, r in resident.items()},
+    }
+
+
 async def run(
     model_key: str,
     budget: float,
@@ -1027,6 +1121,17 @@ async def run(
             "bit_exact_kind": _bit_exact_kind,
         }
     )
+    # Opt-in diagnosis (OMLX_BENCH_SEED_DUMP=1). Writes seed_vs_resident.json
+    # next to the other artifacts: did the seeder's top-k actually become the
+    # resident set? See collect_seed_vs_resident for how to read it.
+    if os.environ.get("OMLX_BENCH_SEED_DUMP", "") == "1":
+        try:
+            _svr = collect_seed_vs_resident(vlm_model, cache)
+            with open(out_dir_p / "seed_vs_resident.json", "w") as _fh:
+                _json.dump(_svr, _fh, indent=1)
+            print(f"seed_vs_resident {_svr['summary']}")
+        except Exception as e:  # never fail a run over a diagnostic
+            print(f"seed_vs_resident FAILED: {e!r}")
 
     # Persist the learned pin profile when pins are active (the server does
     # this in stop(); the harness tears down via release/unload, so save
