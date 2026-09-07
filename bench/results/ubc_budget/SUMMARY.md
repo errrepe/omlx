@@ -162,3 +162,55 @@ cegas.
 Nota lateral: `trans_updates` variou 326.784 → 340.992 → 355.200 → 369.408,
 exatamente +14.208 por run, em processos distintos. Não é uma métrica por run;
 é estado acumulado. Não usá-la como sinal.
+
+## 7. O seed estático deveria dar 0,1935 — e dá 0,0618
+
+`bench/bench_seed_static.py` roda offline sobre `bench/results/lrc/jang4m_trace.jsonl`
+e **reproduz os quatro números publicados** em `sizing/SUMMARY.md` §2, o que
+valida o simulador:
+
+| métrica | este script | sizing §2 |
+|---|---|---|
+| Belady | 0,7396 | 0,740 |
+| seed + LRU | 0,6375 | 0,637 |
+| cold LRU | 0,6287 | 0,629 |
+| working set/camada (mediana, máx) | 103, 193 | ~103, 193 |
+
+A quinta linha é nova. O sistema real **congela** o cache depois de semear
+(sem write-back: `evictions=0`, `puts == size`), então a política dele não é
+`seed+LRU` — é **seed estático**:
+
+```
+seed ESTATICO  = 0,1935     <- o que a producao deveria dar
+medido e2e     = 0,0618     <- o que da
+                 32% do potencial, gap de 3,13x
+```
+
+E não é o algoritmo de escolha que é ruim: 48,3% do top-31 por frequência de
+prefill está dentro do working set de decode. O overlap **implicado** pelo hit
+rate medido é 0,154 — *abaixo* do acaso (0,201 = 103/512). Ou seja: o que
+chega ao cache não está correlacionado com o top-31, apesar de o seeder
+escolher por `Counter.most_common`.
+
+**Isso localiza o bug.** Não é "frequência de prefill não prevê decode" (ela
+prevê: 48% de overlap). É que o conjunto que efetivamente fica residente não é
+o conjunto escolhido. Candidatos, em ordem do que verificaria primeiro:
+
+1. Chave: o seeder põe `(layer, eid, stacked_weight_key)`; o caminho union
+   busca por chave de projeção. Se divergirem, o hit é espúrio.
+2. `retain_hot(hot_pairs)` roda antes dos puts assíncronos no `_WARM_POOL` —
+   se o pool perder jobs (exceções são silenciadas com `continue`), o cache
+   fica com o que sobrou. `size=4464` diz que chegou, mas não diz *quais*.
+3. Ordem de chegada: os puts assíncronos não são ordenados por hotness, e o
+   cap por camada (95) pode truncar justamente os mais quentes.
+
+Próximo passo concreto: dump dos `(layer, eid)` realmente residentes no fim do
+decode e comparar com o top-31 do seeder. É uma instrumentação pequena e
+responde em uma run — e não depende da máquina estar folgada, ao contrário dos
+A/Bs de vazão.
+
+**Ressalva, para não supervalorizar o 0,637:** mesmo o seed+LRU cheio não
+converte linearmente em tok/s. O experimento de write-back subiu o hit rate
+para 0,226 e a vazão caiu 3,4% com disco +16%: um hit no LRU de user-space
+ainda paga a promoção numpy→MLX e a entrada é uma view de mmap que pode não
+estar residente. O 0,637 é teto de *bytes evitados*, não de tempo.
