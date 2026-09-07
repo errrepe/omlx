@@ -960,6 +960,7 @@ private struct AdvancedTab: View {
                                 Text("Default (LRU)").tag("")
                                 Text("LRU").tag("lru")
                                 Text("S3-FIFO").tag("s3fifo")
+                                Text("Route frequency").tag("route_frequency")
                             }.pickerStyle(.menu).frame(width: 140)
                         }
                         Row(label: String(localized: "settings.advanced.expert_streaming.dynamic.label",

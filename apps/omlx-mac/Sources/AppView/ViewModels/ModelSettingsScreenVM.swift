@@ -800,10 +800,10 @@ final class ModelSettingsScreenVM {
             let policy = expertStreamingCachePolicy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if policy.isEmpty {
                 patch.expertStreamingCachePolicy = nil
-            } else if policy == "lru" || policy == "s3fifo" {
+            } else if policy == "lru" || policy == "s3fifo" || policy == "route_frequency" {
                 patch.expertStreamingCachePolicy = policy
             } else {
-                lastError = "Cache policy must be lru or s3fifo"
+                lastError = "Cache policy must be lru, s3fifo or route_frequency"
                 return
             }
         case .expertStreamingDynamic:

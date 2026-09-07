@@ -1158,7 +1158,7 @@
   "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1。コールド層と学習済み pin プロファイルがある場合、各レイヤーの使用頻度が高いこの割合のエキスパートは元の 4-bit を維持し、残りはコールド層から読み込みます。空/0 = 均一層。",
   "modal.model_settings.expert_streaming_cache_policy": "エキスパートキャッシュ方式",
   "modal.model_settings.expert_streaming_cache_policy_default": "デフォルト（LRU）",
-  "modal.model_settings.expert_streaming_cache_policy_hint": "常駐エキスパートの追い出し方式。LRUは実測済みのデフォルト。S3-FIFOはスキャンに強い（実トレースでは互角）。",
+  "modal.model_settings.expert_streaming_cache_policy_hint": "常駐エキスパートの追い出し方式。LRUは実測済みのデフォルト。S3-FIFOはスキャンに強い（実トレースでは互角）。route frequencyは最も多くルーティングされたエキスパートを保持（実験的）。",
   "modal.model_settings.expert_streaming_dynamic": "エキスパート常駐の動的調整（ガバナー）",
   "modal.model_settings.expert_streaming_dynamic_hint": "空きメモリに応じてエキスパートキャッシュを自動リサイズ。余裕があれば拡大、圧迫時は縮小。キャッシュ予算 0 超が必要。",
   "modal.model_settings.expert_streaming_dynamic_max": "ガバナー上限（GiB）",

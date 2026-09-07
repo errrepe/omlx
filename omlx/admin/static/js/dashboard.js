@@ -8363,7 +8363,7 @@
                                 expert_streaming_hot_fraction: (this.modelSettings.expert_streaming_hot_fraction != null && Number(this.modelSettings.expert_streaming_hot_fraction) > 0)
                                     ? Math.min(1, Number(this.modelSettings.expert_streaming_hot_fraction))
                                     : null,
-                                expert_streaming_cache_policy: (this.modelSettings.expert_streaming_cache_policy === 'lru' || this.modelSettings.expert_streaming_cache_policy === 's3fifo')
+                                expert_streaming_cache_policy: (['lru', 's3fifo', 'route_frequency'].indexOf(this.modelSettings.expert_streaming_cache_policy) >= 0)
                                     ? this.modelSettings.expert_streaming_cache_policy
                                     : null,
                                 expert_streaming_dynamic: (this.modelSettings.expert_streaming_dynamic === true)

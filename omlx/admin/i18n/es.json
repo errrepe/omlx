@@ -1158,7 +1158,7 @@
   "modal.model_settings.expert_streaming_hot_fraction_hint": "0–1. Con un nivel frío y un perfil de pins aprendido, esta fracción de los expertos más usados por capa conserva el 4-bit original; el resto lee el nivel frío. Vacío/0 = nivel uniforme.",
   "modal.model_settings.expert_streaming_cache_policy": "Política de caché de expertos",
   "modal.model_settings.expert_streaming_cache_policy_default": "Predeterminado (LRU)",
-  "modal.model_settings.expert_streaming_cache_policy_hint": "Política de expulsión para expertos residentes. LRU es el valor probado por defecto; S3-FIFO resiste escaneos (empate en trazas reales).",
+  "modal.model_settings.expert_streaming_cache_policy_hint": "Política de expulsión para expertos residentes. LRU es el valor probado por defecto; S3-FIFO resiste escaneos (empate en trazas reales); route frequency conserva los más enrutados (experimental).",
   "modal.model_settings.expert_streaming_dynamic": "Residencia dinámica de expertos (gobernador)",
   "modal.model_settings.expert_streaming_dynamic_hint": "Deja que oMLX redimensione la caché de expertos según la memoria libre: crece con holgura, se reduce bajo presión. Requiere presupuesto de caché > 0.",
   "modal.model_settings.expert_streaming_dynamic_max": "Máx. del gobernador (GiB)",
