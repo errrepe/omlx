@@ -911,6 +911,15 @@ async def run(
             # layer pinned at the seed count with 0 evictions).
             "puts": cache.stats.puts,
             "retain_evicted": cache.stats.retain_evicted,
+            # Demand-scoped: hit_rate above counts every get (prefill + the
+            # rolling double split), which diluted it 2.3x below the decode
+            # truth and misled the 0.637-vs-0.062 comparison. Compare offline
+            # predictions against decode_hit_rate, not hit_rate.
+            "decode_hits": cache.stats.decode_hits,
+            "decode_misses": cache.stats.decode_misses,
+            "decode_hit_rate": cache.stats.decode_hit_rate(),
+            "prefill_hits": cache.stats.prefill_hits,
+            "prefill_misses": cache.stats.prefill_misses,
             "admission_drops": int(getattr(cache, "admission_drops", 0) or 0),
             "per_layer_cap": int(getattr(cache, "_per_layer_cap", 0) or 0),
             "per_layer_counts": {

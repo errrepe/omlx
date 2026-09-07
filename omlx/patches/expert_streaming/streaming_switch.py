@@ -844,10 +844,26 @@ class CacheStats:
     # demand) — the signature this counters were added to expose.
     puts: int = 0
     retain_evicted: int = 0
+    # Demand-scoped counters. `hits`/`misses` count EVERY cache.get(), which
+    # includes prefill lookups and the rolling path's prefetch+ensure double
+    # split — a denominator 2.3x the decode demand. That dilution made the e2e
+    # hit_rate read 0.062 when the decode-only truth was 0.149, and it misled
+    # two separate investigations before being measured (see
+    # bench/results/ubc_budget/SUMMARY.md sections 4.1 and 7). These count
+    # exactly once per projection, at the authoritative resolve boundary
+    # (_ensure_union loop / _ensure_rolling), split by call shape.
+    decode_hits: int = 0
+    decode_misses: int = 0
+    prefill_hits: int = 0
+    prefill_misses: int = 0
 
     def hit_rate(self) -> float:
         tot = self.hits + self.misses
         return self.hits / tot if tot else 0.0
+
+    def decode_hit_rate(self) -> float:
+        tot = self.decode_hits + self.decode_misses
+        return self.decode_hits / tot if tot else 0.0
 
 
 class ExpertLRUCache:
@@ -1496,7 +1512,11 @@ class _LayerLoadContext:
     """
 
     def __init__(
-        self, linears: list[Any], cache: ExpertLRUCache, mode: str | None = None
+        self,
+        linears: list[Any],
+        cache: ExpertLRUCache,
+        mode: str | None = None,
+        positions: int | None = None,
     ):
         # Fase 1: the GLU picks the mode per call (union for decode-shaped,
         # rolling for prefill); OMLX_EXPERT_STREAMING_CTX_ROLLING=0 remains
@@ -1504,6 +1524,11 @@ class _LayerLoadContext:
         self.mode = mode or ("union" if not _CTX_ROLLING_ENV else "rolling")
         self.linears = linears
         self.cache = cache
+        # Call shape from the constructor site (indices.size), NOT inferred
+        # from mode: the env kill switch can force union onto prefill calls.
+        # Drives the demand-scoped cache counters; None (legacy/test callers)
+        # simply does not count.
+        self.positions = None if positions is None else int(positions)
         self.bundles: dict[int, dict[int, tuple]] = {}
         self.hits: dict[int, int] = {}
         self.misses: dict[int, int] = {}
@@ -1545,6 +1570,25 @@ class _LayerLoadContext:
             else:
                 cached[eid] = value
         return cached, missing
+
+    def _count_demand(self, n_cached: int, n_missing: int) -> None:
+        """Record one projection's resolve at the authoritative boundary.
+
+        Called exactly once per projection per layer-call (the _ensure_union
+        loop and _ensure_rolling) — never from _prefetch, whose split is
+        recomputed at await time and would double-count. Mirrors
+        _layer_ctx_mode's shape test so the decode bucket matches what the
+        hybrid actually routed through union. No shape info -> not counted.
+        """
+        if self.positions is None:
+            return
+        st = self.cache.stats
+        if _DECODE_UNION_MAX_ROWS > 0 and self.positions <= _DECODE_UNION_MAX_ROWS:
+            st.decode_hits += n_cached
+            st.decode_misses += n_missing
+        else:
+            st.prefill_hits += n_cached
+            st.prefill_misses += n_missing
 
     @staticmethod
     def _pool_for(linear: Any, positions: int = 0):
@@ -1627,6 +1671,7 @@ class _LayerLoadContext:
         self.bundles[lid] = cached
         self.hits[lid] = len(cached)
         self.misses[lid] = len(missing)
+        self._count_demand(len(cached), len(missing))
         bank_bytes = int(linear._tier_bank_bytes_for(missing))
 
         if missing:
@@ -1709,6 +1754,7 @@ class _LayerLoadContext:
             self.bundles[id(proj)] = cached
             self.hits[id(proj)] = len(cached)
             self.misses[id(proj)] = len(missing)
+            self._count_demand(len(cached), len(missing))
             if missing:
                 jobs.append((proj, missing))
         if not jobs:
@@ -3463,7 +3509,8 @@ class StreamingSwitchGLU(nn.Module):
                     barrier=_LAYER_BARRIER_ENV,
                 )
                 plan.ctx = _LayerLoadContext(
-                    projections, self._cache, mode=ctx_mode
+                    projections, self._cache, mode=ctx_mode,
+                    positions=int(indices.size),
                 )
             else:
                 # Fase L1: no bank reader on every projection (dict-backed

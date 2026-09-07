@@ -254,3 +254,27 @@ write-back preenche 4 GiB com uma cópia do que o page cache já serve.
 converte linearmente em tok/s. Um hit no LRU de user-space ainda paga a
 promoção numpy→MLX e a entrada é uma view de mmap que pode não estar residente.
 O 0,637 é teto de *bytes evitados*, não de tempo.
+
+## 8. A métrica consertada: `decode_hit_rate` (validado in vivo)
+
+A causa-raiz da confusão era o `hit_rate` e2e — ele conta **todo** `get()`,
+incluindo prefill e o split duplicado do caminho rolling (prefetch + await).
+Adicionados contadores no ponto autoritativo (`_ensure_union` / `_ensure_rolling`,
+nunca no `_prefetch`): `CacheStats.decode_hits/decode_misses/prefill_hits/
+prefill_misses` + `decode_hit_rate()`, expostos no bench.
+
+Validação in vivo (budget 4, 2k/96, mesma configuração da seção 7):
+
+```
+hit_rate        0,0629   (metrica antiga, diluida)
+decode_hit_rate 0,1425   <- bate com o replay offline (0,1488 na run anterior)
+prefill_hits    0        (o seed dispara no fim do prefill: coerente)
+decode lookups  19.909 + 119.771 = 139.680 = 46.560 x 3  (exato)
+prefill lookups 0 + 89.853 = 89.853 = 29.951 x 3         (exato)
+```
+
+Os ~87k de lookups que sobravam no denominador antigo eram o re-split do
+rolling — os contadores novos os excluem por construção.
+
+**Regra daqui pra frente:** comparar predição offline com `decode_hit_rate`,
+nunca com `hit_rate`.

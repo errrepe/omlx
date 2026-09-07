@@ -816,6 +816,83 @@ def test_layer_context_rolling_union_equivalence():
         assert lin_bundles == {2: 2.0, 5: 5.0, 7: 7.0}
 
 
+def test_layer_context_demand_scoped_cache_counters():
+    """CacheStats.decode_* / prefill_* count once per projection at the
+    authoritative resolve boundary.
+
+    The raw hits/misses pair counts every cache.get(), which the rolling
+    path's prefetch+await double split and the prefill lookups inflate to
+    ~2.3x the decode demand — the dilution that made the e2e hit_rate read
+    0.062 when the decode-only truth was 0.149 and misled the
+    0.637-vs-0.062 comparison (bench/results/ubc_budget/SUMMARY.md 4.1/7).
+    """
+    import numpy as np
+
+    from omlx.patches.expert_streaming.streaming_switch import (
+        _DECODE_UNION_MAX_ROWS,
+        _LayerLoadContext,
+        ExpertLRUCache,
+    )
+
+    if _DECODE_UNION_MAX_ROWS < 8:
+        pytest.skip("decode-union window too small for the fixture positions")
+
+    class _FakeLinear:
+        def __init__(self, layer_idx, name):
+            self.layer_idx = layer_idx
+            self.proj_name = name
+            self._io_pool_override = None
+
+        def bundle_key(self, eid):
+            return (self.layer_idx, int(eid), self.proj_name)
+
+        def _tier_bank_bytes_for(self, ids):
+            return len(ids) * 16
+
+        def _load_expert_bank_np(self, ids):
+            return [(np.full((4,), float(e), dtype=np.float32), None, None) for e in ids]
+
+        def _load_expert_bank_np_full(self, ids):
+            rows = self._load_expert_bank_np(ids)
+            return ([(list(ids), [np.empty((len(ids), 16), dtype=np.uint8)])], rows)
+
+    cache = ExpertLRUCache(1 << 20, 4096, num_layers=1)
+    lins = [_FakeLinear(0, f"p{i}") for i in range(3)]
+    # Seed expert 2 in every projection -> exactly one hit per resolve.
+    for lin in lins:
+        cache.put(lin.bundle_key(2), (np.zeros(4, dtype=np.float32), None, None))
+
+    # Decode-shaped call (positions inside the union window).
+    ctx = _LayerLoadContext(lins, cache, mode="union", positions=8)
+    for lin in lins:
+        ctx.ensure(lin, [2, 5, 7])
+    assert cache.stats.decode_hits == 3
+    assert cache.stats.decode_misses == 6
+    assert cache.stats.prefill_hits == 0
+    assert cache.stats.prefill_misses == 0
+    assert abs(cache.stats.decode_hit_rate() - 3 / 9) < 1e-12
+
+    # Prefill-shaped call lands in the other bucket, decode untouched.
+    ctx2 = _LayerLoadContext(lins, cache, mode="rolling", positions=4096)
+    for lin in lins:
+        ctx2.ensure(lin, [2, 5, 7])
+    assert cache.stats.prefill_hits == 3
+    assert cache.stats.prefill_misses == 6
+    assert cache.stats.decode_hits == 3
+    assert cache.stats.decode_misses == 6
+
+    # Legacy callers without positions do not count at all.
+    ctx3 = _LayerLoadContext(lins, cache, mode="union")
+    for lin in lins:
+        ctx3.ensure(lin, [2, 5, 7])
+    assert cache.stats.decode_hits == 3
+    assert cache.stats.prefill_hits == 3
+
+    # The raw counters, by contrast, keep counting every get() — including
+    # the re-split at await time — which is exactly the dilution above.
+    assert cache.stats.hits > cache.stats.decode_hits + cache.stats.prefill_hits
+
+
 def test_layer_context_union_writes_back_to_cache(monkeypatch):
     """Fase M4: union resolution can ADMIT what it reads (opt-in).
 
