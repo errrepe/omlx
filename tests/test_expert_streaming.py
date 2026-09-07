@@ -816,6 +816,114 @@ def test_layer_context_rolling_union_equivalence():
         assert lin_bundles == {2: 2.0, 5: 5.0, 7: 7.0}
 
 
+def test_layer_context_union_writes_back_to_cache(monkeypatch):
+    """Fase M4: union resolution can ADMIT what it reads (opt-in).
+
+    Union is the decode read path. `_split` *reads* the cache but only the
+    hotness seeder ever wrote to it — measured e2e: puts == size (4464),
+    evictions 0, decode re-read its whole demand set every step (hit rate
+    6.2%). Write-back fixes that, but measured -28% decode throughput
+    (2.867 -> 2.068 tok/s) from ~1.4 GB/s of ~1 MB malloc/free, so it ships
+    OFF by default behind OMLX_EXPERT_STREAMING_CTX_WRITEBACK=1.
+    """
+    import numpy as np
+
+    from omlx.patches.expert_streaming import streaming_switch as _sw
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        _LayerLoadContext,
+    )
+
+    class _FakeLinear:
+        def __init__(self, layer_idx, name, reads):
+            self.layer_idx = layer_idx
+            self.proj_name = name
+            self._io_pool_override = None
+            self.reads = reads
+
+        def bundle_key(self, eid):
+            return (self.layer_idx, int(eid), self.proj_name)
+
+        def _tier_bank_bytes_for(self, ids):
+            return len(ids) * 16
+
+        def _load_expert_bank_np(self, ids):
+            self.reads[0] += 1
+            return [(np.full((4,), float(e), dtype=np.float32), None, None) for e in ids]
+
+        def _load_expert_bank_np_full(self, ids):
+            rows = self._load_expert_bank_np(ids)
+            return ([(list(ids), [np.empty((len(ids), 16), dtype=np.uint8)])], rows)
+
+    reads = [0]
+    cache = ExpertLRUCache(1 << 20, 4096, num_layers=1)
+    lins = [_FakeLinear(0, f"p{i}", reads) for i in range(3)]
+
+    # OFF by default: the read set is served but never retained.
+    _ctx1 = _LayerLoadContext(lins, cache, mode="union")
+    for lin in lins:
+        _ctx1.ensure(lin, [2, 5, 7])
+    assert cache.size == 0
+
+    monkeypatch.setattr(_sw, "_CTX_WRITEBACK_ENV", True)
+    reads[0] = 0  # the default-off pass above already read the set once
+    ctx1 = _LayerLoadContext(lins, cache, mode="union")
+    for lin in lins:
+        ctx1.ensure(lin, [2, 5, 7])
+    assert sum(ctx1.hits.values()) == 0
+    assert sum(ctx1.misses.values()) == 9
+    assert reads[0] == 3  # one bank read per projection
+    # The whole point: the read set is now resident, keyed by bundle_key.
+    assert cache.size == 9
+    for lin in lins:
+        for eid in (2, 5, 7):
+            assert cache.get(lin.bundle_key(eid)) is not None
+
+    # A second decode step over the same demand set must not hit the disk.
+    ctx2 = _LayerLoadContext(lins, cache, mode="union")
+    for lin in lins:
+        ctx2.ensure(lin, [2, 5, 7])
+    assert sum(ctx2.hits.values()) == 9
+    assert sum(ctx2.misses.values()) == 0
+    assert reads[0] == 3
+
+
+def test_expert_lru_per_layer_index_stays_consistent():
+    """Fase M4: the per-layer LRU index mirrors the store so victim selection
+    stays O(1) (it was a full-store scan: 122 us/put, 135 ms per decode token
+    at capacity 4565) and per-layer caps hold under churn."""
+    from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
+
+    cache = ExpertLRUCache(4096 * 12, 4096, num_layers=2)  # cap 12, 6 per layer
+    for eid in range(6):
+        cache.put((0, eid, "w"), eid + 1)
+        cache.put((1, eid, "w"), eid + 1)
+    assert (cache.capacity, cache._per_layer_cap) == (12, 6)
+    assert cache.size == 12
+    assert sum(len(o) for o in cache._layer_orders.values()) == cache.size
+    assert len(cache._layer_orders[0]) == cache._layer_counts[0] == 6
+
+    # Touching (0, 0) makes it the newest of layer 0, so the next insert into
+    # layer 0 must evict (0, 1) — the true LRU victim, not an arbitrary one.
+    assert cache.get((0, 0, "w")) == 1
+    cache.put((0, 99, "w"), 100)
+    assert (0, 1, "w") not in cache
+    assert (0, 0, "w") in cache
+    assert (0, 99, "w") in cache
+    assert cache._layer_counts[0] == 6
+    assert sum(len(o) for o in cache._layer_orders.values()) == cache.size
+
+    # retain_hot rebuilds the index from whatever survived.
+    cache.retain_hot({(0, 0), (1, 5)})
+    assert cache.size == 2
+    assert sum(len(o) for o in cache._layer_orders.values()) == 2
+    assert list(cache._layer_orders[0]) == [(0, 0, "w")]
+
+    # clear drops it too.
+    cache.clear()
+    assert cache._layer_orders == {}
+
+
 def test_transition_profile_round_trip_with_fingerprint(tmp_path=None):
     """Transition payload survives save/load; mismatch is ignored."""
     import json
@@ -959,6 +1067,113 @@ def test_s3fifo_cache_equivalence_and_scan_resistance():
     s3_hot = sum(1 for eid in range(3) if s3.get((0, eid, "w")) is not None)
     assert s3_hot == 3
     assert lru_hot < 3
+
+
+def test_route_frequency_cache_interface_and_reuse_signal():
+    """Trilha A: route-frequency eviction honors the ExpertLRUCache contract."""
+    from omlx.patches.expert_streaming.streaming_switch import (
+        RouteFrequencyCache,
+        make_expert_cache,
+    )
+
+    assert make_expert_cache(1 << 20, 4096, num_layers=1).policy == "lru"
+    rf = make_expert_cache(10 * 4096, 4096, num_layers=1, policy="route_frequency")
+    assert isinstance(rf, RouteFrequencyCache)
+    assert rf.policy == "route_frequency"
+    # Unknown policy keeps LRU (never a silent typo -> new cache class).
+    assert make_expert_cache(1 << 20, 4096, policy="arc").policy == "lru"
+
+    # Interface parity with the other policies.
+    rf = RouteFrequencyCache(10 * 4096, 4096, num_layers=1)
+    for eid in range(5):
+        rf.put((0, eid, "w"), ("w", "s", None))
+        assert rf.get((0, eid, "w")) is not None
+    assert rf.size == 5
+    assert (0, 0, "w") in rf
+    assert rf.get((0, 99, "w")) is None
+    assert rf.stats.hits == 5 and rf.stats.misses == 1
+    assert rf.retain_hot({(0, 0)}) == 4
+    assert rf.size == 1
+    # retain_hot must not leave counters for entries it evicted.
+    assert set(rf.frequency_snapshot()) == {(0, 0, "w")}
+    rf.clear()
+    assert rf.size == 0 and rf.frequency_snapshot() == {}
+
+    # frequency_snapshot is a copy, not a live view.
+    rf.put((0, 0, "w"), ("w", "s", None))
+    snap = rf.frequency_snapshot()
+    snap[(0, 0, "w")] = 999
+    assert rf.frequency_snapshot()[(0, 0, "w")] != 999
+
+    # Counted on misses too: a heavy hitter that fell out of the cache is
+    # still recognisable when it comes back (otherwise this degenerates
+    # into LRU, which is exactly the failure mode we are replacing).
+    rf2 = RouteFrequencyCache(2 * 4096, 4096, num_layers=1)
+    for _ in range(6):
+        rf2.get((0, 7, "w"))
+    assert rf2.frequency_snapshot()[(0, 7, "w")] == 6
+    assert (0, 7, "w") not in rf2
+
+    # The counter map is bounded by _freq_cap even under a pure-miss scan.
+    for eid in range(20000):
+        rf2.get((0, eid, "w"))
+    assert len(rf2._freq) <= rf2._freq_cap
+
+
+def test_route_frequency_decay_halves_and_drops_stale_keys():
+    """Aging: counters halve, non-resident keys are pruned."""
+    from omlx.patches.expert_streaming.streaming_switch import RouteFrequencyCache
+
+    rf = RouteFrequencyCache(4 * 4096, 4096, num_layers=1)
+    rf.put((0, 0, "w"), ("w", "s", None))
+    rf.put((0, 1, "w"), ("w", "s", None))
+    rf._freq[(0, 0, "w")] = 100
+    rf._freq[(0, 1, "w")] = 3
+    rf._freq[(0, 55, "w")] = 7  # routed but never resident
+    rf._decay_every = 1
+    rf._decay_if_needed()
+    assert rf._freq[(0, 0, "w")] == 50
+    assert rf._freq[(0, 1, "w")] == 1
+    assert (0, 55, "w") not in rf._freq
+    # A counter that reaches 0 is dropped instead of pinning the key.
+    rf._freq[(0, 1, "w")] = 1
+    rf._decay_if_needed()
+    assert (0, 1, "w") not in rf._freq
+
+
+def test_route_frequency_keeps_hot_under_scan_where_lru_loses():
+    """Trilha A: the reused set survives a one-hit scan larger than capacity."""
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        RouteFrequencyCache,
+    )
+
+    lru = ExpertLRUCache(5 * 4096, 4096, num_layers=1)
+    rf = RouteFrequencyCache(5 * 4096, 4096, num_layers=1)
+    for c in (lru, rf):
+        for eid in range(3):
+            c.put((0, eid, "w"), ("w", "s", None))
+            assert c.get((0, eid, "w")) is not None
+        for _rep in range(20):
+            for eid in range(3):
+                c.get((0, eid, "w"))
+    for eid in range(10, 20):
+        lru.put((0, eid, "w"), ("w", "s", None))
+        rf.put((0, eid, "w"), ("w", "s", None))
+    lru_hot = sum(1 for eid in range(3) if lru.get((0, eid, "w")) is not None)
+    rf_hot = sum(1 for eid in range(3) if rf.get((0, eid, "w")) is not None)
+    assert rf_hot == 3
+    assert lru_hot < 3
+
+
+def test_io_overrides_accept_route_frequency_policy():
+    """The per-model allowlist must let route_frequency through normalized."""
+    from omlx.patches.expert_streaming import _io_overrides
+
+    ov = _io_overrides(
+        ModelSettings(expert_streaming_cache_policy="Route_Frequency")
+    )
+    assert ov["expert_streaming_cache_policy"] == "route_frequency"
 
 
 def test_expert_streaming_summary_aggregates_counters():

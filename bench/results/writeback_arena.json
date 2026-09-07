@@ -1,0 +1,47 @@
+[
+  {
+    "arm": "baseline",
+    "tokens": 20,
+    "admitted": 0,
+    "size": 0,
+    "capacity": 4565,
+    "evictions": 0,
+    "accounted_gib": 0.0,
+    "retained_gib": 0.0,
+    "peak_retained_gib": 0.0,
+    "amplification": 0.0,
+    "wall_s": 0.20177166699431837,
+    "us_per_admission": 0.0,
+    "rss_max_gib": 0.0710906982421875
+  },
+  {
+    "arm": "views",
+    "tokens": 20,
+    "admitted": 28800,
+    "size": 4560,
+    "capacity": 4565,
+    "evictions": 24240,
+    "accounted_gib": 3.9954185485839844,
+    "retained_gib": 4.2057037353515625,
+    "peak_retained_gib": 4.2057037353515625,
+    "amplification": 1.0526315789473684,
+    "wall_s": 0.43139287500525825,
+    "us_per_admission": 14.978919271015911,
+    "rss_max_gib": 4.2829437255859375
+  },
+  {
+    "arm": "copies",
+    "tokens": 20,
+    "admitted": 28800,
+    "size": 4560,
+    "capacity": 4565,
+    "evictions": 24240,
+    "accounted_gib": 3.9954185485839844,
+    "retained_gib": 3.9954185485839844,
+    "peak_retained_gib": 3.9954185485839844,
+    "amplification": 1.0,
+    "wall_s": 0.7756282920017838,
+    "us_per_admission": 26.931537916728605,
+    "rss_max_gib": 4.6794586181640625
+  }
+]

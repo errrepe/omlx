@@ -1,0 +1,1774 @@
+{
+  "traces": {
+    "qwen": {
+      "model": "Qwen3.8-Flash-Next-JANG_4M",
+      "layers": 48,
+      "experts": 512,
+      "top_k": 10,
+      "hot_pool": 30
+    },
+    "glm": {
+      "model": "GLM-5.3-Flash-JANG-MTP",
+      "layers": 45,
+      "experts": 288,
+      "top_k": 8,
+      "hot_pool": 30
+    },
+    "dsv4": {
+      "model": "DeepSeek-V4-Flash-0731-JANG",
+      "layers": 43,
+      "experts": 256,
+      "top_k": 6,
+      "hot_pool": 30
+    }
+  },
+  "runs": [
+    {
+      "model": "qwen",
+      "cap": 8,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.3234,
+        "hot_hit_rate": 0.4034,
+        "hits": 39739,
+        "misses": 83141,
+        "evictions": 103719,
+        "replay_ms": 742.9,
+        "us_per_lookup": 6.046,
+        "size": 384,
+        "capacity": 384
+      },
+      "s3fifo": {
+        "hit_rate": 0.4445,
+        "hot_hit_rate": 0.5554,
+        "hits": 54620,
+        "misses": 68260,
+        "evictions": 84944,
+        "replay_ms": 215.1,
+        "us_per_lookup": 1.751,
+        "size": 384,
+        "capacity": 384
+      },
+      "route_frequency": {
+        "hit_rate": 0.3854,
+        "hot_hit_rate": 0.4811,
+        "hits": 47358,
+        "misses": 75522,
+        "evictions": 92278,
+        "replay_ms": 473.1,
+        "us_per_lookup": 3.85,
+        "size": 384,
+        "capacity": 384
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 8,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.3881,
+        "hot_hit_rate": 0.4844,
+        "hits": 47692,
+        "misses": 75188,
+        "evictions": 91732,
+        "replay_ms": 464.9,
+        "us_per_lookup": 3.783,
+        "size": 384,
+        "capacity": 384
+      },
+      "s3fifo": {
+        "hit_rate": 0.4509,
+        "hot_hit_rate": 0.5633,
+        "hits": 55411,
+        "misses": 67469,
+        "evictions": 84072,
+        "replay_ms": 213.8,
+        "us_per_lookup": 1.74,
+        "size": 384,
+        "capacity": 384
+      },
+      "lru": {
+        "hit_rate": 0.3252,
+        "hot_hit_rate": 0.4056,
+        "hits": 39964,
+        "misses": 82916,
+        "evictions": 103305,
+        "replay_ms": 736.8,
+        "us_per_lookup": 5.996,
+        "size": 384,
+        "capacity": 384
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 8,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.3255,
+        "hot_hit_rate": 0.4053,
+        "hits": 39997,
+        "misses": 82883,
+        "evictions": 103471,
+        "replay_ms": 718.6,
+        "us_per_lookup": 5.848,
+        "size": 384,
+        "capacity": 384
+      },
+      "s3fifo": {
+        "hit_rate": 0.4469,
+        "hot_hit_rate": 0.5577,
+        "hits": 54914,
+        "misses": 67966,
+        "evictions": 84547,
+        "replay_ms": 212.9,
+        "us_per_lookup": 1.732,
+        "size": 384,
+        "capacity": 384
+      },
+      "route_frequency": {
+        "hit_rate": 0.3871,
+        "hot_hit_rate": 0.4824,
+        "hits": 47568,
+        "misses": 75312,
+        "evictions": 91957,
+        "replay_ms": 468.9,
+        "us_per_lookup": 3.816,
+        "size": 384,
+        "capacity": 384
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 16,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.4975,
+        "hot_hit_rate": 0.6197,
+        "hits": 61133,
+        "misses": 61747,
+        "evictions": 76643,
+        "replay_ms": 1272.3,
+        "us_per_lookup": 10.354,
+        "size": 768,
+        "capacity": 768
+      },
+      "s3fifo": {
+        "hit_rate": 0.5749,
+        "hot_hit_rate": 0.7172,
+        "hits": 70638,
+        "misses": 52242,
+        "evictions": 63827,
+        "replay_ms": 178.3,
+        "us_per_lookup": 1.451,
+        "size": 768,
+        "capacity": 768
+      },
+      "route_frequency": {
+        "hit_rate": 0.5715,
+        "hot_hit_rate": 0.7129,
+        "hits": 70231,
+        "misses": 52649,
+        "evictions": 64232,
+        "replay_ms": 625.8,
+        "us_per_lookup": 5.093,
+        "size": 768,
+        "capacity": 768
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 16,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.5744,
+        "hot_hit_rate": 0.7163,
+        "hits": 70582,
+        "misses": 52298,
+        "evictions": 63882,
+        "replay_ms": 631.4,
+        "us_per_lookup": 5.138,
+        "size": 768,
+        "capacity": 768
+      },
+      "s3fifo": {
+        "hit_rate": 0.5809,
+        "hot_hit_rate": 0.7248,
+        "hits": 71384,
+        "misses": 51496,
+        "evictions": 63012,
+        "replay_ms": 178.8,
+        "us_per_lookup": 1.455,
+        "size": 768,
+        "capacity": 768
+      },
+      "lru": {
+        "hit_rate": 0.5018,
+        "hot_hit_rate": 0.6249,
+        "hits": 61659,
+        "misses": 61221,
+        "evictions": 75982,
+        "replay_ms": 1286.2,
+        "us_per_lookup": 10.467,
+        "size": 768,
+        "capacity": 768
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 16,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.5001,
+        "hot_hit_rate": 0.6219,
+        "hits": 61458,
+        "misses": 61422,
+        "evictions": 76352,
+        "replay_ms": 1347.9,
+        "us_per_lookup": 10.969,
+        "size": 768,
+        "capacity": 768
+      },
+      "s3fifo": {
+        "hit_rate": 0.5807,
+        "hot_hit_rate": 0.7235,
+        "hits": 71354,
+        "misses": 51526,
+        "evictions": 63202,
+        "replay_ms": 180.1,
+        "us_per_lookup": 1.466,
+        "size": 768,
+        "capacity": 768
+      },
+      "route_frequency": {
+        "hit_rate": 0.5741,
+        "hot_hit_rate": 0.715,
+        "hits": 70545,
+        "misses": 52335,
+        "evictions": 63994,
+        "replay_ms": 662.7,
+        "us_per_lookup": 5.393,
+        "size": 768,
+        "capacity": 768
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 31,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.6637,
+        "hot_hit_rate": 0.8234,
+        "hits": 81555,
+        "misses": 41325,
+        "evictions": 50611,
+        "replay_ms": 2071.8,
+        "us_per_lookup": 16.86,
+        "size": 1488,
+        "capacity": 1488
+      },
+      "s3fifo": {
+        "hit_rate": 0.6624,
+        "hot_hit_rate": 0.8223,
+        "hits": 81390,
+        "misses": 41490,
+        "evictions": 48696,
+        "replay_ms": 182.2,
+        "us_per_lookup": 1.482,
+        "size": 1488,
+        "capacity": 1488
+      },
+      "route_frequency": {
+        "hit_rate": 0.7204,
+        "hot_hit_rate": 0.8963,
+        "hits": 88526,
+        "misses": 34354,
+        "evictions": 41572,
+        "replay_ms": 1045.9,
+        "us_per_lookup": 8.511,
+        "size": 1488,
+        "capacity": 1488
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 31,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.7212,
+        "hot_hit_rate": 0.8972,
+        "hits": 88617,
+        "misses": 34263,
+        "evictions": 41363,
+        "replay_ms": 1057.1,
+        "us_per_lookup": 8.602,
+        "size": 1488,
+        "capacity": 1488
+      },
+      "s3fifo": {
+        "hit_rate": 0.6672,
+        "hot_hit_rate": 0.8282,
+        "hits": 81986,
+        "misses": 40894,
+        "evictions": 47987,
+        "replay_ms": 181.6,
+        "us_per_lookup": 1.478,
+        "size": 1488,
+        "capacity": 1488
+      },
+      "lru": {
+        "hit_rate": 0.6643,
+        "hot_hit_rate": 0.8246,
+        "hits": 81632,
+        "misses": 41248,
+        "evictions": 50455,
+        "replay_ms": 2109.6,
+        "us_per_lookup": 17.168,
+        "size": 1488,
+        "capacity": 1488
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 31,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.6645,
+        "hot_hit_rate": 0.8237,
+        "hits": 81652,
+        "misses": 41228,
+        "evictions": 50610,
+        "replay_ms": 2107.2,
+        "us_per_lookup": 17.149,
+        "size": 1488,
+        "capacity": 1488
+      },
+      "s3fifo": {
+        "hit_rate": 0.6665,
+        "hot_hit_rate": 0.8259,
+        "hits": 81898,
+        "misses": 40982,
+        "evictions": 48135,
+        "replay_ms": 182.1,
+        "us_per_lookup": 1.482,
+        "size": 1488,
+        "capacity": 1488
+      },
+      "route_frequency": {
+        "hit_rate": 0.7237,
+        "hot_hit_rate": 0.8987,
+        "hits": 88928,
+        "misses": 33952,
+        "evictions": 41125,
+        "replay_ms": 1062.5,
+        "us_per_lookup": 8.647,
+        "size": 1488,
+        "capacity": 1488
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 63,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.7835,
+        "hot_hit_rate": 0.9604,
+        "hits": 96279,
+        "misses": 26601,
+        "evictions": 31184,
+        "replay_ms": 3063.0,
+        "us_per_lookup": 24.927,
+        "size": 3024,
+        "capacity": 3024
+      },
+      "s3fifo": {
+        "hit_rate": 0.7532,
+        "hot_hit_rate": 0.9222,
+        "hits": 92555,
+        "misses": 30325,
+        "evictions": 34601,
+        "replay_ms": 528.1,
+        "us_per_lookup": 4.298,
+        "size": 3024,
+        "capacity": 3024
+      },
+      "route_frequency": {
+        "hit_rate": 0.7941,
+        "hot_hit_rate": 0.9747,
+        "hits": 97585,
+        "misses": 25295,
+        "evictions": 29571,
+        "replay_ms": 1294.3,
+        "us_per_lookup": 10.533,
+        "size": 3024,
+        "capacity": 3024
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 63,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.7929,
+        "hot_hit_rate": 0.9732,
+        "hits": 97427,
+        "misses": 25453,
+        "evictions": 29685,
+        "replay_ms": 1284.1,
+        "us_per_lookup": 10.45,
+        "size": 3024,
+        "capacity": 3024
+      },
+      "s3fifo": {
+        "hit_rate": 0.756,
+        "hot_hit_rate": 0.9252,
+        "hits": 92901,
+        "misses": 29979,
+        "evictions": 34210,
+        "replay_ms": 534.1,
+        "us_per_lookup": 4.346,
+        "size": 3024,
+        "capacity": 3024
+      },
+      "lru": {
+        "hit_rate": 0.7826,
+        "hot_hit_rate": 0.9593,
+        "hits": 96171,
+        "misses": 26709,
+        "evictions": 31254,
+        "replay_ms": 3078.8,
+        "us_per_lookup": 25.056,
+        "size": 3024,
+        "capacity": 3024
+      }
+    },
+    {
+      "model": "qwen",
+      "cap": 63,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.7839,
+        "hot_hit_rate": 0.9601,
+        "hits": 96327,
+        "misses": 26553,
+        "evictions": 31168,
+        "replay_ms": 3051.7,
+        "us_per_lookup": 24.835,
+        "size": 3024,
+        "capacity": 3024
+      },
+      "s3fifo": {
+        "hit_rate": 0.7556,
+        "hot_hit_rate": 0.9232,
+        "hits": 92854,
+        "misses": 30026,
+        "evictions": 34306,
+        "replay_ms": 528.7,
+        "us_per_lookup": 4.303,
+        "size": 3024,
+        "capacity": 3024
+      },
+      "route_frequency": {
+        "hit_rate": 0.7951,
+        "hot_hit_rate": 0.9743,
+        "hits": 97708,
+        "misses": 25172,
+        "evictions": 29454,
+        "replay_ms": 1271.1,
+        "us_per_lookup": 10.344,
+        "size": 3024,
+        "capacity": 3024
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 8,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.3231,
+        "hot_hit_rate": 0.4024,
+        "hits": 29773,
+        "misses": 62387,
+        "evictions": 77719,
+        "replay_ms": 522.0,
+        "us_per_lookup": 5.664,
+        "size": 360,
+        "capacity": 360
+      },
+      "s3fifo": {
+        "hit_rate": 0.4401,
+        "hot_hit_rate": 0.5501,
+        "hits": 40556,
+        "misses": 51604,
+        "evictions": 64138,
+        "replay_ms": 150.5,
+        "us_per_lookup": 1.633,
+        "size": 360,
+        "capacity": 360
+      },
+      "route_frequency": {
+        "hit_rate": 0.3833,
+        "hot_hit_rate": 0.4783,
+        "hits": 35328,
+        "misses": 56832,
+        "evictions": 69403,
+        "replay_ms": 288.7,
+        "us_per_lookup": 3.132,
+        "size": 360,
+        "capacity": 360
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 8,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.3883,
+        "hot_hit_rate": 0.4836,
+        "hits": 35790,
+        "misses": 56370,
+        "evictions": 68775,
+        "replay_ms": 294.8,
+        "us_per_lookup": 3.199,
+        "size": 360,
+        "capacity": 360
+      },
+      "s3fifo": {
+        "hit_rate": 0.4462,
+        "hot_hit_rate": 0.5567,
+        "hits": 41119,
+        "misses": 51041,
+        "evictions": 63580,
+        "replay_ms": 149.7,
+        "us_per_lookup": 1.624,
+        "size": 360,
+        "capacity": 360
+      },
+      "lru": {
+        "hit_rate": 0.3254,
+        "hot_hit_rate": 0.4046,
+        "hits": 29992,
+        "misses": 62168,
+        "evictions": 77400,
+        "replay_ms": 512.0,
+        "us_per_lookup": 5.556,
+        "size": 360,
+        "capacity": 360
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 8,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.326,
+        "hot_hit_rate": 0.4065,
+        "hits": 30048,
+        "misses": 62112,
+        "evictions": 77284,
+        "replay_ms": 512.6,
+        "us_per_lookup": 5.562,
+        "size": 360,
+        "capacity": 360
+      },
+      "s3fifo": {
+        "hit_rate": 0.4457,
+        "hot_hit_rate": 0.5574,
+        "hits": 41076,
+        "misses": 51084,
+        "evictions": 63426,
+        "replay_ms": 148.9,
+        "us_per_lookup": 1.615,
+        "size": 360,
+        "capacity": 360
+      },
+      "route_frequency": {
+        "hit_rate": 0.3873,
+        "hot_hit_rate": 0.4835,
+        "hits": 35694,
+        "misses": 56466,
+        "evictions": 68746,
+        "replay_ms": 290.5,
+        "us_per_lookup": 3.152,
+        "size": 360,
+        "capacity": 360
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 16,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.4999,
+        "hot_hit_rate": 0.621,
+        "hits": 46069,
+        "misses": 46091,
+        "evictions": 57161,
+        "replay_ms": 853.7,
+        "us_per_lookup": 9.263,
+        "size": 720,
+        "capacity": 720
+      },
+      "s3fifo": {
+        "hit_rate": 0.5603,
+        "hot_hit_rate": 0.6979,
+        "hits": 51640,
+        "misses": 40520,
+        "evictions": 49235,
+        "replay_ms": 131.1,
+        "us_per_lookup": 1.422,
+        "size": 720,
+        "capacity": 720
+      },
+      "route_frequency": {
+        "hit_rate": 0.5696,
+        "hot_hit_rate": 0.7094,
+        "hits": 52493,
+        "misses": 39667,
+        "evictions": 48372,
+        "replay_ms": 436.0,
+        "us_per_lookup": 4.731,
+        "size": 720,
+        "capacity": 720
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 16,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.5715,
+        "hot_hit_rate": 0.7107,
+        "hits": 52673,
+        "misses": 39487,
+        "evictions": 48179,
+        "replay_ms": 435.5,
+        "us_per_lookup": 4.725,
+        "size": 720,
+        "capacity": 720
+      },
+      "s3fifo": {
+        "hit_rate": 0.5686,
+        "hot_hit_rate": 0.707,
+        "hits": 52402,
+        "misses": 39758,
+        "evictions": 48461,
+        "replay_ms": 129.1,
+        "us_per_lookup": 1.4,
+        "size": 720,
+        "capacity": 720
+      },
+      "lru": {
+        "hit_rate": 0.5021,
+        "hot_hit_rate": 0.6228,
+        "hits": 46275,
+        "misses": 45885,
+        "evictions": 56950,
+        "replay_ms": 865.7,
+        "us_per_lookup": 9.393,
+        "size": 720,
+        "capacity": 720
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 16,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.5018,
+        "hot_hit_rate": 0.6241,
+        "hits": 46244,
+        "misses": 45916,
+        "evictions": 56778,
+        "replay_ms": 859.2,
+        "us_per_lookup": 9.323,
+        "size": 720,
+        "capacity": 720
+      },
+      "s3fifo": {
+        "hit_rate": 0.5634,
+        "hot_hit_rate": 0.7024,
+        "hits": 51921,
+        "misses": 40239,
+        "evictions": 48881,
+        "replay_ms": 130.6,
+        "us_per_lookup": 1.417,
+        "size": 720,
+        "capacity": 720
+      },
+      "route_frequency": {
+        "hit_rate": 0.5731,
+        "hot_hit_rate": 0.7146,
+        "hits": 52818,
+        "misses": 39342,
+        "evictions": 47971,
+        "replay_ms": 434.5,
+        "us_per_lookup": 4.714,
+        "size": 720,
+        "capacity": 720
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 31,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.6676,
+        "hot_hit_rate": 0.8241,
+        "hits": 61524,
+        "misses": 30636,
+        "evictions": 37339,
+        "replay_ms": 1342.7,
+        "us_per_lookup": 14.569,
+        "size": 1395,
+        "capacity": 1395
+      },
+      "s3fifo": {
+        "hit_rate": 0.65,
+        "hot_hit_rate": 0.8019,
+        "hits": 59906,
+        "misses": 32254,
+        "evictions": 37610,
+        "replay_ms": 129.4,
+        "us_per_lookup": 1.404,
+        "size": 1395,
+        "capacity": 1395
+      },
+      "route_frequency": {
+        "hit_rate": 0.7136,
+        "hot_hit_rate": 0.8838,
+        "hits": 65766,
+        "misses": 26394,
+        "evictions": 31753,
+        "replay_ms": 752.3,
+        "us_per_lookup": 8.163,
+        "size": 1395,
+        "capacity": 1395
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 31,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.715,
+        "hot_hit_rate": 0.8846,
+        "hits": 65890,
+        "misses": 26270,
+        "evictions": 31659,
+        "replay_ms": 758.6,
+        "us_per_lookup": 8.232,
+        "size": 1395,
+        "capacity": 1395
+      },
+      "s3fifo": {
+        "hit_rate": 0.6583,
+        "hot_hit_rate": 0.811,
+        "hits": 60666,
+        "misses": 31494,
+        "evictions": 36874,
+        "replay_ms": 129.5,
+        "us_per_lookup": 1.406,
+        "size": 1395,
+        "capacity": 1395
+      },
+      "lru": {
+        "hit_rate": 0.6695,
+        "hot_hit_rate": 0.8247,
+        "hits": 61700,
+        "misses": 30460,
+        "evictions": 37069,
+        "replay_ms": 1333.8,
+        "us_per_lookup": 14.473,
+        "size": 1395,
+        "capacity": 1395
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 31,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.6659,
+        "hot_hit_rate": 0.8231,
+        "hits": 61368,
+        "misses": 30792,
+        "evictions": 37430,
+        "replay_ms": 1357.3,
+        "us_per_lookup": 14.727,
+        "size": 1395,
+        "capacity": 1395
+      },
+      "s3fifo": {
+        "hit_rate": 0.6506,
+        "hot_hit_rate": 0.8037,
+        "hits": 59955,
+        "misses": 32205,
+        "evictions": 37494,
+        "replay_ms": 129.3,
+        "us_per_lookup": 1.403,
+        "size": 1395,
+        "capacity": 1395
+      },
+      "route_frequency": {
+        "hit_rate": 0.7126,
+        "hot_hit_rate": 0.8841,
+        "hits": 65672,
+        "misses": 26488,
+        "evictions": 31792,
+        "replay_ms": 772.0,
+        "us_per_lookup": 8.376,
+        "size": 1395,
+        "capacity": 1395
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 63,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.7944,
+        "hot_hit_rate": 0.959,
+        "hits": 73215,
+        "misses": 18945,
+        "evictions": 21733,
+        "replay_ms": 2046.8,
+        "us_per_lookup": 22.209,
+        "size": 2835,
+        "capacity": 2835
+      },
+      "s3fifo": {
+        "hit_rate": 0.7487,
+        "hot_hit_rate": 0.898,
+        "hits": 69000,
+        "misses": 23160,
+        "evictions": 25833,
+        "replay_ms": 295.7,
+        "us_per_lookup": 3.209,
+        "size": 2835,
+        "capacity": 2835
+      },
+      "route_frequency": {
+        "hit_rate": 0.8004,
+        "hot_hit_rate": 0.9671,
+        "hits": 73769,
+        "misses": 18391,
+        "evictions": 21064,
+        "replay_ms": 899.0,
+        "us_per_lookup": 9.755,
+        "size": 2835,
+        "capacity": 2835
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 63,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.8017,
+        "hot_hit_rate": 0.9678,
+        "hits": 73888,
+        "misses": 18272,
+        "evictions": 20934,
+        "replay_ms": 902.9,
+        "us_per_lookup": 9.797,
+        "size": 2835,
+        "capacity": 2835
+      },
+      "s3fifo": {
+        "hit_rate": 0.7529,
+        "hot_hit_rate": 0.9035,
+        "hits": 69391,
+        "misses": 22769,
+        "evictions": 25431,
+        "replay_ms": 300.7,
+        "us_per_lookup": 3.263,
+        "size": 2835,
+        "capacity": 2835
+      },
+      "lru": {
+        "hit_rate": 0.7958,
+        "hot_hit_rate": 0.9595,
+        "hits": 73341,
+        "misses": 18819,
+        "evictions": 21606,
+        "replay_ms": 1959.8,
+        "us_per_lookup": 21.265,
+        "size": 2835,
+        "capacity": 2835
+      }
+    },
+    {
+      "model": "glm",
+      "cap": 63,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.7937,
+        "hot_hit_rate": 0.9586,
+        "hits": 73143,
+        "misses": 19017,
+        "evictions": 21780,
+        "replay_ms": 1959.3,
+        "us_per_lookup": 21.26,
+        "size": 2835,
+        "capacity": 2835
+      },
+      "s3fifo": {
+        "hit_rate": 0.7497,
+        "hot_hit_rate": 0.8999,
+        "hits": 69088,
+        "misses": 23072,
+        "evictions": 25690,
+        "replay_ms": 284.9,
+        "us_per_lookup": 3.092,
+        "size": 2835,
+        "capacity": 2835
+      },
+      "route_frequency": {
+        "hit_rate": 0.7999,
+        "hot_hit_rate": 0.9674,
+        "hits": 73719,
+        "misses": 18441,
+        "evictions": 21059,
+        "replay_ms": 907.9,
+        "us_per_lookup": 9.852,
+        "size": 2835,
+        "capacity": 2835
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 8,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.3247,
+        "hot_hit_rate": 0.4036,
+        "hits": 21444,
+        "misses": 44604,
+        "evictions": 55458,
+        "replay_ms": 370.8,
+        "us_per_lookup": 5.615,
+        "size": 344,
+        "capacity": 344
+      },
+      "s3fifo": {
+        "hit_rate": 0.4387,
+        "hot_hit_rate": 0.5471,
+        "hits": 28974,
+        "misses": 37074,
+        "evictions": 45990,
+        "replay_ms": 102.3,
+        "us_per_lookup": 1.549,
+        "size": 344,
+        "capacity": 344
+      },
+      "route_frequency": {
+        "hit_rate": 0.3858,
+        "hot_hit_rate": 0.4803,
+        "hits": 25479,
+        "misses": 40569,
+        "evictions": 49501,
+        "replay_ms": 193.7,
+        "us_per_lookup": 2.932,
+        "size": 344,
+        "capacity": 344
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 8,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.3857,
+        "hot_hit_rate": 0.4799,
+        "hits": 25477,
+        "misses": 40571,
+        "evictions": 49594,
+        "replay_ms": 194.2,
+        "us_per_lookup": 2.941,
+        "size": 344,
+        "capacity": 344
+      },
+      "s3fifo": {
+        "hit_rate": 0.4417,
+        "hot_hit_rate": 0.5504,
+        "hits": 29172,
+        "misses": 36876,
+        "evictions": 45745,
+        "replay_ms": 103.1,
+        "us_per_lookup": 1.561,
+        "size": 344,
+        "capacity": 344
+      },
+      "lru": {
+        "hit_rate": 0.3258,
+        "hot_hit_rate": 0.4046,
+        "hits": 21517,
+        "misses": 44531,
+        "evictions": 55355,
+        "replay_ms": 367.3,
+        "us_per_lookup": 5.561,
+        "size": 344,
+        "capacity": 344
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 8,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.3227,
+        "hot_hit_rate": 0.4013,
+        "hits": 21314,
+        "misses": 44734,
+        "evictions": 55652,
+        "replay_ms": 367.0,
+        "us_per_lookup": 5.556,
+        "size": 344,
+        "capacity": 344
+      },
+      "s3fifo": {
+        "hit_rate": 0.4375,
+        "hot_hit_rate": 0.5458,
+        "hits": 28894,
+        "misses": 37154,
+        "evictions": 46109,
+        "replay_ms": 103.9,
+        "us_per_lookup": 1.573,
+        "size": 344,
+        "capacity": 344
+      },
+      "route_frequency": {
+        "hit_rate": 0.3829,
+        "hot_hit_rate": 0.4769,
+        "hits": 25287,
+        "misses": 40761,
+        "evictions": 49753,
+        "replay_ms": 191.8,
+        "us_per_lookup": 2.904,
+        "size": 344,
+        "capacity": 344
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 16,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.501,
+        "hot_hit_rate": 0.6213,
+        "hits": 33088,
+        "misses": 32960,
+        "evictions": 40665,
+        "replay_ms": 554.2,
+        "us_per_lookup": 8.391,
+        "size": 688,
+        "capacity": 688
+      },
+      "s3fifo": {
+        "hit_rate": 0.5525,
+        "hot_hit_rate": 0.6861,
+        "hits": 36492,
+        "misses": 29556,
+        "evictions": 35821,
+        "replay_ms": 90.1,
+        "us_per_lookup": 1.365,
+        "size": 688,
+        "capacity": 688
+      },
+      "route_frequency": {
+        "hit_rate": 0.5675,
+        "hot_hit_rate": 0.7056,
+        "hits": 37483,
+        "misses": 28565,
+        "evictions": 34846,
+        "replay_ms": 293.6,
+        "us_per_lookup": 4.445,
+        "size": 688,
+        "capacity": 688
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 16,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.5716,
+        "hot_hit_rate": 0.7098,
+        "hits": 37755,
+        "misses": 28293,
+        "evictions": 34452,
+        "replay_ms": 311.4,
+        "us_per_lookup": 4.714,
+        "size": 688,
+        "capacity": 688
+      },
+      "s3fifo": {
+        "hit_rate": 0.5567,
+        "hot_hit_rate": 0.6906,
+        "hits": 36770,
+        "misses": 29278,
+        "evictions": 35446,
+        "replay_ms": 95.9,
+        "us_per_lookup": 1.451,
+        "size": 688,
+        "capacity": 688
+      },
+      "lru": {
+        "hit_rate": 0.5021,
+        "hot_hit_rate": 0.6216,
+        "hits": 33160,
+        "misses": 32888,
+        "evictions": 40616,
+        "replay_ms": 556.0,
+        "us_per_lookup": 8.418,
+        "size": 688,
+        "capacity": 688
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 16,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.5012,
+        "hot_hit_rate": 0.6213,
+        "hits": 33105,
+        "misses": 32943,
+        "evictions": 40641,
+        "replay_ms": 565.7,
+        "us_per_lookup": 8.565,
+        "size": 688,
+        "capacity": 688
+      },
+      "s3fifo": {
+        "hit_rate": 0.5515,
+        "hot_hit_rate": 0.6852,
+        "hits": 36423,
+        "misses": 29625,
+        "evictions": 35914,
+        "replay_ms": 91.7,
+        "us_per_lookup": 1.388,
+        "size": 688,
+        "capacity": 688
+      },
+      "route_frequency": {
+        "hit_rate": 0.5672,
+        "hot_hit_rate": 0.7049,
+        "hits": 37462,
+        "misses": 28586,
+        "evictions": 34890,
+        "replay_ms": 303.7,
+        "us_per_lookup": 4.598,
+        "size": 688,
+        "capacity": 688
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 31,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.6674,
+        "hot_hit_rate": 0.8213,
+        "hits": 44078,
+        "misses": 21970,
+        "evictions": 26549,
+        "replay_ms": 926.1,
+        "us_per_lookup": 14.022,
+        "size": 1333,
+        "capacity": 1333
+      },
+      "s3fifo": {
+        "hit_rate": 0.6415,
+        "hot_hit_rate": 0.7875,
+        "hits": 42369,
+        "misses": 23679,
+        "evictions": 27483,
+        "replay_ms": 98.6,
+        "us_per_lookup": 1.492,
+        "size": 1333,
+        "capacity": 1333
+      },
+      "route_frequency": {
+        "hit_rate": 0.7073,
+        "hot_hit_rate": 0.8732,
+        "hits": 46714,
+        "misses": 19334,
+        "evictions": 23147,
+        "replay_ms": 545.5,
+        "us_per_lookup": 8.26,
+        "size": 1333,
+        "capacity": 1333
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 31,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.7056,
+        "hot_hit_rate": 0.8698,
+        "hits": 46606,
+        "misses": 19442,
+        "evictions": 23179,
+        "replay_ms": 542.2,
+        "us_per_lookup": 8.21,
+        "size": 1333,
+        "capacity": 1333
+      },
+      "s3fifo": {
+        "hit_rate": 0.6454,
+        "hot_hit_rate": 0.7914,
+        "hits": 42627,
+        "misses": 23421,
+        "evictions": 27155,
+        "replay_ms": 97.5,
+        "us_per_lookup": 1.477,
+        "size": 1333,
+        "capacity": 1333
+      },
+      "lru": {
+        "hit_rate": 0.6695,
+        "hot_hit_rate": 0.8221,
+        "hits": 44221,
+        "misses": 21827,
+        "evictions": 26285,
+        "replay_ms": 926.4,
+        "us_per_lookup": 14.026,
+        "size": 1333,
+        "capacity": 1333
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 31,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.6677,
+        "hot_hit_rate": 0.8214,
+        "hits": 44100,
+        "misses": 21948,
+        "evictions": 26527,
+        "replay_ms": 935.5,
+        "us_per_lookup": 14.165,
+        "size": 1333,
+        "capacity": 1333
+      },
+      "s3fifo": {
+        "hit_rate": 0.6444,
+        "hot_hit_rate": 0.7918,
+        "hits": 42561,
+        "misses": 23487,
+        "evictions": 27294,
+        "replay_ms": 104.2,
+        "us_per_lookup": 1.577,
+        "size": 1333,
+        "capacity": 1333
+      },
+      "route_frequency": {
+        "hit_rate": 0.7052,
+        "hot_hit_rate": 0.8701,
+        "hits": 46575,
+        "misses": 19473,
+        "evictions": 23290,
+        "replay_ms": 550.4,
+        "us_per_lookup": 8.334,
+        "size": 1333,
+        "capacity": 1333
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 63,
+      "rep": 0,
+      "lru": {
+        "hit_rate": 0.7972,
+        "hot_hit_rate": 0.9563,
+        "hits": 52656,
+        "misses": 13392,
+        "evictions": 14930,
+        "replay_ms": 1317.3,
+        "us_per_lookup": 19.945,
+        "size": 2709,
+        "capacity": 2709
+      },
+      "s3fifo": {
+        "hit_rate": 0.7629,
+        "hot_hit_rate": 0.9106,
+        "hits": 50391,
+        "misses": 15657,
+        "evictions": 17139,
+        "replay_ms": 234.7,
+        "us_per_lookup": 3.554,
+        "size": 2709,
+        "capacity": 2709
+      },
+      "route_frequency": {
+        "hit_rate": 0.803,
+        "hot_hit_rate": 0.9633,
+        "hits": 53034,
+        "misses": 13014,
+        "evictions": 14496,
+        "replay_ms": 588.3,
+        "us_per_lookup": 8.907,
+        "size": 2709,
+        "capacity": 2709
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 63,
+      "rep": 1,
+      "route_frequency": {
+        "hit_rate": 0.8026,
+        "hot_hit_rate": 0.9629,
+        "hits": 53010,
+        "misses": 13038,
+        "evictions": 14516,
+        "replay_ms": 581.2,
+        "us_per_lookup": 8.8,
+        "size": 2709,
+        "capacity": 2709
+      },
+      "s3fifo": {
+        "hit_rate": 0.7677,
+        "hot_hit_rate": 0.9151,
+        "hits": 50707,
+        "misses": 15341,
+        "evictions": 16819,
+        "replay_ms": 225.9,
+        "us_per_lookup": 3.421,
+        "size": 2709,
+        "capacity": 2709
+      },
+      "lru": {
+        "hit_rate": 0.7989,
+        "hot_hit_rate": 0.9578,
+        "hits": 52766,
+        "misses": 13282,
+        "evictions": 14813,
+        "replay_ms": 1283.5,
+        "us_per_lookup": 19.433,
+        "size": 2709,
+        "capacity": 2709
+      }
+    },
+    {
+      "model": "dsv4",
+      "cap": 63,
+      "rep": 2,
+      "lru": {
+        "hit_rate": 0.7972,
+        "hot_hit_rate": 0.9561,
+        "hits": 52652,
+        "misses": 13396,
+        "evictions": 14968,
+        "replay_ms": 1307.8,
+        "us_per_lookup": 19.801,
+        "size": 2709,
+        "capacity": 2709
+      },
+      "s3fifo": {
+        "hit_rate": 0.7642,
+        "hot_hit_rate": 0.9119,
+        "hits": 50475,
+        "misses": 15573,
+        "evictions": 17103,
+        "replay_ms": 221.7,
+        "us_per_lookup": 3.357,
+        "size": 2709,
+        "capacity": 2709
+      },
+      "route_frequency": {
+        "hit_rate": 0.8039,
+        "hot_hit_rate": 0.9652,
+        "hits": 53093,
+        "misses": 12955,
+        "evictions": 14485,
+        "replay_ms": 567.0,
+        "us_per_lookup": 8.585,
+        "size": 2709,
+        "capacity": 2709
+      }
+    }
+  ],
+  "meta": {
+    "tokens": 256,
+    "scan": 64,
+    "repeats": 3,
+    "phase_change": true,
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "note": "synthetic trace shape, real MoE topology; per-layer caps approximate budgets: 8~1G, 16~2G, 31~4G, 63~8G"
+  },
+  "summary": [
+    {
+      "model": "qwen",
+      "cap": 8,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.3252,
+          "min_hit_rate": 0.3234,
+          "p50_hot_hit_rate": 0.4053,
+          "p50_us_per_lookup": 5.996,
+          "p50_evictions": 103471
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.4469,
+          "min_hit_rate": 0.4445,
+          "p50_hot_hit_rate": 0.5577,
+          "p50_us_per_lookup": 1.74,
+          "p50_evictions": 84547
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.3871,
+          "min_hit_rate": 0.3854,
+          "p50_hot_hit_rate": 0.4824,
+          "p50_us_per_lookup": 3.816,
+          "p50_evictions": 91957
+        }
+      },
+      "best": "s3fifo",
+      "rf_beats_all": false
+    },
+    {
+      "model": "qwen",
+      "cap": 16,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.5001,
+          "min_hit_rate": 0.4975,
+          "p50_hot_hit_rate": 0.6219,
+          "p50_us_per_lookup": 10.467,
+          "p50_evictions": 76352
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.5807,
+          "min_hit_rate": 0.5749,
+          "p50_hot_hit_rate": 0.7235,
+          "p50_us_per_lookup": 1.455,
+          "p50_evictions": 63202
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.5741,
+          "min_hit_rate": 0.5715,
+          "p50_hot_hit_rate": 0.715,
+          "p50_us_per_lookup": 5.138,
+          "p50_evictions": 63994
+        }
+      },
+      "best": "s3fifo",
+      "rf_beats_all": false
+    },
+    {
+      "model": "qwen",
+      "cap": 31,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.6643,
+          "min_hit_rate": 0.6637,
+          "p50_hot_hit_rate": 0.8237,
+          "p50_us_per_lookup": 17.149,
+          "p50_evictions": 50610
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.6665,
+          "min_hit_rate": 0.6624,
+          "p50_hot_hit_rate": 0.8259,
+          "p50_us_per_lookup": 1.482,
+          "p50_evictions": 48135
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.7212,
+          "min_hit_rate": 0.7204,
+          "p50_hot_hit_rate": 0.8972,
+          "p50_us_per_lookup": 8.602,
+          "p50_evictions": 41363
+        }
+      },
+      "best": "route_frequency",
+      "rf_beats_all": true
+    },
+    {
+      "model": "qwen",
+      "cap": 63,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.7835,
+          "min_hit_rate": 0.7826,
+          "p50_hot_hit_rate": 0.9601,
+          "p50_us_per_lookup": 24.927,
+          "p50_evictions": 31184
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.7556,
+          "min_hit_rate": 0.7532,
+          "p50_hot_hit_rate": 0.9232,
+          "p50_us_per_lookup": 4.303,
+          "p50_evictions": 34306
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.7941,
+          "min_hit_rate": 0.7929,
+          "p50_hot_hit_rate": 0.9743,
+          "p50_us_per_lookup": 10.45,
+          "p50_evictions": 29571
+        }
+      },
+      "best": "route_frequency",
+      "rf_beats_all": true
+    },
+    {
+      "model": "glm",
+      "cap": 8,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.3254,
+          "min_hit_rate": 0.3231,
+          "p50_hot_hit_rate": 0.4046,
+          "p50_us_per_lookup": 5.562,
+          "p50_evictions": 77400
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.4457,
+          "min_hit_rate": 0.4401,
+          "p50_hot_hit_rate": 0.5567,
+          "p50_us_per_lookup": 1.624,
+          "p50_evictions": 63580
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.3873,
+          "min_hit_rate": 0.3833,
+          "p50_hot_hit_rate": 0.4835,
+          "p50_us_per_lookup": 3.152,
+          "p50_evictions": 68775
+        }
+      },
+      "best": "s3fifo",
+      "rf_beats_all": false
+    },
+    {
+      "model": "glm",
+      "cap": 16,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.5018,
+          "min_hit_rate": 0.4999,
+          "p50_hot_hit_rate": 0.6228,
+          "p50_us_per_lookup": 9.323,
+          "p50_evictions": 56950
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.5634,
+          "min_hit_rate": 0.5603,
+          "p50_hot_hit_rate": 0.7024,
+          "p50_us_per_lookup": 1.417,
+          "p50_evictions": 48881
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.5715,
+          "min_hit_rate": 0.5696,
+          "p50_hot_hit_rate": 0.7107,
+          "p50_us_per_lookup": 4.725,
+          "p50_evictions": 48179
+        }
+      },
+      "best": "route_frequency",
+      "rf_beats_all": true
+    },
+    {
+      "model": "glm",
+      "cap": 31,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.6676,
+          "min_hit_rate": 0.6659,
+          "p50_hot_hit_rate": 0.8241,
+          "p50_us_per_lookup": 14.569,
+          "p50_evictions": 37339
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.6506,
+          "min_hit_rate": 0.65,
+          "p50_hot_hit_rate": 0.8037,
+          "p50_us_per_lookup": 1.404,
+          "p50_evictions": 37494
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.7136,
+          "min_hit_rate": 0.7126,
+          "p50_hot_hit_rate": 0.8841,
+          "p50_us_per_lookup": 8.232,
+          "p50_evictions": 31753
+        }
+      },
+      "best": "route_frequency",
+      "rf_beats_all": true
+    },
+    {
+      "model": "glm",
+      "cap": 63,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.7944,
+          "min_hit_rate": 0.7937,
+          "p50_hot_hit_rate": 0.959,
+          "p50_us_per_lookup": 21.265,
+          "p50_evictions": 21733
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.7497,
+          "min_hit_rate": 0.7487,
+          "p50_hot_hit_rate": 0.8999,
+          "p50_us_per_lookup": 3.209,
+          "p50_evictions": 25690
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.8004,
+          "min_hit_rate": 0.7999,
+          "p50_hot_hit_rate": 0.9674,
+          "p50_us_per_lookup": 9.797,
+          "p50_evictions": 21059
+        }
+      },
+      "best": "route_frequency",
+      "rf_beats_all": true
+    },
+    {
+      "model": "dsv4",
+      "cap": 8,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.3247,
+          "min_hit_rate": 0.3227,
+          "p50_hot_hit_rate": 0.4036,
+          "p50_us_per_lookup": 5.561,
+          "p50_evictions": 55458
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.4387,
+          "min_hit_rate": 0.4375,
+          "p50_hot_hit_rate": 0.5471,
+          "p50_us_per_lookup": 1.561,
+          "p50_evictions": 45990
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.3857,
+          "min_hit_rate": 0.3829,
+          "p50_hot_hit_rate": 0.4799,
+          "p50_us_per_lookup": 2.932,
+          "p50_evictions": 49594
+        }
+      },
+      "best": "s3fifo",
+      "rf_beats_all": false
+    },
+    {
+      "model": "dsv4",
+      "cap": 16,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.5012,
+          "min_hit_rate": 0.501,
+          "p50_hot_hit_rate": 0.6213,
+          "p50_us_per_lookup": 8.418,
+          "p50_evictions": 40641
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.5525,
+          "min_hit_rate": 0.5515,
+          "p50_hot_hit_rate": 0.6861,
+          "p50_us_per_lookup": 1.388,
+          "p50_evictions": 35821
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.5675,
+          "min_hit_rate": 0.5672,
+          "p50_hot_hit_rate": 0.7056,
+          "p50_us_per_lookup": 4.598,
+          "p50_evictions": 34846
+        }
+      },
+      "best": "route_frequency",
+      "rf_beats_all": true
+    },
+    {
+      "model": "dsv4",
+      "cap": 31,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.6677,
+          "min_hit_rate": 0.6674,
+          "p50_hot_hit_rate": 0.8214,
+          "p50_us_per_lookup": 14.026,
+          "p50_evictions": 26527
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.6444,
+          "min_hit_rate": 0.6415,
+          "p50_hot_hit_rate": 0.7914,
+          "p50_us_per_lookup": 1.492,
+          "p50_evictions": 27294
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.7056,
+          "min_hit_rate": 0.7052,
+          "p50_hot_hit_rate": 0.8701,
+          "p50_us_per_lookup": 8.26,
+          "p50_evictions": 23179
+        }
+      },
+      "best": "route_frequency",
+      "rf_beats_all": true
+    },
+    {
+      "model": "dsv4",
+      "cap": 63,
+      "policies": {
+        "lru": {
+          "p50_hit_rate": 0.7972,
+          "min_hit_rate": 0.7972,
+          "p50_hot_hit_rate": 0.9563,
+          "p50_us_per_lookup": 19.801,
+          "p50_evictions": 14930
+        },
+        "s3fifo": {
+          "p50_hit_rate": 0.7642,
+          "min_hit_rate": 0.7629,
+          "p50_hot_hit_rate": 0.9119,
+          "p50_us_per_lookup": 3.421,
+          "p50_evictions": 17103
+        },
+        "route_frequency": {
+          "p50_hit_rate": 0.803,
+          "min_hit_rate": 0.8026,
+          "p50_hot_hit_rate": 0.9633,
+          "p50_us_per_lookup": 8.8,
+          "p50_evictions": 14496
+        }
+      },
+      "best": "route_frequency",
+      "rf_beats_all": true
+    }
+  ],
+  "verdict": {
+    "route_frequency_wins": 8,
+    "of": 12,
+    "gate": "route_frequency >= s3fifo AND >= lru in >= 2 of 3 models",
+    "passed": true,
+    "per_model": {
+      "qwen": {
+        "wins": 2,
+        "total": 4
+      },
+      "glm": {
+        "wins": 3,
+        "total": 4
+      },
+      "dsv4": {
+        "wins": 3,
+        "total": 4
+      }
+    },
+    "models_where_rf_wins": 2
+  }
+}

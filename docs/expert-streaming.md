@@ -351,7 +351,26 @@ Why it flipped: the draft/verify cycle runs **3.4 target forwards per generated 
 
 ### B5 — LRU at 6 GiB is net-negative (Fase J)
 
-Measured on Qwen 8k prompt with page-cache only vs LRU (budget=6 GiB, per-layer cap ~47 slots): LRU hit 4.95% with 130k evictions and **0.649 tok/s vs 2.86 tok/s page-cache only**; swap write spikes 519 MB/s and `phys_lifetime` ~19 GiB vs 12 GiB. Insert-on-every-miss thrashes when working set >> capacity and rows pin the stacked bank until evicted (F2 contract). Operational default is **budget=0** for this model/box. If a workload needs a cache, enable the scan-resistant admission filter (`OMLX_EXPERT_STREAMING_ADMISSION=1` — only inserts experts seen >=2 times in the last 1024 accesses) and validate with `OMLX_EXPERT_STREAMING_TRACE=1` + `bench/lrc_analysis.py --cache-sizes 142 trace.jsonl` to read SCH(142); if SCH ~10-15% the cache will not pay.
+Measured on Qwen 8k prompt with page-cache only vs LRU (budget=6 GiB, per-layer cap ~47 — in the pre-fix accounting that number was *experts*/layer, not slots; see the sizing section below): LRU hit 4.95% with 130k evictions and **0.649 tok/s vs 2.86 tok/s page-cache only**; swap write spikes 519 MB/s and `phys_lifetime` ~19 GiB vs 12 GiB. Insert-on-every-miss thrashes when working set >> capacity and rows pin the stacked bank until evicted (F2 contract). Operational default is **budget=0** for this model/box. If a workload needs a cache, enable the scan-resistant admission filter (`OMLX_EXPERT_STREAMING_ADMISSION=1` — only inserts experts seen >=2 times in the last 1024 accesses) and validate with `OMLX_EXPERT_STREAMING_TRACE=1` + `bench/lrc_analysis.py --cache-sizes 142 trace.jsonl` to read SCH(142); if SCH ~10-15% the cache will not pay.
+
+### Fase M4 — corrected sizing (n_proj) and the 48 GB table
+
+`per_slot = per_expert // n_proj`, and `n_proj` is **3 for split GLUs (gate/up/down), 2 for fused (gate_up + down)**. A short-circuit bug in `_convert_switch_mlp_module` collapsed every split GLU to `n_proj = 1` (because `down_proj` exists in *both* layouts, so an `or` fallback keyed on list truthiness never fired). The cache then reserved `budget // per_expert` slots while every slot still held one projection — filling to **a third of the budget it was promised**. Fixed in `__init__.py`; `warmer._seed_lru` got the same correction via `_projections_per_expert()`.
+
+Effect at 4 GiB on `Qwen3.8-Flash-Next-JANG_4M` (L=48, E=512, per_expert 2.69 MB, per_slot 0.90 MB):
+
+| | capacity (slots) | slots/layer | experts/layer | real cache bytes |
+|---|---|---|---|---|
+| broken | 1,521 | 31 | 10 | 1.30 GiB of 4.00 |
+| fixed | 4,560 | 95 | 31 | 4.00 GiB |
+
+The log line now prints `slots/layer` and `experts resident/layer` separately — reporting the expert count under the slot name is what kept this invisible. `ExpertStreamingEstimate.slots_for_budget()` still returns **experts**/layer (its byte math is correct); the docstring says so.
+
+Full per-model table, hit-rate curves and the 48 GB recommendation: **`bench/results/sizing/SUMMARY.md`** (regenerate with `.venv/bin/python bench/bench_sizing_48g.py`). Headline numbers:
+
+- Hit rate saturates at **~8 GiB** (63 experts/layer on 4M) — 97% of the trace's cold-start ceiling of 0.775. Going to 32 GiB (49% coverage) buys 0% more hit rate, because the per-layer working set is ~103 experts median / 193 max, not 512.
+- **Budget is not the throughput lever.** At 4 GiB the offline policy ceiling is 0.637 but measured e2e hit rate was 0.062: the decode path resolves experts through the layer-context union and never writes back to the LRU (`puts == size`, `evict == 0`). Details in `bench/results/residency_fix/SUMMARY.md`.
+- **budget=0 stays the operational default.** A user-space cache competes with the kernel page cache for the same unified memory; the near-empty-cache arm had the lowest disk read of every run measured.
 
 ## Fase E — bottleneck experiments (QD, coalescing, learned pins, MTP tuning, ANE)
 

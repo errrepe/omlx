@@ -812,6 +812,18 @@ async def run(
             "hit_rate": cache.stats.hit_rate(),
             "size": cache.size,
             "capacity": cache.capacity,
+            # Fase M4 residency diagnosis: puts vs misses, seeder damage, and
+            # the per-layer occupancy histogram (a frozen cache shows every
+            # layer pinned at the seed count with 0 evictions).
+            "puts": cache.stats.puts,
+            "retain_evicted": cache.stats.retain_evicted,
+            "admission_drops": int(getattr(cache, "admission_drops", 0) or 0),
+            "per_layer_cap": int(getattr(cache, "_per_layer_cap", 0) or 0),
+            "per_layer_counts": {
+                "min": min(cache._layer_counts.values()) if cache._layer_counts else 0,
+                "max": max(cache._layer_counts.values()) if cache._layer_counts else 0,
+                "distinct": sorted(set(cache._layer_counts.values()))[:8],
+            },
             # FU2: policy + transition-table state for A/B arms.
             "policy": getattr(cache, "policy", "lru"),
             "trans_updates": int(getattr(getattr(cache, "spec_state", None), "trans_updates", 0) or 0),
@@ -1099,8 +1111,9 @@ def main():
              "derivation: decode-phase byte ratio + MTP accept stats)",
     )
     ap.add_argument(
-        "--cache-policy", choices=["lru", "s3fifo"], default="lru",
-        help="FU2: LRU eviction policy for the app-level cache "
+        "--cache-policy", choices=["lru", "s3fifo", "route_frequency"],
+        default="lru",
+        help="FU2: eviction policy for the app-level cache "
              "(page-cache-only budgets ignore it). A/B vs lru.",
     )
     ap.add_argument(
