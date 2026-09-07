@@ -137,11 +137,20 @@ class ExpertResidencyGovernor:
         while len(cache._store) > cap:
             old_k, _ = cache._store.popitem(last=False)
             old_layer = cache._layer_of(old_k)
+            if hasattr(cache, "_layer_orders"):
+                cache._layer_index_drop(old_k, old_layer)
             cache._layer_counts[old_layer] = max(0, cache._layer_counts.get(old_layer, 1) - 1)
             cache.stats.evictions += 1
         if self.num_layers > 0:
             for layer in list(getattr(cache, "_layer_counts", {})):
                 while cache._layer_counts.get(layer, 0) > per_layer:
+                    # Fase M4: O(1) victim via the base per-layer index when
+                    # this cache maintains one (the store scan below is
+                    # O(size) per shrink and the governor runs mid-request).
+                    if hasattr(cache, "_evict_layer"):
+                        if not cache._evict_layer(layer):
+                            break
+                        continue
                     victim = None
                     for k in cache._store:
                         if cache._layer_of(k) == layer:

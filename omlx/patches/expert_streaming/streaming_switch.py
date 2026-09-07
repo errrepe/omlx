@@ -136,6 +136,14 @@ _CTX_PREFETCH_MAX_BYTES = max(
         )
     ),
 )
+# Fase M4: admit into the expert LRU what the union path reads. Off by
+# default — measured on JANG_4M (budget 4 GiB, 96 decode tokens): hit rate
+# 0.062 -> 0.226 and disk bytes -16%, but tok_s 2.867 -> 2.068 (-28%) because
+# ~706 new admissions/token x 940800 B is ~1.4 GB/s of ~1 MB malloc/free
+# (sys_cpu 16% -> 34%, RSS max 4.9 -> 9.3 GiB). The user-space cache also
+# competes with the kernel page cache, which serves repeats ~13x cheaper than
+# the disk and costs no allocation churn. Keep as an opt-in experiment.
+_CTX_WRITEBACK_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_WRITEBACK", "") == "1"
 
 # Prefill attribution diag: sync the GPU at every prefill-sized MoE GLU call
 # and record the drain as a per-layer gpu bucket. Serializes CPU/GPU overlap
@@ -831,6 +839,11 @@ class CacheStats:
     hits: int = 0
     misses: int = 0
     evictions: int = 0
+    # Fase M4 residency diagnosis: puts actually accepted vs gets that missed.
+    # A cache that misses N times but puts ~0 is frozen (never admits decode
+    # demand) — the signature this counters were added to expose.
+    puts: int = 0
+    retain_evicted: int = 0
 
     def hit_rate(self) -> float:
         tot = self.hits + self.misses
@@ -866,6 +879,14 @@ class ExpertLRUCache:
         self._store: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
         # per-layer tracking for eviction
         self._layer_counts: Dict[int, int] = {}
+        # Fase M4: per-layer LRU index (key -> None, recency order) so the
+        # per-layer victim is O(1). Without it `put` scanned the whole store
+        # on every insert once every layer sat at its cap — measured 122 us
+        # per put / 135 ms per decode token at capacity 4565, which is more
+        # than a third of the current decode budget. Subclasses that override
+        # put (s3fifo, route_frequency) keep their own victim selection and
+        # never read this, so a stale index can only affect the base policy.
+        self._layer_orders: dict[int, OrderedDict] = {}
         self.stats = CacheStats()
         self.profile = ProfileAccumulator(enabled=_PROFILE_ENV)
         # Fase K K1: per-conversion speculation state (set by the converter).
@@ -906,6 +927,52 @@ class ExpertLRUCache:
         except Exception:
             return -1
 
+    # -- per-layer LRU index (O(1) victim selection) ------------------------
+
+    def _layer_index_add(self, key: tuple[int, int, str], layer: int) -> None:
+        order = self._layer_orders.get(layer)
+        if order is None:
+            order = self._layer_orders[layer] = OrderedDict()
+        order[key] = None
+
+    def _layer_index_touch(self, key: tuple[int, int, str], layer: int) -> None:
+        order = self._layer_orders.get(layer)
+        if order is not None and key in order:
+            order.move_to_end(key)
+
+    def _layer_index_drop(self, key: tuple[int, int, str], layer: int | None = None) -> None:
+        if layer is None:
+            layer = self._layer_of(key)
+        order = self._layer_orders.get(layer)
+        if order is not None:
+            order.pop(key, None)
+
+    def _evict_layer(self, layer: int) -> bool:
+        """Evict the least-recently-used entry of `layer`; True if one went.
+
+        O(1) via the per-layer index. Falls back to the linear scan when the
+        index has no live entry for the layer (subclasses that keep their own
+        stores never maintain the index, so it can go stale).
+        """
+        order = self._layer_orders.get(layer)
+        if order:
+            for victim in list(order):
+                del order[victim]
+                if victim in self._store:
+                    self._store.pop(victim, None)
+                    self.stats.evictions += 1
+                    self._layer_counts[layer] = max(
+                        0, self._layer_counts.get(layer, 1) - 1
+                    )
+                    return True
+        for k in list(self._store.keys()):
+            if self._layer_of(k) == layer:
+                self._store.pop(k)
+                self.stats.evictions += 1
+                self._layer_counts[layer] = max(0, self._layer_counts.get(layer, 1) - 1)
+                return True
+        return False
+
     def get(self, key: tuple[int, int, str]) -> Any | None:
         # O2 stash check (decode speculation) - bypasses LRU, never counts as miss
         spec = self.spec_state if _STASH_ENV else None
@@ -916,6 +983,7 @@ class ExpertLRUCache:
             # Miss counter incremented below after the store miss.
         if key in self._store:
             self._store.move_to_end(key)
+            self._layer_index_touch(key, self._layer_of(key))
             self.stats.hits += 1
             return self._store[key]
         if _RA_ENV and spec is not None:
@@ -958,28 +1026,26 @@ class ExpertLRUCache:
         layer = self._layer_of(key)
         if self.num_layers > 0 and self._per_layer_cap:
             cnt = self._layer_counts.get(layer, 0)
-            # evict oldest entry of same layer if per-layer full
+            # evict oldest entry of same layer if per-layer full (O(1) index)
             if cnt >= self._per_layer_cap:
-                # find oldest entry of this layer
-                for k in list(self._store.keys()):
-                    if self._layer_of(k) == layer:
-                        self._store.pop(k)
-                        self.stats.evictions += 1
-                        self._layer_counts[layer] = max(0, self._layer_counts.get(layer, 1) - 1)
-                        break
+                self._evict_layer(layer)
                 # if still over capacity due to rounding, fall through to global
         # global cap
         while len(self._store) >= self.capacity:
             old_k, _ = self._store.popitem(last=False)
+            self._layer_index_drop(old_k, self._layer_of(old_k))
             self.stats.evictions += 1
             old_layer = self._layer_of(old_k)
             self._layer_counts[old_layer] = max(0, self._layer_counts.get(old_layer, 1) - 1)
         self._store[key] = value
+        self._layer_index_add(key, layer)
         self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
+        self.stats.puts += 1
 
     def clear(self) -> None:
         self._store.clear()
         self._layer_counts.clear()
+        self._layer_orders.clear()
         self.stats = CacheStats()
 
     @property
@@ -1001,13 +1067,19 @@ class ExpertLRUCache:
             if (key[0], key[1]) not in hot_pairs:
                 del self._store[key]
                 evicted += 1
+        # Rebuild the per-layer index unconditionally: entries can reach the
+        # store without going through base put (governor resizes, subclass
+        # paths), and a stale index silently degrades victim selection.
+        counts: Dict[int, int] = {}
+        self._layer_orders = {}
+        for key in self._store:
+            layer = self._layer_of(key)
+            counts[layer] = counts.get(layer, 0) + 1
+            self._layer_index_add(key, layer)
+        self._layer_counts = counts
         if evicted:
-            counts: Dict[int, int] = {}
-            for key in self._store:
-                layer = self._layer_of(key)
-                counts[layer] = counts.get(layer, 0) + 1
-            self._layer_counts = counts
             self.stats.evictions += evicted
+        self.stats.retain_evicted += evicted
         return evicted
 
     @property
@@ -1177,6 +1249,143 @@ class S3FIFOExpertCache(ExpertLRUCache):
         return len(self._small) + len(self._store)
 
 
+class RouteFrequencyCache(ExpertLRUCache):
+    """Trilha A: route-frequency eviction (port of PR #3359's policy).
+
+    MoE routing is skewed: a minority of experts take most of the tokens,
+    and the router keeps picking them for as long as the context stays on
+    topic. Recency alone (LRU) cannot tell "reused every token" from
+    "touched once by the last prefill chunk", so this keeps a hit counter
+    per (layer, expert, proj) and evicts the **least** used, recency only
+    breaking ties. Counters halve every 2x capacity insertions, so a phase
+    change (new topic, new task) demotes yesterday's heavy hitters instead
+    of pinning them forever.
+
+    Per-layer caps, admission filter, retain_hot, stats and the stash/spec
+    hooks are inherited unchanged -- only the eviction order differs, same
+    as S3FIFOExpertCache. Select with
+    OMLX_EXPERT_STREAMING_CACHE=route_frequency (default lru).
+
+    Cost note: choosing a victim is a scan of the store (O(size)), the same
+    order as S3FIFOExpertCache._evict_layer. It early-exits on the first
+    entry with a count <= 1, which is the common case once the cache has
+    churned; the worst case (every resident entry routed > 1x) is a full
+    sweep per eviction.
+    """
+
+    def __init__(self, budget_bytes: int, per_expert_bytes: int, num_layers: int | None = None):
+        super().__init__(budget_bytes, per_expert_bytes, num_layers)
+        self._freq: dict[tuple[int, int, str], int] = {}
+        self._inserts = 0
+        # Aging period: long enough that a full-cache pass of insertions
+        # does not wipe counts, short enough to track a phase change.
+        self._decay_every = max(64, 2 * max(1, self.capacity))
+        # Every route bumps a counter, including misses, so the map needs a
+        # bound of its own: misses on a wide expert vocabulary would other-
+        # wise grow it without any insertion to trigger the decay sweep.
+        self._freq_cap = max(4096, 8 * max(1, self.capacity))
+
+    @property
+    def policy(self) -> str:
+        return "route_frequency"
+
+    def _bump(self, key: tuple[int, int, str]) -> None:
+        # Counted on every route (hit or miss): a heavy hitter that is
+        # currently off-cache must still be recognisable when it comes
+        # back, otherwise the policy degenerates into LRU.
+        self._freq[key] = self._freq.get(key, 0) + 1
+        if len(self._freq) > self._freq_cap:
+            # Amortised O(n) sweep: keep only counters of resident entries.
+            # Costs one pass per _freq_cap misses, so it never dominates.
+            self._freq = {k: v for k, v in self._freq.items() if k in self._store}
+
+    def _decay_if_needed(self) -> None:
+        self._inserts += 1
+        if self._inserts < self._decay_every:
+            return
+        self._inserts = 0
+        for key in list(self._freq):
+            halved = self._freq[key] >> 1
+            # Drop faded counters and keys that are no longer resident so
+            # the map stays bounded by the cache, not by the vocabulary.
+            if halved <= 0 or key not in self._store:
+                self._freq.pop(key, None)
+            else:
+                self._freq[key] = halved
+
+    def get(self, key: tuple[int, int, str]) -> Any | None:
+        self._bump(key)
+        return super().get(key)
+
+    def _evict_lowest(self, layer: int | None) -> bool:
+        """Evict the least-routed entry (oldest wins ties); layer=None is global."""
+        victim: tuple[int, int, str] | None = None
+        lowest = 0
+        # _store is in recency order (oldest first), so a strict "<" makes
+        # the earliest entry win any tie.
+        for key in self._store:
+            if layer is not None and self._layer_of(key) != layer:
+                continue
+            count = self._freq.get(key, 0)
+            if victim is None or count < lowest:
+                victim, lowest = key, count
+                if count <= 1:
+                    break
+        if victim is None:
+            return False
+        self._store.pop(victim)
+        self._freq.pop(victim, None)
+        self.stats.evictions += 1
+        victim_layer = self._layer_of(victim)
+        self._layer_counts[victim_layer] = max(
+            0, self._layer_counts.get(victim_layer, 1) - 1
+        )
+        return True
+
+    def put(self, key: tuple[int, int, str], value: Any) -> None:
+        if self.capacity <= 0:
+            return
+        if key in self._store:
+            self._store.move_to_end(key)
+            self._store[key] = value
+            return
+        if not self._admission_should_insert(key):
+            return
+        layer = self._layer_of(key)
+        # Same per-layer-cap-then-global order as ExpertLRUCache.put, with
+        # the frequency victim instead of the recency one.
+        if (
+            self.num_layers > 0
+            and self._per_layer_cap
+            and self._layer_counts.get(layer, 0) >= self._per_layer_cap
+            and not self._evict_lowest(layer)
+        ):
+            self._evict_lowest(None)
+        while len(self._store) >= self.capacity:
+            if not self._evict_lowest(None):
+                break
+        self._store[key] = value
+        # A re-inserted expert keeps whatever frequency it had re-earned.
+        self._freq[key] = max(1, self._freq.get(key, 0))
+        self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
+        self._decay_if_needed()
+
+    def retain_hot(self, hot_pairs: set) -> int:
+        evicted = super().retain_hot(hot_pairs)
+        if evicted and self._freq:
+            self._freq = {k: v for k, v in self._freq.items() if k in self._store}
+        return evicted
+
+    def clear(self) -> None:
+        super().clear()
+        self._freq.clear()
+        self._inserts = 0
+
+    def frequency_snapshot(self) -> dict[tuple[int, int, str], int]:
+        """Live counters, for benches and health output."""
+        return dict(self._freq)
+
+
 def make_expert_cache(
     budget_bytes: int,
     per_slot: int,
@@ -1191,6 +1400,8 @@ def make_expert_cache(
     eff = (policy or _CACHE_POLICY_ENV or "lru").strip().lower()
     if eff == "s3fifo":
         return S3FIFOExpertCache(budget_bytes, per_slot, num_layers=num_layers)
+    if eff == "route_frequency":
+        return RouteFrequencyCache(budget_bytes, per_slot, num_layers=num_layers)
     return ExpertLRUCache(budget_bytes, per_slot, num_layers=num_layers)
 
 
@@ -1525,6 +1736,39 @@ class _LayerLoadContext:
                 )
                 return
             self.bundles[id(proj)].update(zip(ids, rows))
+            # Fase M4: union resolution is the ONLY decode read path, and it
+            # never wrote back — _split *read* the cache but only the hotness
+            # seeder ever populated it. Measured: puts == size (4464),
+            # evictions 0, decode re-reads its whole demand set every step and
+            # the LRU is effectively read-only (hit 6.2%).
+            #
+            # Admitting raises the hit rate 3.7x (0.062 -> 0.226; ~0.14 ->
+            # ~0.52 counting decode accesses only) and costs ~3% decode
+            # throughput — INSIDE the +-4% noise floor of this machine
+            # (bench/results/wb_remeasure). The historical "-28%" was
+            # measured before the O(1) per-layer eviction fix and was
+            # dominated by the O(store) victim scan: 67k evictions x ~120 us.
+            #
+            # The disqualifying number is I/O, not throughput: write-back
+            # reads +16% MORE disk bytes (27.4 -> 31.9 GiB) while tripling
+            # the hit rate. It fills 4 GiB of unified memory with a copy of
+            # data the kernel page cache already holds, which shrinks the
+            # page cache and pushes reads that used to hit it down to disk.
+            # The hits it manufactures are hits on bytes the UBC would have
+            # served nearly as cheaply.
+            #
+            # Stays opt-in (see _CTX_WRITEBACK_ENV). Same key contract as the
+            # legacy path (bundle_key, raw np tuple).
+            if _CTX_WRITEBACK_ENV and not getattr(
+                self.cache, "prefill_bypass", False
+            ):
+                put = getattr(self.cache, "put", None)
+                if put is not None:
+                    for eid, raw in zip(ids, rows):
+                        try:
+                            put(proj.bundle_key(eid), raw)
+                        except Exception:
+                            break
         if memtrace.enabled:
             memtrace.record(
                 "ctx.ensure.exit",
