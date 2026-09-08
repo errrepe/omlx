@@ -864,22 +864,168 @@ class TestExpandPerLayerQuantKeys:
             "mode": "affine",
         }
 
-    def test_skips_runtime_variant_for_ple_keys(self):
-        """PLE shards are mmap-served, never quantized modules."""
-        key = "language_model.layers.0.ple.ngram_embedding.weight"
+    def test_ple_overrides_get_runtime_variant(self):
+        """Resident-mode PLE modules are real quantize targets.
+
+        The JANGQ policy keys overrides by the checkpoint spelling
+        (``language_model.layers.N.ple.*``) while the runtime tree nests
+        them under ``language_model.model.layers.N`` with the ngram table
+        one level deeper (``ple.ple_embedding.ngram_embedding``). Without
+        the variant ``nn.quantize`` misses the override, applies the
+        global 64/8 policy, and the (2500012, 160) shards fail the
+        group-size divisibility check (160 % 64 != 0).
+        """
+        key = "language_model.layers.0.ple.ngram_embedding.shards.0"
+        ckpt_prefixed = "model.language_model.layers.1.ple.ngram_embedding.shards.3"
+        already_runtime = (
+            "language_model.model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.2"
+        )
         cfg = {
             "quantization": {
                 "bits": 8,
                 "group_size": 64,
-                key: {"bits": 2, "group_size": 32},
+                key: {"bits": 3, "group_size": 32},
+                ckpt_prefixed: {"bits": 4, "group_size": 32},
+                already_runtime: {"bits": 3, "group_size": 32},
             }
         }
 
         model_loading.expand_per_layer_quant_keys(cfg)
+        quant = cfg["quantization"]
 
-        assert "language_model.model.layers.0.ple.ngram_embedding.weight" not in cfg[
-            "quantization"
-        ]
+        assert quant[
+            "language_model.model.layers.0.ple.ple_embedding."
+            "ngram_embedding.shards.0"
+        ] == {"bits": 3, "group_size": 32, "mode": "affine"}
+        assert quant[
+            "language_model.model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.3"
+        ] == {"bits": 4, "group_size": 32, "mode": "affine"}
+        # An already-runtime key maps onto itself: no duplicate entry is
+        # added and the value only gains the injected mode.
+        assert quant[already_runtime] == {
+            "bits": 3,
+            "group_size": 32,
+            "mode": "affine",
+        }
+        # The checkpoint spellings are preserved alongside the variants.
+        assert len(
+            [k for k in quant if "shards.0" in k or "shards.3" in k]
+        ) == 4
+
+    def test_resident_ple_quantize_end_to_end(self):
+        """The expanded policy drives nn.quantize on a synthetic resident
+        PLE tree with the JANGQ shard geometry.
+
+        Mirrors the mlx_vlm ``get_class_predicate``. Without the runtime
+        variants the (rows, 160) shards fall back to the global 64/8
+        policy and ``to_quantized`` raises the divisibility error seen
+        on JANG_4M; with them each shard quantizes at its own spec.
+        """
+        nn = pytest.importorskip("mlx.nn")
+        mx = pytest.importorskip("mlx.core")
+
+        class Shards(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shards = [nn.Embedding(4096, 160) for _ in range(2)]
+
+        class NgramTable(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ngram_embedding = Shards()
+
+        class PLE(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ple_embedding = NgramTable()
+                # key_proj's input width must stay divisible by 64 -- the
+                # real JANGQ policy quantizes it at gs=64, unlike the
+                # 160-wide ngram shards.
+                self.key_proj = nn.Linear(192, 320)
+
+        class Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ple = PLE()
+
+        class Text(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = [Layer()]
+
+        class VLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = Text()
+
+        def build_quant():
+            return {
+                "bits": 8,
+                "group_size": 64,
+                "language_model.layers.0.ple.ngram_embedding.shards.0": {
+                    "bits": 3,
+                    "group_size": 32,
+                },
+                "language_model.layers.0.ple.ngram_embedding.shards.1": {
+                    "bits": 4,
+                    "group_size": 32,
+                },
+                "language_model.layers.0.ple.key_proj": {
+                    "bits": 8,
+                    "group_size": 64,
+                },
+            }
+
+        weights = {
+            "language_model.model.layers.0.ple.ple_embedding."
+            "ngram_embedding.shards.0.scales": mx.zeros((1,)),
+            "language_model.model.layers.0.ple.ple_embedding."
+            "ngram_embedding.shards.1.scales": mx.zeros((1,)),
+            "language_model.model.layers.0.ple.key_proj.scales": mx.zeros(
+                (1,)
+            ),
+        }
+
+        def predicate(path, module):
+            if path in quant:
+                return quant[path]
+            if not hasattr(module, "to_quantized"):
+                return False
+            if module.weight.size % 64 != 0:
+                return False
+            return f"{path}.scales" in weights
+
+        # Pre-fix behaviour: only checkpoint-spelled overrides exist, the
+        # runtime-path lookup misses, and the global 64/8 policy hits the
+        # 160-wide shards.
+        quant = build_quant()
+        with pytest.raises(ValueError, match="divisible by the quantization"):
+            nn.quantize(
+                VLM(), group_size=64, bits=8, class_predicate=predicate
+            )
+
+        # Post-fix behaviour: expand adds the runtime variants so the
+        # per-shard specs win.
+        cfg = {"quantization": build_quant()}
+        model_loading.expand_per_layer_quant_keys(cfg)
+        quant = cfg["quantization"]
+        model = VLM()
+        nn.quantize(model, group_size=64, bits=8, class_predicate=predicate)
+
+        shards = (
+            model.language_model.model.layers[0]
+            .ple.ple_embedding.ngram_embedding.shards
+        )
+        assert type(shards[0]) is nn.QuantizedEmbedding
+        assert (shards[0].bits, shards[0].group_size) == (3, 32)
+        assert type(shards[1]) is nn.QuantizedEmbedding
+        assert (shards[1].bits, shards[1].group_size) == (4, 32)
+        key_proj = model.language_model.model.layers[0].ple.key_proj
+        assert type(key_proj) is nn.QuantizedLinear
+        assert (key_proj.bits, key_proj.group_size) == (8, 64)
 
     def test_dsv4_bit_plan_synthesizes_switch_mlp_specs(self):
         """JANGQ DeepSeek-V4 mixes MoE precision per projection/layer.

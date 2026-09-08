@@ -175,3 +175,94 @@ def test_oq_ngram_predicate_matches_jang():
     assert not _is_qwen4_exp_ngram_embedding_tensor(
         "language_model.layers.1.mlp.gate_proj", cfg
     )
+
+def test_mmap_ple_ignores_runtime_quant_variants(tmp_path):
+    """Resident-mode runtime variants must be inert in mmap mode.
+
+    ``expand_per_layer_quant_keys`` now adds runtime-path overrides for
+    the JANGQ PLE policy. With the SSD-backed table the ngram module is
+    a ``DiskBackedShardedEmbedding``: the ``...shards.N`` override
+    paths match no submodule, the table module itself is not
+    quantizable, and only the real ``key_proj`` linear quantizes at
+    its 8-bit spec.
+    """
+    import mlx.nn as nn
+
+    from omlx.utils.model_loading import expand_per_layer_quant_keys
+
+    root = _write_fake_ckpt(tmp_path, [_JANG], [_DOUBLED, _RUNTIME_DOUBLED])
+    emb = DiskBackedShardedEmbedding(root, _JANG, 8, 32, 2)
+    try:
+        class Ngram(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ngram_embedding = emb
+
+        class Ple(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ple_embedding = Ngram()
+                self.key_proj = nn.Linear(64, 64)
+
+        class Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ple = Ple()
+
+        class Text(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                # ple_layer_ids is 1-based: [2] places the PLE stack on
+                # tree index 1, exactly like the real JANGQ configs.
+                self.model.layers = [nn.Module(), Layer()]
+
+        class VLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = Text()
+
+        cfg = {
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                f"{_JANG}.shards.0": {"bits": 3, "group_size": 32},
+                f"{_JANG}.shards.1": {"bits": 3, "group_size": 32},
+                "language_model.layers.1.ple.key_proj": {
+                    "bits": 8,
+                    "group_size": 64,
+                },
+            }
+        }
+        expand_per_layer_quant_keys(cfg)
+        quant = cfg["quantization"]
+        # The resident-mode fix added the runtime variants...
+        assert (
+            "language_model.model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.0" in quant
+        )
+        # ...which is exactly what the mlx_vlm predicate consults.
+
+        def predicate(path, module):
+            if path in quant:
+                return quant[path]
+            if not hasattr(module, "to_quantized"):
+                return False
+            if module.weight.size % 64 != 0:
+                return False
+            return False
+
+        model = VLM()
+        nn.quantize(model, group_size=64, bits=8, class_predicate=predicate)
+
+        table = (
+            model.language_model.model.layers[1]
+            .ple.ple_embedding.ngram_embedding
+        )
+        assert type(table) is DiskBackedShardedEmbedding
+        assert len(table._shard_specs) == 2
+        key_proj = model.language_model.model.layers[1].ple.key_proj
+        assert type(key_proj) is nn.QuantizedLinear
+        assert (key_proj.bits, key_proj.group_size) == (8, 64)
+    finally:
+        emb.close()

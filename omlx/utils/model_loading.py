@@ -153,6 +153,32 @@ def _register_fused_experts_split_variants(
             extras[down_key] = val
 
 
+def _ple_runtime_variant(key: str) -> str:
+    """Map a checkpoint-spelled PLE quantization key onto the runtime tree.
+
+    Qwen4-Exp PLE policies are published under several historical
+    spellings -- ``model.language_model.layers.N.ple.*``,
+    JANGQ-shallow ``language_model.layers.N.ple.*``, or the runtime path
+    itself -- while the module tree holds them at
+    ``language_model.model.layers.N.ple.*`` with the ngram table one
+    level deeper (``ple.ple_embedding.ngram_embedding``). Keys already
+    in runtime form are returned unchanged.
+    """
+    if key.startswith(_CKPT_TEXT_PREFIX):
+        variant = _RUNTIME_TEXT_PREFIX + key[len(_CKPT_TEXT_PREFIX) :]
+    elif key.startswith(_RUNTIME_TEXT_PREFIX):
+        variant = key
+    elif key.startswith(_VLM_TEXT_PREFIX):
+        variant = _RUNTIME_TEXT_PREFIX + key[len(_VLM_TEXT_PREFIX) :]
+    else:
+        variant = _RUNTIME_TEXT_PREFIX + key
+    if ".ngram_embedding." in variant and ".ple.ple_embedding." not in variant:
+        variant = variant.replace(
+            ".ple.ngram_embedding.", ".ple.ple_embedding.ngram_embedding."
+        )
+    return variant
+
+
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
     """Add module-tree-path variants of per-layer quantization keys.
 
@@ -165,6 +191,11 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
     - HF checkpoint order ``model.language_model.layers.N.*``, which
       ``sanitize`` swaps to module-tree order
       ``language_model.model.layers.N.*``.
+    - JANGQ PLE overrides (``language_model.layers.N.ple.*``), which the
+      runtime additionally nests one level deeper as
+      ``...ple.ple_embedding.ngram_embedding``. Resident-mode shards are
+      quantizable ``nn.Embedding`` modules, so they need the runtime
+      variant; in mmap mode the extra key matches no module and is inert.
 
     Without the matching variant the lookup misses, the global bits are used,
     and the layer is built at the wrong bit-width.
@@ -195,9 +226,26 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 if proj_variant not in quant and proj_variant not in extras:
                     extras[proj_variant] = val
             if ".ple." in key:
-                # PLE ngram shards are served from SSD by the mmap table,
-                # never by a quantizable module: no runtime variant, or
-                # nn.quantize would target the sharded embedding.
+                # JANGQ PLE overrides are keyed by the checkpoint spelling
+                # (``language_model.layers.N.ple.*``) while the runtime tree
+                # nests the same modules at ``language_model.model.layers.N``
+                # with the ngram table one level deeper
+                # (``ple.ple_embedding.ngram_embedding``). In resident mode
+                # (``qwen4_ple_ssd_offload: false``) the shards are real
+                # ``nn.Embedding`` modules, so ``nn.quantize`` targets them:
+                # without the runtime variant the override lookup misses,
+                # the global 64/8 policy applies, and the (2500012, 160)
+                # shards fail the group-size divisibility check
+                # (160 % 64 != 0). In mmap mode the added key matches no
+                # module -- DiskBackedShardedEmbedding exposes no shard
+                # submodules -- so the variant is inert.
+                ple_variant = _ple_runtime_variant(key)
+                if (
+                    ple_variant != key
+                    and ple_variant not in quant
+                    and ple_variant not in extras
+                ):
+                    extras[ple_variant] = val
                 continue
             if key.startswith(_CKPT_TEXT_PREFIX):
                 # model.language_model.X -> language_model.model.X
