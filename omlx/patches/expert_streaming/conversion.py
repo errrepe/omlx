@@ -998,82 +998,6 @@ def _absorb_dsv4_spill(backing, model_path) -> int:
     return _spill_absorbed
 
 
-def _maybe_attach_expert_bank(
-    backing, model_settings, cold_root, spill_absorbed
-) -> None:
-    """Expert-packed bank (v2, Cherenkov steal): every projection
-    of a MoE layer fused into ONE record per expert (~2.7 MiB
-    here), so a layer-call miss is a single coalesced preadv per
-    run of ids instead of one command per projection (measured
-    roofline 2026-09-10: 1 MB reads = 1.62 GB/s vs 2 MB = 3.14
-    GB/s at fixed ~0.5-0.75 ms command latency — command SIZE
-    is decode throughput on this device). Single-tier only: the
-    HOBBIT split and spill stacking
-    keep the source layout; a stale or missing bank refuses with a
-    reason, never silently.
-
-    Bank resolution order (per-model setting first, then the
-    OMLX_EXPERT_STREAMING_BANK env as the operator fallback):
-     1. expert_streaming_bank_enabled setting on the model (UI
-        toggle): True attaches, False is an explicit opt-out
-        that overrides the env; None (unset) defers to the env;
-     2. OMLX_EXPERT_STREAMING_BANK=expert_packed env (bench and
-        headless operators);
-     3. off.
-    The bank location honors expert_streaming_bank_path (None =
-    <model>/.omlx/expert_bank) so a user can point the model at a
-    bank kept outside the model dir.
-    """
-    _bank_setting = getattr(
-        model_settings, "expert_streaming_bank_enabled", None
-    )
-    _bank_path_setting = getattr(
-        model_settings, "expert_streaming_bank_path", None
-    )
-    _bank_path = str(_bank_path_setting).strip() if _bank_path_setting else ""
-    _bank_mode = os.environ.get("OMLX_EXPERT_STREAMING_BANK", "").strip()
-    _bank_want = _bank_mode == "expert_packed"
-    if _bank_setting is True:
-        _bank_want = True
-    elif _bank_setting is False and _bank_want:
-        logger.warning(
-            "Expert streaming: expert_streaming_bank_enabled=false "
-            "overrides OMLX_EXPERT_STREAMING_BANK — bank disabled"
-        )
-        _bank_want = False
-    if _bank_want:
-        if cold_root is not None:
-            logger.warning(
-                "Expert streaming: expert bank ignored — incompatible "
-                "with the active cold tier (single-tier v1)"
-            )
-        elif spill_absorbed:
-            logger.warning(
-                "Expert streaming: expert bank ignored — incompatible "
-                "with spill-stacked banks (v1)"
-            )
-        else:
-            _bank_ok, _bank_why, _bank_n = backing.attach_expert_bank(
-                _bank_path or None
-            )
-            if _bank_ok:
-                logger.info(
-                    "Expert streaming: fused expert bank attached "
-                    "(%d layers, one record per expert%s) — prefill/"
-                    "batch reads use one preadv per expert run",
-                    _bank_n,
-                    f" at {_bank_path}" if _bank_path else "",
-                )
-            else:
-                logger.warning(
-                    "Expert streaming: expert bank not attached: %s "
-                    "(convert: python -m "
-                    "omlx.patches.expert_streaming.expert_bank_pack "
-                    "<model_dir>)",
-                    _bank_why,
-                )
-
-
 def _apply_hobbit_split(
     backing, model_path, io_ov, estimate, cold_root
 ) -> dict[int, set]:
@@ -1197,9 +1121,6 @@ def _build_expert_backing(
             cold_root = _resolve_cold_tier_root(model_path, model_settings)
             backing = ExpertBackingStore(model_path, cold_root=cold_root)
             _spill_absorbed = _absorb_dsv4_spill(backing, model_path)
-            _maybe_attach_expert_bank(
-                backing, model_settings, cold_root, _spill_absorbed
-            )
             hot_ids_by_layer = _apply_hobbit_split(
                 backing, model_path, io_ov, estimate, cold_root
             )

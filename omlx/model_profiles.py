@@ -72,11 +72,9 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     # from the checkpoint at validation time, so a copied profile cannot
     # carry a stale scope.
     "model_type",
-    # Bank/IO/pinning/policy tunables. Per-model by construction: several
-    # are checkpoint- or hardware-bound (bank_path, pins, seed) and must
-    # never propagate across models via templates.
-    "expert_streaming_bank_enabled",
-    "expert_streaming_bank_path",
+    # IO/pinning/policy tunables. Per-model by construction: several are
+    # checkpoint- or hardware-bound (pins, seed) and must never propagate
+    # across models via templates.
     "expert_streaming_cache_policy",
     "expert_streaming_cache_prior",
     "expert_streaming_coalesce",

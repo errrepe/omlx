@@ -100,12 +100,6 @@ _RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
 # at the promotion point, where the U copies and the bank briefly coexist.
 # 0 restores the per-expert promote + stack path.
 _BANK_PROMOTE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_BANK_PROMOTE", "1") != "0"
-# v2 fused expert bank (Cherenkov steal): one record per expert
-# serves every projection of a layer call. Multi-token (prefill/batch)
-# calls ride the fused record; single-token decode stays per-projection
-# (see gate 0 in _ensure_union_fused). 0 falls back to per-projection
-# banks everywhere.
-_FUSED_BANK_ENV = os.environ.get("OMLX_EXPERT_STREAMING_FUSED_BANK", "1") != "0"
 # Etapa A1b: same single-promotion trick, but on the *layer-context* path,
 # which is the one that actually runs when the Etapa B barrier is on (the
 # default). The context reads the demand bank as NumPy on an IO pool worker
@@ -1397,10 +1391,10 @@ class _LayerLoadContext:
         # simply does not count.
         self.positions = None if positions is None else int(positions)
         # Sequence length of the call (indices.shape[-2]): the multi-token
-        # signal for the fused-bank gate. positions alone cannot tell a
-        # single-token decode apart from a prefill row on top_k>1 models
-        # (GLM-5.3 JANG: 1 token x top_k 8 = 8 routed rows), where the
-        # fused record would reread cached projections every token.
+        # signal for the decode/prefill stats split and phase caps.
+        # positions alone cannot tell a single-token decode apart from a
+        # prefill row on top_k>1 models (GLM-5.3 JANG: 1 token x top_k 8
+        # = 8 routed rows).
         self.seq_len = None if seq_len is None else int(seq_len)
         # V2 phase-aware caps: select the cache's active pair from the
         # same shape test as the decode/prefill stats split — real
@@ -1804,207 +1798,6 @@ class _LayerLoadContext:
             for eid, row in zip(ids, rows):
                 self.cache.put(proj.bundle_key(eid), row)
 
-    def _ensure_union_fused(self, expert_ids: list[int]) -> bool:
-        """Union resolve through the v2 fused bank when it can serve the layer.
-
-        Returns True when the layer call is fully handled (including a
-        deliberate decline); False means nothing was counted and the caller
-        must run the per-projection path. All gating happens BEFORE the
-        demand split so a clean fallback never double-counts demand.
-
-        The demand unit of a MoE layer-call is the expert: gate/up/down of
-        one expert are always co-demanded, so the fused bank reads ONE
-        record per expert (~2.7 MiB here) instead of one bank command per
-        projection -- a 3x cut in preadv count with larger commands, which
-        is exactly what the fixed-latency NVMe roofline rewards (measured:
-        2 MB reads run ~2x the GB/s of 1 MB; command latency ~0.5-0.75 ms
-        dominates sub-2MB commands).
-
-        Hit-aware mix (E1-E3 post-mortem): an expert whose EVERY projection
-        is missing is served by one fused record; an expert with only SOME
-        projections missing is served by per-projection reads so the
-        already-cached components are not reread inside the record. The
-        full-record-only policy regressed decode -2..-10% in partial-hit
-        regimes because a 2.64 MiB record always rereads what a
-        per-projection path would skip.
-
-        Uniform tiers only: under the HOBBIT split projections resolve to
-        different readers per tier and a fused record spans packings, so
-        the layer falls back to per-projection banks.
-        """
-        if not self.linears:
-            return False
-        # Gate 0: fused records pay off on multi-token calls (prefill /
-        # batch), where the co-demanded expert set is large and command
-        # count dominates. Single-token decode calls the per-projection
-        # path instead: E3 measured full-record fused at -10% and the
-        # hit-aware mix at -12% there, while per-projection reads win
-        # (the page cache already dedups record overfetch, and fragmenting
-        # into sub-MiB commands would halve NVMe bandwidth). seq_len is the
-        # authoritative signal: positions conflates rows with tokens and a
-        # top_k>1 single-token decode would ride the fused path (GLM-5.3
-        # JANG measured -44% decode until this used indices.shape[-2]).
-        if self.seq_len is not None:
-            if self.seq_len <= 1:
-                return False
-        elif self.positions is not None and self.positions <= 1:
-            return False
-        # Gate 1: fused prefix resolvable and shared by every projection.
-        lead = self.linears[0]
-        prefix = getattr(lead, "_fused_prefix_cache", None)
-        if prefix is None:
-            try:
-                prefix = lead._fused_layer_prefix()
-            except Exception:
-                prefix = None
-            lead._fused_prefix_cache = prefix
-        if prefix is None:
-            return False
-        for proj in self.linears:
-            if proj is lead:
-                continue
-            p = getattr(proj, "_fused_prefix_cache", None)
-            if p is None:
-                try:
-                    p = proj._fused_layer_prefix()
-                except Exception:
-                    p = None
-                proj._fused_prefix_cache = p
-            if p != prefix:
-                return False
-        # Gate 2: no HOBBIT tier mixing.
-        for proj in self.linears:
-            if proj._is_split_active():
-                return False
-        # Gate 3: size gate BEFORE the split (expert_ids is an upper bound
-        # of the missing set -- over-estimating here only declines a layer
-        # that would have fit, never admits one that would not).
-        try:
-            backing = lead.backing
-            rec = backing.bank_reader_for_prefix(prefix)
-            if rec is None:
-                return False
-            rp = rec._rp_for(backing._bank_prefixes[prefix])
-        except Exception:
-            return False
-        if (
-            _CTX_UNION_MAX_BYTES > 0
-            and len(expert_ids) * int(rp.expert_bytes) > _CTX_UNION_MAX_BYTES
-        ):
-            self.declined = True
-            return True
-
-        # Split the demand per projection: cached ids skip the read.
-        jobs: list[tuple[Any, list[int]]] = []
-        missing_sets: dict[int, set[int]] = {}
-        for proj in self.linears:
-            cached, missing = self._split(proj, expert_ids)
-            self.bundles[id(proj)] = cached
-            self.hits[id(proj)] = len(cached)
-            self.misses[id(proj)] = len(missing)
-            self._count_demand(len(cached), len(missing))
-            if missing:
-                jobs.append((proj, missing))
-                missing_sets[id(proj)] = set(missing)
-        self._demand_counted = True
-        if not jobs:
-            return True
-        # Hit-aware demand classification: full-miss experts take ONE
-        # fused record; partial-miss experts take per-projection reads of
-        # only their missing components.
-        n_proj = len(self.linears)
-        miss_count: dict[int, int] = {}
-        for proj in self.linears:
-            for eid in missing_sets.get(id(proj), ()):
-                miss_count[eid] = miss_count.get(eid, 0) + 1
-        full_miss: list[int] = sorted(
-            e for e, c in miss_count.items() if c == n_proj
-        )
-        partial_jobs: list[tuple[Any, list[int]]] = []
-        for proj in self.linears:
-            ids = [
-                e for e in missing_sets.get(id(proj), ())
-                if miss_count[e] < n_proj
-            ]
-            if ids:
-                partial_jobs.append((proj, ids))
-        if not full_miss and not partial_jobs:
-            return True
-        keys: list = []
-        for proj in self.linears:
-            keys.append(proj.stacked_weight_key)
-            keys.append(proj.stacked_scales_key)
-            if proj.stacked_biases_key:
-                keys.append(proj.stacked_biases_key)
-        pool = self._pool_for(lead, len(expert_ids))
-        # Launch BOTH read waves before blocking: the fused record job and
-        # the per-projection partial jobs share the pool, so they overlap
-        # instead of serializing into two waves (measured: sequential waves
-        # cost +13% read_duration on the 4-request E3 bench).
-        fused_future = None
-        if full_miss:
-            fused_future = pool.submit(lead._read_fused_rows, full_miss, keys)
-        partial_results: list = []
-        if partial_jobs:
-            partial_results = list(
-                pool.map(
-                    lambda job: job[0]._load_expert_bank_np(job[1]),
-                    partial_jobs,
-                )
-            )
-        if fused_future is not None:
-            rows = fused_future.result()
-            if rows is None or len(rows) != len(full_miss):
-                # Dirty fallback: demand is already counted and split; the
-                # per-projection path must skip re-counting AND re-splitting
-                # (see _ensure_union).
-                self._fused_fallback = True
-                self._fallback_missing = {
-                    id(proj): list(miss) for proj, miss in jobs
-                }
-                return False
-            by_id = {int(e): row for e, row in zip(full_miss, rows)}
-            for eid in full_miss:
-                row = by_id[int(eid)]
-                for proj in self.linears:
-                    self.bundles[id(proj)][eid] = (
-                        row.get(proj.stacked_weight_key),
-                        row.get(proj.stacked_scales_key),
-                        (
-                            row.get(proj.stacked_biases_key)
-                            if proj.stacked_biases_key
-                            else None
-                        ),
-                    )
-            for proj in self.linears:
-                self._admit_rows(
-                    proj,
-                    list(full_miss),
-                    [self.bundles[id(proj)][eid] for eid in full_miss],
-                )
-        for (proj, ids), rows in zip(partial_jobs, partial_results):
-            if rows is None or len(rows) != len(ids):
-                self._fused_fallback = True
-                self._fallback_missing = {
-                    id(proj): list(miss) for proj, miss in jobs
-                }
-                return False
-            self.bundles[id(proj)].update(zip(ids, rows))
-            self._admit_rows(proj, ids, rows)
-        if memtrace.enabled:
-            memtrace.record(
-                "ctx.ensure.fused",
-                layer=lead.layer_idx,
-                n_proj=n_proj,
-                positions=len(expert_ids),
-                uniq=len(full_miss)
-                + sum(len(ids) for _, ids in partial_jobs) // max(n_proj, 1),
-                fused_bytes=len(full_miss) * int(rp.expert_bytes),
-                full_miss=len(full_miss),
-                partial_proj=sum(len(ids) for _, ids in partial_jobs),
-            )
-        return True
-
     def _join_union_proj(self, linear: Any) -> None:
         """PAR-3: join only this projection's union read future.
 
@@ -2058,16 +1851,6 @@ class _LayerLoadContext:
                 self._join_union_proj(linear)
             return
         self._loaded = True
-        # v2 fused bank first: one record per expert serves every
-        # projection of the layer (Cherenkov storage unit). On a fused
-        # fallback (read failed mid-way) the demand split below must not
-        # re-count what the fused path already counted.
-        if _FUSED_BANK_ENV and self._ensure_union_fused(expert_ids):
-            return
-        # Fused fallback: demand was already split/counted by
-        # _ensure_union_fused, so the loop below only rebuilds the jobs
-        # without re-counting. The _loaded latch stays set.
-        counted = getattr(self, '_demand_counted', False)
         layer = self.linears[0].layer_idx if self.linears else -1
         if memtrace.enabled:
             memtrace.record(
@@ -2077,32 +1860,14 @@ class _LayerLoadContext:
                 uniq=len(expert_ids),
             )
         jobs: list[tuple[Any, list[int]]] = []
-        fallback_missing = getattr(self, "_fallback_missing", None)
-        if fallback_missing is not None:
-            # Fused fallback: the fused attempt already split demand into
-            # bundles/hits/misses (a second _split would re-run the host
-            # sync + cache lookup per projection). Rebuild the jobs from
-            # the recorded missing sets, minus anything the fused read
-            # already landed into bundles on a partial fallback.
-            for proj in self.linears:
-                bids = self.bundles.get(id(proj)) or {}
-                miss = [
-                    e
-                    for e in fallback_missing.get(id(proj), ())
-                    if e not in bids
-                ]
-                if miss:
-                    jobs.append((proj, miss))
-        else:
-            for proj in self.linears:
-                cached, missing = self._split(proj, expert_ids)
-                self.bundles[id(proj)] = cached
-                self.hits[id(proj)] = len(cached)
-                self.misses[id(proj)] = len(missing)
-                if not counted:
-                    self._count_demand(len(cached), len(missing))
-                if missing:
-                    jobs.append((proj, missing))
+        for proj in self.linears:
+            cached, missing = self._split(proj, expert_ids)
+            self.bundles[id(proj)] = cached
+            self.hits[id(proj)] = len(cached)
+            self.misses[id(proj)] = len(missing)
+            self._count_demand(len(cached), len(missing))
+            if missing:
+                jobs.append((proj, missing))
         if not jobs:
             return
         pool = self._pool_for(jobs[0][0], len(expert_ids))
@@ -2583,35 +2348,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             return len(ids) * self._per_slot_bytes()
 
 
-    def _fused_layer_prefix(self):
-        """Layer prefix of this linear's fused v2 bank, or None.
-
-        The v2 bank packs every projection of one MoE layer into a single
-        record per expert (Cherenkov storage unit). When the backing has
-        the fused bank attached and THIS projection's components are in
-        it, the returned prefix drives a one-preadv-per-miss union read.
-        None keeps the per-projection bank path.
-        """
-        backing = self.backing
-        get_prefix = getattr(backing, "bank_reader_for_prefix", None)
-        comp = getattr(backing, "packed_component", None)
-        if get_prefix is None or comp is None:
-            return None
-        pc = comp(self.stacked_weight_key)
-        if pc is None:
-            return None
-        # language_model.layers.N.mlp.switch_mlp.gate_proj.weight
-        # -> language_model.layers.N.mlp.switch_mlp
-        key = self.stacked_weight_key
-        for _suffix in (".weight", ".scales", ".biases"):
-            if key.endswith(_suffix):
-                key = key[: -len(_suffix)]
-                break
-        prefix = key[: key.rfind(".")]
-        if backing.bank_reader_for_prefix(prefix) is None:
-            return None
-        return prefix
-
     def _read_expert_banks(self, expert_ids: list[int]):
         """Read a contiguous demand bank per (key, tier).
 
@@ -2739,68 +2475,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             return None
 
 
-    def _read_fused_rows(self, expert_ids: list[int], keys=None):
-        """Serve a whole-layer demand set through the v2 fused bank.
-
-        Returns rows in expert_ids order -- each row a dict keyed by every
-        requested stacked key with typed views sliced out of the fused
-        record -- or None when the fused bank is unavailable. The union
-        context routes ONE such read per layer instead of one per
-        projection: a miss costs one coalesced preadv per run of ids
-        (Cherenkov storage unit) instead of one command per projection.
-        *keys* defaults to this linear's own stacked keys; the layer
-        context passes the union of every projection's keys so one read
-        feeds all of them.
-        """
-        prefix = getattr(self, "_fused_prefix_cache", None)
-        if prefix is None:
-            prefix = self._fused_layer_prefix()
-            self._fused_prefix_cache = prefix
-        if prefix is None:
-            return None
-        backing = self.backing
-        if keys is None:
-            keys = [self.stacked_weight_key, self.stacked_scales_key]
-            if self.stacked_biases_key:
-                keys.append(self.stacked_biases_key)
-        comps = []
-        for key in keys:
-            pc = backing.packed_component(key)
-            if pc is None:
-                return None
-            comps.append((key,) + tuple(pc))
-        try:
-            got = backing.read_expert_bank_fused(prefix, expert_ids)
-            if got is None:
-                return None
-            bank, record_bytes = got
-            if bank.shape[0] != len(expert_ids):
-                return None
-            # dtype/shape truth lives in the SOURCE shard header (the bank
-            # file only carries the fused record grid); the packed bytes
-            # are byte-identical copies of those source rows.
-            rps = []
-            for key, _pk, _off, _nb in comps:
-                reader = backing._reader_for_key(key)
-                rps.append(reader._rp_for(key))
-            rows: list[dict] = []
-            for i in range(len(expert_ids)):
-                row = bank[i]
-                out: dict = {}
-                for (key, _pk, off, nb), rp in zip(comps, rps):
-                    out[key] = np.frombuffer(
-                        row[off:off + nb], dtype=rp.np_dtype
-                    ).reshape(rp.per_shape)
-                rows.append(out)
-            return rows
-        except Exception as exc:
-            try:
-                self.cache._count_ctx_fallback(f"fused_read_l{self.layer_idx}")
-                if memtrace.enabled:
-                    memtrace.record("fused.read_fail", layer=self.layer_idx, n=len(expert_ids), err=str(exc)[:120])
-            except Exception:
-                pass
-            return None
     def _load_expert_bank_np(self, expert_ids: list[int]) -> list[tuple] | None:
         """Read a demand set into one raw NumPy bank per (key, tier).
 

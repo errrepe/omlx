@@ -811,58 +811,6 @@ private struct AdvancedTab: View {
                     }
                 }
                 if vm.expertStreamingSupported && vm.expertStreamingEnabled {
-                    Row(label: String(localized: "settings.advanced.expert_bank.label",
-                                      defaultValue: "Fused Expert Bank (MoE streaming)",
-                                      comment: "Row label for the fused expert bank toggle"),
-                        sublabel: vm.expertBankAvailable
-                            ? String(localized: "settings.advanced.expert_bank.sub",
-                                     defaultValue: "Read whole experts as one fused record during prefill. Single-token decode is unaffected.",
-                                     comment: "Sublabel for the fused expert bank toggle")
-                            : String(localized: "settings.advanced.expert_bank.missing",
-                                     defaultValue: "No packed bank found — enable requires one (see server log for the convert command).",
-                                     comment: "Sublabel when no packed bank exists")) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            // Working-profile semantics like every other
-                            // profile-eligible toggle: marks the draft dirty;
-                            // the server write happens on Apply/Update.
-                            RowSwitch(isOn: vm.bindProfile($vm.expertBankEnabled))
-                            // A bank that is already on stays toggleable so
-                            // it can be switched off; otherwise no bank on
-                            // disk means there is nothing to enable.
-                            .disabled(!vm.expertBankAvailable && !vm.expertBankEnabled)
-                            if !vm.expertBankStatus.isEmpty {
-                                Text(vm.expertBankStatus)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(2)
-                            }
-                            if vm.expertBankEnabled {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(String(localized: "settings.advanced.expert_bank.path.label",
-                                                defaultValue: "Bank location (optional)",
-                                                comment: "Label above the bank path field"))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    TextField(
-                                        String(localized: "settings.advanced.expert_bank.path.placeholder",
-                                               defaultValue: "Default: model folder",
-                                               comment: "Placeholder for the bank path field"),
-                                        text: vm.bindProfile($vm.expertBankPath),
-                                        prompt: Text(vm.expertBankDefaultPath.isEmpty
-                                                     ? "Default: model folder"
-                                                     : vm.expertBankDefaultPath)
-                                    )
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(.system(.caption, design: .monospaced))
-                                    Text(String(localized: "settings.advanced.expert_bank.path.hint",
-                                                defaultValue: "Empty uses the bank inside the model folder; a path points at an existing bank elsewhere.",
-                                                comment: "Hint under the bank path field"))
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
-                        }
-                    }
                 Row(label: String(localized: "settings.advanced.expert_budget_auto.label",
                                       defaultValue: "Automatic Expert Budget",
                                       comment: "Row label for the automatic expert budget toggle"),

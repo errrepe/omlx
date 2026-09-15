@@ -53,8 +53,6 @@
         'expert_streaming_dynamic_min_gib',
         'expert_streaming_dynamic_stall_target',
         'expert_streaming_prefill_budget_gib',
-        'expert_streaming_bank_enabled',
-        'expert_streaming_bank_path',
         'expert_streaming_cache_policy',
         'expert_streaming_cache_prior',
         'expert_streaming_coalesce',
@@ -273,10 +271,6 @@
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
                 expert_streaming_enabled: false,
-                // Tri-state: null = never chosen (env fallback), true/false =
-                // explicit opt-in/opt-out. Omitted from the payload while null.
-                expert_streaming_bank_enabled: null,
-                expert_streaming_bank_path: '',
                 // 3-state budget: 'auto' | 'pagecache' (budget_gib 0 / auto off)
                 // | 'pinned' (explicit GiB).
                 expert_streaming_budget_mode: 'auto',
@@ -1398,21 +1392,6 @@
                         else if (ms.expert_streaming_budget_mode === 'auto') out.expert_streaming_budget_auto = true;
                         continue;
                     }
-                    // Bank tri-state: null (auto/untouched) omits the key.
-                    if (k === 'expert_streaming_bank_enabled') {
-                        if (ms.expert_streaming_bank_enabled !== null
-                            && ms.expert_streaming_bank_enabled !== undefined) {
-                            out.expert_streaming_bank_enabled = !!ms.expert_streaming_bank_enabled;
-                        }
-                        continue;
-                    }
-                    if (k === 'expert_streaming_bank_path') {
-                        const p = (ms.expert_streaming_bank_path || '').trim();
-                        if (ms.expert_streaming_bank_enabled === true && p) {
-                            out.expert_streaming_bank_path = p;
-                        }
-                        continue;
-                    }
                     // Standard field: omit unset values entirely — the server
                     // treats absent universal keys as "reset to default" when
                     // the profile is applied (snapshot semantics).
@@ -1483,8 +1462,6 @@
                     'expert_streaming_dynamic',
                     'expert_streaming_budget_gib',
                     'expert_streaming_budget_auto',
-                    'expert_streaming_bank_enabled',
-                    'expert_streaming_bank_path',
                 ]);
                 const ms = this.modelSettings || {};
                 const isDiffusion = !!ms.is_diffusion_model;
@@ -1919,17 +1896,6 @@
                         model?.qwen4_ple_ssd_offload_forced === true,
                     expert_streaming_supported:
                         model?.expert_streaming_supported === true,
-                    expert_bank_available: model?.expert_bank_available === true,
-                    expert_bank_status: model?.expert_bank_status || '',
-                    expert_bank_default_path: model?.expert_bank_default_path || '',
-                    // Tri-state: null = never chosen (env fallback applies);
-                    // the save payload omits the key in that state.
-                    expert_streaming_bank_enabled:
-                        s.expert_streaming_bank_enabled === true
-                            ? true
-                            : (s.expert_streaming_bank_enabled === false ? false : null),
-                    expert_streaming_bank_path:
-                        s.expert_streaming_bank_path || '',
                     deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
                         || s.deepseek_v41_engram_ssd_offload === true,
                     deepseek_v41_engram_ssd_offload_requested:
@@ -2938,16 +2904,6 @@
                                     this.modelSettings.qwen4_ple_ssd_offload_forced
                                         ? !!this.modelSettings.qwen4_ple_ssd_offload_requested
                                         : !!this.modelSettings.qwen4_ple_ssd_offload,
-                                // Tri-state: null = never chosen — the key is
-                                // omitted below so the stored value / env
-                                // fallback is preserved (not collapsed to
-                                // false by a save of unrelated fields).
-                                expert_streaming_bank_enabled:
-                                    this.modelSettings.expert_streaming_bank_enabled === true,
-                                expert_streaming_bank_path:
-                                    this.modelSettings.expert_streaming_bank_enabled === true
-                                        ? (this.modelSettings.expert_streaming_bank_path || null)
-                                        : null,
                                 deepseek_v41_engram_ssd_offload:
                                     this.modelSettings.deepseek_v41_engram_ssd_offload_forced
                                         ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
@@ -3103,14 +3059,6 @@
                                     : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
-                            // Untouched bank control (tri-state null) omits
-                            // both keys so the stored tri-state / env fallback
-                            // survives a save of unrelated settings.
-                            if (this.modelSettings.expert_streaming_bank_enabled === null
-                                || this.modelSettings.expert_streaming_bank_enabled === undefined) {
-                                delete payload.expert_streaming_bank_enabled;
-                                delete payload.expert_streaming_bank_path;
-                            }
                             if (isDiffusion) {
                                 Object.assign(payload, {
                                     top_p: null,
@@ -3147,8 +3095,6 @@
                                     // Whole expert-streaming family is
                                     // unsupported on the diffusion lane.
                                     expert_streaming_enabled: false,
-                                    expert_streaming_bank_enabled: false,
-                                    expert_streaming_bank_path: null,
                                     expert_streaming_budget_gib: null,
                                     expert_streaming_budget_auto: null,
                                     expert_streaming_dynamic: null,

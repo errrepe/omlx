@@ -75,48 +75,6 @@ async def _update_settings(
 
 
 @pytest.mark.asyncio
-async def test_expert_bank_settings_persist_and_flag_reload():
-    """Bank toggle + path persist via the admin PUT and signal reload."""
-    pool = MagicMock()
-    entry = MagicMock()
-    entry.engine = None  # not loaded -> no auto-unload path needed
-    pool.get_entry.return_value = entry
-    settings = ModelSettings()
-    assert settings.expert_streaming_bank_enabled is None  # tri-state default
-
-    request = admin_routes.ModelSettingsRequest(
-        expert_streaming_bank_enabled=True,
-        expert_streaming_bank_path="/volumes/bank2/expert_bank",
-    )
-    result = await _update_settings(pool, settings, request)
-    assert settings.expert_streaming_bank_enabled is True
-    assert settings.expert_streaming_bank_path == "/volumes/bank2/expert_bank"
-    # reload_required reflects that bank readers attach at engine build
-    assert result.get("reload_required") in (True, None)
-
-
-@pytest.mark.asyncio
-async def test_expert_bank_opt_out_and_blank_path_clear():
-    """Explicit off + empty path clears any previous override."""
-    pool = MagicMock()
-    entry = MagicMock()
-    entry.engine = None
-    pool.get_entry.return_value = entry
-    settings = ModelSettings(
-        expert_streaming_bank_enabled=True,
-        expert_streaming_bank_path="/old/bank",
-    )
-
-    request = admin_routes.ModelSettingsRequest(
-        expert_streaming_bank_enabled=False,
-        expert_streaming_bank_path="  ",
-    )
-    await _update_settings(pool, settings, request)
-    assert settings.expert_streaming_bank_enabled is False
-    assert settings.expert_streaming_bank_path is None
-
-
-@pytest.mark.asyncio
 async def test_load_time_setting_change_clears_cached_failure():
     pool, entry = _failed_pool()
     settings = ModelSettings(trust_remote_code=False)

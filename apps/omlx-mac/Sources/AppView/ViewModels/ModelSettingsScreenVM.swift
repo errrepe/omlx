@@ -30,7 +30,6 @@ final class ModelSettingsScreenVM {
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, qwen4PleSsdOffload
         case expertStreamingEnabled, moeExpertResidentFraction, engramSsdOffload
-        case expertBankEnabled, expertBankPath
         case expertBudgetAuto, expertBudgetGib
         case expertDynamicMode, expertDynamicMaxGib
         case expertDynamicMinGib, expertDynamicStall, expertPrefillGib
@@ -262,12 +261,6 @@ final class ModelSettingsScreenVM {
     var engramSsdOffload: Bool = false
     var engramSsdOffloadSupported: Bool = false
     var engramSsdOffloadForced: Bool = false
-    // MoE expert streaming: fused expert bank (opt-in) + location override.
-    // `expertBankEnabledStored` keeps the server's tri-state (nil = never
-    // chosen → env fallback) so profile saves don't collapse it to false.
-    var expertBankEnabled: Bool = false
-    var expertBankEnabledStored: Bool? = nil
-    var expertBankPath: String = ""
     // Dynamic expert budget (auto default, user-overridable). Gib/stall
     // fields are strings: empty = auto/cleared, numeric = pinned.
     // expertDynamicMode: 0 = auto, 1 = on, 2 = off.
@@ -279,9 +272,6 @@ final class ModelSettingsScreenVM {
     var expertDynamicStall: String = ""
     var expertPrefillGib: String = ""
     var expertStreamingSupported: Bool = false
-    var expertBankAvailable: Bool = false
-    var expertBankStatus: String = ""
-    var expertBankDefaultPath: String = ""
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -503,7 +493,6 @@ final class ModelSettingsScreenVM {
             return true
         case .expertStreamingEnabled, .moeExpertResidentFraction,
              .engramSsdOffload,
-             .expertBankEnabled, .expertBankPath,
              .expertBudgetAuto, .expertBudgetGib,
              .expertDynamicMode, .expertDynamicMaxGib,
              .expertDynamicMinGib, .expertDynamicStall, .expertPrefillGib:
@@ -671,18 +660,6 @@ final class ModelSettingsScreenVM {
                     m.deepseekV41EngramSsdOffloadForced ?? false
                 self.engramSsdOffload = self.engramSsdOffloadForced
                     || (s?.deepseekV41EngramSsdOffload ?? false)
-                self.expertBankAvailable =
-                    m.expertBankAvailable ?? false
-                self.expertBankStatus =
-                    m.expertBankStatus ?? ""
-                self.expertBankDefaultPath =
-                    m.expertBankDefaultPath ?? ""
-                self.expertBankEnabledStored =
-                    s?.expertStreamingBankEnabled
-                self.expertBankEnabled =
-                    s?.expertStreamingBankEnabled ?? false
-                self.expertBankPath =
-                    s?.expertStreamingBankPath ?? ""
                 self.expertBudgetAuto =
                     s?.expertStreamingBudgetAuto ?? true
                 self.expertBudgetGib =
@@ -867,20 +844,6 @@ final class ModelSettingsScreenVM {
             guard isDeepseekV41, engramSsdOffloadSupported,
                   !engramSsdOffloadForced else { return }
             patch.deepseekV41EngramSsdOffload = engramSsdOffload
-        case .expertBankEnabled:
-            guard expertStreamingSupported else { return }
-            patch.expertStreamingBankEnabled = expertBankEnabled
-            expertBankEnabledStored = expertBankEnabled
-            // Toggling off also clears the path override server-side.
-            if !expertBankEnabled {
-                patch.expertStreamingBankPath = .some(nil)
-            }
-        case .expertBankPath:
-            guard expertStreamingSupported, expertBankEnabled else { return }
-            // Empty path = default location: send JSON null so the server
-            // clears any previous override instead of persisting "".
-            patch.expertStreamingBankPath =
-                expertBankPath.isEmpty ? .some(nil) : .some(expertBankPath)
         case .expertBudgetAuto:
             guard expertStreamingSupported else { return }
             patch.expertStreamingBudgetAuto = expertBudgetAuto
@@ -1504,17 +1467,6 @@ final class ModelSettingsScreenVM {
                               moeExpertResidentFraction)
                 }
                 if expertStreamingSupported {
-                    // Bank tri-state: only written once the user has chosen
-                    // (stored or just toggled); unset omits the key so the
-                    // env fallback survives a profile save.
-                    if expertBankEnabledStored != nil || expertBankEnabled {
-                        putBool(ProfileSettingsKey.expertStreamingBankEnabled,
-                                expertBankEnabled)
-                        if expertBankEnabled {
-                            putString(ProfileSettingsKey.expertStreamingBankPath,
-                                      expertBankPath)
-                        }
-                    }
                     if !expertBudgetAuto,
                        let gib = Double(
                            expertBudgetGib.trimmingCharacters(in: .whitespaces)

@@ -342,54 +342,6 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen4_ple_ssd_offload"] as? Bool, true)
     }
 
-    func testExpertBankWireKeysAndCompatibility() throws {
-        let vm = ModelSettingsScreenVM()
-        vm.model = makeModel(id: "jang4m", configModelType: "qwen4_exp")
-        vm.expertStreamingSupported = true
-
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let dto = try decoder.decode(
-            ModelSettingsDTO.self,
-            from: Data(#"{"expert_streaming_bank_enabled":true,"expert_streaming_bank_path":"/volumes/bank"}"#.utf8)
-        )
-        XCTAssertEqual(dto.expertStreamingBankEnabled, true)
-        XCTAssertEqual(dto.expertStreamingBankPath, "/volumes/bank")
-
-        var patch = ModelSettingsPatch()
-        patch.expertStreamingBankEnabled = true
-        patch.expertStreamingBankPath = .some("/volumes/bank")
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        let object = try JSONSerialization.jsonObject(
-            with: encoder.encode(patch)
-        ) as? [String: Any]
-        XCTAssertEqual(object?["expert_streaming_bank_enabled"] as? Bool, true)
-        XCTAssertEqual(object?["expert_streaming_bank_path"] as? String, "/volumes/bank")
-
-        // Toggling off sends JSON null to clear the override server-side.
-        var offPatch = ModelSettingsPatch()
-        offPatch.expertStreamingBankEnabled = false
-        offPatch.expertStreamingBankPath = .some(nil)
-        let offObject = try JSONSerialization.jsonObject(
-            with: encoder.encode(offPatch)
-        ) as? [String: Any]
-        XCTAssertEqual(offObject?["expert_streaming_bank_enabled"] as? Bool, false)
-        XCTAssertTrue(
-            (offObject?["expert_streaming_bank_path"] as? NSNull) == NSNull()
-        )
-
-        // The model payload carries the capability + bank health fields.
-        let modelDTO = try decoder.decode(
-            ModelDTO.self,
-            from: Data(#"{"id":"jang4m","loaded":false,"is_loading":false,"estimated_size":0,"expert_streaming_supported":true,"expert_bank_available":true,"expert_bank_status":"ok","expert_bank_default_path":"/m/.omlx/expert_bank"}"#.utf8)
-        )
-        XCTAssertEqual(modelDTO.expertStreamingSupported, true)
-        XCTAssertEqual(modelDTO.expertBankAvailable, true)
-        XCTAssertEqual(modelDTO.expertBankStatus, "ok")
-        XCTAssertEqual(modelDTO.expertBankDefaultPath, "/m/.omlx/expert_bank")
-    }
-
     func testQwenAneSettingsDecodeFromServerAndEncodeForPatch() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -557,9 +509,6 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
             expertStreamingSupported: nil,
-            expertBankAvailable: nil,
-            expertBankStatus: nil,
-            expertBankDefaultPath: nil,
             moeExpertOffloadSupported: nil,
             deepseekV41EngramSsdOffloadSupported: nil,
             deepseekV41EngramSsdOffloadForced: nil,

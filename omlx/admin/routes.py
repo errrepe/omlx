@@ -247,14 +247,6 @@ class ModelSettingsRequest(BaseModel):
     preserve_thinking: bool | None = None
     cache_reasoning_output: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
-    # Fused expert bank (v2): opt-in per model. Multi-token calls read one
-    # record per expert (needs a packed bank); single-token decode is
-    # unaffected by design (phase-gated in the runtime).
-    expert_streaming_bank_enabled: bool | None = None
-    # Bank location override: None = <model>/.omlx/expert_bank; a path
-    # points at an existing bank elsewhere (shared volume, second SSD).
-    # Relative paths resolve against the model dir.
-    expert_streaming_bank_path: str | None = None
     # Canonical streaming switch (moe_expert_offload_enabled remains the
     # accepted alias — both feed moe_offload_requested).
     expert_streaming_enabled: bool | None = None
@@ -794,7 +786,6 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         # Whole expert-streaming tunable family: the diffusion lane never
         # builds the streaming backend, so stored values must not survive
         # a save/profile-apply on this lane.
-        "expert_streaming_bank_path",
         "expert_streaming_budget_gib",
         "expert_streaming_budget_auto",
         "expert_streaming_dynamic",
@@ -829,7 +820,6 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["moe_expert_offload_enabled"] = False
     settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["expert_streaming_enabled"] = False
-    settings["expert_streaming_bank_enabled"] = False
     settings["qwen4_ple_ssd_offload"] = False
     settings["deepseek_v41_engram_ssd_offload"] = False
     settings["specprefill_enabled"] = False
@@ -913,8 +903,6 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     # streaming backend (mirrors _sanitize_diffusion_settings_dict and the
     # WebUI's DIFFUSION_UNSUPPORTED_PROFILE_FIELDS).
     settings.expert_streaming_enabled = False
-    settings.expert_streaming_bank_enabled = False
-    settings.expert_streaming_bank_path = None
     settings.expert_streaming_budget_gib = None
     settings.expert_streaming_budget_auto = None
     settings.expert_streaming_dynamic = None
@@ -2311,9 +2299,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         qwen4_resident_bytes = 0
         qwen4_mmap_bytes = 0
         expert_streaming_supported = False
-        expert_bank_available = False
-        expert_bank_status = ""
-        expert_bank_default_path = ""
         if (model_info.get("config_model_type") or "").replace(
             "-", "_"
         ).lower() == "qwen4_exp":
@@ -2345,9 +2330,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                     model_id,
                     exc_info=True,
                 )
-        # Fused expert bank surface: expert streaming must support the
-        # model (MoE allowlist), then report whether a packed bank exists
-        # and its health so the UI can hint instead of failing at load.
+        # Expert streaming capability: MoE allowlist only.
         try:
             from ..patches.expert_streaming.residency import (
                 expert_streaming_estimate,
@@ -2356,25 +2339,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             _est = expert_streaming_estimate(
                 model_info.get("model_path", "")
             )
-            if _est.supported:
-                expert_streaming_supported = True
-                expert_bank_default_path = str(
-                    Path(model_info.get("model_path", ""))
-                    / ".omlx"
-                    / "expert_bank"
-                )
-                from ..patches.expert_streaming.expert_bank_pack import (
-                    bank_status_for,
-                )
-
-                _ok, _why, _m = bank_status_for(
-                    model_info.get("model_path", "")
-                )
-                expert_bank_available = bool(_ok)
-                expert_bank_status = _why
+            expert_streaming_supported = bool(_est.supported)
         except (OSError, TypeError, ValueError):
             logger.debug(
-                "Could not inspect expert-streaming bank for %s",
+                "Could not inspect expert-streaming support for %s",
                 model_id,
                 exc_info=True,
             )
@@ -2508,9 +2476,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
             "expert_streaming_supported": expert_streaming_supported,
-            "expert_bank_available": expert_bank_available,
-            "expert_bank_status": expert_bank_status,
-            "expert_bank_default_path": expert_bank_default_path,
             "deepseek_v41_engram_ssd_offload_supported": deepseek_v41_engram_ssd_offload_supported,
             "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
             "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
@@ -2854,13 +2819,6 @@ async def update_model_settings(
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
         )
-    if "expert_streaming_bank_enabled" in sent:
-        current_settings.expert_streaming_bank_enabled = bool(
-            request.expert_streaming_bank_enabled
-        )
-    if "expert_streaming_bank_path" in sent:
-        path_value = (request.expert_streaming_bank_path or "").strip()
-        current_settings.expert_streaming_bank_path = path_value or None
     # Canonical streaming switch (None leaves the stored value untouched).
     if "expert_streaming_enabled" in sent:
         current_settings.expert_streaming_enabled = bool(

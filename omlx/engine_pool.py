@@ -974,8 +974,6 @@ class EnginePool:
                 "expert_streaming_cache_policy",
                 "expert_streaming_topk_threshold",
                 "expert_streaming_cache_prior",
-                "expert_streaming_bank_enabled",
-                "expert_streaming_bank_path",
             ):
                 # budget_gib is canonicalized: the WebUI writes an explicit 0
                 # for page-cache mode, and 0 must hash the same as unset so

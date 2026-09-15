@@ -513,26 +513,6 @@ class ModelSettings:
     # cap. None = auto (decode_cap / 4, min 32 slots). The decode cap is
     # the dynamic one the governor tunes.
     expert_streaming_prefill_budget_gib: Optional[float] = None
-    # Fused expert bank (v2, Cherenkov-inspired): one .sfbank per MoE layer
-    # whose records pack ALL projections of an expert (2.64 MiB/expert on
-    # JANG_4M), so a multi-token (prefill/batch) layer call reads ONE
-    # record per expert instead of one command per projection. Phase-gated:
-    # single-token decode stays per-projection (see streaming_switch), so
-    # enabling it can only change prefill I/O. Opt-in per model; requires
-    # a packed bank (convert: python -m
-    # omlx.patches.expert_streaming.expert_bank_pack <model_dir>). A
-    # missing/refused bank logs a warning and streams per-projection —
-    # never a load failure. Tri-state: None = the user has not chosen
-    # (falls back to OMLX_EXPERT_STREAMING_BANK=expert_packed env, the
-    # bench/operator path); True = opt-in (UI toggle); False = explicit
-    # opt-out that overrides the env.
-    expert_streaming_bank_enabled: Optional[bool] = None
-    # Where the fused bank lives. None = <model>/.omlx/expert_bank (the
-    # packer default). A path points at an EXISTING bank elsewhere — e.g.
-    # a read-only model volume or a second SSD — letting users share one
-    # bank across installs or keep the model dir clean. Relative paths
-    # resolve against the model dir.
-    expert_streaming_bank_path: Optional[str] = None
     deepseek_v41_engram_ssd_offload: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)

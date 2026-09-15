@@ -65,12 +65,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let qwen4PleSsdOffloadForced: Bool?
     let qwen4PleResidentBytes: Int64?
     let qwen4PleMmapBytes: Int64?
-    /// MoE expert streaming: model supports streaming, and a packed fused
-    /// expert bank exists (with a health message when it does not).
+    /// MoE expert streaming: model supports the streaming converter.
     let expertStreamingSupported: Bool?
-    let expertBankAvailable: Bool?
-    let expertBankStatus: String?
-    let expertBankDefaultPath: String?
     /// Legacy MoE expert offload (resident-fraction adapter) capability.
     /// Broader than `expertStreamingSupported`: deepseek_v41 / gemma4 /
     /// olmoe take the legacy path without the unified streaming converter.
@@ -126,9 +122,6 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let moeExpertOffloadResidentFraction: Double?
     // DeepSeek V4.1 Engram SSD offload (per-model; never in profiles).
     let deepseekV41EngramSsdOffload: Bool?
-    // MoE expert streaming: fused expert bank toggle + location override
-    let expertStreamingBankEnabled: Bool?
-    let expertStreamingBankPath: String?
     // Dynamic expert budget (auto default): nil everywhere = automatic
     // (RAM-scaled initial budget + hunger/pressure governor).
     let expertStreamingBudgetGib: Double?
@@ -239,10 +232,6 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var moeExpertOffloadResidentFraction: Double? = nil
     // DeepSeek V4.1 Engram SSD offload (per-model; never in profiles).
     var deepseekV41EngramSsdOffload: Bool? = nil
-    // MoE expert streaming: fused expert bank toggle + location override.
-    // Toggling off sends nil path so the server clears the override.
-    var expertStreamingBankEnabled: Bool? = nil
-    var expertStreamingBankPath: String?? = nil
     // Dynamic expert budget: Double??/Bool?? so the editor can send JSON
     // null to clear a pin back to auto (nil omits the key).
     var expertStreamingBudgetGib: Double?? = nil

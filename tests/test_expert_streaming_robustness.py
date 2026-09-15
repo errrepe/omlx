@@ -501,25 +501,6 @@ class TestSummaryMergesBacking:
         assert out["backing"]["layers"] == 2
 
 
-class TestFfnBankGroupRegex:
-    """3.4: the bank pack must discover DeepSeek V4 ffn.switch_mlp keys."""
-
-    def test_ffn_and_mlp_layouts_match(self):
-        from omlx.patches.expert_streaming.expert_bank_pack import _GROUP_RE
-
-        m = _GROUP_RE.match(
-            "model.layers.0.ffn.switch_mlp.gate_proj.weight"
-        )
-        assert m is not None
-        assert m.group("kind") == "weight"
-        assert _GROUP_RE.match(
-            "model.layers.0.mlp.experts.down_proj.scales"
-        )
-        assert _GROUP_RE.match(
-            "language_model.model.layers.3.ffn.switch_mlp.up_proj.biases"
-        )
-
-
 class TestAliasPreservesSettings:
     """3.3: the alias path clones the user's settings instead of
     building a bare ModelSettings that drops every streaming tunable."""

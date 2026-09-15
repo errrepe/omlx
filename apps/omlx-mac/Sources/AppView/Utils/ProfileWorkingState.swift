@@ -71,8 +71,6 @@ struct ModelSettingsSnapshot: Equatable {
     // legacy-adapter resident fraction).
     var expertStreamingEnabled: Bool
     var moeExpertResidentFraction: String
-    var expertBankEnabled: Bool
-    var expertBankPath: String
     var expertBudgetAuto: Bool
     var expertBudgetGib: String
     var expertDynamicMode: Int
@@ -159,8 +157,6 @@ enum ProfileSettingsKey {
     static let expertStreamingEnabled = "expert_streaming_enabled"
     static let moeExpertOffloadEnabled = "moe_expert_offload_enabled"
     static let moeExpertOffloadResidentFraction = "moe_expert_offload_resident_fraction"
-    static let expertStreamingBankEnabled = "expert_streaming_bank_enabled"
-    static let expertStreamingBankPath = "expert_streaming_bank_path"
     static let expertStreamingBudgetGib = "expert_streaming_budget_gib"
     static let expertStreamingBudgetAuto = "expert_streaming_budget_auto"
     static let expertStreamingDynamic = "expert_streaming_dynamic"
