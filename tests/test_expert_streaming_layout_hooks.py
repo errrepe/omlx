@@ -181,16 +181,18 @@ class TestModelHooks:
         assert resolve_verify_scope("llama") is None
 
 
+class _Box:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
 class TestFindMoeContainer:
-    class _Box:
-        def __init__(self, **kw):
-            self.__dict__.update(kw)
 
     def _layer(self, layout="mlp", nested=False):
-        sm = self._Box(switch_mlp=object())
+        sm = _Box(switch_mlp=object())
         if nested:
-            return self._Box(block=self._Box(**{layout: sm}))
-        return self._Box(**{layout: sm})
+            return _Box(block=_Box(**{layout: sm}))
+        return _Box(**{layout: sm})
 
     def test_direct_chain(self):
         from omlx.patches.expert_streaming.model_hooks import (
@@ -209,7 +211,7 @@ class TestFindMoeContainer:
 
         # dense mlp without switch_mlp + MoE ffn: the chain must skip the
         # dense container, not stop at it.
-        layer = self._Box(mlp=object(), ffn=self._Box(switch_mlp=1))
+        layer = _Box(mlp=object(), ffn=_Box(switch_mlp=1))
         assert find_moe_container(layer, ("mlp", "ffn")) is layer.ffn
 
     def test_block_nesting(self):
@@ -229,21 +231,18 @@ class TestFindMoeContainer:
             find_moe_container,
         )
 
-        assert find_moe_container(self._Box(mlp=object()), ("mlp",)) is None
+        assert find_moe_container(_Box(mlp=object()), ("mlp",)) is None
         assert find_moe_container(None, ("mlp", "ffn")) is None
 
 
 class TestFindMtpStages:
-    class _Box:
-        def __init__(self, **kw):
-            self.__dict__.update(kw)
 
     def test_finds_mtp_on_owner_child(self):
         from omlx.patches.expert_streaming.model_hooks import find_mtp_stages
 
-        lm = self._Box(mtp=[self._Box(), self._Box()])
-        layers_owner = self._Box(language_model=lm)
-        model = self._Box()
+        lm = _Box(mtp=[_Box(), _Box()])
+        layers_owner = _Box(language_model=lm)
+        model = _Box()
         stages = find_mtp_stages(
             (layers_owner, model), ("language_model", "model")
         )
@@ -252,11 +251,11 @@ class TestFindMtpStages:
     def test_prefers_first_nonempty(self):
         from omlx.patches.expert_streaming.model_hooks import find_mtp_stages
 
-        a = self._Box(mtp=[self._Box()])
-        b = self._Box(mtp=[self._Box(), self._Box()])
+        a = _Box(mtp=[_Box()])
+        b = _Box(mtp=[_Box(), _Box()])
         assert find_mtp_stages((a, b), ("language_model",)) is a.mtp
-        assert find_mtp_stages((self._Box(), b), ("model",)) is b.mtp
-        assert find_mtp_stages((self._Box(), None), ("model",)) is None
+        assert find_mtp_stages((_Box(), b), ("model",)) is b.mtp
+        assert find_mtp_stages((_Box(), None), ("model",)) is None
 
     def test_weighted_sum_kernel_resolves(self):
         from omlx.patches.expert_streaming.model_hooks import (

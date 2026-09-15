@@ -2,7 +2,7 @@
 """Non-default eviction policy for the expert cache.
 
 ``S3FIFOExpertCache`` subclasses ``ExpertLRUCache`` and keeps its
-per-layer caps, admission filter, retain_hot, stats and the speculation
+per-layer caps, retain_hot, stats and the speculation
 hooks — only the victim-selection order differs. Selected via
 OMLX_EXPERT_STREAMING_CACHE (or the per-model
 ``expert_streaming_cache_policy`` setting) in
@@ -24,7 +24,7 @@ class S3FIFOExpertCache(ExpertLRUCache):
     prefill demand), where S3-FIFO's scan resistance wins: a small FIFO
     filters one-hit wonders, the main queue holds reuse, and a ghost
     queue promotes re-referenced entries (2nd chance). Per-layer caps,
-    admission filter, retain_hot, stats and the spec hooks are
+    retain_hot, stats and the spec hooks are
     inherited unchanged — only the global eviction order differs.
     Select with OMLX_EXPERT_STREAMING_CACHE=s3fifo (default lru).
     """
@@ -154,8 +154,6 @@ class S3FIFOExpertCache(ExpertLRUCache):
             self._idx_touch(self._main_layers, layer, key)
             self._store[key] = value
             return
-        if not self._admission_should_insert(key):
-            return
         _cap = self._cap_for(layer)
         if self.num_layers > 0 and _cap:
             cnt = self._layer_counts.get(layer, 0)
@@ -175,18 +173,21 @@ class S3FIFOExpertCache(ExpertLRUCache):
             self._idx_add(self._main_layers, layer, key)
         else:
             if len(self._small) >= self._small_cap:
-                old_k, _ = self._small.popitem(last=False)
-                self._idx_drop(self._small_layers, self._layer_of(old_k), old_k)
+                old_k = self._pop_small_head_unlocked()
                 self.stats.evictions += 1
-                self._layer_counts[self._layer_of(old_k)] = max(
-                    0, self._layer_counts.get(self._layer_of(old_k), 1) - 1
-                )
-                self._ghost[old_k] = None
-                while len(self._ghost) > self._ghost_cap:
-                    self._ghost.popitem(last=False)
+                self._dec_layer_count(self._layer_of(old_k))
             self._small[key] = value
             self._idx_add(self._small_layers, layer, key)
         self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
+
+    def _pop_small_head_unlocked(self):
+        """Evict the small FIFO's head into the ghost queue; return it."""
+        old_k, _ = self._small.popitem(last=False)
+        self._idx_drop(self._small_layers, self._layer_of(old_k), old_k)
+        self._ghost[old_k] = None
+        while len(self._ghost) > self._ghost_cap:
+            self._ghost.popitem(last=False)
+        return old_k
 
     def _evict_layer_unlocked(self, layer: int) -> bool:
         """Evict one entry of `layer` — small queue first (probation)."""
@@ -200,9 +201,7 @@ class S3FIFOExpertCache(ExpertLRUCache):
                     if victim in store:
                         store.pop(victim)
                         self.stats.evictions += 1
-                        self._layer_counts[layer] = max(
-                            0, self._layer_counts.get(layer, 1) - 1
-                        )
+                        self._dec_layer_count(layer)
                         return True
         # Fallback scan: entries that bypassed index maintenance (none
         # should exist — defensive only).
@@ -211,28 +210,20 @@ class S3FIFOExpertCache(ExpertLRUCache):
                 if self._layer_of(k) == layer:
                     store.pop(k)
                     self.stats.evictions += 1
-                    self._layer_counts[layer] = max(
-                        0, self._layer_counts.get(layer, 1) - 1
-                    )
+                    self._dec_layer_count(layer)
                     return True
         return False
 
     def _evict_one_global_unlocked(self) -> None:
         if len(self._small):
-            old_k, _ = self._small.popitem(last=False)
-            self._idx_drop(self._small_layers, self._layer_of(old_k), old_k)
-            self._ghost[old_k] = None
-            while len(self._ghost) > self._ghost_cap:
-                self._ghost.popitem(last=False)
+            old_k = self._pop_small_head_unlocked()
         elif len(self._store):
             old_k, _ = self._store.popitem(last=False)
             self._idx_drop(self._main_layers, self._layer_of(old_k), old_k)
         else:
             return
         self.stats.evictions += 1
-        self._layer_counts[self._layer_of(old_k)] = max(
-            0, self._layer_counts.get(self._layer_of(old_k), 1) - 1
-        )
+        self._dec_layer_count(self._layer_of(old_k))
 
     def _clear_unlocked(self) -> None:
         super()._clear_unlocked()
@@ -248,15 +239,9 @@ class S3FIFOExpertCache(ExpertLRUCache):
         # global drain could act — the cache never really shrank.
         self._derive_queue_caps()
         while len(self._small) > self._small_cap:
-            old_k, _ = self._small.popitem(last=False)
-            self._idx_drop(self._small_layers, self._layer_of(old_k), old_k)
+            old_k = self._pop_small_head_unlocked()
             self.stats.evictions += 1
-            self._layer_counts[self._layer_of(old_k)] = max(
-                0, self._layer_counts.get(self._layer_of(old_k), 1) - 1
-            )
-            self._ghost[old_k] = None
-        while len(self._ghost) > self._ghost_cap:
-            self._ghost.popitem(last=False)
+            self._dec_layer_count(self._layer_of(old_k))
 
     def _drain_to_unlocked(self, cap: int) -> None:
         """S3-FIFO: drain both queues, demoting small victims to ghost.

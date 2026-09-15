@@ -55,14 +55,9 @@ def test_gate_state_ignores_unbounded_cache():
         cache.close()
 
 
-def test_gate_state_dead_cache_does_not_linger(monkeypatch):
-    # No admission worker: its thread holds a strong ref to the cache, so a
-    # detached-admission cache is only collectable after close() — that's
-    # the worker's pre-existing ownership, not the weak registry's. With
-    # admission off the WeakSet must drop the dead cache immediately.
-    import omlx.patches.expert_streaming.streaming_switch as sw
-
-    monkeypatch.setattr(sw, "_ADMIT_ENV", "off")
+def test_gate_state_dead_cache_does_not_linger():
+    # The admission worker holds only a weakref to its cache, so a dead
+    # engine's cache is collected and the WeakSet drops it immediately.
     cache = ExpertLRUCache(budget_bytes=1 << 20, per_expert_bytes=1024, num_layers=2)
     del cache
     gc.collect()

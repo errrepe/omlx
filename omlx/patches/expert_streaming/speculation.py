@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import os
 import threading
-import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
+
+from ._env import env_int
 
 
 _TRANSITION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_TRANSITION", "1") != "0"
@@ -37,9 +38,9 @@ _TRANSITION_OVERFETCH = 1  # extra candidates per demanded expert
 # costs a bounded burst and then shuts itself off.
 _STAGED_ENV = os.environ.get("OMLX_EXPERT_STREAMING_STAGED", "1") != "0"
 # Bound on staged rows + in-flight keys (rows are ~0.9 MB each here).
-_STAGED_MAX = max(16, int(os.environ.get("OMLX_EXPERT_STREAMING_STAGED_MAX", "512")))
+_STAGED_MAX = env_int("OMLX_EXPERT_STREAMING_STAGED_MAX", 512, lo=16)
 # Predicted set cap per (layer call, projection).
-_STAGED_MAX_IDS = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_STAGED_IDS", "48")))
+_STAGED_MAX_IDS = env_int("OMLX_EXPERT_STREAMING_STAGED_IDS", 48, lo=1)
 # Per-layer recall gate: stage only when the prev-token prediction has
 # covered at least this share of observed demand recently (EWMA).
 _STAGED_MIN_RECALL = float(
@@ -54,7 +55,7 @@ _STAGED_RECALL_DECAY = 0.9
 # transition-table extras by their measured precision (the share of last
 # token's extras that appeared in this token's demand). 0 disables.
 _ADVISE_TTL = max(
-    0, int(os.environ.get("OMLX_EXPERT_STREAMING_ADVISE_TTL", "96"))
+    0, env_int("OMLX_EXPERT_STREAMING_ADVISE_TTL", 96)
 )
 _ADVISE_TRANS_MIN_PRECISION = float(
     os.environ.get("OMLX_EXPERT_STREAMING_TRANS_MIN_PRECISION", "0.05") or 0
@@ -108,14 +109,6 @@ class SpeculationState:
         self._trans_pending: Dict[int, set] = {}
         self._trans_hits = 0
         self._trans_total = 0
-        # Probe: same-token layer sets + cross-layer recall measurements.
-        # Decode walks layers in order; a non-increasing layer index marks
-        # a token boundary, so the just-finished token's sets roll into
-        # `_prev_token_sets`.
-        self._last_record_layer: Optional[int] = None
-        self._cur_token_sets: Dict[int, list[int]] = {}
-        self._prev_token_sets: Dict[int, list[int]] = {}
-        self._xlayer_ewma: Dict[str, float] = {}
 
     # -- registry / history ----------------------------------------------
 
@@ -134,7 +127,6 @@ class SpeculationState:
     ) -> None:
         """Remember this layer's routing for the next token's speculation."""
         now = [int(e) for e in ids]
-        li = int(layer_idx)
         # Called once per MoE layer-call from StreamingSwitchGLU.__call__ —
         # the projections share the plan's uniq_list, so a per-projection
         # record would triple-count every layer.
@@ -142,28 +134,6 @@ class SpeculationState:
             if self.closed:
                 return
             self._advise_clock += 1
-            last = self._last_record_layer
-            if last is not None and li <= last:
-                self._prev_token_sets = self._cur_token_sets
-                self._cur_token_sets = {}
-            self._last_record_layer = li
-            self._cur_token_sets[li] = now
-            now_set = set(now)
-            if li > 0 and now_set:
-                for key, src_map in (
-                    ("xlayer_same", self._cur_token_sets),
-                    ("xlayer_diag", self._prev_token_sets),
-                ):
-                    src = src_map.get(li - 1)
-                    if src:
-                        obs = len(set(src) & now_set) / len(now_set)
-                        old = self._xlayer_ewma.get(key, 0.0)
-                        new = (
-                            _STAGED_RECALL_DECAY * old
-                            + (1.0 - _STAGED_RECALL_DECAY) * obs
-                        )
-                        self._xlayer_ewma[key] = new
-                        self.stats[key + "_recall"] = new
             # Transition-overfetch precision: score last call's extras
             # for this layer against what this call actually demanded.
             pend = self._trans_pending.pop(int(layer_idx), None)
@@ -175,37 +145,12 @@ class SpeculationState:
                 # Recall of the prev-token prediction for THIS call — the
                 # gate that decides whether staging this layer pays.
                 inter = len(set(prev) & set(now))
-                # Speculative-MoE feasibility counters (measure-only): a
-                # predicted-set execution recomputes every expert the
-                # prediction missed (now \ prev) and wastes the extras it
-                # loaded (prev \ now); full cover = zero-recompute calls.
-                _ps, _ns = set(prev), set(now)
-                self.stats["prev_cover_calls"] = (
-                    self.stats.get("prev_cover_calls", 0) + 1
-                )
-                if _ps >= _ns:
-                    self.stats["prev_cover_full"] = (
-                        self.stats.get("prev_cover_full", 0) + 1
-                    )
-                self.stats["prev_cover_miss_sum"] = self.stats.get(
-                    "prev_cover_miss_sum", 0
-                ) + len(_ns - _ps)
-                self.stats["prev_cover_extra_sum"] = self.stats.get(
-                    "prev_cover_extra_sum", 0
-                ) + len(_ps - _ns)
                 obs = inter / max(1, len(now))
                 old = self.recall_ewma.get(int(layer_idx), 0.0)
                 self.recall_ewma[int(layer_idx)] = (
                     _STAGED_RECALL_DECAY * old
                     + (1.0 - _STAGED_RECALL_DECAY) * obs
                 )
-                told = self._xlayer_ewma.get("temporal", 0.0)
-                tnew = (
-                    _STAGED_RECALL_DECAY * told
-                    + (1.0 - _STAGED_RECALL_DECAY) * obs
-                )
-                self._xlayer_ewma["temporal"] = tnew
-                self.stats["temporal_recall"] = tnew
             if _TRANSITION_ENV and prev and now:
                 # Credit temporal transitions prev -> now (EWMA without a
                 # global decay pass: w = 1 + 0.9*w, normalized on read).
@@ -369,19 +314,10 @@ class SpeculationState:
         if entry is None:
             return None
         fut, ids, linear = entry
-        # Measure how long the demand path parks behind an in-flight
-        # staged read.
-        _waited = not fut.done()
-        _wt0 = time.perf_counter() if _waited else 0.0
         try:
             got = fut.result()
         except Exception:
             got = None
-        if _waited:
-            _wdt = int((time.perf_counter() - _wt0) * 1e6)
-            with self.lock:
-                self.stats["stage_wait_us"] = self.stats.get("stage_wait_us", 0) + _wdt
-                self.stats["stage_waits"] = self.stats.get("stage_waits", 0) + 1
         rows = got[1] if isinstance(got, tuple) else got
         with self.lock:
             if self.closed:

@@ -170,14 +170,18 @@ class TestColdTierLabelValidation:
         ]
         _write_cold_tier(tmp_path, keys, bits="3")
         captured = self._spy_backing(monkeypatch)
-        convert_model_to_streaming(
+        _, backing = convert_model_to_streaming(
             SimpleNamespace(),
             str(tmp_path),
             SimpleNamespace(expert_streaming_cold_tier="2"),
             use_file_backing=True,
         )
-        # A 3-bit tier must not serve a "2" request — validation ran.
-        assert captured.get("cold_root") is None
+        try:
+            # A 3-bit tier must not serve a "2" request — validation ran.
+            assert captured.get("cold_root") is None
+        finally:
+            if backing is not None:
+                backing.close()
 
     def test_matching_bits_label_accepted(self, tmp_path, monkeypatch):
         from omlx.patches.expert_streaming import convert_model_to_streaming
@@ -190,13 +194,17 @@ class TestColdTierLabelValidation:
         ]
         _write_cold_tier(tmp_path, keys, bits="3")
         captured = self._spy_backing(monkeypatch)
-        convert_model_to_streaming(
+        _, backing = convert_model_to_streaming(
             SimpleNamespace(),
             str(tmp_path),
             SimpleNamespace(expert_streaming_cold_tier="3"),
             use_file_backing=True,
         )
-        assert captured.get("cold_root") is not None
+        try:
+            assert captured.get("cold_root") is not None
+        finally:
+            if backing is not None:
+                backing.close()
 
 
 class TestPrefillPinOrdering:
@@ -223,11 +231,14 @@ class TestPrefillPinOrdering:
             use_file_backing=True,
         )
         assert backing is not None
-        cache = backing._streaming_cache
-        # Reconciliation must have run (fused: 2 projections, not 3).
-        assert cache.per_expert_bytes > 0
-        expected = int(0.01 * 1024**3) // cache.per_expert_bytes
-        assert cache._prefill_global_cap == expected
+        try:
+            cache = backing._streaming_cache
+            # Reconciliation must have run (fused: 2 projections, not 3).
+            assert cache.per_expert_bytes > 0
+            expected = int(0.01 * 1024**3) // cache.per_expert_bytes
+            assert cache._prefill_global_cap == expected
+        finally:
+            backing.close()
 
 
 class TestCanonicalKillSwitch:

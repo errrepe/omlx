@@ -144,15 +144,6 @@ class ExpertStreamingEstimate:
     # per-expert layouts with unmapped projection names).
     moe_intermediate_size: int = 0
     expert_fused: bool = False
-    # Cold-tier awareness. When the estimate was computed against an
-    # active cold tier, expert_bytes_effective measures the banks actually
-    # read at decode (cold packing, smaller) instead of the source
-    # checkpoint banks; tier is "uniform" (all cold), "hobbit"
-    # (hot/cold split — effective is a hot-fraction-weighted blend) or
-    # "none". Empty (tier "none") means effective == expert_bytes.
-    tier: str = "none"
-    expert_bytes_effective: int = 0
-    per_expert_bytes_effective: int = 0
 
     def slots_for_budget(self, budget_bytes: int) -> int:
         """**Experts** per layer that fit in *budget_bytes* — not slots.
@@ -428,7 +419,6 @@ def _cached_estimate(
     model_path_str: str,
     sig: tuple[tuple[str, int, int], ...],
     index_sig: tuple[int, int] | None,
-    _cold_overlay: tuple[float | None, str | None] | None = None,
 ) -> ExpertStreamingEstimate:
     model_path = Path(model_path_str)
     config = _load_config(model_path)
@@ -586,27 +576,6 @@ def _cached_estimate(
     # streaming_bytes_for_budget.
     streaming_bytes = int(dense_bytes * _MODEL_OVERHEAD_FACTOR)
 
-    # Cold-tier effective bytes are resolved by the caller-provided
-    # overlay (see expert_streaming_estimate): the base scan always
-    # measures the source checkpoint; the overlay rescales to what decode
-    # actually reads. With no overlay the source measurements apply.
-    tier = "none"
-    expert_bytes_effective = expert_bytes
-    if _cold_overlay is not None:
-        try:
-            _scale, _tier_name = _cold_overlay
-            tier = str(_tier_name or "uniform")
-            if _scale is not None and 0 < float(_scale) <= 1.0:
-                expert_bytes_effective = int(expert_bytes * float(_scale))
-        except Exception:
-            pass
-    per_expert_effective = per_expert
-    if num_moe_layers > 0 and experts_per_layer > 0 and expert_bytes_effective != expert_bytes:
-        try:
-            per_expert_effective = expert_bytes_effective // (num_moe_layers * experts_per_layer)
-        except Exception:
-            per_expert_effective = per_expert
-
     return ExpertStreamingEstimate(
         supported=supported,
         checkpoint_bytes=checkpoint_bytes,
@@ -623,81 +592,7 @@ def _cached_estimate(
         moe_intermediate_size=moe_intermediate,
         expert_fused=expert_fused,
         model_type=model_type,
-        tier=tier,
-        expert_bytes_effective=expert_bytes_effective,
-        per_expert_bytes_effective=per_expert_effective,
     )
-
-
-def _resolve_cold_overlay(
-    model_path: Path,
-    cold_root: str | Path | None = None,
-    hot_fraction: float | None = None,
-) -> tuple[float | None, str | None] | None:
-    """Byte-scale overlay for an active cold tier (or None).
-
-    Returns (scale, tier_name) where scale rescales source expert bytes
-    to what decode actually reads. Uniform tier: measured from the cold
-    shards' headers (data_offsets of the same expert keys). HOBBIT split:
-    hot-fraction-weighted blend of 1.0 (hot, source packing) and the cold
-    scale. None when no complete tier is active — the base scan applies.
-    """
-    try:
-        import os as _os
-
-        croot = Path(cold_root).expanduser().resolve() if cold_root else None
-        if croot is None:
-            env_root = _os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT", "")
-            croot = Path(env_root).expanduser().resolve() if env_root else model_path / "expert_cold"
-        if not croot.is_dir():
-            return None
-        # Completeness: every source expert key must exist under the tier.
-        # Light check here (file presence); the converter's full status
-        # check remains authoritative for activation.
-        cold_files = list(croot.glob("*.safetensors"))
-        if not cold_files:
-            return None
-        cold_bytes = 0
-        cold_keys = 0
-        for fp in cold_files:
-            try:
-                hdr = _safetensors_header(fp)
-            except Exception:
-                continue
-            for k, entry in hdr.items():
-                if k == "__metadata__":
-                    continue
-                try:
-                    s, e = entry["data_offsets"]
-                    cold_bytes += int(e) - int(s)
-                    cold_keys += 1
-                except Exception:
-                    continue
-        if cold_keys == 0 or cold_bytes <= 0:
-            return None
-        # Source expert bytes for the same checkpoint (base scan, no overlay).
-        base = _cached_estimate(str(model_path), _sig_of(model_path), _index_sig_of(model_path))
-        if not base.supported or base.expert_bytes <= 0:
-            return None
-        scale = cold_bytes / base.expert_bytes
-        if not (0 < scale <= 1.0):
-            # A tier larger than source is a misconfiguration — ignore.
-            return None
-        try:
-            hf = None if hot_fraction is None else max(0.0, min(1.0, float(hot_fraction)))
-        except (TypeError, ValueError):
-            hf = None
-        # hf == 1.0 must not collapse to the fully-cold ``scale``:
-        # shard_bank elects ``n_hot = ceil(hf * width)`` hot experts per
-        # layer (see _load_pin_profile), so hf == 1.0 means EVERY expert
-        # is stored at full precision — the effective per-expert bytes
-        # are the SOURCE bytes, i.e. a scale of 1.0. Under-charging
-        # here under-charges expert_bytes_effective at admission.
-        if hf is not None and hf > 0.0:
-            return (hf * 1.0 + (1.0 - hf) * scale, "hobbit")
-        return (scale, "uniform")
-    except Exception:
-        return None
 
 
 def _sig_of(p: Path) -> tuple[tuple[str, int, int], ...]:
@@ -721,26 +616,18 @@ def _index_sig_of(p: Path) -> tuple[int, int] | None:
 
 def expert_streaming_estimate(
     model_path: str | Path,
-    cold_root: str | Path | None = None,
-    hot_fraction: float | None = None,
 ) -> ExpertStreamingEstimate:
-    """Inspect checkpoint headers without materializing tensor data.
-
-    Pass ``cold_root`` (and ``hot_fraction`` for a HOBBIT split) to
-    measure what decode actually reads when a cold tier is active; omit
-    both for the source-checkpoint estimate.
-    """
+    """Inspect checkpoint headers without materializing tensor data."""
 
     p = Path(model_path).expanduser().resolve()
     sig = _sig_of(p)
     index_sig = _index_sig_of(p)
-    overlay = _resolve_cold_overlay(p, cold_root, hot_fraction)
     # Observability: the VLM loader runs this scan on EVERY load
     # (allowlist short-circuit + this lru_cache keep it cheap), so a timed
     # debug line records the true cost and hit rate in production logs.
     hits_before = _cached_estimate.cache_info().hits
     t0 = time.perf_counter()
-    est = _cached_estimate(str(p), sig, index_sig, overlay)
+    est = _cached_estimate(str(p), sig, index_sig)
     scan_ms = (time.perf_counter() - t0) * 1000.0
     logger.debug(
         "Expert streaming scan %s: %.1f ms (%s), supported=%s layers=%d",

@@ -145,40 +145,6 @@ def spill_layer_name(layer_idx: int) -> str:
     return _LAYER_FILE.format(idx=layer_idx)
 
 
-def expected_layer_keys(layer_idx: int) -> list[str]:
-    """Stacked key names one layer's spill shard must contain."""
-    return [
-        f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
-        for _, dst in _PROJ_MAP
-        for suffix in _SUFFIXES
-    ]
-
-
-def spill_layer_ok(spill_dir: Path, layer_idx: int) -> bool:
-    """True when the layer shard exists with a complete header.
-
-    Header-only check (all nine stacked keys present): it detects a
-    truncated kill-mid-save, NOT source correspondence. Must not gate
-    reuse after a spill miss — a source change leaves complete headers
-    from the previous checkpoint behind (PR #3468). The sanitize path
-    clears stale shards on miss and re-stacks; this helper remains for
-    unit tests only.
-    """
-    import struct as _struct
-
-    path = spill_dir / spill_layer_name(layer_idx)
-    try:
-        if not path.is_file() or path.stat().st_size == 0:
-            return False
-        with path.open("rb") as f:
-            hsize = _struct.unpack("<Q", f.read(8))[0]
-            hdr = json.loads(f.read(hsize))
-        want = expected_layer_keys(layer_idx)
-        return all(k in hdr for k in want)
-    except Exception:
-        return False
-
-
 def stack_layer_to_spill(
     weights: dict[str, Any],
     *,

@@ -28,6 +28,8 @@ from typing import Any, Dict, NamedTuple, Tuple
 import mlx.core as mx
 import numpy as np
 
+from ._env import env_int
+
 _PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
 
 _libc = ctypes.CDLL(None, use_errno=True)
@@ -71,34 +73,49 @@ _RADVISORY = struct.Struct("=qi4x")  # off_t ra_offset; int ra_count; + tail pad
 _MLOCK_FAILED_LOGGED = False
 
 
-def _mlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
-    """mlock a page-aligned range of an existing file mapping. Zero-copy:
-    the locked pages are the file cache pages themselves. The mapping's
-    base address is obtained via PyObject_GetBuffer (the mmap is
-    read-only, so from_buffer's writable requirement does not apply)."""
-    global _MLOCK_FAILED_LOGGED
+def _mm_page_range(mm: mmap.mmap, offset: int, length: int):
+    """Page-aligned ``(base, nbytes)`` for ``mm[offset:offset+length]``.
+
+    The mapping's base address is obtained via PyObject_GetBuffer (the
+    mmap is read-only, so from_buffer's writable requirement does not
+    apply). The address stays valid while ``mm`` is open — the released
+    buffer export only drops a refcount, not the mapping.
+    """
+    view = _PyBuffer()
     try:
-        view = _PyBuffer()
         if _pyapi.PyObject_GetBuffer(mm, ctypes.byref(view), 0) != 0 or not view.buf:
-            return False
+            return None
         try:
-            base = view.buf
             start = (offset // _PAGE_SIZE) * _PAGE_SIZE
             end = min(view.len, ((offset + length + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE)
             if end <= start:
-                return False
-            rc = _libc.mlock(ctypes.c_void_p(base + start), ctypes.c_size_t(end - start))
-            if rc != 0 and not _MLOCK_FAILED_LOGGED:
-                import errno
-
-                _MLOCK_FAILED_LOGGED = True
-                logger.warning(
-                    "mlock failed (errno=%s) — pinned-expert mode disabled for new pins",
-                    errno.errorcode.get(ctypes.get_errno(), ctypes.get_errno()),
-                )
-            return rc == 0
+                return None
+            return view.buf + start, end - start
         finally:
             _pyapi.PyBuffer_Release(ctypes.byref(view))
+    except Exception:
+        return None
+
+
+def _mlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
+    """mlock a page-aligned range of an existing file mapping. Zero-copy:
+    the locked pages are the file cache pages themselves."""
+    global _MLOCK_FAILED_LOGGED
+    try:
+        r = _mm_page_range(mm, offset, length)
+        if r is None:
+            return False
+        base, size = r
+        rc = _libc.mlock(ctypes.c_void_p(base), ctypes.c_size_t(size))
+        if rc != 0 and not _MLOCK_FAILED_LOGGED:
+            import errno
+
+            _MLOCK_FAILED_LOGGED = True
+            logger.warning(
+                "mlock failed (errno=%s) — pinned-expert mode disabled for new pins",
+                errno.errorcode.get(ctypes.get_errno(), ctypes.get_errno()),
+            )
+        return rc == 0
     except Exception as e:
         if not _MLOCK_FAILED_LOGGED:
             _MLOCK_FAILED_LOGGED = True
@@ -114,19 +131,11 @@ def _munlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
     ``pinned_bytes`` cannot stay stale across an unload/reload.
     """
     try:
-        view = _PyBuffer()
-        if _pyapi.PyObject_GetBuffer(mm, ctypes.byref(view), 0) != 0 or not view.buf:
+        r = _mm_page_range(mm, offset, length)
+        if r is None:
             return False
-        try:
-            base = view.buf
-            start = (offset // _PAGE_SIZE) * _PAGE_SIZE
-            end = min(view.len, ((offset + length + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE)
-            if end <= start:
-                return False
-            rc = _libc.munlock(ctypes.c_void_p(base + start), ctypes.c_size_t(end - start))
-            return rc == 0
-        finally:
-            _pyapi.PyBuffer_Release(ctypes.byref(view))
+        base, size = r
+        return _libc.munlock(ctypes.c_void_p(base), ctypes.c_size_t(size)) == 0
     except Exception:
         logger.debug("munlock failed", exc_info=True)
         return False
@@ -166,7 +175,7 @@ def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
 #
 # Default 16 sits at the device's useful queue depth; deeper
 # oversubscribes it and regresses. OMLX_EXPERT_STREAMING_RUN_QD overrides.
-_RUN_IO_QD = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_QD", "16")))
+_RUN_IO_QD = env_int("OMLX_EXPERT_STREAMING_RUN_QD", 16, lo=1)
 
 # NOTE: the singleton and the accessor must not share a name — a module-level
 # def _run_io_pool would rebind the very global the accessor is meant to
@@ -320,7 +329,6 @@ class _ReadParams(NamedTuple):
     """
 
     shape: tuple[int, ...]
-    dtype_str: str
     np_dtype: np.dtype
     item: int
     num_experts: int
@@ -395,7 +403,6 @@ class _ShardReader:
             )
         rp = _ReadParams(
             shape=shape,
-            dtype_str=dtype_str,
             np_dtype=np_dtype,
             item=item,
             num_experts=num_experts,
@@ -427,8 +434,40 @@ class _ShardReader:
         if got != n:
             raise OSError(f"Short read (preadv) at {abs_off}: {got} of {n}") from None
 
+    def _read_iovecs(self, abs_off: int, iovecs: list) -> None:
+        """Scatter-gather preadv: each iovec receives its row in order.
+
+        Used when a run's rows map 1:1 onto the output rows (no bridged
+        holes), so the kernel lands every expert straight at its demand
+        position — no temp buffer, no userspace copy.
+        """
+        n = sum(iov.nbytes for iov in iovecs)
+        fd = self._file.fileno()
+        try:
+            got = os.preadv(fd, iovecs, abs_off)
+        except (AttributeError, OSError):
+            data = os.pread(fd, n, abs_off)
+            if len(data) != n:
+                raise OSError(
+                    f"Short read at {abs_off}: {len(data)} of {n}"
+                ) from None
+            pos = 0
+            for iov in iovecs:
+                iov[:] = data[pos : pos + iov.nbytes]
+                pos += iov.nbytes
+            return
+        if got != n:
+            raise OSError(
+                f"Short read (preadv) at {abs_off}: {got} of {n}"
+            ) from None
+
     def expert_slice(self, key: str, expert_id: int) -> np.ndarray:
         rp = self._rp_for(key)
+        if expert_id < 0 or expert_id >= rp.num_experts:
+            raise ValueError(
+                f"expert_slice: id {expert_id} out of range "
+                f"(num_experts={rp.num_experts}) for {key}"
+            )
         off = rp.tensor_abs_off + expert_id * rp.expert_bytes
         # Single zero-copy preadv into a writable buffer; the typed view is a
         # zero-copy reinterpret (no bytearray double-copy).
@@ -439,6 +478,11 @@ class _ShardReader:
     def expert_byte_range(self, key: str, expert_id: int) -> Tuple[int, int]:
         """Absolute file offsets (start, end) of one expert's slice."""
         rp = self._rp_for(key)
+        if expert_id < 0 or expert_id >= rp.num_experts:
+            raise ValueError(
+                f"expert_byte_range: id {expert_id} out of range "
+                f"(num_experts={rp.num_experts}) for {key}"
+            )
         off = rp.tensor_abs_off + expert_id * rp.expert_bytes
         return off, off + rp.expert_bytes
 
@@ -1085,9 +1129,8 @@ each key to its shard filename, so stacked banks spilled outside the
         # the slice index, which is what would corrupt every id
         # behind a bridge. Rows are disjoint per descriptor, so the
         # byte content of out never depends on completion order.
-        for j in js:
-            base = (eids[j] - first) * rp.expert_bytes
-            out[j, :] = buf[base : base + rp.expert_bytes]
+        rows = buf.reshape(-1, rp.expert_bytes)
+        out[np.asarray(js)] = rows[[eids[j] - first for j in js]]
 
     def _read_component_into(
         self, key, eids, out, merge_gap, max_run_bytes
@@ -1123,13 +1166,18 @@ each key to its shard filename, so stacked banks spilled outside the
         # otherwise double the component's footprint.
         if len(runs) == 1:
             off, first, count, js = runs[0]
-            buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
             # The single-run path reads inline on the CALLER thread.
             try:
-                reader._read_into(off, buf)
+                if count == len(js) and out.flags["C_CONTIGUOUS"]:
+                    reader._read_iovecs(
+                        off, [memoryview(out[j]) for j in js]
+                    )
+                else:
+                    buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                    reader._read_into(off, buf)
+                    self._scatter_run_rows(eids, out, rp, first, js, buf)
             except Exception:
                 return False
-            self._scatter_run_rows(eids, out, rp, first, js, buf)
         else:
             # Sliding window: keep up to _RUN_IO_QD
             # reads in flight continuously — draining the queue at every
@@ -1149,46 +1197,42 @@ each key to its shard filename, so stacked banks spilled outside the
     ) -> bool:
         """Submission-order sliding window (default): the OLDEST submitted
         read is reaped once the window fills. False → caller fails."""
-        window: list = []  # (off, first, js, buf, future)
+        # Window entries: (first, js, buf_or_iovecs, future). buf is a
+        # temp run buffer to scatter from; iovecs are out-row memoryviews
+        # the kernel fills in place (set when the run has no bridged
+        # rows, so row order IS the js order).
+        window: list = []
         ok = True
-
-        def _wait_future(wfut) -> bool:
-            # Bounded wait: a stalled device fails the read
-            # instead of parking the inference thread forever.
-            try:
-                if _IO_TIMEOUT_S > 0:
-                    wfut.result(timeout=_IO_TIMEOUT_S)
-                else:
-                    wfut.result()
-                return True
-            except concurrent.futures.TimeoutError:
-                _log_io_timeout()
-                return False
-            except BaseException:
-                return False
+        direct = out.flags["C_CONTIGUOUS"]
 
         for idx, (off, first, count, js) in enumerate(runs):
-            buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
-            window.append(
-                (off, first, js, buf, io_exec.submit(reader._read_into, off, buf))
-            )
+            if count == len(js) and direct:
+                iovecs = [memoryview(out[j]) for j in js]
+                window.append(
+                    (first, js, None, io_exec.submit(reader._read_iovecs, off, iovecs))
+                )
+            else:
+                buf = np.empty(count * rp.expert_bytes, dtype=np.uint8)
+                window.append(
+                    (first, js, buf, io_exec.submit(reader._read_into, off, buf))
+                )
             if len(window) >= _RUN_IO_QD or idx == len(runs) - 1:
-                wo, wfirst, wjs, wbuf, wfut = window.pop(0)
-                if not _wait_future(wfut):
+                wfirst, wjs, wbuf, wfut = window.pop(0)
+                if not _await_io_future(wfut):
                     ok = False
-                if ok:
+                if ok and wbuf is not None:
                     self._scatter_run_rows(eids, out, rp, wfirst, wjs, wbuf)
             if not ok:
-                for _o, _f, _j, _b, fut in window:
+                for _f, _j, _b, fut in window:
                     # Drain instead of dropping — a read
                     # exception in an abandoned prefetch future
                     # would vanish with it.
                     _await_io_future(fut)
                 return False
-        for wo, wfirst, wjs, wbuf, wfut in window:
-            if not _wait_future(wfut):
+        for wfirst, wjs, wbuf, wfut in window:
+            if not _await_io_future(wfut):
                 ok = False
-            if ok:
+            if ok and wbuf is not None:
                 self._scatter_run_rows(eids, out, rp, wfirst, wjs, wbuf)
         return ok
 

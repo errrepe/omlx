@@ -18,7 +18,6 @@ import copy
 import gc
 import json
 import logging
-import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -423,10 +422,7 @@ class EnginePool:
 
             fraction = runtime_settings.moe_expert_offload_resident_fraction
             if entry.config_model_type == "deepseek_v41":
-                if (
-                    v41_estimate is None
-                    and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-                ):
+                if v41_estimate is None:
                     from .patches.deepseek_v41.moe_offload import (
                         estimate_expert_savings,
                     )
@@ -464,6 +460,39 @@ class EnginePool:
                         entry.model_path, base, fraction
                     )
         return base + extra
+
+    def _forced_ssd_offload(
+        self,
+        entry: EngineEntry,
+        estimate: object,
+        label: str,
+        ceiling: int | None,
+    ) -> bool:
+        """Ceiling-resolved force decision + the user-facing warning.
+
+        Normal residency calls use the stable ceiling so a post-unload
+        vm_stat dip cannot pin the new engine to SSD. Pre-load admission
+        may pass its earlier live ceiling explicitly when only mmap fits.
+        """
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
+        forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "%s forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
+                "roughly 2.5x slower than a resident load.",
+                label,
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
+        return forced
 
     def _qwen4_ple_offload_status(
         self,
@@ -509,26 +538,7 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
-        # Normal residency calls use the stable ceiling so a post-unload
-        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
-        # pass its earlier live ceiling explicitly when only mmap fits.
-        if ceiling is None:
-            ceiling = self._residency_ceiling()
-            if ceiling <= 0:
-                ceiling = self._fallback_admission_ceiling()
-            if ceiling <= 0:
-                ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
-        if forced:
-            logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
-                "roughly 2.5x slower than a resident load.",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        forced = self._forced_ssd_offload(entry, estimate, "Qwen4-Exp PLE", ceiling)
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -596,25 +606,9 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
-        # Normal residency calls use the stable ceiling so a post-unload
-        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
-        # pass its earlier live ceiling explicitly when only mmap fits.
-        if ceiling is None:
-            ceiling = self._residency_ceiling()
-            if ceiling <= 0:
-                ceiling = self._fallback_admission_ceiling()
-            if ceiling <= 0:
-                ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
-        if forced:
-            logger.warning(
-                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB).",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        forced = self._forced_ssd_offload(
+            entry, estimate, "DeepSeek V4.1 Engram", ceiling
+        )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)

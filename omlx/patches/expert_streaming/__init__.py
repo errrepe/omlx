@@ -511,6 +511,103 @@ def ensure_streaming_backing_or_raise(
     )
 
 
+async def streaming_offload_load(
+    model: Any,
+    model_name: str,
+    settings: Any,
+    *,
+    label: str = "model",
+) -> tuple[Any | None, int]:
+    """The load-time offload sequence shared by the engine paths.
+
+    Streaming conversion -> legacy MoE offload -> zero-conversion guard.
+    Must run BEFORE ``materialize_lazy_state`` and gate/up fusion: the
+    checkpoint stayed lazy on this path and dropping the stock MoE modules
+    is what keeps non-resident experts from ever materializing. All MLX
+    work runs on the MLX executor because it allocates the resident slot
+    tensors (#1304).
+
+    Returns ``(backing, wrapped)`` — the streaming backing for the caller
+    to keep alive, and the legacy-offload wrapped-layer count (0 when the
+    unified path served or offload was not requested). The caller stamps
+    ``backing`` onto the engine itself.
+    """
+    import asyncio
+
+    from ..engine_core import get_mlx_executor
+    from ..model_settings import moe_offload_requested
+
+    loop = asyncio.get_running_loop()
+    backing = None
+    if getattr(settings, "expert_streaming_enabled", False):
+        try:
+            def _do_streaming():
+                _, b = convert_model_to_streaming(model, model_name, settings)
+                # keep backing alive on the model
+                if b is not None:
+                    try:
+                        model._expert_streaming_backing = b  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                return b
+
+            backing = await loop.run_in_executor(get_mlx_executor(), _do_streaming)
+            logger.info("Expert streaming enabled for %s %s", label, model_name)
+        except Exception as e:
+            # Fail clean: streaming was explicitly enabled, so a backing
+            # failure must fail the load — continuing to materialize
+            # would retain all expert banks in RAM (OOM).
+            logger.error(
+                "Expert streaming conversion failed for %s %s: %s",
+                label,
+                model_name,
+                e,
+                exc_info=True,
+            )
+            raise RuntimeError(
+                f"Expert streaming conversion failed for {label} {model_name}: {e}"
+            ) from e
+
+    # MoE expert offload: replace covered SwitchGLU layers with a
+    # fetch-on-miss LRU cache streaming experts from the checkpoint's
+    # own safetensors. The caches' slot maps and resident slots live on
+    # plain attributes outside the module tree, so the lazy-state
+    # materialization never reaches them; left lazy they stay bound to
+    # the loader stream and the first request from an inference thread
+    # dies with "There is no Stream(gpu, N) in current thread" — the
+    # post-apply materialize fixes that on the same executor.
+    wrapped = 0
+    if moe_offload_requested(settings):
+        from ..patches.moe_expert_offload import (
+            apply_moe_expert_offload,
+            materialize_offload_state,
+        )
+
+        fraction = float(
+            getattr(settings, "moe_expert_offload_resident_fraction", 0.25)
+        )
+        wrapped = await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_moe_expert_offload,
+            model,
+            model_name,
+            fraction,
+            settings,
+        )
+        if wrapped:
+            await loop.run_in_executor(
+                get_mlx_executor(), materialize_offload_state, model
+            )
+
+    # Fail before materializing: a lazy-loaded streaming checkpoint with
+    # zero converted layers would evaluate every expert bank in RAM.
+    if moe_offload_requested(settings):
+        ensure_streaming_backing_or_raise(
+            model, backing, requested=True, model_name=model_name
+        )
+    return backing, wrapped
+
+
 def shutdown_expert_streaming(backing: Any) -> None:
     """Release MoE streaming resources held by *backing*.
 

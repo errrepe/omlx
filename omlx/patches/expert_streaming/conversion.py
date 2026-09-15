@@ -260,14 +260,13 @@ def _resolve_stacked_key(
     return candidates[0]
 
 
-def _source_packing(src: Any, group_size: int, bits: int, mode: str) -> tuple[int, int, str]:
+def _source_packing(src: Any) -> tuple[int, int, str]:
     """Packing for one streaming projection from its source module.
 
     JANGQ checkpoints mix precisions inside one layer (e.g. a 2-bit gate
     with 3-bit up/down). Each streaming linear keeps its own source
-    projection's packing; the layer-level values stay as fallback only.
-    A projection missing any packing attr fails loudly (same rule
-    as the layer-level detection above) — never inherits silently.
+    projection's packing. A projection missing any packing attr fails
+    loudly — never inherits silently.
     """
     for _name in ("group_size", "bits", "mode"):
         if getattr(src, _name, None) is None:
@@ -458,7 +457,7 @@ def _convert_switch_mlp_module(
             )
 
     def _proj_packing(src):
-        return _source_packing(src, group_size, bits, mode)
+        return _source_packing(src)
 
     # Cold precision tier: when the backing serves this layer's banks
     # from expert_cold/, every projection of the layer computes at the
@@ -534,9 +533,6 @@ def _convert_switch_mlp_module(
             w = getattr(proj, "weight", None)
             if w is not None:
                 mx.eval(w)
-                # store stacked for slicing in streaming linear fallback
-                backing[(layer_idx, proj_name)] = w  # type: ignore[index]
-                # also for quantized scales/biases
                 if is_quantized:
                     sc = getattr(proj, "scales", None)
                     if sc is not None:
@@ -547,13 +543,9 @@ def _convert_switch_mlp_module(
                         if b is not None:
                             mx.eval(b)
                             backing[(layer_idx, proj_name, "biases")] = b  # type: ignore[index]
-                        else:
-                            # ensure weight/scales keys exist for uniform fallback
-                            pass
-            # bias
-            b = getattr(proj, "bias", None)
-            if b is not None:
-                mx.eval(b)
+                else:
+                    # bf16 streaming linear slices the bank row directly
+                    backing[(layer_idx, proj_name)] = w  # type: ignore[index]
 
     # Now create streaming linears for the projections. Fused and split
     # layouts share one builder: resolve the stacked keys, read the source
@@ -1765,7 +1757,8 @@ def convert_model_to_streaming(
     try:
         # Stamped so ensure_streaming_backing_or_raise can verify real
         # conversion — backing presence alone is not evidence.
-        backing.streaming_converted = converted + mtp_converted  # type: ignore[attr-defined]
+        # converted already includes mtp_converted (incremented at 1290)
+        backing.streaming_converted = converted  # type: ignore[attr-defined]
     except Exception:
         pass
 

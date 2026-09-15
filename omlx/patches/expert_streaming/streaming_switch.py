@@ -15,7 +15,6 @@ import logging
 import os
 import queue as _queue
 import threading
-import time
 import weakref
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ._env import env_int
 from .slot_cache import DecodeVisitStats, SlotArena
 from .speculation import SpeculationState, _STAGED_MAX_IDS
 
@@ -39,14 +39,12 @@ _STAGED_HEADROOM_ENV = (
 )
 _BANK_MAX_BYTES = max(
     1,
-    int(os.environ.get("OMLX_EXPERT_STREAMING_BANK_MAX_BYTES", str(256 * 1024**2))),
+    env_int("OMLX_EXPERT_STREAMING_BANK_MAX_BYTES", 256 * 1024**2),
 )
 # Chunk oversized demand banks instead of declining them. Prefill demand
 # (~500/512 experts per projection, ~450 MB) exceeds _BANK_MAX_BYTES, so
 # the bank is allocated once and filled by cap-bounded read_expert_into
 # slices — the segments/promotion contract is unchanged.
-# 0 restores the decline-to-fallback behaviour.
-_BANK_CHUNK_ENV = os.environ.get("OMLX_EXPERT_STREAMING_BANK_CHUNK", "1") != "0"
 # Bound each contiguous run inside a bank read. Uncapped, a dense
 # (prefill) demand set is one run = one preadv on one worker — the device
 # sits at single-stream speed (~1.5 GB/s) instead of the ~2.7 GB/s
@@ -60,38 +58,15 @@ _BANK_RUN_MAX_BYTES = max(
         )
     ),
 )
-# Opt-in dense-span reads. When a tier group demands more than this
-# fraction of the tier's expert axis, the miss set is so interleaved with
-# cache hits that every "contiguous" run is 1-4 experts (~1 MB,
-# latency-bound at ~1.5 GB/s). Bridging the holes reads the full span
-# sequentially — ~40% more bytes but at the ~2.5 GB/s ceiling, a net win
-# if the device delivers. Hole rows are never scattered (same contract as
-# merge_gap), so the output/LRU sees only demanded experts. 0 disables;
-# e.g. 0.5 enables for sets covering half the axis. Default OFF: small-gap
-# bridging is unproven in this regime (chunked banks + run cap + QD16).
-_BANK_DENSE_ENV = float(
-    os.environ.get("OMLX_EXPERT_STREAMING_BANK_DENSE", "0") or 0
-)
-_RUN_MAX = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_MAX", "16")))
-# Promote an all-miss demand bank with a single mx.array instead of U
-# per-expert mx arrays followed by mx.stack. Bit-identical — gather_qmm
-# receives the same bytes, dtype and shape — but it halves the Metal
-# transient at the promotion point, where the U copies and the bank
-# briefly coexist. 0 restores the per-expert promote + stack path.
-_BANK_PROMOTE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_BANK_PROMOTE", "1") != "0"
-# Same single-promotion on the layer-context path: the context reads the
-# demand bank as NumPy on an IO pool worker and hands the raw buffers
-# back; promoting them to MLX must happen on the inference thread, so no
-# MLX op is ever bound off-stream. 0 restores the per-expert promote +
-# stack path.
-_BANK_PROMOTE_CTX_ENV = (
-    os.environ.get("OMLX_EXPERT_STREAMING_BANK_PROMOTE_CTX", "1") != "0"
-)
+_RUN_MAX = env_int("OMLX_EXPERT_STREAMING_RUN_MAX", 16, lo=1)
+# An all-miss demand bank is promoted with a single mx.array instead of U
+# per-expert mx arrays followed by mx.stack — bit-identical (gather_qmm
+# receives the same bytes, dtype and shape) but it halves the Metal
+# transient at the promotion point, where the U copies and the bank would
+# briefly coexist. The layer-context path reads the bank as NumPy on an
+# IO pool worker and promotes on the inference thread, so no MLX op is
+# ever bound off-stream.
 _LAYER_BARRIER_ENV = os.environ.get("OMLX_EXPERT_STREAMING_LAYER_BARRIER", "1") != "0"
-# Rolling per-projection bank load instead of the union load.
-# 0 restores union behaviour (every projection's NumPy bank resident at
-# once).
-_CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "0"
 # Hybrid decode fast path: routed calls at or below this many positions
 # resolve through UNION mode (all projections in flight at once); larger
 # calls keep rolling so prefill never holds all projections resident.
@@ -101,7 +76,7 @@ _CTX_ROLLING_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CTX_ROLLING", "1") != "
 # uses the call's real sequence length via _decode_call_shape (a 1-row
 # prefill tail chunk is NOT decode).
 _DECODE_UNION_MAX_ROWS = max(
-    0, int(os.environ.get("OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS", "64"))
+    0, env_int("OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS", 64)
 )
 
 
@@ -125,35 +100,28 @@ def _decode_call_shape(positions: int, seq_len: int | None = None) -> bool:
 # prefill-shaped call out of union residency.
 _CTX_UNION_MAX_BYTES = max(
     0,
-    int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_UNION_MAX_BYTES", str(1024**3))),
+    env_int("OMLX_EXPERT_STREAMING_CTX_UNION_MAX_BYTES", 1024**3),
 )
-# Batch the per-expert cache.get under one lock in _split, and the
-# staged-hit writeback through put_many — ~60 lookups x 3 projections x 48
-# layers of RLock churn per decode token. 0 restores per-key get/put.
-_SPLIT_BATCH_ENV = (
-    os.environ.get("OMLX_EXPERT_STREAMING_SPLIT_BATCH", "1") != "0"
-)
+# Batched cache lookup/writeback: get_many/put_many walk the index once
+# under a single lock — ~60 lookups x 3 projections x 48 layers of RLock
+# churn per decode token otherwise.
 # Raw uint8 demand banks cannot be pooled: the LRU retains rows as views
 # into them, so recycling a bank would corrupt cached experts (aliasing).
 # The allocation cost (one np.empty per (key, tier) per layer call) is
 # small next to the preadv payload.
 
 
-def _layer_ctx_mode(positions: int, *, quantized: bool, barrier: bool) -> str | None:
+def _layer_ctx_mode(positions: int) -> str:
     """Layer-context mode for one GLU call.
 
-    None -> no context (not quantized / barrier off). 'union' for
-    small routed-row calls when the hybrid is enabled; 'rolling'
-    otherwise. The env kills or forces union via the global switch in
-    the caller.
+    'union' for small routed-row calls when the hybrid is enabled;
+    'rolling' otherwise.
 
     ``positions`` is deliberate here: the union choice is a memory
     question (can every projection's bank be resident at once), which
     scales with routed rows — NOT the phase question, which is a
     sequence-length property handled by ``_decode_call_shape``.
     """
-    if not (quantized and barrier):
-        return None
     if _DECODE_UNION_MAX_ROWS > 0 and int(positions) <= _DECODE_UNION_MAX_ROWS:
         return "union"
     return "rolling"
@@ -166,7 +134,7 @@ def _layer_ctx_mode(positions: int, *, quantized: bool, barrier: bool) -> str | 
 # leaves the NVMe idle between reads. 3 keeps the following projections
 # in flight at no measured memory cost.
 _CTX_PREFETCH_AHEAD = max(
-    0, int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_AHEAD", "3"))
+    0, env_int("OMLX_EXPERT_STREAMING_CTX_AHEAD", 3)
 )
 # Banks larger than this are never held speculatively; they are read on demand.
 _CTX_PREFETCH_MAX_BYTES = max(
@@ -177,32 +145,14 @@ _CTX_PREFETCH_MAX_BYTES = max(
         )
     ),
 )
-# Prefill attribution diag: sync the GPU at every prefill-sized MoE GLU call
-# and record the drain as a per-layer gpu bucket. Serializes CPU/GPU overlap
-# (wall inflates), so use it for attribution only — never for latency claims.
-# Routes above this count are treated as prefill-sized for the diag sync.
-
-# Scan-resistant admission filter: when OMLX_EXPERT_STREAMING_ADMISSION=1,
-# only experts seen >=2 times in the recent window enter the LRU (off by
-# default). The window scales with capacity (min 1024, up to 1/4 of slots)
-# so the filter stays meaningful at real budgets — a fixed 1024-entry
-# window is noise next to a multi-GiB working set.
-# OMLX_EXPERT_STREAMING_ADMISSION_WINDOW overrides.
-_ADMISSION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION", "") == "1"
-_ADMISSION_WINDOW_ENV = int(os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION_WINDOW", "0") or 0)
-
 # Detached demand admission. Decode-miss rows are views into shared bank
 # buffers — caching them retains the whole bank per entry (~9x the
 # per-expert accounting on prefill-sized banks). The detached worker
 # copies the row into a private np array off the demand path and
 # batch-puts under one lock, so admission costs ~a queue push on the
-# critical path. OMLX_EXPERT_STREAMING_ADMIT:
-#   detached (default): worker copy + 2nd-touch filter + batch put
-#   sync:    admit the view on the demand path
-#   0/off:   no demand admission (frozen cache: seed + staged hits only)
-_ADMIT_ENV = os.environ.get("OMLX_EXPERT_STREAMING_ADMIT", "detached").strip().lower()
-_ADMIT_Q_MAX = int(os.environ.get("OMLX_EXPERT_STREAMING_ADMIT_Q", "8192") or 8192)
-_ADMIT_BATCH = int(os.environ.get("OMLX_EXPERT_STREAMING_ADMIT_BATCH", "96") or 96)
+# critical path.
+_ADMIT_Q_MAX = env_int("OMLX_EXPERT_STREAMING_ADMIT_Q", 8192)
+_ADMIT_BATCH = env_int("OMLX_EXPERT_STREAMING_ADMIT_BATCH", 96)
 
 # Cross-layer speculation via F_RDADVISE (default on;
 # OMLX_EXPERT_STREAMING_RA=0 disables). Each MoE layer advises the next
@@ -238,7 +188,7 @@ _ARENA_ENV = os.environ.get("OMLX_EXPERT_STREAMING_ARENA", "1") != "0"
 # bank-read path is already optimal there).
 _ARENA_MAX_BYTES = max(
     1,
-    int(os.environ.get("OMLX_EXPERT_STREAMING_ARENA_MAX_MIB", "128")),
+    env_int("OMLX_EXPERT_STREAMING_ARENA_MAX_MIB", 128),
 ) << 20
 # Read jobs per projection inside arena produce. 1 = one coalesced bank
 # read per projection (the union path's shape). >1 splits a projection's
@@ -248,19 +198,10 @@ _ARENA_MAX_BYTES = max(
 # way.
 _ARENA_PRODUCE_JOBS = max(
     1,
-    int(os.environ.get("OMLX_EXPERT_STREAMING_ARENA_PROJ_JOBS", "3")),
+    env_int("OMLX_EXPERT_STREAMING_ARENA_PROJ_JOBS", 3),
 )
 # Opt-in whole-layer readahead during prefill. A prefill-shaped call
 # touches ~every expert of the next layer, so advising its full stacked
-# range has precision ~1.0 — the regime F_RDADVISE is actually good at
-# (unlike the decode advisory, which speculates on ~10 of 512 experts).
-# Fires only when the current call is prefill-shaped; deduped to once per
-# (layer call, target) via plan.advised_runs.
-# OFF by default: the advisory issues real device I/O on the same
-# saturated SSD — speculation cannot help when the bottleneck is
-# bandwidth, not discovery. 1 opts back in.
-_RA_PREFILL_ENV = os.environ.get("OMLX_EXPERT_STREAMING_RA_PREFILL", "") == "1"
-
 # Live-cache registry for cross-subsystem signals (the MTP gate in
 # batch_generator). Weak so a dead engine's cache never lingers;
 # `closed` marks explicit teardown.
@@ -295,8 +236,8 @@ def streaming_gate_state() -> "dict | None":
     }
 
 # Rows/positions above which a routed call is prefill-shaped rather than
-# decode speculation: the advisory cap, the regime-pool selector and the
-# prefill-bypass cache guard all share this boundary.
+# decode speculation: the advisory cap and the prefill-bypass cache guard
+# share this boundary.
 _PREFILL_SHAPE_MIN_ROWS = 64
 # Hard cap on the advisory row set (rows above the boundary are
 # prefill-shaped, not decode speculation).
@@ -322,41 +263,19 @@ _MAX_ADVISE_ROWS = _PREFILL_SHAPE_MIN_ROWS
 # per-call pools would oversubscribe the device. Prefetch shares this
 # demand pool; the rolling path's extra depth comes from
 # _CTX_PREFETCH_AHEAD — this pool stays 16.
-_IO_QD = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_QD", "") or 16))
+_IO_QD = env_int("OMLX_EXPERT_STREAMING_QD", 16, lo=1)
 
 _EXPERT_IO_POOL = ThreadPoolExecutor(
     max_workers=_IO_QD,
     thread_name_prefix="omlx-expert-io",
 )
 
-# Opt-in separate pool for PREFILL-SHAPED calls
-# (OMLX_EXPERT_STREAMING_PREFILL_QD=<workers>): two bounded regime pools
-# keep independent decode/prefill queue depths without oversubscribing
-# either phase; 0 (default) keeps the single process-wide pool. Selection
-# happens per layer call from the count of routed positions
-# (> _PREFILL_REGIME_MIN_POSITIONS).
-_PREFILL_QD_ENV = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_PREFILL_QD", "") or 0))
-_PREFILL_REGIME_MIN_POSITIONS = _PREFILL_SHAPE_MIN_ROWS
-_PREFILL_IO_POOL: ThreadPoolExecutor | None = (
-    ThreadPoolExecutor(
-        max_workers=_PREFILL_QD_ENV,
-        thread_name_prefix="omlx-expert-io-prefill",
-    )
-    if _PREFILL_QD_ENV > 0
-    else None
-)
-
-
-def io_pool_for_positions(
-    linear: Any, positions: int
-) -> ThreadPoolExecutor:
-    """Regime pool for a layer call: prefill-shaped calls may use the
-    separate bounded pool; decode keeps the process-wide QD16 singleton."""
+def _io_pool(linear: Any) -> ThreadPoolExecutor:
+    """Read pool for a layer call: the process-wide QD16 singleton, or the
+    per-linear override set by conversion for tests."""
     override = getattr(linear, "_io_pool_override", None)
     if override is not None:
         return override
-    if _PREFILL_IO_POOL is not None and positions > _PREFILL_REGIME_MIN_POSITIONS:
-        return _PREFILL_IO_POOL
     return _EXPERT_IO_POOL
 
 
@@ -598,10 +517,8 @@ class ExpertLRUCache:
             per_layer = max(1, self.capacity // self.num_layers)
             # distribute remainder
             self._per_layer_cap = per_layer
-            self._global_cap = self.capacity
         else:
             self._per_layer_cap = self.capacity
-            self._global_cap = self.capacity
         # Dynamic budget (auto default): per-layer cap overrides for the
         # governor's targeted growth ({layer: slots}; empty = uniform).
         # Cleared by resize() back to uniform; survives clear() (policy,
@@ -630,26 +547,16 @@ class ExpertLRUCache:
         self.stats = CacheStats()
         # Per-conversion speculation state (set by the converter).
         self.spec_state: SpeculationState | None = None
-        # Scan-resistant frequency window (only when env set); no capacity
-        # cap on engagement — a 1024-entry window is trivial next to the
-        # read volume at GiB budgets.
-        self._admission_enabled = bool(_ADMISSION_ENV and self.capacity > 0)
-        # Window scales with capacity (fixed 1024 drowns at GiB budgets).
-        if _ADMISSION_WINDOW_ENV > 0:
-            self._admission_window = max(16, _ADMISSION_WINDOW_ENV)
-        else:
-            self._admission_window = max(1024, min(self.capacity // 4, 16384)) if self.capacity > 0 else 1024
-        self._admission_counts: Dict[Tuple[int, int, str], int] = {}
-        self._admission_order: deque[Tuple[int, int, str]] = deque()  # type: ignore[type-arg]
-        self.admission_drops = 0
-        # Detached-admission 2nd-touch window — same shape as the
-        # scan-resistant filter but independent: it counts *demand
-        # sightings* (one note per submitted miss) so a key admits from
-        # its second demand. The worker applies it before copying;
-        # put_many itself is unfiltered (seed/staged puts never touch
-        # this window).
+        # Second-touch admission window: counts *demand sightings* (one
+        # note per submitted miss) so a key admits from its second demand
+        # under pressure. The worker applies it before copying; put_many
+        # itself is unfiltered (seed/staged puts never touch this window).
+        # The window scales with capacity — a fixed 1024-entry window is
+        # noise next to a multi-GiB working set.
+        self._admission_window = max(1024, min(self.capacity // 4, 16384)) if self.capacity > 0 else 1024
         self._admit_counts: Dict[Tuple[int, int, str], int] = {}
         self._admit_order: deque[Tuple[int, int, str]] = deque()  # type: ignore[type-arg]
+        self.admission_drops = 0
         # Live-cache registry: the MTP gate (batch_generator) reads the
         # aggregate signal — weakrefs so a closed engine's cache never
         # lingers past GC.
@@ -662,9 +569,7 @@ class ExpertLRUCache:
         # never share a worker; closed by ExpertBackingStore.close() via
         # _streaming_cache.
         self.admission: _AdmissionWorker | None = (
-            _AdmissionWorker(self)
-            if _ADMIT_ENV == "detached" and self.capacity > 0
-            else None
+            _AdmissionWorker(self) if self.capacity > 0 else None
         )
         # Per-engine ctx fallback counters (per reason).
         self._ctx_fallbacks: dict[str, int] = {}
@@ -850,6 +755,11 @@ class ExpertLRUCache:
 
     # -- per-layer LRU index (O(1) victim selection) ------------------------
 
+    def _dec_layer_count(self, layer: int) -> None:
+        self._layer_counts[layer] = max(
+            0, self._layer_counts.get(layer, 1) - 1
+        )
+
     def _layer_index_add(self, key: tuple[int, int, str], layer: int) -> None:
         order = self._layer_orders.get(layer)
         if order is None:
@@ -861,9 +771,7 @@ class ExpertLRUCache:
         if order is not None and key in order:
             order.move_to_end(key)
 
-    def _layer_index_drop(self, key: tuple[int, int, str], layer: int | None = None) -> None:
-        if layer is None:
-            layer = self._layer_of(key)
+    def _layer_index_drop(self, key: tuple[int, int, str], layer: int) -> None:
         order = self._layer_orders.get(layer)
         if order is not None:
             order.pop(key, None)
@@ -882,15 +790,13 @@ class ExpertLRUCache:
                 if victim in self._store:
                     self._store.pop(victim, None)
                     self.stats.evictions += 1
-                    self._layer_counts[layer] = max(
-                        0, self._layer_counts.get(layer, 1) - 1
-                    )
+                    self._dec_layer_count(layer)
                     return True
         for k in list(self._store.keys()):
             if self._layer_of(k) == layer:
                 self._store.pop(k)
                 self.stats.evictions += 1
-                self._layer_counts[layer] = max(0, self._layer_counts.get(layer, 1) - 1)
+                self._dec_layer_count(layer)
                 return True
         return False
 
@@ -921,47 +827,12 @@ class ExpertLRUCache:
             _by_layer[_miss_layer] = _by_layer.get(_miss_layer, 0) + 1
         return None
 
-    def _admission_should_insert(self, key: tuple[int, int, str]) -> bool:
-        if not self._admission_enabled:
-            return True
-        # Frequency keyed by the FULL bundle key (layer, expert,
-        # stacked_key incl. HOBBIT tier suffix) — a bare (layer, expert)
-        # key would let a hot gate_proj admit a cold up_proj of the same
-        # expert.
-        lk = (int(key[0]), int(key[1]), str(key[2]))
-        # With room in the layer and the global store the sliding window
-        # only delays admission — it exists to stop scan pollution under
-        # pressure, not to gate free space.
-        layer = self._layer_of(lk)
-        cap = self._cap_for(layer)
-        layer_full = bool(
-            self.num_layers > 0
-            and cap
-            and self._layer_counts.get(layer, 0) >= cap
-        )
-        if not layer_full and len(self._store) < self._global_cap_active():
-            return True
-        c = self._admission_counts.get(lk, 0) + 1
-        self._admission_counts[lk] = c
-        self._admission_order.append(lk)
-        if len(self._admission_order) > self._admission_window:
-            old = self._admission_order.popleft()
-            oc = self._admission_counts.get(old, 0) - 1
-            if oc <= 0:
-                self._admission_counts.pop(old, None)
-            else:
-                self._admission_counts[old] = oc
-        if c < 2:
-            self.admission_drops += 1
-            return False
-        return True
-
     def admission_note(self, key: tuple[int, int, str]) -> bool:
         """2nd-touch filter for the detached admission worker.
 
         One call per submitted demand miss; admits from the second sighting
-        inside the same sliding window as the scan-resistant filter. Runs on the
-        worker thread — the demand path only enqueues.
+        inside the sliding window. Runs on the worker thread — the demand
+        path only enqueues.
 
         Capacity-aware: when the layer and the global store both have
         room, the first sighting admits directly — the filter exists to
@@ -1019,8 +890,6 @@ class ExpertLRUCache:
             self._store.move_to_end(key)
             self._store[key] = value
             return
-        if not self._admission_should_insert(key):
-            return
         # per-layer cap enforcement (governor overrides + phase pair)
         layer = self._layer_of(key)
         _cap = self._cap_for(layer)
@@ -1035,8 +904,7 @@ class ExpertLRUCache:
             old_k, _ = self._store.popitem(last=False)
             self._layer_index_drop(old_k, self._layer_of(old_k))
             self.stats.evictions += 1
-            old_layer = self._layer_of(old_k)
-            self._layer_counts[old_layer] = max(0, self._layer_counts.get(old_layer, 1) - 1)
+            self._dec_layer_count(self._layer_of(old_k))
         self._store[key] = value
         self._layer_index_add(key, layer)
         self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
@@ -1261,18 +1129,19 @@ class _LayerLoadContext:
     tier-segmented (read_expert_into components are tier-homogeneous by
     contract).
 
-    Two modes, selected by OMLX_EXPERT_STREAMING_CTX_ROLLING:
+    Two modes, selected per call by _layer_ctx_mode:
 
-    rolling (default)
+    rolling
         Each projection resolves its own bank on demand. At most
         _CTX_PREFETCH_AHEAD following projections are read on pool workers
         in the background, so the next bank is in flight while the current
         one is promoted and consumed on the GPU. Peak NumPy residency drops
         from the *union* of every projection (~3 banks) to ~1-2 banks.
 
-    union (env var = 0)
+    union
         One pool.map across every projection; all banks are resident until
-        the last projection is consumed. Maximum I/O parallelism, highest RSS.
+        the last projection is consumed. Maximum I/O parallelism, highest
+        RSS — used for decode-sized routed sets.
 
     Both modes preserve one shared routing plan per layer call, and reads
     run on IO-pool workers that never allocate MLX arrays.
@@ -1287,9 +1156,8 @@ class _LayerLoadContext:
         seq_len: int | None = None,
     ):
         # The GLU picks the mode per call (union for decode-shaped,
-        # rolling for prefill); OMLX_EXPERT_STREAMING_CTX_ROLLING=0 is the
-        # global kill switch (forces union here).
-        self.mode = mode or ("union" if not _CTX_ROLLING_ENV else "rolling")
+        # rolling for prefill).
+        self.mode = mode or "rolling"
         self.linears = linears
         self.cache = cache
         # Call shape from the constructor site (indices.size), NOT inferred
@@ -1319,7 +1187,6 @@ class _LayerLoadContext:
                 exc_info=True,
             )
         self.bundles: dict[int, dict[int, tuple]] = {}
-        self.hits: dict[int, int] = {}
         self.misses: dict[int, int] = {}
         self.failed = False
         # The raw contiguous NumPy banks behind bundles, kept so the
@@ -1333,7 +1200,6 @@ class _LayerLoadContext:
         # rolling state
         self._order: dict[int, int] = {id(lin): i for i, lin in enumerate(linears)}
         self._futures: dict[int, Any] = {}
-        self._inflight: dict[int, int] = {}
         self._resolved: set[int] = set()
         self._expert_ids: list[int] = []
         # union latch
@@ -1388,7 +1254,7 @@ class _LayerLoadContext:
             batch_get = getattr(self.cache, "peek_many", None)
             if batch_get is None:
                 batch_get = getattr(self.cache, "get_many", None)
-        if _SPLIT_BATCH_ENV and batch_get is not None:
+        if batch_get is not None:
             keys = [linear.bundle_key(eid) for eid in expert_ids]
             staged_puts: list = []
             for eid, key, value in zip(
@@ -1505,19 +1371,6 @@ class _LayerLoadContext:
                     "expert_streaming: governor tick skipped", exc_info=True
                 )
 
-    @staticmethod
-    def _pool_for(linear: Any, positions: int = 0):
-        # Regime by asked demand size (decode ~10 experts, prefill
-        # ~hundreds). The caller passes the context's demand-set size —
-        # the rolling path MUST route its prefetch submissions through
-        # this delegate, not the fixed singleton, or a prefill pool would
-        # never see a single rolling task.
-        return io_pool_for_positions(linear, positions)
-
-    @property
-    def _inflight_bytes(self) -> int:
-        return sum(self._inflight.values())
-
     # -- rolling path -------------------------------------------------------
 
     def _prefetch(self, linear: Any) -> None:
@@ -1546,7 +1399,6 @@ class _LayerLoadContext:
                 nxt, self._expert_ids, wait=False, count=False
             )
             self.bundles[nid] = cached
-            self.hits[nid] = len(cached)
             self.misses[nid] = len(missing)
             if not missing and len(cached) == len(self._expert_ids):
                 # Fully cached with real values in hand: nothing to read,
@@ -1558,19 +1410,12 @@ class _LayerLoadContext:
             bank_bytes = int(nxt._tier_bank_bytes_for(missing))
             if bank_bytes > _CTX_PREFETCH_MAX_BYTES:
                 continue
-            # Ask for the raw contiguous banks as well when
-            # single-promotion is on. The read is identical either way — only
-            # what the worker hands back differs, and it stays NumPy, so no
-            # MLX op is ever created on a pool thread.
-            reader = (
-                nxt._load_expert_bank_np_full
-                if _BANK_PROMOTE_CTX_ENV
-                else nxt._load_expert_bank_np
+            # The worker reads the raw contiguous bank and hands back
+            # (segments, rows) — NumPy only, so no MLX op is ever created
+            # on a pool thread.
+            self._futures[nid] = _io_pool(nxt).submit(
+                nxt._load_expert_bank_np_full, missing
             )
-            # Prefetch shares the demand pool.
-            pool = io_pool_for_positions(nxt, len(self._expert_ids))
-            self._futures[nid] = pool.submit(reader, missing)
-            self._inflight[nid] = bank_bytes
             submitted += 1
 
     def _ensure_rolling(self, linear: Any, expert_ids: list[int]) -> None:
@@ -1585,17 +1430,13 @@ class _LayerLoadContext:
         # A prefetch may already be in flight; the split is recomputed
         # because the cache can change between submit and await. The FIRST
         # projection of the rolling path resolves synchronously here — its
-        # read depth is bounded by read_expert_into's _RUN_IO_QD run pool,
-        # not by the regime pool; only the FOLLOWING projections
-        # (prefetch) run on the regime pool.
+        # read depth is bounded by read_expert_into's _RUN_IO_QD run pool;
+        # only the FOLLOWING projections (prefetch) run on the shared pool.
         fut = self._futures.pop(lid, None)
-        self._inflight.pop(lid, None)
         cached, missing = self._split(linear, ids)
         self.bundles[lid] = cached
-        self.hits[lid] = len(cached)
         self.misses[lid] = len(missing)
         self._count_demand(len(cached), len(missing))
-        bank_bytes = int(linear._tier_bank_bytes_for(missing))
 
         if missing:
             if fut is not None:
@@ -1604,31 +1445,18 @@ class _LayerLoadContext:
                 except Exception:
                     got = None
             else:
-                got = (
-                    linear._load_expert_bank_np_full(missing)
-                    if _BANK_PROMOTE_CTX_ENV
-                    else (None, linear._load_expert_bank_np(missing))
-                )
-            # A worker dispatched as bare rows (prefetch submitted before this
-            # call, or with the knob off) yields a list; normalise to the
-            # (segments, rows) shape so the consumer has one contract.
-            if got is not None and not isinstance(got, tuple):
-                got = (None, got)
+                got = linear._load_expert_bank_np_full(missing)
             rows = None if got is None else got[1]
             if rows is None or len(rows) != len(missing):
                 self.failed = True
-                self.fallback_reason = (
-                    "bank_too_large"
-                    if not _BANK_CHUNK_ENV and bank_bytes > _BANK_MAX_BYTES
-                    else "read_failure"
-                )
+                self.fallback_reason = "read_failure"
                 return
             self.bundles[lid].update(zip(missing, rows))
             # Single-promotion is only valid when the read covered the
             # *whole* demand set. A partial bank would have to be
             # concatenated with separately promoted cache hits, which
             # changes the layout contract, so it falls back per expert.
-            if _BANK_PROMOTE_CTX_ENV and got[0] is not None and len(missing) == len(ids):
+            if got[0] is not None and len(missing) == len(ids):
                 self.bank_raw[lid] = got[0]
                 self.bank_ids[lid] = list(missing)
 
@@ -1636,16 +1464,11 @@ class _LayerLoadContext:
     # -- union path ---------------------------------------------------------
 
     def _admit_rows(self, proj: Any, ids: list[int], rows: list) -> None:
-        """Admit decode-miss rows to the LRU per ``_ADMIT_ENV``.
+        """Enqueue decode-miss rows for the detached admission worker.
 
-        detached (default): enqueue for the admission worker (copy +
-        2nd-touch filter + batch put, all off this thread). sync: put the
-        bank views directly. 0/off: no demand admission. Prefill-shaped
-        calls never admit — their demand is one-shot and the hotness
-        seeder owns prefill residency.
+        Prefill-shaped calls never admit — their demand is one-shot and
+        the hotness seeder owns prefill residency.
         """
-        if _ADMIT_ENV not in ("detached", "sync"):
-            return
         # Decode-miss rows only: the demand admission is the decode working
         # set's maintenance path, so a verify chunk or a small prefill tail
         # (seq_len > 1, however few routed rows) must not admit into the LRU.
@@ -1657,11 +1480,8 @@ class _LayerLoadContext:
         if adm is not None:
             for eid, row in zip(ids, rows):
                 adm.submit(proj.bundle_key(eid), row)
-        elif _ADMIT_ENV == "sync":
-            for eid, row in zip(ids, rows):
-                self.cache.put(proj.bundle_key(eid), row)
 
-    def _ensure_union(self, linear: Any, expert_ids: list[int]) -> None:
+    def _ensure_union(self, expert_ids: list[int]) -> None:
         if self._loaded:
             return
         self._loaded = True
@@ -1669,14 +1489,13 @@ class _LayerLoadContext:
         for proj in self.linears:
             cached, missing = self._split(proj, expert_ids)
             self.bundles[id(proj)] = cached
-            self.hits[id(proj)] = len(cached)
             self.misses[id(proj)] = len(missing)
             self._count_demand(len(cached), len(missing))
             if missing:
                 jobs.append((proj, missing))
         if not jobs:
             return
-        pool = self._pool_for(jobs[0][0], len(expert_ids))
+        pool = _io_pool(jobs[0][0])
         live = sum(proj._tier_bank_bytes_for(ids) for proj, ids in jobs)
         # A demand set too large for union residency declines so the
         # linears fall back per expert instead of holding the whole layer at
@@ -1689,15 +1508,7 @@ class _LayerLoadContext:
         for (proj, ids), rows in zip(jobs, results):
             if rows is None or len(rows) != len(ids):
                 self.failed = True
-                self.fallback_reason = (
-                    "bank_too_large"
-                    if not _BANK_CHUNK_ENV
-                    and any(
-                        p._tier_bank_bytes_for(ids_) > _BANK_MAX_BYTES
-                        for p, ids_ in jobs
-                    )
-                    else "read_failure"
-                )
+                self.fallback_reason = "read_failure"
                 return
             self.bundles[id(proj)].update(zip(ids, rows))
             self._admit_rows(proj, ids, rows)
@@ -1706,7 +1517,7 @@ class _LayerLoadContext:
     def ensure(self, linear: Any, expert_ids: list[int]) -> None:
         """Resolve linear's demand set for this layer call."""
         if self.mode == "union":
-            self._ensure_union(linear, expert_ids)
+            self._ensure_union(expert_ids)
         else:
             self._ensure_rolling(linear, expert_ids)
 
@@ -1731,9 +1542,7 @@ class _RemapPlan:
     # 1-token top_k=8 decode is 8 routed rows, and a 4-token verify can
     # have few rows — positions alone mislabels both.
     seq_len: Any = None
-    gate_s: float = 0.0
-    unique_s: float = 0.0
-    uniq_mx: Any = None  # MLX unique expert IDs reused by bias gather
+    uniq_np: Any = None  # host-side unique ids; promoted lazily for bias
     ctx: Any = None  # per-layer load context (quantized GLU)
     # (target_linear_id, run_first, run_count) already advised in this
     # layer call — the projections share one plan, so dedupe here.
@@ -1741,28 +1550,22 @@ class _RemapPlan:
     # Arena mode (OMLX_EXPERT_STREAMING_ARENA): when the GLU binds the
     # demand set into persistent slot rows, arena_rhs is rhs_indices in
     # slot space and each linear reads the arena bank — no per-call
-    # assembly. arena_* carry the layer-level ensure stats for
-    # telemetry/governor.
+    # assembly.
     arena_rhs: Any = None
-    arena_hits: int = 0
-    arena_misses: int = 0
 
 
 def _build_plan_into(plan: _RemapPlan, indices) -> None:
     """Populate a shared routing plan in place (called once per MoE layer)."""
-    t0 = time.perf_counter()
     mx.eval(indices)
     # np.asarray, not np.array(copy=False): NumPy >=2.0 makes copy=False
     # mean "never copy" and an MLX array must copy device->host, so that
     # call raises. asarray(copy=None) is the direct host path.
     flat_np = np.asarray(indices).reshape(-1)
-    t1 = time.perf_counter()
     uniq_np = np.unique(flat_np)
     uniq_list = uniq_np.tolist()
     # compact remap via searchsorted (uniq is sorted ascending):
     # vectorized C lookup
     remapped_np = np.searchsorted(uniq_np, flat_np).astype(np.int32)
-    t2 = time.perf_counter()
     plan.indices_shape = tuple(indices.shape)
     # Only fill seq_len when the caller did not set it — the GLU stamps the
     # true token count before dispatch (a gather-sorted flat `idx` is 1-D
@@ -1776,10 +1579,8 @@ def _build_plan_into(plan: _RemapPlan, indices) -> None:
     plan.flat_np = flat_np
     plan.uniq_list = uniq_list
     plan.remapped = mx.array(remapped_np.reshape(indices.shape))
-    plan.uniq_mx = mx.array(uniq_np)
+    plan.uniq_np = uniq_np
     plan.positions = int(flat_np.size)
-    plan.gate_s = t1 - t0
-    plan.unique_s = t2 - t1
 
 
 # ---------------------------------------------------------------------------
@@ -1853,14 +1654,22 @@ class StreamingSwitchLinear(nn.Module):
             plan = _RemapPlan()
         if plan.flat_np is None:
             _build_plan_into(plan, indices)
-        # Load each unique expert weight
+        # Load each unique expert weight. Derive hit/miss from the get
+        # result actually used for the load — a probe-then-load read can
+        # go stale when a concurrent eviction lands between the two
+        # (TOCTOU). get_many takes the cache lock once for the whole set.
+        keys = [
+            (self.layer_idx, int(eid), self.stacked_key)
+            for eid in plan.uniq_list
+        ]
+        get_many = getattr(self.cache, "get_many", None)
+        values = (
+            get_many(keys)
+            if get_many is not None
+            else [self.cache.get(k) for k in keys]
+        )
         mini_weights = []
-        for eid in plan.uniq_list:
-            key = (self.layer_idx, int(eid), self.stacked_key)
-            # Derive hit/miss from the get() result actually used for the
-            # load — a probe-then-load read can go stale when a concurrent
-            # eviction lands between the two (TOCTOU).
-            w = self.cache.get(key)
+        for eid, key, w in zip(plan.uniq_list, keys, values):
             if w is None:
                 w = self._read_expert_weight(key, int(eid))
             mini_weights.append(w)
@@ -1873,7 +1682,7 @@ class StreamingSwitchLinear(nn.Module):
         # Call gather_mm with mini-bank
         out = mx.gather_mm(x, mini_bank.swapaxes(-1, -2), rhs_indices=remapped, sorted_indices=sorted_indices)
         if self._bias is not None and self._has_bias:
-            b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)  # (U,O)
+            b_mini = mx.take(self._bias, mx.array(plan.uniq_np), axis=0)  # (U,O)
             out = out + mx.expand_dims(b_mini[remapped], -2)
         return out
 
@@ -1954,6 +1763,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         self._hot_experts: set | None = None
         self._cold_bits: int | None = None
         self._cold_gs: int | None = None
+        self._split_active = False
         # The arena bank lives in a plain object so its mx.array rows stay
         # out of the module parameter tree.
         self._arena_bank = _ArenaBank()
@@ -1963,14 +1773,14 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         self._hot_experts = {int(e) for e in (hot_experts or [])}
         self._cold_bits = int(cold_bits)
         self._cold_gs = int(cold_gs)
+        self._split_active = bool(
+            self._hot_experts and self._cold_bits != self.bits
+        )
 
     def _is_split_active(self) -> bool:
-        return (
-            self._hot_experts is not None
-            and len(self._hot_experts) > 0
-            and self._cold_bits is not None
-            and self._cold_bits != self.bits
-        )
+        # Conversion-time invariant — computed once at set_hobbit_split,
+        # re-checked per expert on the bundle_key hot path.
+        return self._split_active
 
     def _tier_of(self, expert_id: int) -> int:
         """0 = hot (source packing), 1 = cold (tier packing)."""
@@ -2023,19 +1833,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         if self.stacked_biases_key:
             keys.append(self.stacked_biases_key)
         return sum(self._slice_bytes(k) for k in keys)
-
-    def _bank_bytes_for(self, n_experts: int) -> int:
-        """Bytes of raw NumPy bank needed to hold n_experts of this projection.
-
-        Used by the layer-context memory bookkeeping and by the demand-set
-        bank reader to size reads under the bank cap. Tier-blind (cold-first):
-        use _tier_bank_bytes_for when the demand set is known — under the
-        HOBBIT split hot experts carry the SOURCE packing width, which this
-        cold-first measurement under-estimates.
-        """
-        if n_experts <= 0:
-            return 0
-        return n_experts * self._per_slot_bytes()
 
     def _tier_groups(self, ids: list[int]) -> dict[int, list[int]]:
         """Group ids by tier with ONE pass (split-aware segmentation).
@@ -2104,11 +1901,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             keys.append(self.stacked_biases_key)
         try:
             split = self._is_split_active()
-            # No gap bridging: hole-bridged coalesced reads lose more to
-            # the idle bytes than they gain from sequentiality. The
-            # capability stays in shard_bank.segment_runs(merge_gap=...);
-            # the runtime never opts in.
-            merge_gap = 0
             if split:
                 groups: list[tuple[int, list[int]]] = []
                 for t in (0, 1):
@@ -2136,23 +1928,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 banks = [
                     np.empty((len(ids_t), size), dtype=np.uint8) for size in per_bytes
                 ]
-                if not _BANK_CHUNK_ENV and total > _BANK_MAX_BYTES:
-                    return None
-                run_cap_bytes = _BANK_RUN_MAX_BYTES if _BANK_CHUNK_ENV else 0
-                dense_merge = 0
-                if _BANK_DENSE_ENV > 0 and _BANK_CHUNK_ENV:
-                    try:
-                        n_axis = _readers[0]._rp_for(keys[0]).num_experts
-                        if len(ids_t) >= n_axis * _BANK_DENSE_ENV:
-                            # Demand covers most of the axis: bridge every
-                            # hole so each run is one contiguous span (still
-                            # capped by run_cap_bytes) — sequential reads at
-                            # the device ceiling instead of ~1 MB scattered
-                            # runs. Hole bytes are read but never scattered.
-                            dense_merge = 1 << 20
-                    except Exception:
-                        dense_merge = 0
-                if _BANK_CHUNK_ENV and len(ids_t) * sum(per_bytes) > _BANK_MAX_BYTES:
+                if len(ids_t) * sum(per_bytes) > _BANK_MAX_BYTES:
                     # Read the bank in row windows bounded by the
                     # cap. Rows are views into `banks` either way, so peak
                     # residency is identical to the single-read shape; only
@@ -2166,8 +1942,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                         if not self.backing.read_expert_into(
                             components,
                             views,
-                            merge_gap=max(merge_gap, dense_merge),
-                            max_run_bytes=run_cap_bytes,
+                            merge_gap=0,
+                            max_run_bytes=_BANK_RUN_MAX_BYTES,
                         ):
                             return None
                 else:
@@ -2175,8 +1951,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     if not self.backing.read_expert_into(
                         components,
                         banks,
-                        merge_gap=max(merge_gap, dense_merge),
-                        max_run_bytes=run_cap_bytes,
+                        merge_gap=0,
+                        max_run_bytes=_BANK_RUN_MAX_BYTES,
                     ):
                         return None
                 segments.append((ids_t, banks))
@@ -2351,13 +2127,10 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         return (self.layer_idx, expert_id, base)
 
     def _admit(self, key: tuple[int, int, str], row: Any) -> None:
-        """Demand admission: worker copy+put (detached, default), view
-        put (sync), or nothing (0)."""
+        """Demand admission: enqueue for the detached worker copy+put."""
         adm = getattr(self.cache, "admission", None)
         if adm is not None:
             adm.submit(key, row)
-        elif _ADMIT_ENV == "sync":
-            self.cache.put(key, row)
 
     def _load_expert_np(self, expert_id: int) -> tuple | None:
         """Numpy-only load for the prefetch worker.
@@ -2490,47 +2263,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         if not targets:
             return
         advised_runs = plan.advised_runs if plan is not None else None
-        if (
-            _RA_PREFILL_ENV
-            and plan is not None
-            and int(getattr(plan, "positions", 0)) > _PREFILL_SHAPE_MIN_ROWS
-        ):
-            # A prefill-shaped call guarantees the NEXT layer will
-            # also touch ~every expert (same tokens flow through it), so
-            # advise its whole expert axis once per layer call — sequential
-            # ranges the kernel can stream while the current layer computes.
-            # This must NOT wait on prev_uniq: a single-pass prefill has no
-            # recorded next-layer demand yet, and a decode-shaped call never
-            # enters (positions <= 64), so the first token after prefill
-            # does not flood the queue.
-            try:
-                for target in targets:
-                    dedupe_key = (id(target), 0, -1)
-                    if advised_runs is not None:
-                        if dedupe_key in advised_runs:
-                            continue
-                        advised_runs.add(dedupe_key)
-                    key = target.stacked_weight_key
-                    reader = target.backing._reader_for_key(key, 0)
-                    n_experts = reader._rp_for(key).num_experts
-                    ok, adv_bytes, adv_segs = target.backing.advise_expert_run(
-                        key, 0, n_experts
-                    )
-                    if ok:
-                        state.bump("advised", n_experts)
-                        state.bump("advised_experts", n_experts)
-                        state.bump("advised_runs", 1)
-                        state.bump("advised_bytes", adv_bytes)
-                        state.bump("advice_tier_segments", adv_segs)
-                    else:
-                        state.bump("advice_failures", 1)
-            except Exception:
-                logger.debug(
-                    "expert_streaming: prefill advisory skipped for layer %d",
-                    next_layer,
-                    exc_info=True,
-                )
-            return
         # Prev-token routing is the advisory prediction (advisory ids,
         # never output).
         prev = state.prev_uniq_by_layer.get(next_layer)
@@ -2587,16 +2319,22 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     pass
             # One shared segmentation with the demand path —
             # consecutive ids within one resolved reader become one run for
-            # a single F_RDADVISE (tier boundaries break the run).
+            # a single F_RDADVISE (tier boundaries break the run). Without
+            # the hot/cold split every id resolves to the same reader, so
+            # the runs are plain consecutive spans.
             from .shard_bank import segment_runs
 
-            rid_of = {
-                e: id(self.backing._reader_for_key(self.stacked_weight_key, e))
-                for e in sorted_prev
-            }
-            runs = segment_runs(
-                sorted_prev, same=lambda a, b: rid_of[a] == rid_of[b]
-            )
+            if self._is_split_active():
+                rid_of = {
+                    e: id(self.backing._reader_for_key(self.stacked_weight_key, e))
+                    for e in sorted_prev
+                }
+                runs = segment_runs(
+                    sorted_prev, same=lambda a, b: rid_of[a] == rid_of[b]
+                )
+            else:
+                runs = segment_runs(sorted_prev)
+            n_adv = n_bytes = n_segs = n_runs = n_fail = 0
             for target in targets:
                 for first, count in runs:
                     if advised_runs is not None:
@@ -2609,13 +2347,12 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                             target.stacked_weight_key, first, count
                         )
                         if ok:
-                            state.bump("advised", count)
-                            state.bump("advised_experts", count)
-                            state.bump("advised_runs", 1)
-                            state.bump("advised_bytes", adv_bytes)
-                            state.bump("advice_tier_segments", adv_segs)
+                            n_adv += count
+                            n_bytes += adv_bytes
+                            n_segs += adv_segs
+                            n_runs += 1
                         else:
-                            state.bump("advice_failures", 1)
+                            n_fail += 1
                     except Exception:
                         logger.debug(
                             "expert_streaming: advisory run failed for "
@@ -2623,6 +2360,17 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                             next_layer,
                             exc_info=True,
                         )
+            if n_adv:
+                state.bump("advised", n_adv)
+                state.bump("advised_experts", n_adv)
+            if n_runs:
+                state.bump("advised_runs", n_runs)
+            if n_bytes:
+                state.bump("advised_bytes", n_bytes)
+            if n_segs:
+                state.bump("advice_tier_segments", n_segs)
+            if n_fail:
+                state.bump("advice_failures", n_fail)
         except Exception:
             logger.debug(
                 "expert_streaming: advisory skipped for layer %d",
@@ -2705,23 +2453,23 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 return
             # Drop what the cache already serves; staging duplicates read.
             # Membership probe only — get() would mint hits/misses and
-            # promote recency for rows no demand ever touched.
-            want = [
-                e
-                for e in ids
-                if target.bundle_key(e) not in self.cache
-            ]
+            # promote recency for rows no demand ever touched. peek_many
+            # takes the cache lock once for the whole set.
+            _peek = getattr(self.cache, "peek_many", None)
+            if _peek is not None:
+                _keys = [target.bundle_key(e) for e in ids]
+                want = [e for e, v in zip(ids, _peek(_keys)) if v is None]
+            else:
+                want = [
+                    e
+                    for e in ids
+                    if target.bundle_key(e) not in self.cache
+                ]
             if not want:
                 return
             want.sort()
-            reader = (
-                target._load_expert_bank_np_full
-                if _BANK_PROMOTE_CTX_ENV
-                else target._load_expert_bank_np
-            )
-            pool = io_pool_for_positions(
-                target, int(getattr(plan, "positions", 0))
-            )
+            reader = target._load_expert_bank_np_full
+            pool = _io_pool(target)
             # Re-staging replaces last token's staged set for this layer:
             # drop stale rows/futures keyed under next_layer BEFORE
             # registering.
@@ -2730,14 +2478,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # the new read around it. Keys are exact bundle keys
             # (layer, expert, kind); shared futures cancel only when no
             # sibling staged key still references them.
-            for stale in (
-                k for k in list(state.staged) if k[0] == next_layer
-            ):
-                state.stage_drop(stale)
-            for stale in (
-                k for k in list(state.staged_futs) if k[0] == next_layer
-            ):
-                state.stage_drop(stale)
+            for staged_keys in (state.staged, state.staged_futs):
+                for stale in (
+                    k for k in list(staged_keys) if k[0] == next_layer
+                ):
+                    state.stage_drop(stale)
             fut = pool.submit(reader, want)
             n = state.stage_register(fut, want, target)
             if n:
@@ -2762,25 +2507,12 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         if gov is None:
             return True
         try:
-            # Public governor accessors (contract API); private reads are
-            # the compatibility fallback for a foreign governor duck.
             at_floor = getattr(gov, "at_floor", None)
-            floor_hit = (
-                at_floor()
-                if callable(at_floor)
-                else int(getattr(self.cache, "capacity", 0))
-                <= gov._min_cap_slots()
-            )
-            if floor_hit:
+            if callable(at_floor) and at_floor():
                 return False
             desperate = getattr(gov, "in_desperate_band", None)
-            if callable(desperate):
-                if desperate():
-                    return False
-            else:
-                free = float(getattr(gov, "_last_free_gib", 0.0) or 0.0)
-                if 0.0 < free < gov.low_free_bytes / 1024**3:
-                    return False
+            if callable(desperate) and desperate():
+                return False
         except Exception:
             return True
         return True
@@ -2938,8 +2670,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             # bank (row-major) — sorted reads keep the NVMe's locality
             missing.sort()
             if (
-                _BANK_PROMOTE_ENV
-                and len(missing) == len(plan.uniq_list)
+                len(missing) == len(plan.uniq_list)
                 and hasattr(self.backing, "read_expert_into")
             ):
                 # Every demanded expert is a miss, so the demand set
@@ -2954,8 +2685,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     if cache_result:
                         self._admit(self.bundle_key(eid), raw)
             elif hasattr(self.backing, "load_expert_slice"):
-                # Prefill-shaped calls may use the separate pool.
-                io_pool = io_pool_for_positions(self, plan.positions)
+                io_pool = _io_pool(self)
                 # Bank-first path: read all missing experts
                 # into one raw bank per (key, tier) on this thread, then
                 # expose rows as views. Avoids one task/result allocation per
@@ -3032,7 +2762,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         """Promote the resolved rows into the bank(s) gather_qmm consumes."""
         dt = self._slice_dtypes_lazy()
         ctx_banks = None
-        if res.banked is None and plan.ctx is not None and _BANK_PROMOTE_CTX_ENV:
+        if res.banked is None and plan.ctx is not None:
             # The layer context read this projection's demand set
             # as one contiguous NumPy bank per key (possibly on an IO pool
             # worker). Promote it *here*, on the inference thread, so MLX
@@ -3058,12 +2788,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         # (no per-expert promote, no mx.stack) — bit-identical by
         # construction. Anything else falls back per tier.
         tier_single: dict[int, tuple] = {}
-        if res.banked is not None:
-            for ids_t, triple in res.banked[0]:
-                tier = self._tier_of(ids_t[0]) if split else 0
-                tier_single[tier] = triple
-        elif ctx_banks is not None:
-            for ids_t, triple in ctx_banks:
+        segs_in = res.banked[0] if res.banked is not None else ctx_banks
+        if segs_in:
+            for ids_t, triple in segs_in:
                 tier = self._tier_of(ids_t[0]) if split else 0
                 tier_single[tier] = triple
 
@@ -3134,16 +2861,15 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         uniq = [int(e) for e in plan.uniq_list]
         hot_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 0]
         cold_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 1]
-        hot_idx_set = set(hot_idx)  # hoisted: per-iter set() was O(n^2)
-        for i, eid in enumerate(uniq):
-            t = 0 if i in hot_idx_set else 1  # hot_rank lookup
+        for t, idxs in ((0, hot_idx), (1, cold_idx)):
             if t in tier_single:
                 continue
-            w, s, b = bundles[eid]
-            tier_w[t].append(self._promote_np(w))
-            tier_s[t].append(self._promote_np(s, dt[0]))
-            if b is not None:
-                tier_b[t].append(self._promote_np(b, dt[1]))
+            for i in idxs:
+                w, s, b = bundles[uniq[i]]
+                tier_w[t].append(self._promote_np(w))
+                tier_s[t].append(self._promote_np(s, dt[0]))
+                if b is not None:
+                    tier_b[t].append(self._promote_np(b, dt[1]))
 
         def _stack_tier(t: int) -> tuple:
             """Per-expert stack for one tier (no matching segment)."""
@@ -3230,7 +2956,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
     def _finish(self, plan, out):
         """Shared tail: residual bias."""
         if self._bias is not None and self._has_bias:
-            b_mini = mx.take(self._bias, plan.uniq_mx, axis=0)
+            b_mini = mx.take(self._bias, mx.array(plan.uniq_np), axis=0)
             out = out + mx.expand_dims(b_mini[plan.remapped], -2)
         return out
 
@@ -3388,11 +3114,7 @@ class StreamingSwitchGLU(nn.Module):
                 # Hybrid: decode-shaped calls (<64 routed rows) read all
                 # projections at once (union); prefill keeps rolling so
                 # all banks are never resident simultaneously.
-                ctx_mode = _layer_ctx_mode(
-                    int(indices.size),
-                    quantized=self.quantized,
-                    barrier=_LAYER_BARRIER_ENV,
-                )
+                ctx_mode = _layer_ctx_mode(int(indices.size))
                 plan.ctx = _LayerLoadContext(
                     projections, self._cache, mode=ctx_mode,
                     positions=int(indices.size),
@@ -3535,17 +3257,23 @@ class StreamingSwitchGLU(nn.Module):
         served: non-bank backing, hot/cold split active, or a demand set
         larger than the layer cap — those calls keep the bundle path.
         """
-        projections = (
-            [self.gate_up_proj, self.down_proj]
-            if hasattr(self, "gate_up_proj")
-            else [self.up_proj, self.gate_proj, self.down_proj]
-        )
-        if not all(
-            isinstance(p, StreamingQuantizedSwitchLinear)
-            and not p._is_split_active()
-            and hasattr(p.backing, "load_expert_slice")
-            for p in projections
-        ):
+        projections = getattr(self, "_arena_projs", None)
+        if projections is None:
+            cand = (
+                [self.gate_up_proj, self.down_proj]
+                if hasattr(self, "gate_up_proj")
+                else [self.up_proj, self.gate_proj, self.down_proj]
+            )
+            if not all(
+                isinstance(p, StreamingQuantizedSwitchLinear)
+                and not p._is_split_active()
+                and hasattr(p.backing, "load_expert_slice")
+                for p in cand
+            ):
+                self._arena_projs = False  # permanent shape: latch the decline
+                return False
+            self._arena_projs = projections = cand
+        elif projections is False:
             return False
         if plan.flat_np is None:
             _build_plan_into(plan, idx)
@@ -3598,7 +3326,7 @@ class StreamingSwitchGLU(nn.Module):
         # demand sets above it keep the bundle path.
         if len(uniq) > arena.book.cap:
             return False
-        h0, m0 = arena.book.hits, arena.book.misses
+        m0 = arena.book.misses
         with arena.lock:
             # frozen for non-decode calls: verify/prefill
             # experts commit at the eviction-candidate end and hits skip
@@ -3610,8 +3338,7 @@ class StreamingSwitchGLU(nn.Module):
                 self._arena_produce(projections, int(plan.positions)),
             )
             plan.arena_rhs = arena.rows_for(uniq)[plan.remapped]
-        plan.arena_hits = arena.book.hits - h0
-        plan.arena_misses = arena.book.misses - m0
+        arena_misses = arena.book.misses - m0
         # The layer-ctx close() feeds these counters in bundle mode; arena
         # skips the ctx, so report the same visit signal directly — the
         # governor's dynamic-budget loop stays informed either way. The
@@ -3621,9 +3348,9 @@ class StreamingSwitchGLU(nn.Module):
         # permanent 0.0.
         st = getattr(self._cache, "stats", None)
         if st is not None:
-            missed = plan.arena_misses > 0
+            missed = arena_misses > 0
             n_demanded = len(uniq)
-            n_missed = int(plan.arena_misses)
+            n_missed = int(arena_misses)
             n_covered = max(0, n_demanded - n_missed)
             if is_decode:
                 st.decode_layers += 1
@@ -3845,7 +3572,7 @@ class StreamingSwitchGLU(nn.Module):
                 else:
                     jobs.append((li, missing))
             if len(jobs) > 1:
-                pool = io_pool_for_positions(linears[0], positions)
+                pool = _io_pool(linears[0])
                 futs = [
                     pool.submit(
                         per_lin[li][0]._load_expert_bank_np,

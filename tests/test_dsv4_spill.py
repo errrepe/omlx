@@ -24,8 +24,6 @@ def test_stack_layer_to_spill_roundtrip(tmp_path):
     assert len(out) == 9
     assert out["model.layers.0.ffn.switch_mlp.gate_proj.weight"].shape == (2, 8, 4)
     assert out["model.layers.0.ffn.switch_mlp.down_proj.scales"].shape == (2, 4, 2)
-    assert S.spill_layer_ok(tmp_path, 0)
-    assert not S.spill_layer_ok(tmp_path, 1)
 
 
 def test_spill_validity_roundtrip(tmp_path):

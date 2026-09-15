@@ -17,19 +17,21 @@ thread-safe; callers serialize under their own per-layer lock.
 """
 from __future__ import annotations
 
-import os
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 import mlx.core as mx
+
+from ._env import env_int
 
 # OMLX_EXPERT_STREAMING_HOTPIN: pin the K hottest experts per book against
 # eviction. Routing frequency is tracked on the demand set each ensure_set
 # call; pins are recomputed per call and counters halve periodically so the
 # protected set follows the current routing distribution instead of
 # freezing history. 0 (default) keeps plain LRU victims.
-_HOTPIN_K = int(os.environ.get("OMLX_EXPERT_STREAMING_HOTPIN", "0") or 0)
+_HOTPIN_K = env_int("OMLX_EXPERT_STREAMING_HOTPIN", 0)
 _HOTPIN_DECAY_CALLS = 512
 
 
@@ -94,7 +96,7 @@ class SlotBookkeeping:
     """
 
     def __init__(self, rooms: int, cap: int | None = None) -> None:
-        self.slot_of: dict[int, int] = {}
+        self.slot_of: OrderedDict[int, int] = OrderedDict()
         self.rooms = int(rooms)
         self.cap = self.rooms if cap is None else int(cap)
         self.free: list[int] = list(range(self.rooms))
@@ -152,10 +154,9 @@ class SlotBookkeeping:
 
     def touch(self, expert: int) -> bool:
         """Move *expert* to the MRU end when resident; returns residency."""
-        slot = self.slot_of.pop(expert, None)
-        if slot is None:
+        if expert not in self.slot_of:
             return False
-        self.slot_of[expert] = slot
+        self.slot_of.move_to_end(expert)
         return True
 
     def _note_eviction(self, victim: int, verify: bool) -> None:
@@ -288,13 +289,9 @@ class SlotBookkeeping:
         verify path uses it so draft-only experts leave first without
         disturbing the decode-hot order.
         """
+        self.slot_of[expert] = slot
         if to_oldest:
-            rest = dict(self.slot_of)
-            self.slot_of.clear()
-            self.slot_of[expert] = slot
-            self.slot_of.update(rest)
-        else:
-            self.slot_of[expert] = slot
+            self.slot_of.move_to_end(expert, last=False)
         self.misses += 1
 
     def rollback(
@@ -356,7 +353,7 @@ class SlotBookkeeping:
         # still-resident ones at their current rows, restored victims at
         # the rows they were popped from. Entries committed before the
         # failure postdate the snapshot and append in commit order.
-        rebuilt: dict[int, int] = {}
+        rebuilt: OrderedDict[int, int] = OrderedDict()
         for e in order_snapshot:
             if e in stay_evicted:
                 continue
@@ -378,7 +375,9 @@ class SlotBookkeeping:
 
     def rebuild(self, kept: list[int]) -> None:
         """Remap rows to 0..k-1 in *kept* order after a physical compact."""
-        self.slot_of = {expert: row for row, expert in enumerate(kept)}
+        self.slot_of = OrderedDict(
+            (expert, row) for row, expert in enumerate(kept)
+        )
         self.verify_installed.intersection_update(kept)
         self.rooms = len(kept)
         self.free = []
@@ -453,8 +452,8 @@ class SlotArena:
         """Write one payload ``{proj: {field: array}}`` into row ``slot``."""
         for proj, fields in payload.items():
             arrays = self._arrays_of(proj)
-            for field, array in fields.items():
-                arrays[field][slot] = array
+            for fname, array in fields.items():
+                arrays[fname][slot] = array
 
     def set_cap(self, cap: int) -> int:
         """Retarget the residency ceiling; returns the applied cap.
@@ -484,11 +483,11 @@ class SlotArena:
             for proj in self.projections:
                 current = self._arrays_of(proj)
                 grown = {
-                    field: mx.zeros((need, *array.shape[1:]), dtype=array.dtype)
-                    for field, array in current.items()
+                    fname: mx.zeros((need, *array.shape[1:]), dtype=array.dtype)
+                    for fname, array in current.items()
                 }
-                for field, array in current.items():
-                    grown[field][: self.book.rooms] = array
+                for fname, array in current.items():
+                    grown[fname][: self.book.rooms] = array
                 grown_all[proj] = grown
             mx.eval(*[a for g in grown_all.values() for a in g.values()])
             for proj in self.projections:
@@ -534,12 +533,12 @@ class SlotArena:
             kept = order[drop:]
             stacked_all = {
                 proj: {
-                    field: self._kept_rows(
+                    fname: self._kept_rows(
                         array,
                         [self.book.slot_of[e] for e in kept],
                         target,
                     )
-                    for field, array in self._arrays_of(proj).items()
+                    for fname, array in self._arrays_of(proj).items()
                 }
                 for proj in self.projections
             }

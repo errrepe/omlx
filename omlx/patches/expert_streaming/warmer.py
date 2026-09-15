@@ -29,17 +29,22 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
+from ._env import env_float, env_int
+
 logger = logging.getLogger(__name__)
 
 # Decode rows are top_k * batch (8 * B); prefill chunks are much larger.
 # A small prompt (<= this many rows) may warm needlessly once — bounded waste.
-_MAX_WARM_ROWS = 64
+# Same routed-row bound the switch's _decode_call_shape falls back to, so
+# OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS=0 disables both consistently.
+_MAX_WARM_ROWS = max(
+    0, env_int("OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS", 64)
+)
 
 PIN_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_PIN", "0") == "1"
 # F_RDADVISE readahead: the submitted jobs are kernel readahead hints,
@@ -50,13 +55,13 @@ RA_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_RA", "1") != "0"
 # cache contents with the prompt's hot experts.
 SEED_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_SEED", "1") != "0"
 SEED_BYTES = int(
-    float(os.environ.get("OMLX_EXPERT_STREAMING_SEED_GIB", "2.0")) * 1024**3
+    env_float("OMLX_EXPERT_STREAMING_SEED_GIB", 2.0) * 1024**3
 )
 # The default pin budget is deliberately small (256 MiB).
 PIN_BUDGET_BYTES = int(
-    float(os.environ.get("OMLX_EXPERT_STREAMING_PIN_GIB", "0.25")) * 1024**3
+    env_float("OMLX_EXPERT_STREAMING_PIN_GIB", 0.25) * 1024**3
 )
-PIN_OBSERVE_CALLS = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_TOKENS", "8")))
+PIN_OBSERVE_CALLS = env_int("OMLX_EXPERT_STREAMING_PIN_TOKENS", 8, lo=1)
 # Learned pin store: persist observed per-layer frequencies to this JSON
 # and reload them on the next load, skipping the observation window so
 # the hot set is wired from token 1.
@@ -65,7 +70,7 @@ PIN_PROFILE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_PIN_PROFILE", "") or No
 # model's full expert width (GLM: 288 experts/layer) or the fraction's
 # denominator is meaningless. Env-tunable; JSON stays a list of
 # [expert, count] pairs per layer.
-_PIN_PROFILE_KEEP = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_KEEP", "512")))
+_PIN_PROFILE_KEEP = env_int("OMLX_EXPERT_STREAMING_PIN_KEEP", 512, lo=1)
 
 # Profile format version. v2 splits the learned frequencies into
 # per-regime counters (decode vs prefill) and refuses to apply a profile
@@ -97,7 +102,7 @@ def _is_decode_call(positions: int, seq_len: int | None = None) -> bool:
     """
     if seq_len is not None:
         return int(seq_len) <= 1
-    return positions <= _MAX_WARM_ROWS
+    return _MAX_WARM_ROWS > 0 and positions <= _MAX_WARM_ROWS
 
 
 def _proj_keys(linear: Any) -> list[str]:
@@ -127,12 +132,6 @@ class PageCacheWarmer:
             for layer, linears in linears_by_layer.items()
         }
         self.last_uniq: Dict[int, list[int]] = {}
-        # These two are bumped from _WARM_POOL workers (_advise_one runs
-        # inside the submitted _run), so a bare ``+=`` loses updates —
-        # same reason the read path's counters lock theirs.
-        self._stats_lock = threading.Lock()
-        self.advised = 0
-        self.advise_failures = 0
 
     def on_layer_start(
         self, layer_idx: int, positions: int, seq_len: int | None = None
@@ -195,15 +194,9 @@ class PageCacheWarmer:
 
     def _advise_one(self, backing: Any, key: str, first_id: int, count: int) -> None:
         try:
-            if backing.advise_expert_run(key, first_id, count):
-                with self._stats_lock:
-                    self.advised += 1
-            else:
-                with self._stats_lock:
-                    self.advise_failures += 1
+            backing.advise_expert_run(key, first_id, count)
         except Exception:
-            with self._stats_lock:
-                self.advise_failures += 1
+            pass
 
 
 class PinController:
@@ -261,7 +254,6 @@ class PinController:
         self.profile_regime = self.pin_regime
         self.calls = 0
         self.pinned = False
-        self.pin_jobs = 0
         self.pin_load_time_ms = 0.0
         self.pinned_pages_estimate = 0
         # Server wiring passes a per-model path (<model>/.omlx/...); the env
@@ -512,7 +504,6 @@ class PinController:
                     self.backing.pin_expert(key, eid)
                 except Exception:
                     pass
-            self.pin_jobs = len(jobs)
             self.pin_load_time_ms = (time.perf_counter() - t0) * 1000.0
             self.save_profile()
             logger.info(
@@ -583,9 +574,7 @@ class PrefillHotnessRecorder:
         self.freq: Dict[int, Counter] = {}
         self.saw_prefill = False
         self.seeded = False
-        self.seeded_experts = 0
         self.seeded_s = 0.0
-        self.seed_done = threading.Event()
         # Diagnostic: the exact hot set the seed picked, per layer. Kept so
         # a post-run comparison can separate "the ranking is bad" from "the
         # ranking never became resident".
@@ -629,7 +618,6 @@ class PrefillHotnessRecorder:
         if self.cache is not None:
             setattr(self.cache, "prefill_bypass", False)
         if not self.freq:
-            self.seed_done.set()
             return
         t0 = time.perf_counter()
         try:
@@ -640,7 +628,6 @@ class PrefillHotnessRecorder:
         except Exception as e:
             logger.debug("Expert streaming: hotness seed failed: %s", e)
             return
-        self.seeded_experts = n
         self.seeded_s = time.perf_counter() - t0
         logger.info(
             "Expert streaming: seeded %d hot expert slices from prefill "
@@ -703,50 +690,46 @@ class PrefillHotnessRecorder:
                     elif loader is not None:
                         jobs.append((layer, lin, loader, eid))
         if not jobs:
-            self.seed_done.set()
             return ready
 
         def _run() -> None:
             warmed = 0
-            try:
-                for layer, lin, loader, eid in jobs:
-                    try:
-                        # Quantized streamers expose raw slice keys. Read plain
-                        # NumPy buffers off-thread; never allocate MLX arrays here.
-                        weight_key = getattr(lin, "stacked_weight_key", None)
-                        scales_key = getattr(lin, "stacked_scales_key", None)
-                        if (
-                            weight_key
-                            and scales_key
-                            and hasattr(self.backing, "load_expert_slice")
-                        ):
-                            w = self.backing.load_expert_slice(weight_key, eid)
-                            s = self.backing.load_expert_slice(scales_key, eid)
-                            b = None
-                            bias_key = getattr(lin, "stacked_biases_key", None)
-                            if bias_key:
-                                try:
-                                    b = self.backing.load_expert_slice(bias_key, eid)
-                                except Exception:
-                                    b = None
-                                if b is None:
-                                    # Bias consistency: a declared bias
-                                    # tensor that failed to read must not
-                                    # admit a (w, s, None) bundle — the
-                                    # QMM path treats partial bias
-                                    # coverage as an error. Skip the
-                                    # bundle; a demand read retries it.
-                                    continue
-                            self.cache.put((layer, eid, weight_key), (w, s, b))
-                        else:
-                            # Non-quantized test/backing path: retain correctness
-                            # with its existing loader contract.
-                            loader(eid)
-                        warmed += 1
-                    except Exception:
-                        continue
-            finally:
-                self.seed_done.set()
+            for layer, lin, loader, eid in jobs:
+                try:
+                    # Quantized streamers expose raw slice keys. Read plain
+                    # NumPy buffers off-thread; never allocate MLX arrays here.
+                    weight_key = getattr(lin, "stacked_weight_key", None)
+                    scales_key = getattr(lin, "stacked_scales_key", None)
+                    if (
+                        weight_key
+                        and scales_key
+                        and hasattr(self.backing, "load_expert_slice")
+                    ):
+                        w = self.backing.load_expert_slice(weight_key, eid)
+                        s = self.backing.load_expert_slice(scales_key, eid)
+                        b = None
+                        bias_key = getattr(lin, "stacked_biases_key", None)
+                        if bias_key:
+                            try:
+                                b = self.backing.load_expert_slice(bias_key, eid)
+                            except Exception:
+                                b = None
+                            if b is None:
+                                # Bias consistency: a declared bias
+                                # tensor that failed to read must not
+                                # admit a (w, s, None) bundle — the
+                                # QMM path treats partial bias
+                                # coverage as an error. Skip the
+                                # bundle; a demand read retries it.
+                                continue
+                        self.cache.put((layer, eid, weight_key), (w, s, b))
+                    else:
+                        # Non-quantized test/backing path: retain correctness
+                        # with its existing loader contract.
+                        loader(eid)
+                    warmed += 1
+                except Exception:
+                    continue
             logger.debug(
                 "Expert streaming: async LRU seed warmed %d/%d bundles",
                 warmed,
@@ -802,7 +785,6 @@ class PrefillHotnessRecorder:
                                 pass
             finally:
                 self.seeded_s = time.perf_counter() - t0
-                self.seed_done.set()
             logger.info(
                 "Expert streaming: page-cache seed burst done: %d slices in %.2fs",
                 n,
@@ -832,7 +814,12 @@ class WarmPinHook:
         # histogram, so the switch only pays the np.bincount when at least
         # one of them is attached. The readahead warmer keeps the plain
         # uniq_list contract (contiguous-run F_RDADVISE grouping).
-        return self.pinner is not None or self.recorder is not None
+        # The recorder stops consuming counts once seeded — without the
+        # latch the default config (seed on, pins off) pays a per-token
+        # np.bincount forever for a histogram nobody reads.
+        return self.pinner is not None or (
+            self.recorder is not None and not self.recorder.seeded
+        )
 
     def on_layer_start(
         self, layer_idx: int, positions: int, seq_len: int | None = None

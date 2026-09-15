@@ -349,92 +349,16 @@ class BatchedEngine(BaseEngine):
         # dense weights and RoPE freqs. Effective settings already include
         # forced activation from EnginePool. Also runs before gate+up fusion
         # (fusion would change the stacked layout).
-        if getattr(self._model_settings, "expert_streaming_enabled", False):
-            try:
-                from ..patches.expert_streaming import convert_model_to_streaming
+        from ..patches.expert_streaming import streaming_offload_load
 
-                def _do_streaming():
-                    _, backing = convert_model_to_streaming(
-                        self._model, self._model_name, self._model_settings
-                    )
-                    # keep backing alive on the engine/model
-                    if backing is not None:
-                        self._expert_streaming_backing = backing
-                        try:
-                            self._model._expert_streaming_backing = backing  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-                    return backing
-
-                await loop.run_in_executor(get_mlx_executor(), _do_streaming)
-                logger.info("Expert streaming enabled for %s", self._model_name)
-            except Exception as e:
-                # Fail clean: streaming was explicitly enabled, so a backing
-                # failure must fail the load — continuing to materialize
-                # would retain all expert banks in RAM (OOM).
-                logger.error(
-                    "Expert streaming conversion failed for %s: %s",
-                    self._model_name,
-                    e,
-                    exc_info=True,
-                )
-                raise RuntimeError(
-                    f"Expert streaming conversion failed for {self._model_name}: {e}"
-                ) from e
-        # MoE expert offload: replace covered SwitchGLU layers with a
-        # fetch-on-miss LRU cache streaming experts from the checkpoint's
-        # own safetensors. Must run BEFORE materialize_lazy_state — the load
-        # above stayed lazy when this is enabled, and dropping the stock
-        # modules here is what keeps non-resident experts from ever
-        # materializing. Runs on the MLX executor because it allocates the
-        # resident slot tensors (#1304).
-        moe_offload_wrapped = 0
-        from ..model_settings import moe_offload_requested
-
-        if moe_offload_requested(self._model_settings):
-            from ..patches.moe_expert_offload import (
-                apply_moe_expert_offload,
-                materialize_offload_state,
-            )
-
-            fraction = float(
-                getattr(
-                    self._model_settings,
-                    "moe_expert_offload_resident_fraction",
-                    0.25,
-                )
-            )
-            moe_offload_wrapped = await loop.run_in_executor(
-                get_mlx_executor(),
-                apply_moe_expert_offload,
-                self._model,
-                self._model_name,
-                fraction,
-                self._model_settings,
-            )
-            if moe_offload_wrapped:
-                # The caches' slot maps and resident slots live on plain
-                # attributes outside the module tree, so materialize_lazy_state
-                # below never reaches them; left lazy they stay bound to this
-                # loader stream and the first request from an inference thread
-                # dies with "There is no Stream(gpu, N) in current thread".
-                await loop.run_in_executor(
-                    get_mlx_executor(), materialize_offload_state, self._model
-                )
-
-        # Fail before materializing: a lazy-loaded streaming checkpoint with
-        # zero converted layers would evaluate every expert bank in RAM.
-        if moe_offload_requested(self._model_settings):
-            from ..patches.expert_streaming import (
-                ensure_streaming_backing_or_raise,
-            )
-
-            ensure_streaming_backing_or_raise(
-                self._model,
-                getattr(self, "_expert_streaming_backing", None),
-                requested=True,
-                model_name=self._model_name,
-            )
+        _es_backing, moe_offload_wrapped = await streaming_offload_load(
+            self._model,
+            self._model_name,
+            self._model_settings,
+            label="model",
+        )
+        if _es_backing is not None:
+            self._expert_streaming_backing = _es_backing
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304). Post-streaming the MoE
