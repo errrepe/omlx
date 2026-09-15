@@ -158,6 +158,141 @@ def _span_max_rows() -> int:
         return 64
 
 
+def _ra_enabled() -> bool:
+    """Exact-demand kernel readahead (megaplan F1) — F_RDADVISE only.
+
+    ``OffloadedExpert.__call__`` already holds the whole call's routing
+    in ``flat_i`` before any fetch runs, so prefill and verify demand is
+    COMPUTED, not predicted: advise it into the page cache ahead of the
+    ensure loop and the demand reads hit warm pages. Hints only — zero
+    userspace bytes materialize, ordering and numerics are untouched.
+    OMLX_V41_RA=0 disables.
+    """
+    return os.environ.get("OMLX_V41_RA", "1") != "0"
+
+
+def _ra_tokens() -> int:
+    """Lookahead window in route rows (tokens) advised per chunk."""
+    try:
+        return max(1, int(os.environ.get("OMLX_V41_RA_TOKENS", "64")))
+    except (TypeError, ValueError):
+        return 64
+
+
+def _ra_gap() -> int:
+    """Id gap bridged by one advisory run (dead bytes cost no decode)."""
+    try:
+        return max(0, int(os.environ.get("OMLX_V41_RA_GAP", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _ra_max_rows() -> int:
+    """Cap on one advisory run's span in rows."""
+    try:
+        return max(1, int(os.environ.get("OMLX_V41_RA_MAX", "256")))
+    except (TypeError, ValueError):
+        return 256
+
+
+def _ra_next() -> bool:
+    """Whole-bank advise of the NEXT MoE layer when demand saturates.
+
+    At saturated coverage (long prompts) the next layer's demand is
+    almost surely its whole bank, so advising it at this layer's entry
+    buys a full layer of readahead lead time. Gated by
+    ``_ra_next_cov`` so short prompts only advise the exact demand.
+    OMLX_V41_RA_NEXT=0 disables.
+    """
+    return os.environ.get("OMLX_V41_RA_NEXT", "1") != "0"
+
+
+def _ra_next_cov() -> float:
+    """Coverage threshold (unique demanded / bank size) for next-layer."""
+    try:
+        return min(1.0, max(0.0, float(os.environ.get(
+            "OMLX_V41_RA_NEXT_COV", "0.5"
+        ))))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _prefill_cap() -> int:
+    """Transient per-layer residency ceiling during prefill (megaplan F2).
+
+    ``working_set_step`` = cap // top_k: at cap=10/top_k=6 a prefill
+    chunk is ONE token, serializing thousands of ensures per layer.
+    Raising ``book.cap`` for the call's duration widens the chunk; rooms
+    grow on demand inside the call and ``compact(rooms=entry)`` hands
+    them back in the finally — decode-hot residents sit at the MRU end
+    (frozen commits never touch them), so the restore compact keeps
+    exactly them. Default 64 rows/layer (megaplan A/B winner: the
+    transient footprint decays into a warm resident set for decode);
+    0 disables. OMLX_V41_PREFILL_CAP, rows per layer.
+    """
+    try:
+        return max(0, int(os.environ.get("OMLX_V41_PREFILL_CAP", "64")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _chunk_lookahead() -> bool:
+    """Materialized next-chunk staging for multi-row calls (F2).
+
+    Each iteration submits the NEXT chunk's exact demand to the staging
+    worker, so its fetch overlaps this chunk's ensure+compute and the
+    ensure joins on staged payloads instead of reading cold. Exact
+    demand — every staged row is consumed by the next ensure; nothing
+    mispredicts. OMLX_V41_CHUNK_STAGE=0 disables.
+    """
+    return os.environ.get("OMLX_V41_CHUNK_STAGE", "1") != "0"
+
+
+def _verify_scratch() -> int:
+    """Extra rows verify may hold per layer on top of cap (megaplan F4).
+
+    A DSpark verify block routes ~depth*top_k unique experts per layer —
+    at cap=10 the union (~30) cannot fit, so today every verify call
+    re-splits into one-token chunks and verify-installed rows churn each
+    other while the FIRST chunk also eats decode residents. With
+    scratch > 0 the admission bound becomes cap+scratch: the union lands
+    in ONE ensure (one coalesced fetch round), acquire() evicts only
+    verify-installed rows, and rooms grow up to the bound instead of
+    consuming decode-hot residents. Scratch rows persist between rounds
+    as cold-end residents — free cross-iteration hits — and the decode
+    trim/governor compact reclaims them under pressure. Default 8
+    rows/layer (megaplan A/B winner: verify_misses −22%, resident
+    evictions 443→121; 32 OOM'd the 48 GiB bench box — size against
+    headroom). 0 keeps the legacy chunked-verify behavior.
+    OMLX_V41_VERIFY_SCRATCH, rows/layer.
+    """
+    try:
+        return max(0, int(os.environ.get("OMLX_V41_VERIFY_SCRATCH", "8")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _draft_offload() -> int:
+    """Resident expert rows per DSpark draft stage (megaplan F5).
+
+    The preserved DSpark head is three stages x 128 routed experts —
+    ~7-10 GiB on the production layout OUTSIDE the trunk offload plan.
+    A positive value wraps ``mtp.*.ffn.experts`` in the same
+    OffloadedExpert machinery with this many resident rows per stage,
+    freeing most of that memory at the cost of draft misses on the
+    speculative path. Draft slots deliberately stay out of the trunk
+    backing: the governor's budget math keeps covering only the 40
+    backbone layers. Default 8 rows/stage (megaplan A/B winner: the
+    freed ~6.4 GiB raised trunk cap 11→17 and was a net decode win on
+    the 48 GiB bench box). 0 keeps draft stages fully resident.
+    OMLX_V41_DRAFT_OFFLOAD.
+    """
+    try:
+        return max(0, int(os.environ.get("OMLX_V41_DRAFT_OFFLOAD", "8")))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _span_groups(rows, gap, cap_rows):
     """Ascending expert rows -> merged span lists.
 
@@ -205,7 +340,7 @@ _FLOAT_BYTES = {"BF16": 2, "F16": 2, "F32": 4}
 class ExpertOffloadPlan:
     """Validate every routed tensor before promising any memory savings."""
 
-    def __init__(self, path, raw, mapping, config, fraction):
+    def __init__(self, path, raw, mapping, config, fraction, draft_rows=0):
         if not 0 < fraction <= 1:
             raise ValueError("MoE resident fraction must be in (0, 1]")
         self.path = Path(path)
@@ -216,6 +351,11 @@ class ExpertOffloadPlan:
         self.capacity = min(
             self.count, max(config.n_activated_experts, round(self.count * fraction))
         )
+        # Per-prefix counts/capacities: draft stages (F5) carry their own
+        # 128-expert bank and resident-row budget, so shape validation and
+        # slot sizing cannot rely on the trunk's count/capacity globals.
+        self._count_of = {}
+        self._capacity_of = {}
         self.layers = {}
         self.excluded_keys = set()
         self.resident_bytes = 0
@@ -259,8 +399,69 @@ class ExpertOffloadPlan:
                     if proj == "w2"
                     else (config.moe_inter_dim, config.dim)
                 )
-                specs[proj] = self._projection(prefix, proj, shape)
+                spec, size = self._projection(prefix, proj, shape, self.count)
+                specs[proj] = spec
+                self.full_bytes += size
+                self.resident_bytes += size * self.capacity // self.count
             self.layers[prefix] = specs
+            self._count_of[prefix] = self.count
+            self._capacity_of[prefix] = self.capacity
+        # F5 opt-in DSpark draft offload: same stacked/per-expert layout
+        # as trunk experts (converted names stack under language_model.
+        # mtp.{stage}.ffn.experts), smaller bank and its own row budget.
+        # Bytes stay in draft_* counters — full_bytes/resident_bytes keep
+        # describing the 40 trunk layers the governor sizes against.
+        self.draft_rows = int(draft_rows or 0)
+        self.draft_full_bytes = 0
+        self.draft_resident_bytes = 0
+        if self.draft_rows:
+            dcount = int(
+                getattr(config, "dspark_n_routed_experts", 0)
+                or config.n_routed_experts
+            )
+            dactive = int(
+                getattr(config, "dspark_n_activated_experts", 0)
+                or config.n_activated_experts
+            )
+            if not getattr(config, "preserve_mtp", False) or not getattr(
+                config, "n_mtp_layers", 0
+            ):
+                raise ValueError(
+                    "DSpark draft offload requires a preserved draft head "
+                    "(preserve_mtp with n_mtp_layers > 0)"
+                )
+            # A request wider than the bank is a resident stage, not an
+            # error — the default must stay safe on small draft banks.
+            self.draft_rows = min(self.draft_rows, dcount)
+            if self.draft_rows < dactive:
+                raise ValueError(
+                    "OMLX_V41_DRAFT_OFFLOAD must hold at least the "
+                    f"activated set ({dactive}); got {self.draft_rows}"
+                )
+            for stage in range(config.n_mtp_layers):
+                prefix = f"language_model.mtp.{stage}.ffn.experts"
+                specs = {}
+                for proj in _PROJECTIONS:
+                    shape = (
+                        (config.dim, config.moe_inter_dim)
+                        if proj == "w2"
+                        else (config.moe_inter_dim, config.dim)
+                    )
+                    spec, size = self._projection(prefix, proj, shape, dcount)
+                    specs[proj] = spec
+                    self.draft_full_bytes += size
+                    self.draft_resident_bytes += (
+                        size * self.draft_rows // dcount
+                    )
+                self.layers[prefix] = specs
+                self._count_of[prefix] = dcount
+                self._capacity_of[prefix] = self.draft_rows
+
+    def count_of(self, prefix):
+        return self._count_of.get(prefix, self.count)
+
+    def capacity_of(self, prefix):
+        return self._capacity_of.get(prefix, self.capacity)
 
     def _entry(self, key):
         filename = self.mapping[key]
@@ -274,7 +475,8 @@ class ExpertOffloadPlan:
         self.excluded_keys.add(key)
         return entry
 
-    def _projection(self, prefix, proj, logical):
+    def _projection(self, prefix, proj, logical, count=None):
+        count = self.count if count is None else int(count)
         if self.converted is not None:
             name = f"{prefix}.{proj}"
             spec = self.converted.get("quantized_modules", {}).get(name)
@@ -283,14 +485,14 @@ class ExpertOffloadPlan:
                 fields += ["scales"] + (["biases"] if spec["mode"] == "affine" else [])
             entries = {f: self._entry(f"{name}.{f}") for f in fields}
             for field, entry in entries.items():
-                shape = (self.count, *logical)
+                shape = (count, *logical)
                 dtype = entry["dtype"]
                 if spec:
                     bits, group = spec["bits"], spec.get("group_size", 32)
                     if logical[-1] % group:
                         raise ValueError(f"Invalid expert group size: {name}")
                     shape = (
-                        self.count,
+                        count,
                         logical[0],
                         (
                             logical[1] * bits // 32
@@ -316,7 +518,7 @@ class ExpertOffloadPlan:
             base = prefix.removeprefix("language_model.")
             signature = None
             size = 0
-            for expert in range(self.count):
+            for expert in range(count):
                 name = f"{base}.{expert}.{proj}"
                 entry = self._entry(name + ".weight")
                 dtype = entry["dtype"]
@@ -348,9 +550,7 @@ class ExpertOffloadPlan:
                 if expert and item != signature:
                     raise ValueError(f"Mixed expert formats within {prefix}.{proj}")
                 signature, spec = item, current
-        self.full_bytes += size
-        self.resident_bytes += size * self.capacity // self.count
-        return spec
+        return spec, size
 
     def _backing(self):
         """Shared ExpertBackingStore for converted stacked expert rows.
@@ -444,6 +644,16 @@ class ExpertOffloadPlan:
         )
         return repack_weight(raw, dtype, scale, scale_dtype)[0]
 
+    def _field_keys(self, prefix, proj):
+        """Stacked store keys for one projection (weight + quant fields)."""
+        spec = self.layers[prefix][proj]
+        fields = ["weight"]
+        if spec:
+            fields += ["scales"] + (
+                ["biases"] if spec["mode"] == "affine" else []
+            )
+        return [f"{prefix}.{proj}.{f}" for f in fields]
+
     def fetch_span(self, prefix, proj, lo, hi):
         """Read physical rows ``[lo, hi)`` of one projection contiguously.
 
@@ -451,13 +661,9 @@ class ExpertOffloadPlan:
         only the requested rows, so gap-merged overfetch costs I/O but
         no decode CPU. Converted checkpoints only (stacked dim-0 rows).
         """
-        spec = self.layers[prefix][proj]
-        fields = ["weight"]
-        if spec:
-            fields += ["scales"] + (["biases"] if spec["mode"] == "affine" else [])
         return {
-            field: self._read_span(f"{prefix}.{proj}.{field}", lo, hi)
-            for field in fields
+            key.rsplit(".", 1)[-1]: self._read_span(key, lo, hi)
+            for key in self._field_keys(prefix, proj)
         }
 
     def _fetch_executor(self):
@@ -536,8 +742,9 @@ class _ExpertSlots:
         # lock, grow/compact and the acquire/commit/rollback protocol are
         # the same primitive the unified streaming linears use.
         self.specs = {}
+        capacity = plan.capacity_of(prefix)
         self.arena = SlotArena(
-            plan.capacity,
+            capacity,
             _PROJECTIONS,
             self._arrays,
             lambda proj, values: self._bind(proj, values, self.specs[proj]),
@@ -553,10 +760,14 @@ class _ExpertSlots:
         self.span_phys_rows = 0
         self.span_fallbacks = 0  # merged reads that degraded to per-expert
         self.staged_failures = 0  # staged futures that yielded no payload
+        # F1 exact-demand readahead telemetry (F_RDADVISE hints only).
+        self.ra_calls = 0
+        self.ra_rows = 0
+        self.ra_bytes = 0
         for proj in _PROJECTIONS:
             sample = plan.fetch(prefix, proj, 0)
             values = {
-                field: mx.zeros((plan.capacity, *array.shape), dtype=array.dtype)
+                field: mx.zeros((capacity, *array.shape), dtype=array.dtype)
                 for field, array in sample.items()
             }
             spec = plan.layers[prefix][proj]
@@ -610,6 +821,10 @@ class _ExpertSlots:
     def staged_drops(self):
         return self.arena.staged_drops
 
+    @property
+    def staged_submits(self):
+        return self.arena.staged_submits
+
     def clear_residency(self):
         """Drop all residency and cancel pending staged fetches."""
         with self._slots_lock:
@@ -639,9 +854,14 @@ class _ExpertSlots:
             names.append("biases")
         return {name: getattr(lin, name) for name in names}
 
-    def compact(self, keep):
-        """Keep the most-recent ``keep`` entries, remap rows 0..k-1."""
-        return self.arena.compact(keep)
+    def compact(self, keep, rooms=None):
+        """Keep the most-recent ``keep`` entries, remap rows 0..k-1.
+
+        ``rooms`` (>= kept) also shrinks physical storage back below the
+        high-water mark — the F2 prefill-cap restore hands grown rows
+        back without needing residents to drop first.
+        """
+        return self.arena.compact(keep, rooms=rooms)
 
     def ensure(self, indices, phase=None):
         verify = bool(_verify_frozen.get())
@@ -664,7 +884,7 @@ class _ExpertSlots:
         # backing._lock->slots._slots_lock cannot deadlock against it.
         with self._slots_lock:
             rows, missed = self._ensure_locked(
-                indices, frozen=verify or phase == "prefill"
+                indices, frozen=verify or phase == "prefill", verify=verify
             )
         if phase == "decode" and self.backing is not None:
             self.backing.note_visit(self.layer, missed)
@@ -677,9 +897,23 @@ class _ExpertSlots:
                 self.layer, {int(e) for e in indices.reshape(-1).tolist()}
             )
             self.backing.stage_next(self.layer)
+        elif phase == "verify" and self.backing is not None:
+            # Telemetry only (megaplan F0): verify stalls are real wall
+            # time but deliberately stay OUT of the governor's hunger
+            # signal until the verify path can hold its working set
+            # (F4 scratch rows).
+            self.backing.note_verify_visit(self.layer, missed)
+            # F3: feed the verify predictor (per-round routed union) and
+            # advise the next layer's predicted demand — under DSpark
+            # virtually all trunk traffic is verify, so this predictor
+            # is the only one that sees real routing.
+            self.backing.note_verify_routing(
+                self.layer, {int(e) for e in indices.reshape(-1).tolist()}
+            )
+            self.backing.advise_verify_next(self.layer)
         return rows
 
-    def stage_predicted(self, experts):
+    def stage_predicted(self, experts, limit=None):
         """Submit speculative fetches for predicted demand.
 
         Runs under this layer's slots lock so residency checks and the
@@ -689,11 +923,17 @@ class _ExpertSlots:
         coalesce the predicted set into merged span reads under the same
         ``_span_groups`` bounds as demand — one ``fetch_span`` per run on
         the single staging worker instead of three per-expert fetches.
+
+        ``limit`` overrides the staged-dict bound: the F2 chunk-lookahead
+        submits EXACT next-chunk demand (bounded by chunk width), not a
+        prediction that may go unconsumed.
         """
         if not _stage_enabled():
             return
         with self._slots_lock:
-            room = _stage_max(self.plan) - len(self._staged)
+            room = (
+                _stage_max(self.plan) if limit is None else int(limit)
+            ) - len(self._staged)
             todo = sorted(
                 {
                     int(e)
@@ -708,6 +948,7 @@ class _ExpertSlots:
                 # Plan closed between the residency check and here —
                 # staging is a hint, never on the demand path; drop it.
                 return
+            staged_before = len(self._staged)
             if self.plan.converted is not None:
                 for group in _span_groups(todo, _span_gap(), _span_max_rows()):
                     try:
@@ -726,10 +967,103 @@ class _ExpertSlots:
                         )
                     except Exception:
                         break
+            self.arena.staged_submits += len(self._staged) - staged_before
 
-    def _ensure_locked(self, indices, frozen):
+    def _advise_keys(self, experts):
+        """F_RDADVISE the given expert rows across every projection field.
+
+        Converted checkpoints store stacked rows, so a sorted id run is
+        one contiguous byte range per field — ``advise_expert_run``
+        collapses each into a single radvisory (and splits at tier
+        boundaries internally). Returns (rows, bytes) actually advised;
+        0/0 on any failure — readahead is a hint, never the demand path.
+        """
+        if self.plan.converted is None or not experts:
+            return 0, 0
+        try:
+            store = self.plan._backing()
+        except Exception:
+            return 0, 0
+        total = 0
+        for proj in _PROJECTIONS:
+            for key in self.plan._field_keys(self.prefix, proj):
+                for run in _span_groups(experts, _ra_gap(), _ra_max_rows()):
+                    try:
+                        ok, nbytes, _seg = store.advise_expert_run(
+                            key, run[0], run[-1] - run[0] + 1
+                        )
+                    except Exception:
+                        ok, nbytes = False, 0
+                    if ok:
+                        total += nbytes
+        return len(experts), total
+
+    def advise_demand(self, experts):
+        """Readahead the demanded-but-missing experts of an upcoming chunk.
+
+        Exact-demand prefetch (megaplan F1): the caller already knows the
+        routing, so the advisory covers only what the ensure will truly
+        fetch — residents and in-flight staged rows are filtered under
+        the slots lock, then the fcntls run lock-free.
+        """
+        if not _ra_enabled() or self.plan.converted is None:
+            return 0
+        with self._slots_lock:
+            missing = sorted(
+                {
+                    int(e)
+                    for e in experts
+                    if int(e) not in self.book.slot_of
+                    and int(e) not in self._staged
+                }
+            )
+        if not missing:
+            return 0
+        rows, nbytes = self._advise_keys(missing)
+        self.ra_calls += 1
+        self.ra_rows += rows
+        self.ra_bytes += nbytes
+        return rows
+
+    def advise_bank(self):
+        """Whole-bank readahead for this layer (saturated-coverage case).
+
+        Used for the NEXT layer during a long prefill: when this layer's
+        union covers most of the bank, the next layer's almost surely
+        does too — advising all rows at once buys a full layer of lead
+        time while this layer's compute+IO runs.
+        """
+        if (
+            not _ra_enabled()
+            or not _ra_next()
+            or self.plan.converted is None
+        ):
+            return 0
+        try:
+            store = self.plan._backing()
+        except Exception:
+            return 0
+        total = 0
+        for proj in _PROJECTIONS:
+            for key in self.plan._field_keys(self.prefix, proj):
+                try:
+                    ok, nbytes, _seg = store.advise_expert_run(
+                        key, 0, self.plan.count_of(self.prefix)
+                    )
+                except Exception:
+                    ok, nbytes = False, 0
+                if ok:
+                    total += nbytes
+        if total:
+            self.ra_calls += 1
+            self.ra_rows += self.plan.count_of(self.prefix)
+            self.ra_bytes += total
+        return total
+
+    def _ensure_locked(self, indices, frozen, verify=False):
         needed = set(indices.reshape(-1).tolist())
-        if len(needed) > self.book.cap:
+        scratch = _verify_scratch() if verify else 0
+        if len(needed) > self.book.cap + scratch:
             # A governor shrink can land between the caller's chunk-size
             # read and this ensure: surface the overflow as a marker so
             # __call__ re-splits the tail and retries instead of dying
@@ -743,8 +1077,13 @@ class _ExpertSlots:
         # leave first; prefill chunks use it as scan resistance — a long
         # prompt then churns its own cold-end rows instead of sweeping
         # the decode-hot set (the generic path's _prefill_cap pair plays
-        # the same role on its shared pool).
-        missed = self.arena.ensure_set(needed, frozen, self._produce)
+        # the same role on its shared pool). Under verify, ``scratch``
+        # admits a working set wider than cap (F4): the verify union
+        # lands in one ensure and victims come from the verify-installed
+        # region only.
+        missed = self.arena.ensure_set(
+            needed, frozen, self._produce, verify=verify, scratch=scratch
+        )
         return (
             self.arena.rows_for(indices.reshape(-1).tolist()).reshape(
                 indices.shape
@@ -899,52 +1238,154 @@ class OffloadedExpert(nn.Module):
         phase = "decode" if flat_i.shape[0] == 1 else "prefill"
         outputs = []
         start = 0
-        while start < flat_i.shape[0]:
-            # Bound each chunk by route count without an O(prompt^2)
-            # search. Governor-driven ceiling, not the plan's initial
-            # capacity — read under the slots lock so it cannot tear
-            # against a mid-call resize, and re-read per chunk so a
-            # governor shrink re-splits the remaining rows instead of
-            # leaving a chunk's routed set wider than the live cap
-            # (needed > book.cap aborts ensure mid-prefill).
-            with self.slots._slots_lock:
-                step = working_set_step(self.slots.cap, flat_i.shape[-1])
-            idx = flat_i[start : start + step]
-            try:
-                slots = self.slots.ensure(idx, phase=phase)
-            except _WorkingSetOverCap:
-                # A shrink landed between the step read and the ensure:
-                # re-read the live cap and re-split the tail rather than
-                # aborting the request. The finer step always makes
-                # progress (needed <= step*top_k <= old cap); when it
-                # cannot shrink further the working set is unservable.
-                with self.slots._slots_lock:
-                    shrunk = working_set_step(
-                        self.slots.cap, flat_i.shape[-1]
-                    )
-                if shrunk >= step:
-                    raise
-                continue
-            value = flat_x[start : start + step]
-            scores = None if flat_w is None else flat_w[start : start + step]
-            if sorted_indices:
-                slots = slots.reshape(-1)
-                order = mx.argsort(slots)
-                inverse = mx.argsort(order)
-                value, slots = value[order], slots[order]
-                scores = None if scores is None else scores.reshape(-1)[order]
-            out = self.slots.expert(
-                value,
-                slots,
-                scores,
-                sorted_indices=sorted_indices,
-                input_quantized=input_quantized,
+        # F1 exact-demand readahead: this call's whole routing is known
+        # up front, so each iteration advises the next RA_TOKENS rows'
+        # missing experts into the page cache (F_RDADVISE — kernel hints,
+        # zero userspace bytes). Covers prefill AND multi-row verify
+        # blocks alike; single-row decode calls have nothing to advise.
+        ra_advised = set()
+        ra_upto = 0
+        ra_window = _ra_tokens()
+        multi = flat_i.shape[0] > 1
+        is_verify = bool(_verify_frozen.get())
+        # F2 transient prefill capacity: raise the working cap for the
+        # call's duration so one ensure covers cap//top_k tokens instead
+        # of one — ~10x fewer serialized fetch rounds at the benchmark's
+        # cap=10. Grows rooms on demand; the finally restores the cap
+        # (unless the governor retargeted mid-call) and compacts the
+        # extra rooms back out, keeping the MRU-end decode residents.
+        entry_cap = entry_rooms = raised_cap = None
+        if multi and not is_verify:
+            target = min(
+                _prefill_cap(), self.slots.plan.count_of(self.slots.prefix)
             )
-            if sorted_indices:
-                out = out[inverse]
-            mx.eval(out)
-            outputs.append(out)
-            start += step
+            with self.slots._slots_lock:
+                entry_cap = self.slots.book.cap
+                entry_rooms = self.slots.book.rooms
+                if target > entry_cap:
+                    self.slots.book.cap = target
+                    raised_cap = target
+        if (
+            multi
+            and _ra_enabled()
+            and not is_verify
+            and self.slots.backing is not None
+        ):
+            # Next-layer whole-bank advise (F1b): this call's union
+            # coverage is the proxy for the next layer's — at saturated
+            # coverage its demand is almost surely the whole bank, and
+            # advising now buys a full layer of readahead lead time.
+            union = {int(e) for e in flat_i.reshape(-1).tolist()}
+            if len(union) >= _ra_next_cov() * max(
+                1, self.slots.plan.count_of(self.slots.prefix)
+            ):
+                self.slots.backing.advise_next_layer(self.slots.layer)
+        try:
+            while start < flat_i.shape[0]:
+                # Bound each chunk by route count without an O(prompt^2)
+                # search. Governor-driven ceiling, not the plan's initial
+                # capacity — read under the slots lock so it cannot tear
+                # against a mid-call resize, and re-read per chunk so a
+                # governor shrink re-splits the remaining rows instead of
+                # leaving a chunk's routed set wider than the live cap
+                # (needed > book.cap aborts ensure mid-prefill).
+                with self.slots._slots_lock:
+                    # Under verify the scratch rows (F4) widen the
+                    # working set: one ensure covers the whole block's
+                    # union instead of cap//top_k tokens.
+                    step = working_set_step(
+                        self.slots.cap
+                        + (_verify_scratch() if is_verify else 0),
+                        flat_i.shape[-1],
+                    )
+                if multi:
+                    if _ra_enabled():
+                        horizon = min(
+                            flat_i.shape[0], start + step + ra_window
+                        )
+                        if horizon > ra_upto:
+                            window = flat_i[ra_upto:horizon]
+                            todo = {
+                                int(e) for e in window.reshape(-1).tolist()
+                            } - ra_advised
+                            if todo:
+                                ra_advised |= todo
+                                self.slots.advise_demand(todo)
+                            ra_upto = horizon
+                    if _chunk_lookahead():
+                        # F2 staged lookahead: the NEXT chunk's exact
+                        # demand fetches on the staging worker while this
+                        # chunk ensures+computes; the next ensure joins
+                        # on the staged payloads. Exact — every staged
+                        # row is consumed, so the bound is chunk width.
+                        nxt = flat_i[start + step : start + 2 * step]
+                        if nxt.size:
+                            self.slots.stage_predicted(
+                                {
+                                    int(e)
+                                    for e in nxt.reshape(-1).tolist()
+                                },
+                                limit=step * flat_i.shape[-1],
+                            )
+                idx = flat_i[start : start + step]
+                try:
+                    slots = self.slots.ensure(idx, phase=phase)
+                except _WorkingSetOverCap:
+                    # A shrink landed between the step read and the
+                    # ensure: re-read the live cap and re-split the tail
+                    # rather than aborting the request. The finer step
+                    # always makes progress (needed <= step*top_k <= old
+                    # cap); when it cannot shrink further the working
+                    # set is unservable.
+                    with self.slots._slots_lock:
+                        shrunk = working_set_step(
+                            self.slots.cap
+                            + (_verify_scratch() if is_verify else 0),
+                            flat_i.shape[-1],
+                        )
+                    if shrunk >= step:
+                        raise
+                    continue
+                value = flat_x[start : start + step]
+                scores = (
+                    None if flat_w is None else flat_w[start : start + step]
+                )
+                if sorted_indices:
+                    slots = slots.reshape(-1)
+                    order = mx.argsort(slots)
+                    inverse = mx.argsort(order)
+                    value, slots = value[order], slots[order]
+                    scores = (
+                        None
+                        if scores is None
+                        else scores.reshape(-1)[order]
+                    )
+                out = self.slots.expert(
+                    value,
+                    slots,
+                    scores,
+                    sorted_indices=sorted_indices,
+                    input_quantized=input_quantized,
+                )
+                if sorted_indices:
+                    out = out[inverse]
+                mx.eval(out)
+                outputs.append(out)
+                start += step
+        finally:
+            if raised_cap is not None:
+                # Restore the working ceiling — unless the governor
+                # retargeted it mid-call (a smaller live cap wins) — and
+                # hand the transiently grown rows back: compact keeps the
+                # MRU tail (decode residents survive; prefill commits
+                # landed at the cold end) and releases empty storage.
+                with self.slots._slots_lock:
+                    if self.slots.book.cap == raised_cap:
+                        self.slots.book.cap = entry_cap
+                    keep = min(
+                        len(self.slots.book.slot_of), self.slots.book.cap
+                    )
+                self.slots.compact(keep, rooms=entry_rooms)
         return mx.concatenate(outputs, axis=0).reshape(*indices.shape, 1, x.shape[-1])
 
 

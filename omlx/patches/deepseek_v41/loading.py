@@ -150,15 +150,44 @@ def load(
         }
 
         if moe_expert_offload_resident_fraction is not None:
-            from .moe_offload import ExpertOffloadPlan, OffloadedExpert
+            from .moe_offload import (
+                ExpertOffloadPlan,
+                OffloadedExpert,
+                _draft_offload,
+            )
 
             offload = ExpertOffloadPlan(
-                path, raw, mapping, config, moe_expert_offload_resident_fraction
+                path,
+                raw,
+                mapping,
+                config,
+                moe_expert_offload_resident_fraction,
+                draft_rows=_draft_offload() if config.preserve_mtp else 0,
             )
             model._moe_offload_plan = offload
             for layer_id, layer in enumerate(model.language_model.layers):
                 prefix = f"language_model.layers.{layer_id}.ffn.experts"
                 layer.ffn.experts = OffloadedExpert(layer.ffn.experts, offload, prefix)
+            # F5 opt-in: draft stages wrap in the same bounded-residency
+            # machinery but stay outside the trunk backing — the governor
+            # budget keeps covering only the backbone layers.
+            for stage_id, stage in enumerate(
+                getattr(model.language_model, "mtp", None) or ()
+            ):
+                prefix = f"language_model.mtp.{stage_id}.ffn.experts"
+                if prefix in offload.layers:
+                    stage.ffn.experts = OffloadedExpert(
+                        stage.ffn.experts, offload, prefix
+                    )
+            if offload.draft_rows:
+                logger.info(
+                    "DeepSeek V4.1 DSpark offload: %d/%d experts resident "
+                    "per draft stage (%.2f GiB -> %.2f GiB)",
+                    offload.draft_rows,
+                    offload.count_of("language_model.mtp.0.ffn.experts"),
+                    offload.draft_full_bytes / 1024**3,
+                    offload.draft_resident_bytes / 1024**3,
+                )
             logger.info(
                 "DeepSeek V4.1 MoE offload: %d/%d experts resident per layer "
                 "(%.2f GiB -> %.2f GiB expert weights)",

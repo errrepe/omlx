@@ -49,8 +49,10 @@ def _prime_recall(backing, layer, value=1.0):
     backing.recall_ewma[int(layer)] = value
 
 
-def test_verify_scope_freezes_slot_recency(tmp_path):
-    """DSpark verify traffic must not disturb decode-hot LRU order."""
+def test_verify_scope_freezes_slot_recency(tmp_path, monkeypatch):
+    """DSpark verify traffic must not disturb decode-hot LRU order
+    (legacy eviction semantics — scratch rows have their own tests)."""
+    monkeypatch.setenv("OMLX_V41_VERIFY_SCRATCH", "0")
     disk = _offloaded_disk(tmp_path)
     try:
         slots = disk.language_model.layers[0].ffn.experts.slots
@@ -550,3 +552,535 @@ def test_offload_preserves_dspark_tensors_and_matches(tmp_path):
             disk.close()
     finally:
         resident.close()
+
+
+def test_verify_visits_counted_separately(tmp_path):
+    """F0 telemetry: verify ensures count verify_visits, never decode
+    visits, and book-level verify_misses accumulate per expert."""
+    disk, backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        slots = disk.language_model.layers[0].ffn.experts.slots
+        with verify_scope():
+            slots.ensure(mx.array([[0, 1]]))
+            slots.ensure(mx.array([[0, 1]]))  # verify hit: visited, no miss
+        assert backing.stats.verify_visits == 2
+        assert backing.stats.verify_visits_missed == 1
+        assert backing.stats.decode_layers == 0
+        assert slots.book.verify_misses == 2
+        assert slots.book.verify_installed == {0, 1}
+        summary = backing.summary()
+        assert summary["verify_visits"] == 2
+        assert summary["verify_visits_missed"] == 1
+        assert summary["verify_misses"] == 2
+    finally:
+        disk.close()
+
+
+def test_verify_evict_resident_counted(tmp_path, monkeypatch):
+    """F0 telemetry: evicting a pre-verify resident during verify counts
+    as verify_evict_resident; evicting a verify-installed row does not.
+    (scratch=0: verify still evicts, so the counter is exercised.)"""
+    monkeypatch.setenv("OMLX_V41_VERIFY_SCRATCH", "0")
+    disk, backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        slots = disk.language_model.layers[0].ffn.experts.slots
+        slots.ensure(mx.array([0, 1]))  # decode residents, cap=2
+        with verify_scope():
+            slots.ensure(mx.array([2]))  # evicts 0 (decode resident)
+            assert slots.book.verify_evict_resident == 1
+            slots.ensure(mx.array([3]))  # evicts 2 (verify-installed)
+            assert slots.book.verify_evict_resident == 1
+            assert slots.book.verify_installed == {3}
+        assert backing.summary()["verify_evict_resident"] == 1
+    finally:
+        disk.close()
+
+
+def test_staged_skip_reasons_split(tmp_path):
+    """F0 telemetry: staged_skips split by cause while the aggregate
+    stays the sum of the gated skips (bench JSON compat)."""
+    disk, backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        slots0 = disk.language_model.layers[0].ffn.experts.slots
+        slots0.ensure(mx.array([[0, 1]]))
+        # No predictor for layer 1 yet -> no_pred bucket (not a gate skip).
+        assert backing.staged_skips_no_pred == 1
+        assert backing.staged_skips == 0
+        # Predictor present, recall unproven -> recall bucket.
+        disk.language_model.layers[1].ffn.experts.slots.ensure(
+            mx.array([[6, 7]])
+        )
+        backing.note_routing(1, {4, 5})
+        slots0.ensure(mx.array([[2, 3]]))
+        assert backing.staged_skips_recall == 1
+        assert backing.staged_skips == 1
+        # Recall primed, staging submits -> staged_submits counts entries.
+        _prime_recall(backing, 1)
+        slots0.ensure(mx.array([[0, 1]]))
+        slots1 = disk.language_model.layers[1].ffn.experts.slots
+        assert set(slots1._staged) == {4, 5}
+        assert slots1.staged_submits == 2
+        assert backing.summary()["staged_submits"] == 2
+    finally:
+        disk.close()
+
+
+def test_verify_feeds_predictor_and_advises_next(tmp_path):
+    """F3: verify traffic records per-round routed unions; a layer-index
+    decrease wraps the round and promotes the accumulated unions —
+    the staged_hits=0 bug was verify starving every predictor. (The
+    advisory itself is converted-checkpoint only; the converted-path
+    coverage lives in test_deepseek_v41_span_staging.py.)"""
+    disk, backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        slots0 = disk.language_model.layers[0].ffn.experts.slots
+        slots1 = disk.language_model.layers[1].ffn.experts.slots
+        with verify_scope():
+            # Round 1: layer0 {0,1}, layer1 {3,4} then {5,6} (cap=2
+            # churns the verify-installed rows, union accumulates 4).
+            slots0.ensure(mx.array([0, 1]))
+            slots1.ensure(mx.array([3, 4]))
+            slots1.ensure(mx.array([5, 6]))
+            assert backing.verify_uniq == {}
+            assert backing.verify_acc[1] == {3, 4, 5, 6}
+            # Round 2 begins: layer index decrease wraps the round and
+            # promotes acc -> uniq.
+            slots0.ensure(mx.array([0, 1]))
+            assert backing.verify_uniq[0] == {0, 1}
+            assert backing.verify_uniq[1] == {3, 4, 5, 6}
+            # Round-1 coverage of round-2's {0,1} is total -> recall 0.1.
+            assert backing.verify_recall[0] == pytest.approx(0.1)
+        # Source checkpoint: advise_demand is a no-op (no stacked
+        # store), but the gating path still counts the attempt. Round 1
+        # ran with an empty predictor (3 ensures -> 3 no_pred skips) and
+        # the wrap ensure hit the recall gate once (recall[1] was 0).
+        assert backing.verify_ra_no_pred == 3
+        assert backing.verify_ra_recall == 1
+        backing.verify_recall[1] = 1.0  # skip EWMA warm-up
+        with verify_scope():
+            slots0.ensure(mx.array([0, 1]))
+        # Gate passed this time (no new skip) even though the source
+        # path's advise itself is a no-op.
+        assert backing.verify_ra_recall == 1
+        assert backing.verify_ra_no_pred == 3
+    finally:
+        disk.close()
+
+
+def test_verify_advise_gates_on_recall(tmp_path):
+    """F3: a next-layer prediction with unproven recall is skipped and
+    the cause is visible in the split counters."""
+    disk, backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        slots0 = disk.language_model.layers[0].ffn.experts.slots
+        slots1 = disk.language_model.layers[1].ffn.experts.slots
+        with verify_scope():
+            slots0.ensure(mx.array([0, 1]))
+            slots1.ensure(mx.array([3, 4]))
+            slots0.ensure(mx.array([0, 1]))  # wrap: uniq[1] = {3,4}
+        # No recall history for layer1: the wrap ensure's advise and
+        # this next one both stop at the recall gate.
+        before = slots1.ra_calls
+        with verify_scope():
+            slots0.ensure(mx.array([0, 1]))
+        assert slots1.ra_calls == before
+        assert backing.verify_ra_recall == 2
+        assert backing.verify_ra_submits == 0
+    finally:
+        disk.close()
+
+
+def test_verify_advise_no_pred_and_disabled(tmp_path, monkeypatch):
+    """F3: empty predictor counts no_pred skips; OMLX_V41_VERIFY_RA=0
+    disables the advisory entirely."""
+    disk, backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        slots0 = disk.language_model.layers[0].ffn.experts.slots
+        with verify_scope():
+            slots0.ensure(mx.array([0, 1]))
+        assert backing.verify_ra_no_pred == 1  # verify_uniq still empty
+        monkeypatch.setenv("OMLX_V41_VERIFY_RA", "0")
+        backing.verify_uniq[1] = {3, 4}
+        backing.verify_recall[1] = 1.0
+        with verify_scope():
+            slots0.ensure(mx.array([0, 1]))
+        assert backing.verify_ra_submits == 0
+    finally:
+        disk.close()
+
+
+def test_verify_scratch_holds_union_and_protects_residents(
+    tmp_path, monkeypatch
+):
+    """F4: scratch rows admit the whole verify union in ONE ensure;
+    victims come only from the verify-installed region — decode-hot
+    residents are never consumed. The decode-phase trim reclaims the
+    scratch occupancy afterwards."""
+    monkeypatch.setenv("OMLX_V41_VERIFY_SCRATCH", "6")
+    disk, backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        slots = disk.language_model.layers[0].ffn.experts.slots
+        slots.ensure(mx.array([0, 1]))  # decode residents, cap=2
+        rooms0 = slots.rooms
+        with verify_scope():
+            # union=6 > cap=2 — only servable through scratch rows.
+            slots.ensure(mx.array([2, 3, 4, 5, 6, 7]))
+        assert set(slots.slot_of) == {0, 1, 2, 3, 4, 5, 6, 7}
+        assert slots.rooms == rooms0 + 6
+        assert slots.book.verify_evict_resident == 0
+        assert slots.book.verify_installed == {2, 3, 4, 5, 6, 7}
+        # Cross-iteration reuse: the same union hits fully next round.
+        with verify_scope():
+            hits0 = slots.book.hits
+            slots.ensure(mx.array([2, 3, 4, 5, 6, 7]))
+            assert slots.book.hits - hits0 == 6
+        # Ordinary decode traffic trims scratch occupancy back to cap —
+        # the cold-end verify rows leave first, decode-hot stays.
+        slots.ensure(mx.array([0, 1]))
+        assert set(slots.slot_of) == {0, 1}
+    finally:
+        disk.close()
+
+
+def test_verify_scratch_widens_chunk_step(tmp_path, monkeypatch):
+    """F4: a verify block's whole union fits one ensure — the chunk
+    loop stops re-splitting into one-token ensures."""
+    monkeypatch.setenv("OMLX_V41_VERIFY_SCRATCH", "6")
+    disk, _backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        ffn = disk.language_model.layers[0].ffn
+        slots = disk.language_model.layers[0].ffn.experts.slots
+        calls = []
+        orig = slots.ensure
+
+        def spy(idx, phase=None):
+            calls.append(int(idx.shape[0]))
+            return orig(idx, phase=phase)
+
+        slots.ensure = spy
+        mx.random.seed(0)
+        x = mx.random.normal((1, 4, 32))
+        with verify_scope():
+            mx.eval(ffn(x, None))
+        slots.ensure = orig
+        assert calls == [4]  # one ensure, not [1]*4
+    finally:
+        disk.close()
+
+
+def test_verify_scratch_bound_degrades_gracefully(tmp_path, monkeypatch):
+    """F4: a scratch bound below the union still works — chunks of
+    scratch//top_k rows each, victims still verify-installed first."""
+    monkeypatch.setenv("OMLX_V41_VERIFY_SCRATCH", "2")  # limit = 4
+    disk, _backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        ffn = disk.language_model.layers[0].ffn
+        slots = disk.language_model.layers[0].ffn.experts.slots
+        slots.ensure(mx.array([0, 1]))  # decode residents
+        calls = []
+        orig = slots.ensure
+
+        def spy(idx, phase=None):
+            calls.append(int(idx.shape[0]))
+            return orig(idx, phase=phase)
+
+        slots.ensure = spy
+        mx.random.seed(0)
+        x = mx.random.normal((1, 4, 32))
+        with verify_scope():
+            mx.eval(ffn(x, None))
+        slots.ensure = orig
+        assert calls == [2, 2]  # step = (2+2)//2 = 2 tokens per ensure
+        # Decode residents survived: limit 4 < union ~8 churns only the
+        # verify-installed rows after the first ensure.
+        assert slots.book.verify_evict_resident <= 2
+    finally:
+        disk.close()
+
+
+def test_verify_scratch_zero_keeps_chunked(tmp_path, monkeypatch):
+    """F4: OMLX_V41_VERIFY_SCRATCH=0 preserves the legacy chunked
+    verify behavior — the default keeps bit-exact parity with today."""
+    monkeypatch.setenv("OMLX_V41_VERIFY_SCRATCH", "0")
+    disk, _backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        ffn = disk.language_model.layers[0].ffn
+        slots = disk.language_model.layers[0].ffn.experts.slots
+        calls = []
+        orig = slots.ensure
+
+        def spy(idx, phase=None):
+            calls.append(int(idx.shape[0]))
+            return orig(idx, phase=phase)
+
+        slots.ensure = spy
+        mx.random.seed(0)
+        x = mx.random.normal((1, 4, 32))
+        with verify_scope():
+            mx.eval(ffn(x, None))
+        slots.ensure = orig
+        assert calls == [1, 1, 1, 1]
+    finally:
+        disk.close()
+
+
+_DRAFT = dict(
+    preserve_mtp=True,
+    n_mtp_layers=3,
+    dspark_block_size=3,
+    dspark_noise_token_id=2,
+    dspark_target_layer_ids=(2, 3, 4),
+    dspark_n_routed_experts=4,
+    dspark_n_activated_experts=2,
+    dspark_markov_rank=32,
+    compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    temperature=0,
+)
+
+
+def test_draft_offload_resident_when_disabled(tmp_path, monkeypatch):
+    """F5: OMLX_V41_DRAFT_OFFLOAD=0 keeps the DSpark head resident —
+    mtp.*.ffn.experts stays a plain Expert module and no draft expert
+    keys are excluded from the normal load."""
+    monkeypatch.setenv("OMLX_V41_DRAFT_OFFLOAD", "0")
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        n_routed_experts=8,
+        n_activated_experts=2,
+        **_DRAFT,
+    )
+    disk, _ = load(
+        source, preserve_mtp=True, moe_expert_offload_resident_fraction=0.25
+    )
+    try:
+        from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+
+        assert disk._moe_offload_plan.draft_rows == 0
+        for stage in disk.language_model.mtp:
+            assert not isinstance(stage.ffn.experts, OffloadedExpert)
+    finally:
+        disk.close()
+
+
+def test_draft_offload_default_wraps_and_clamps(tmp_path, monkeypatch):
+    """F5: the default (8 rows/stage) wraps mtp.*.ffn.experts in
+    OffloadedExpert; a bank smaller than the default clamps to full
+    residency instead of failing."""
+    monkeypatch.delenv("OMLX_V41_DRAFT_OFFLOAD", raising=False)
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        n_routed_experts=8,
+        n_activated_experts=2,
+        **_DRAFT,
+    )
+    disk, _ = load(
+        source, preserve_mtp=True, moe_expert_offload_resident_fraction=0.25
+    )
+    try:
+        from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+
+        # 4-expert fixture bank < default 8 -> clamps to 4 (resident).
+        assert disk._moe_offload_plan.draft_rows == 4
+        for stage in disk.language_model.mtp:
+            experts = stage.ffn.experts
+            assert isinstance(experts, OffloadedExpert)
+            assert experts.slots.cap == 4
+            assert experts.slots.backing is None
+    finally:
+        disk.close()
+
+
+def test_draft_offload_wraps_stages_and_stays_exact(tmp_path, monkeypatch):
+    """F5: OMLX_V41_DRAFT_OFFLOAD wraps mtp.*.ffn.experts in
+    OffloadedExpert with its own row budget — outside the trunk backing
+    — and the draft ffn output matches the fully resident model."""
+    from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        n_routed_experts=8,
+        n_activated_experts=2,
+        **_DRAFT,
+    )
+    resident, _ = load(source, preserve_mtp=True)
+    try:
+        monkeypatch.setenv("OMLX_V41_DRAFT_OFFLOAD", "2")
+        disk, _ = load(
+            source,
+            preserve_mtp=True,
+            moe_expert_offload_resident_fraction=0.25,
+        )
+        try:
+            plan = disk._moe_offload_plan
+            assert plan.draft_rows == 2
+            assert plan.draft_full_bytes > 0
+            assert plan.draft_resident_bytes < plan.draft_full_bytes
+            for stage in disk.language_model.mtp:
+                experts = stage.ffn.experts
+                assert isinstance(experts, OffloadedExpert)
+                assert experts.slots.cap == 2
+                # Draft slots never join the trunk governor.
+                assert experts.slots.backing is None
+            mx.random.seed(0)
+            x = mx.random.normal((1, 4, 32))
+            for i in range(3):
+                out_r = resident.language_model.mtp[i].ffn(x, None)
+                out_d = disk.language_model.mtp[i].ffn(x, None)
+                mx.eval(out_r)
+                mx.eval(out_d)
+                np.testing.assert_allclose(
+                    np.array(out_r),
+                    np.array(out_d),
+                    rtol=2e-4,
+                    atol=2e-4,
+                )
+        finally:
+            disk.close()
+    finally:
+        resident.close()
+
+
+def test_draft_offload_validates_rows(tmp_path, monkeypatch):
+    """F5: the row budget must hold the activated set and fit the bank;
+    without a preserved head the env is ignored entirely."""
+    (tmp_path / "ckpt").mkdir()
+    source, _ = write_checkpoint(
+        tmp_path / "ckpt",
+        vision=False,
+        n_routed_experts=8,
+        n_activated_experts=2,
+        **_DRAFT,
+    )
+    monkeypatch.setenv("OMLX_V41_DRAFT_OFFLOAD", "1")  # below top-2
+    with pytest.raises(ValueError, match="DRAFT_OFFLOAD"):
+        load(
+            source,
+            preserve_mtp=True,
+            moe_expert_offload_resident_fraction=0.25,
+        )
+    # Above the 4-expert bank clamps to full residency — never an error.
+    monkeypatch.setenv("OMLX_V41_DRAFT_OFFLOAD", "5")
+    disk, _ = load(
+        source, preserve_mtp=True, moe_expert_offload_resident_fraction=0.25
+    )
+    try:
+        assert disk._moe_offload_plan.draft_rows == 4
+    finally:
+        disk.close()
+    # No preserved head: the knob is inert (nothing to offload).
+    (tmp_path / "plain").mkdir()
+    plain, _ = write_checkpoint(
+        tmp_path / "plain",
+        vision=False,
+        n_routed_experts=8,
+        n_activated_experts=2,
+    )
+    monkeypatch.setenv("OMLX_V41_DRAFT_OFFLOAD", "2")
+    disk, _ = load(plain, moe_expert_offload_resident_fraction=0.25)
+    try:
+        assert disk._moe_offload_plan.draft_rows == 0
+    finally:
+        disk.close()
+
+
+def test_draft_offload_converted_checkpoint(tmp_path, monkeypatch):
+    """F5 converted path: stacked mtp.* expert rows ride the shared
+    backing store like trunk experts — fetch returns the resident
+    model's rows bit-for-bit."""
+    from omlx.patches.deepseek_v41.convert import convert
+    from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+
+    (tmp_path / "ckpt").mkdir()
+    source, _ = write_checkpoint(
+        tmp_path / "ckpt",
+        vision=False,
+        n_routed_experts=8,
+        n_activated_experts=2,
+        **_DRAFT,
+    )
+    target = tmp_path / "converted"
+    convert(source, target, preserve_mtp=True)
+    resident, _ = load(target, preserve_mtp=True)
+    try:
+        monkeypatch.setenv("OMLX_V41_DRAFT_OFFLOAD", "2")
+        disk, _ = load(
+            target,
+            preserve_mtp=True,
+            moe_expert_offload_resident_fraction=0.25,
+        )
+        try:
+            experts = disk.language_model.mtp[0].ffn.experts
+            assert isinstance(experts, OffloadedExpert)
+            slots = experts.slots
+            mx.random.seed(0)
+            x = mx.random.normal((1, 4, 32))
+            mx.eval(disk.language_model.mtp[0].ffn(x, None))
+            assert slots.slot_of  # offloaded rows served the call
+            resident_experts = resident.language_model.mtp[0].ffn.experts
+            for expert, row in slots.slot_of.items():
+                np.testing.assert_array_equal(
+                    np.array(slots.expert.w1.weight[row]),
+                    np.array(resident_experts.w1.weight[expert]),
+                )
+        finally:
+            disk.close()
+    finally:
+        resident.close()
+
+
+def test_verify_hunger_bridge_fraction(tmp_path, monkeypatch):
+    """F6: OMLX_V41_VERIFY_HUNGER bridges a fraction of verify traffic
+    into the governor's decode-visit stream — 0 keeps verify
+    telemetry-only, 1.0 feeds every visit, 0.5 emits every other."""
+    disk, backing = _backed_disk(tmp_path, dynamic=False)
+    try:
+        slots = disk.language_model.layers[0].ffn.experts.slots
+        with verify_scope():
+            slots.ensure(mx.array([[0, 1]]))
+        assert backing.stats.decode_layers == 0  # default: no bridge
+        monkeypatch.setenv("OMLX_V41_VERIFY_HUNGER", "0.5")
+        with verify_scope():
+            for _ in range(4):
+                slots.ensure(mx.array([[0, 1]]))
+        assert backing.stats.decode_layers == 2  # every other visit
+        monkeypatch.setenv("OMLX_V41_VERIFY_HUNGER", "1.0")
+        with verify_scope():
+            slots.ensure(mx.array([[0, 1]]))
+            slots.ensure(mx.array([[2, 3]]))  # missed -> hunger sees it
+        assert backing.stats.decode_layers == 4
+        assert backing.stats.decode_layers_missed >= 1
+        # Verify counters keep counting independently of the bridge.
+        assert backing.stats.verify_visits == 7
+    finally:
+        disk.close()
+
+
+def test_verify_advise_headroom_gate(tmp_path):
+    """F6: the verify advisory obeys the same headroom discipline as
+    decode staging — at the capacity floor it skips and counts the
+    cause; headroom restores it."""
+    disk, backing = _backed_disk(tmp_path)
+    try:
+        gov = backing.governor
+        assert gov is not None
+        gov.min_budget_bytes = 0
+        gov.min_cap = 2  # = plan capacity = floor -> no staging slack
+        slots0 = disk.language_model.layers[0].ffn.experts.slots
+        backing.verify_uniq[1] = {3, 4}
+        backing.verify_recall[1] = 1.0
+        with verify_scope():
+            slots0.ensure(mx.array([[0, 1]]))
+        assert backing.verify_ra_headroom == 1
+        assert backing.verify_ra_submits == 0
+        # Spare capacity: the gate opens again (source checkpoint makes
+        # advise_demand itself a no-op, so no submit is counted — the
+        # signal is that headroom stops accumulating).
+        backing.resize(4, 4)
+        with verify_scope():
+            slots0.ensure(mx.array([[0, 1]]))
+        assert backing.verify_ra_headroom == 1
+    finally:
+        disk.close()

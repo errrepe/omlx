@@ -104,6 +104,16 @@ class SlotBookkeeping:
         self.freq: dict[int, int] = {}
         self.pinned: frozenset[int] = frozenset()
         self._demand_calls = 0
+        # Verify-phase telemetry (V41 megaplan F0): experts committed while
+        # a verify scope was active and still resident — they sit at the
+        # cold end by construction (frozen commits land to_oldest), so
+        # evicting one is harmless churn while evicting anything else is
+        # consuming decode residency. ``verify_misses``/``verify_evict_resident``
+        # count demand misses served under verify and victims popped during
+        # verify that were NOT verify-installed, respectively.
+        self.verify_installed: set[int] = set()
+        self.verify_misses = 0
+        self.verify_evict_resident = 0
 
     def note_demand(self, needed: Iterable[int], pin_k: int) -> None:
         """Frequency-track the demanded set and refresh the pinned hot set.
@@ -148,8 +158,22 @@ class SlotBookkeeping:
         self.slot_of[expert] = slot
         return True
 
+    def _note_eviction(self, victim: int, verify: bool) -> None:
+        """Bookkeep a popped victim: verify-resident accounting + set fix.
+
+        Under verify, evicting an entry that was NOT itself installed by
+        verify traffic consumes decode residency — counted separately so
+        the verify path's damage is observable (and later prevented).
+        """
+        if verify and victim not in self.verify_installed:
+            self.verify_evict_resident += 1
+        self.verify_installed.discard(victim)
+
     def evict_oldest_outside(
-        self, needed: Iterable[int], on_evict: Callable[[int], None] | None = None
+        self,
+        needed: Iterable[int],
+        on_evict: Callable[[int], None] | None = None,
+        verify: bool = False,
     ) -> tuple[int, int] | None:
         """Pop the LRU-oldest expert not in *needed* → ``(expert, row)``."""
         needed_set = needed if isinstance(needed, (set, frozenset)) else set(needed)
@@ -165,6 +189,7 @@ class SlotBookkeeping:
             return None
         row = self.slot_of.pop(victim)
         self.evictions += 1
+        self._note_eviction(victim, verify)
         if on_evict is not None:
             on_evict(victim)
         return victim, row
@@ -173,28 +198,68 @@ class SlotBookkeeping:
         self,
         needed: Iterable[int] = (),
         on_evict: Callable[[int], None] | None = None,
+        verify: bool = False,
+        target: int | None = None,
     ) -> int:
-        """Evict LRU-oldest entries outside *needed* until within ``cap``."""
+        """Evict LRU-oldest entries outside *needed* until within ``cap``.
+
+        ``target`` overrides the ceiling: the verify scratch path trims
+        to ``cap + scratch`` so its transient rows are not evicted by
+        the post-shrink trim that exists for decode-phase occupancy.
+        """
+        ceiling = self.cap if target is None else int(target)
         trimmed = 0
-        while len(self.slot_of) > self.cap:
-            evicted = self.evict_oldest_outside(needed, on_evict)
+        while len(self.slot_of) > ceiling:
+            evicted = self.evict_oldest_outside(needed, on_evict, verify)
             if evicted is None:
                 break
             self.free.append(evicted[1])
             trimmed += 1
         return trimmed
 
-    def acquire(self, needed: Iterable[int]) -> tuple[int, int | None, bool]:
+    def acquire(
+        self,
+        needed: Iterable[int],
+        verify: bool = False,
+        scratch: int = 0,
+    ) -> tuple[int, int | None, bool]:
         """Reserve a row for a missing expert.
 
         Returns ``(slot, victim, needs_grow)``: a free row, an evicted
         victim's row, or — when every resident is needed — ``(rooms,
         None, True)`` telling the caller to grow physical storage first,
         then take the new row from ``free``.
+
+        Under ``verify`` with ``scratch > 0`` (V41 megaplan F4) only
+        verify-installed rows are fair victims — pre-verify residents
+        are decode-hot and verify must not consume them. While rooms
+        are below ``cap + scratch`` the caller grows instead; above the
+        bound the policy degrades gracefully to ordinary LRU victims.
         """
         if self.free:
             return self.free.pop(), None, False
         needed_set = needed if isinstance(needed, (set, frozenset)) else set(needed)
+        if verify and scratch:
+            # Oldest verify-installed victim first: slot_of is head=cold,
+            # so scan from the tail and take the LAST match — the
+            # verify-installed entry nearest the decode residents is the
+            # oldest-installed one (LRU-fair inside the scratch region).
+            victim = next(
+                (
+                    e
+                    for e in reversed(self.slot_of)
+                    if e in self.verify_installed
+                    and e not in needed_set
+                    and e not in self.pinned
+                ),
+                None,
+            )
+            if victim is not None:
+                self.evictions += 1
+                self._note_eviction(victim, verify)
+                return self.slot_of.pop(victim), victim, False
+            if self.rooms < self.cap + scratch:
+                return self.rooms, None, True
         victim = next(
             (
                 e
@@ -205,6 +270,7 @@ class SlotBookkeeping:
         )
         if victim is not None:
             self.evictions += 1
+            self._note_eviction(victim, verify)
             return self.slot_of.pop(victim), victim, False
         return self.rooms, None, True
 
@@ -307,11 +373,13 @@ class SlotBookkeeping:
         """Drop *expert*'s residency, returning its row to ``free``."""
         slot = self.slot_of.pop(expert, None)
         if slot is not None:
+            self.verify_installed.discard(expert)
             self.free.append(slot)
 
     def rebuild(self, kept: list[int]) -> None:
         """Remap rows to 0..k-1 in *kept* order after a physical compact."""
         self.slot_of = {expert: row for row, expert in enumerate(kept)}
+        self.verify_installed.intersection_update(kept)
         self.rooms = len(kept)
         self.free = []
 
@@ -319,6 +387,7 @@ class SlotBookkeeping:
         """Drop all residency; returns the evicted expert ids."""
         evicted = list(self.slot_of)
         self.slot_of.clear()
+        self.verify_installed.clear()
         self.free = list(range(self.rooms))
         return evicted
 
@@ -378,6 +447,7 @@ class SlotArena:
         self.staged = {}
         self.staged_hits = 0
         self.staged_drops = 0
+        self.staged_submits = 0
 
     def write_row(self, slot: int, payload: dict) -> None:
         """Write one payload ``{proj: {field: array}}`` into row ``slot``."""
@@ -431,32 +501,43 @@ class SlotArena:
             # clamp against what exists, not the construction-time size.
             self.rooms_max = max(self.rooms_max, self.book.rooms)
 
-    def compact(self, keep: int) -> int:
+    def compact(self, keep: int, rooms: int | None = None) -> int:
         """Keep the most-recent ``keep`` entries, remap rows 0..k-1.
 
         Two-phase like ``grow``: stacks for ALL projections evaluate
         before the first rebind, so a mid-compact failure cannot serve a
         half-remapped layer.
+
+        ``rooms`` optionally sets the physical row count after the remap
+        (>= len(kept)): the transient prefill-cap path uses it to hand
+        back grown-but-free rows at call end — dropping residents is not
+        required to release empty storage.
         """
         with self.lock:
             order = list(self.book.slot_of)
-            # No-op unless keep shrinks the live set — raising keep is a
-            # ceiling change (lazy growth covers expansion); empty rooms
-            # are the physical floor, not slack to release.
-            if len(order) <= keep:
-                return 0
+            keep = max(0, min(int(keep), len(order)))
+            if rooms is None:
+                # No-op unless keep shrinks the live set — raising keep
+                # is a ceiling change (lazy growth covers expansion);
+                # empty rooms are the physical floor, not slack to
+                # release.
+                if len(order) <= keep:
+                    return 0
+                target = keep
+            else:
+                target = max(int(rooms), keep)
+                # Explicit rooms shrink: release grown-but-free rows even
+                # when no resident drops — but never below len(kept).
+                if len(order) <= keep and self.book.rooms <= target:
+                    return 0
             drop = len(order) - keep
             kept = order[drop:]
             stacked_all = {
                 proj: {
-                    field: (
-                        mx.stack(
-                            [array[self.book.slot_of[e]] for e in kept]
-                        )
-                        if kept
-                        else mx.zeros(
-                            (0, *array.shape[1:]), dtype=array.dtype
-                        )
+                    field: self._kept_rows(
+                        array,
+                        [self.book.slot_of[e] for e in kept],
+                        target,
                     )
                     for field, array in self._arrays_of(proj).items()
                 }
@@ -468,9 +549,33 @@ class SlotArena:
             if self._eval_params is not None:
                 self._eval_params()
             self.book.rebuild(kept)
+            if target > len(kept):
+                self.book.free.extend(range(len(kept), target))
+                self.book.rooms = target
             return drop
 
-    def ensure_set(self, needed, frozen: bool, produce: Callable) -> bool:
+    @staticmethod
+    def _kept_rows(array, rows, target):
+        """Stack ``rows`` of ``array`` into a (target, *row_shape) bank."""
+        kept = (
+            mx.stack([array[row] for row in rows])
+            if rows
+            else mx.zeros((0, *array.shape[1:]), dtype=array.dtype)
+        )
+        if target <= kept.shape[0]:
+            return kept
+        grown = mx.zeros((target, *array.shape[1:]), dtype=array.dtype)
+        grown[: kept.shape[0]] = kept
+        return grown
+
+    def ensure_set(
+        self,
+        needed,
+        frozen: bool,
+        produce: Callable,
+        verify: bool = False,
+        scratch: int = 0,
+    ) -> bool:
         """Cover ``needed`` expert ids; returns True if any miss committed.
 
         Pass 1 reserves a row per missing expert (``acquire`` — free row,
@@ -491,9 +596,24 @@ class SlotArena:
         Leftover staged entries (predicted but not demanded) drop here —
         their futures are cancelled so an in-flight speculative read
         stops early instead of finishing into a dropped payload.
+
+        ``verify`` (V41 megaplan F0 telemetry, F4 scratch): marks the call
+        as draft-verify traffic — committed experts join
+        ``book.verify_installed`` (they already land to_oldest under
+        ``frozen``) and evictions of non-verify-installed residents count
+        as ``verify_evict_resident``. With ``scratch > 0`` the admission
+        bound becomes ``cap + scratch`` rows: a verify block's union fits
+        in ONE ensure instead of re-splitting into one-token chunks, and
+        ``acquire`` evicts only verify-installed rows — growing rooms up
+        to the bound rather than consuming decode-hot residents. The
+        scratch content is logically transient (cold-end residents) but
+        persists between verify rounds for cross-iteration hits; the
+        decode-phase ``trim_to_cap`` reclaims it on the next ordinary
+        ensure, and the governor's compact drops it under pressure.
         """
         needed = set(needed)
-        if len(needed) > self.book.cap:
+        limit = self.book.cap + scratch if verify and scratch else self.book.cap
+        if len(needed) > limit:
             raise ValueError("Expert working set exceeds resident capacity")
         fetch_list = []
         committed_through = -1
@@ -504,8 +624,12 @@ class SlotArena:
                 self.book.note_demand(needed, _HOTPIN_K)
             # Post-shrink trim: evict oldest non-needed down to the
             # ceiling. Safe: needed <= cap < len implies a non-needed
-            # entry exists.
-            self.book.trim_to_cap(needed)
+            # entry exists. Under verify+scratch the ceiling is the
+            # scratch bound, so the trim does not undo the transient
+            # residency this call is allowed to hold.
+            self.book.trim_to_cap(
+                needed, verify=verify, target=limit
+            )
             # Protect the entire working set, including hits after
             # misses.
             resident = 0
@@ -516,20 +640,38 @@ class SlotArena:
                     if not frozen:
                         self.book.touch(expert)
             misses = len(needed) - resident
+            if verify:
+                self.book.verify_misses += misses
             # Grow-once pre-pass: the largest row count this call can
             # need is what the miss set requires after free rows and
             # evictable victims are spent. Pinned-but-not-needed rows are
             # NOT evictable, so demand may legitimately push rooms past
             # cap — occupancy over the ceiling is forced by the pins,
-            # not by this bound.
-            victims_available = sum(
-                1
-                for e in self.book.slot_of
-                if e not in needed and e not in self.book.pinned
-            )
-            grow_by = max(
-                0, misses - len(self.book.free) - victims_available
-            )
+            # not by this bound. Under verify+scratch the victim pool is
+            # the verify-installed set only (decode-hot residents are not
+            # forfeit), and growth is bounded by the scratch ceiling.
+            if verify and scratch:
+                verify_victims = sum(
+                    1
+                    for e in self.book.slot_of
+                    if e in self.book.verify_installed
+                    and e not in needed
+                    and e not in self.book.pinned
+                )
+                grow_room = max(0, limit - self.book.rooms)
+                grow_by = min(
+                    max(0, misses - len(self.book.free) - verify_victims),
+                    grow_room,
+                )
+            else:
+                victims_available = sum(
+                    1
+                    for e in self.book.slot_of
+                    if e not in needed and e not in self.book.pinned
+                )
+                grow_by = max(
+                    0, misses - len(self.book.free) - victims_available
+                )
             if grow_by:
                 self.grow(self.book.rooms + grow_by)
             for expert in needed:
@@ -541,7 +683,9 @@ class SlotArena:
                     # first victim pop so a rollback can reinsert victims
                     # at their ORIGINAL positions instead of the MRU end.
                     order_snapshot = list(self.book.slot_of)
-                slot, victim, needs_grow = self.book.acquire(needed)
+                slot, victim, needs_grow = self.book.acquire(
+                    needed, verify=verify, scratch=scratch
+                )
                 if needs_grow:
                     # Safety net only: the pre-pass above opens every row
                     # the demand can need, so this cannot fire without
@@ -562,6 +706,8 @@ class SlotArena:
             ):
                 self.write_row(slot, payload)
                 self.book.commit(expert, slot, to_oldest=frozen)
+                if verify:
+                    self.book.verify_installed.add(expert)
                 committed_through = i
         except Exception:
             self.book.rollback(

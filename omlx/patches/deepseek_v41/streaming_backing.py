@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from dataclasses import dataclass, field
 
 from ..expert_streaming.slot_cache import DecodeVisitStats
 
@@ -56,6 +57,59 @@ except (TypeError, ValueError):
 _STAGED_RECALL_DECAY = 0.9
 
 
+def _verify_ra_enabled() -> bool:
+    """Verify-fed cross-iteration readahead (megaplan F3) — advise only.
+
+    Under DSpark essentially every trunk forward is a verify call, so
+    the decode-phase prev-token predictor starves (the staged_hits=0
+    bug). The verify predictor instead records each layer's routed
+    UNION per verify round and advises the next layer's predicted set —
+    F_RDADVISE only: a union is ~depth*top_k rows, far too large to
+    materialize as staged payloads held across an iteration.
+    OMLX_V41_VERIFY_RA=0 disables.
+    """
+    return os.environ.get("OMLX_V41_VERIFY_RA", "1") != "0"
+
+
+try:
+    _VERIFY_MIN_RECALL = float(
+        os.environ.get("OMLX_V41_VERIFY_MIN_RECALL", "0.3") or "0.3"
+    )
+except (TypeError, ValueError):
+    logger.warning(
+        "Invalid OMLX_V41_VERIFY_MIN_RECALL value; using 0.3",
+        exc_info=True,
+    )
+    _VERIFY_MIN_RECALL = 0.3
+
+
+def _verify_hunger_frac() -> float:
+    """Share of verify traffic bridged into the hunger signal (F6).
+
+    Verify misses stayed out of the governor deliberately: pre-F4 the
+    verify working set (~depth*top_k) exceeded ``cap`` structurally, so
+    verify stalls were hunger the budget could never satisfy. Scratch
+    rows make the union servable now — but feeding verify 1:1 would
+    still let a ~36-expert union dominate a 10-row decode budget. A
+    fractional bridge (0.25 = every fourth verify visit counts as a
+    decode visit, hit or miss) lets measurement pick the dose; the
+    emitted visit keeps THIS visit's outcome so the stall ratio stays
+    truthful. 0 = verify stays telemetry-only (default).
+    OMLX_V41_VERIFY_HUNGER, 0..1.
+    """
+    try:
+        return min(
+            1.0,
+            max(
+                0.0,
+                float(os.environ.get("OMLX_V41_VERIFY_HUNGER", "0") or "0"),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@dataclass
 class _V41CacheStats(DecodeVisitStats):
     """Cumulative decode-visit counters for governor windows.
 
@@ -68,9 +122,24 @@ class _V41CacheStats(DecodeVisitStats):
     while the generic cache notes one visit per layer-call. Governor
     windows therefore fill ~chunks-per-layer-call faster here; the stall
     signal stays a ratio so ``stall_target`` applies unchanged.
+
+    Verify visits are counted separately (megaplan F0): real wall-time
+    stalls, but deliberately excluded from the governor's hunger signal —
+    under DSpark verify demand exceeds ``cap`` structurally, so feeding
+    it would target growth the working set cannot satisfy.
     """
 
-    pass
+    verify_visits: int = 0
+    verify_visits_missed: int = 0
+    verify_misses_by_layer: dict = field(default_factory=dict)
+
+    def note_verify_visit(self, layer_idx: int, missed: bool) -> None:
+        self.verify_visits += 1
+        if missed:
+            self.verify_visits_missed += 1
+            self.verify_misses_by_layer[layer_idx] = (
+                self.verify_misses_by_layer.get(layer_idx, 0) + 1
+            )
 
 
 class V41StreamingBacking:
@@ -102,6 +171,32 @@ class V41StreamingBacking:
         self.recall_ewma: dict = {}
         self._order = sorted(self.slots_of)
         self.staged_skips = 0
+        # Megaplan F0: skip causes split for diagnostics — a staged_hits=0
+        # run needs to distinguish "no predictor yet", "recall gate" and
+        # "headroom suppressed" without a debugger. staged_skips stays
+        # the aggregate of recall+headroom skips (bench JSON compat).
+        self.staged_skips_no_pred = 0
+        self.staged_skips_recall = 0
+        self.staged_skips_headroom = 0
+        # F3 verify predictor: the routed UNION each layer saw during the
+        # last completed verify round (verify_uniq) predicts its next
+        # round — adjacent draft text routes similarly. verify_acc
+        # accumulates the in-flight round's unions; a verify pass visits
+        # layers in monotonically non-decreasing order (chunked ensures
+        # repeat the same index), so an index DECREASE marks a new round
+        # and promotes acc -> uniq. verify_recall EWMAs how much of each
+        # new chunk the last round's union actually covered.
+        self.verify_uniq: dict = {}
+        self.verify_acc: dict = {}
+        self._verify_last = -1
+        self.verify_recall: dict = {}
+        self.verify_ra_submits = 0
+        self.verify_ra_no_pred = 0
+        self.verify_ra_recall = 0
+        self.verify_ra_headroom = 0
+        # F6 fractional verify->hunger bridge accumulator (see
+        # _verify_hunger_frac); crossing 1.0 emits one decode visit.
+        self._verify_hunger_credit = 0.0
         # plan.full_bytes spans ALL layers while count is per-layer: derive
         # per-expert size from resident_bytes (capacity x layers) so the
         # governor's GiB budgets stay truthful. Actions are scale-invariant
@@ -278,6 +373,102 @@ class V41StreamingBacking:
             except Exception:
                 logger.debug("governor tick failed", exc_info=True)
 
+    def note_verify_visit(self, layer_idx: int, missed: bool) -> None:
+        """Count one verify-phase layer-call (telemetry only, F0).
+
+        Deliberately does NOT tick the governor: under DSpark the verify
+        working set (~depth*top_k) exceeds cap structurally, so verify
+        misses would fake hunger the budget cannot satisfy. Real verify
+        demand misses surface after F4 scratch rows make the set servable.
+        """
+        with self._lock:
+            self.stats.note_verify_visit(layer_idx, missed)
+        frac = _verify_hunger_frac()
+        if frac <= 0.0:
+            return
+        with self._lock:
+            self._verify_hunger_credit += frac
+            if self._verify_hunger_credit < 1.0:
+                return
+            self._verify_hunger_credit -= 1.0
+        # The bridge emitted a visit: join the decode stream with this
+        # visit's outcome (misses feed hunger at the verify miss rate,
+        # hits dilute it identically — the fraction scales BOTH).
+        self.note_visit(layer_idx, missed)
+
+    def note_verify_routing(self, layer_idx: int, experts) -> None:
+        """Feed a verify chunk's routed set to the F3 predictor.
+
+        Round detection: a verify pass visits its MoE layers in
+        non-decreasing order, so a layer-index DECREASE means the round
+        wrapped — the accumulated unions promote to the predictor and a
+        fresh round begins. Recall measures the last round's union
+        coverage of THIS chunk (the quantity the next-layer advisory
+        relies on).
+        """
+        li = int(layer_idx)
+        now = {int(e) for e in experts}
+        if not now:
+            return
+        with self._lock:
+            # A pass visits layers in non-decreasing order — repeated
+            # indices are this layer's own chunks, a DECREASE is the
+            # next round's first layer. Promote the accumulated unions.
+            if li < self._verify_last:
+                self.verify_uniq = self.verify_acc
+                self.verify_acc = {}
+            self._verify_last = li
+            prev = self.verify_uniq.get(li)
+            if prev:
+                obs = len(prev & now) / len(now)
+                self.verify_recall[li] = (
+                    _STAGED_RECALL_DECAY * self.verify_recall.get(li, 0.0)
+                    + (1.0 - _STAGED_RECALL_DECAY) * obs
+                )
+            acc = self.verify_acc.get(li)
+            if acc is None:
+                acc = self.verify_acc[li] = set()
+            acc.update(now)
+
+    def advise_verify_next(self, layer_idx: int) -> None:
+        """Advise the next layer's predicted verify demand (F3).
+
+        Wraps to layer 0 on purpose: the last layer's "next" is the NEXT
+        verify round's first layer — the longest-lead case. Runs the
+        same ``advise_demand`` filter as the exact-demand path (residents
+        and staged rows are skipped), so a wrong prediction only costs
+        page-cache bytes, never correctness or held memory.
+        """
+        if not _verify_ra_enabled() or not self._order:
+            return
+        try:
+            pos = self._order.index(int(layer_idx))
+        except (TypeError, ValueError):
+            return
+        nxt = self._order[(pos + 1) % len(self._order)]
+        with self._lock:
+            pred = self.verify_uniq.get(nxt)
+            recall = self.verify_recall.get(nxt, 0.0)
+        if not pred:
+            self.verify_ra_no_pred += 1
+            return
+        if recall < _VERIFY_MIN_RECALL:
+            self.verify_ra_recall += 1
+            return
+        # F6: same headroom discipline as decode staging — the advisory
+        # fetches real pages, so under floor-capacity or desperate-free
+        # pressure it competes with THIS layer's demand reads. The
+        # prediction is only early-fetch of true demand; skipping it
+        # under pressure just reverts to demand-time reads.
+        if not self._stage_headroom():
+            self.verify_ra_headroom += 1
+            return
+        try:
+            if self.slots_of[nxt].advise_demand(pred):
+                self.verify_ra_submits += 1
+        except Exception:
+            pass
+
     def note_routing(self, layer_idx: int, experts) -> None:
         """Record a decode token's routed set as this layer's predictor
         for the next token (same temporal-locality assumption the generic
@@ -320,18 +511,44 @@ class V41StreamingBacking:
         nxt = self._order[(pos + 1) % len(self._order)]
         pred = self.prev_uniq.get(nxt)
         if not pred:
+            self.staged_skips_no_pred += 1
             return
         # Recall gate (generic stage_gate parity): a layer whose
         # prev-token prediction stopped covering demand does not earn
         # speculative reads — the EWMA shuts it off after a bounded burst.
         if self.recall_ewma.get(nxt, 0.0) < _STAGED_MIN_RECALL:
             self.staged_skips += 1
+            self.staged_skips_recall += 1
             return
         if not self._stage_headroom():
             self.staged_skips += 1
+            self.staged_skips_headroom += 1
             return
         try:
             self.slots_of[nxt].stage_predicted(pred)
+        except Exception:
+            pass
+
+    def advise_next_layer(self, layer_idx: int) -> None:
+        """Whole-bank F_RDADVISE of the next MoE layer (megaplan F1b).
+
+        Called at a saturated-coverage prefill call's entry: the next
+        layer's demand is almost surely its whole bank, so advising it
+        now overlaps that IO with this layer's compute+fetch. No wrap —
+        the last layer's "next" would be the NEXT request's layer 0,
+        whose demand is a different token's tiny set. Failure is silent:
+        readahead is a hint, never the demand path.
+        """
+        if not self._order:
+            return
+        try:
+            pos = self._order.index(int(layer_idx))
+        except (TypeError, ValueError):
+            return
+        if pos + 1 >= len(self._order):
+            return
+        try:
+            self.slots_of[self._order[pos + 1]].advise_bank()
         except Exception:
             pass
 
@@ -395,6 +612,20 @@ class V41StreamingBacking:
         span_fallbacks = sum(
             getattr(s, "span_fallbacks", 0) for s in self.slots_of.values()
         )
+        staged_submits = sum(
+            getattr(s, "staged_submits", 0) for s in self.slots_of.values()
+        )
+        verify_misses = sum(
+            getattr(s.book, "verify_misses", 0) for s in self.slots_of.values()
+        )
+        verify_evict_resident = sum(
+            getattr(s.book, "verify_evict_resident", 0)
+            for s in self.slots_of.values()
+        )
+        ra_calls = sum(getattr(s, "ra_calls", 0) for s in self.slots_of.values())
+        ra_rows = sum(getattr(s, "ra_rows", 0) for s in self.slots_of.values())
+        ra_bytes = sum(getattr(s, "ra_bytes", 0) for s in self.slots_of.values())
+        stats = self.stats
         return {
             "hits": hits,
             "misses": misses,
@@ -406,7 +637,27 @@ class V41StreamingBacking:
             "staged_hits": staged_hits,
             "staged_drops": staged_drops,
             "staged_failures": staged_failures,
+            "staged_submits": staged_submits,
             "staged_skips": self.staged_skips,
+            "staged_skips_no_pred": self.staged_skips_no_pred,
+            "staged_skips_recall": self.staged_skips_recall,
+            "staged_skips_headroom": self.staged_skips_headroom,
+            "verify_visits": stats.verify_visits,
+            "verify_visits_missed": stats.verify_visits_missed,
+            "verify_misses": verify_misses,
+            "verify_evict_resident": verify_evict_resident,
+            "verify_ra_submits": self.verify_ra_submits,
+            "verify_ra_no_pred": self.verify_ra_no_pred,
+            "verify_ra_recall": self.verify_ra_recall,
+            "verify_ra_headroom": self.verify_ra_headroom,
+            "verify_recall": (
+                sum(self.verify_recall.values()) / len(self.verify_recall)
+                if self.verify_recall
+                else 0.0
+            ),
+            "ra_calls": ra_calls,
+            "ra_rows": ra_rows,
+            "ra_bytes": ra_bytes,
             "span_reads": span_reads,
             "span_demand_rows": span_demand,
             "span_phys_rows": span_phys,
