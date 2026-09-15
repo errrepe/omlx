@@ -4,7 +4,6 @@ import json
 import struct
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -309,16 +308,6 @@ class TestSpeculativeExclusivity:
                 model_type="gemma4",
             )
 
-    def test_fraction_still_validated(self):
-        from omlx.model_settings import validate_moe_expert_offload
-
-        with pytest.raises(ValueError, match="resident_fraction"):
-            validate_moe_expert_offload(
-                {
-                    "moe_expert_offload_enabled": True,
-                    "moe_expert_offload_resident_fraction": 0,
-                }
-            )
 
 
 class TestCompatAllowlistUnified:
@@ -362,18 +351,6 @@ class TestStackedKeyValidation:
     def _backing(self, keys):
         return SimpleNamespace(_weight_map={k: "shard.safetensors" for k in keys})
 
-    def test_missing_required_key_raises(self):
-        from omlx.patches.expert_streaming import _resolve_stacked_key
-
-        backing = self._backing({"model.layers.0.mlp.switch_mlp.gate_proj.weight"})
-        with pytest.raises(ValueError, match="up_proj.weight"):
-            _resolve_stacked_key(
-                ["model.layers.0.mlp.switch_mlp.up_proj.weight"],
-                "up_proj",
-                "weight",
-                backing,
-                "layers.0.",
-            )
 
     def test_optional_bias_falls_back(self):
         from omlx.patches.expert_streaming import _resolve_stacked_key

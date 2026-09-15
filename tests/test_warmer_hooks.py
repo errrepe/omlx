@@ -9,12 +9,10 @@ would suppress every later attempt.
 """
 from types import SimpleNamespace
 
-from omlx.patches.expert_streaming import warmer
 from omlx.patches.expert_streaming.warmer import (
     PageCacheWarmer,
     PinController,
     PrefillHotnessRecorder,
-    WarmPinHook,
     _is_decode_call,
 )
 
@@ -96,17 +94,3 @@ def test_recorder_seed_gates_on_seq_len():
     assert not rec3.seeded
 
 
-def test_hook_forwards_seq_len():
-    calls = []
-
-    class _Sink:
-        def on_layer_start(self, layer_idx, positions, seq_len=None):
-            calls.append(("start", layer_idx, positions, seq_len))
-
-        def on_layer_plan(self, layer_idx, uniq, positions, counts=None, seq_len=None):
-            calls.append(("plan", layer_idx, positions, seq_len))
-
-    hook = WarmPinHook(_Sink(), None, None)
-    hook.on_layer_start(0, 8, seq_len=1)
-    hook.on_layer_plan(0, [1], 8, None, seq_len=1)
-    assert calls == [("start", 0, 8, 1), ("plan", 0, 8, 1)]

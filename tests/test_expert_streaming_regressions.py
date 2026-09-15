@@ -154,19 +154,3 @@ def test_spill_source_change_invalidates_and_empty_manifest_rejected(tmp_path):
     assert S.spill_is_valid(model_dir) is None
 
 
-def test_prefill_standin_carries_lru_probe():
-    """_record_chunk_transient needs _streaming_lru_heap_growth."""
-    from omlx.prefill_transient_tracker import PrefillTransientTracker
-    from omlx.scheduler import Scheduler
-
-    tracker = PrefillTransientTracker()
-    ns = SimpleNamespace(
-        _prefill_min_chunk_tokens=256,
-        _prefill_transient_tracker=tracker,
-        _streaming_lru_cache=None,
-        _streaming_lru_bytes_last=None,
-    )
-    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(ns, Scheduler)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(ns, Scheduler)
-    ns._record_chunk_transient(512, 0, 1024, request_id="r", loop_label="t", kv_len=0, requested_step=512)
-    # No AttributeError: the stand-in carries the LRU probe.

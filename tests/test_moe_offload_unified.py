@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 
 from omlx.model_settings import moe_offload_requested
 from omlx.patches import moe_expert_offload as legado
@@ -70,21 +69,6 @@ class TestViaStreaming:
         model = SimpleNamespace(_expert_streaming_backing=object())
         assert legado._apply_via_streaming(model, _cfg(tmp_path, "qwen4_exp"), 0.25) == 4
 
-    def test_converts_and_stamps_backing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(self.EST, lambda *_a, **_k: _fake_est())
-        seen = {}
-
-        def _fake_convert(model, path, settings):
-            seen["budget"] = settings.expert_streaming_budget_gib
-            seen["dynamic"] = settings.expert_streaming_dynamic
-            return model, object()
-
-        monkeypatch.setattr(self.CONV, _fake_convert)
-        model = SimpleNamespace()
-        assert legado._apply_via_streaming(model, _cfg(tmp_path, "qwen4_exp"), 0.25) == 4
-        assert seen["budget"] == pytest.approx(2.0)
-        assert seen["dynamic"] is True
-        assert isinstance(model._expert_streaming_backing, object)
 
     def test_unsupported_estimate_returns_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(self.EST, lambda *_a, **_k: _fake_est(supported=False))

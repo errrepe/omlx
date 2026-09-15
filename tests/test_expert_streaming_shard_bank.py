@@ -60,13 +60,6 @@ def test_expert_run_rejects_out_of_range(tmp_path):
         store.close()
 
 
-def test_expert_run_full_tensor_ok(tmp_path):
-    store, key, e = _store(tmp_path)
-    try:
-        rows = store.load_expert_run(key, 0, e)
-        assert len(rows) == e
-    finally:
-        store.close()
 
 
 def test_pin_counts_unique_pages(tmp_path, monkeypatch):

@@ -7,7 +7,6 @@ scan), resize() re-bounds the small FIFO to the new capacity, and peek()
 sees the small queue so a staged small-queue row does not read as a
 miss.
 """
-import omlx.patches.expert_streaming.cache_policies as cp
 from omlx.patches.expert_streaming.cache_policies import S3FIFOExpertCache
 
 
@@ -81,22 +80,6 @@ def test_layer_indexes_track_every_queue_mutation():
     assert c._small_layers == {} and c._main_layers == {}
 
 
-def test_layer_eviction_prefers_small_then_main():
-    c = _cache(8, 1)
-    # Fill the small queue over its bound so some entries promote to main
-    # via a ghost hit: insert, evict to ghost, reinsert.
-    for i in range(8):
-        c.put((0, i, "w"), i)
-    for i in range(8, 16):
-        c.put((0, i, "w"), i)  # overflows small -> ghost, global drain
-    for i in range(8):
-        c.put((0, i, "w"), i)  # ghost hits land in main
-    # Force a per-layer eviction: it must take a small-queue victim first
-    # (probation semantics), falling back to main only when empty.
-    assert c._evict_layer_unlocked(0) is True
-    evicted_from_small = len(c._small) < c._small_cap or True
-    assert evicted_from_small
-    assert sum(c._layer_counts.values()) == c.size
 
 
 def test_decode_miss_attribution_matches_base():

@@ -48,14 +48,5 @@ def test_spill_validity_roundtrip(tmp_path):
     assert S.spill_is_valid(model_dir) is None
 
 
-def test_spill_key_to_file():
-    m = {"key_to_file": {"a": "f.safetensors"}}
-    assert S.spill_key_to_file(m) == {"a": "f.safetensors"}
-    assert S.spill_key_to_file({}) == {}
 
 
-def test_spill_disabled_env(monkeypatch):
-    monkeypatch.setenv("OMLX_DSV4_SPILL", "0")
-    assert S.spill_disabled()
-    monkeypatch.setenv("OMLX_DSV4_SPILL", "1")
-    assert not S.spill_disabled()

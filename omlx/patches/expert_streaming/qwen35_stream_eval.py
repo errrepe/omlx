@@ -111,7 +111,7 @@ def _clear_cache_synced() -> None:
         _sync_and_clear_cache()
     except Exception:
         logger.warning(
-            "_sync_and_clear_cache failed; skipping the per-layer clear (K12)",
+            "_sync_and_clear_cache failed; skipping the per-layer clear",
             exc_info=True,
         )
 
