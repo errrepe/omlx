@@ -1885,7 +1885,7 @@ class VLMBatchedEngine(BaseEngine):
                     # Unified predicate: the canonical expert_streaming_enabled
                     # key and the legacy alias both arm the offload path, and
                     # the OMLX_MOE_EXPERT_OFFLOAD=0 kill switch still wins.
-                    return load(
+                    loaded = load(
                         self._model_name,
                         moe_expert_offload_resident_fraction=(
                             self._model_settings.moe_expert_offload_resident_fraction
@@ -1899,14 +1899,19 @@ class VLMBatchedEngine(BaseEngine):
                                 False,
                             )
                         ),
-                        ced_prefill=bool(
-                            getattr(
-                                self._model_settings,
-                                "deepseek_v41_ced_prefill_enabled",
-                                False,
+                        # Converted checkpoints can't auto-derive from
+                        # is_mtp_active() — forward the request or the
+                        # resident DSpark head is dropped on load.
+                        preserve_mtp=(
+                            True
+                            if getattr(
+                                self._model_settings, "mtp_enabled", False
                             )
+                            else None
                         ),
                     )
+                    self._attach_v41_dynamic_residency(loaded)
+                    return loaded
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
@@ -2215,17 +2220,6 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
-        if (
-            self._adapter.model_type == "deepseek_v41"
-            and self._adapter.config.ced_prefill
-            and scheduler_config.paged_ssd_cache_dir
-        ):
-            # Approximate decoder states must not become hits in full-prefill
-            # mode (or vice versa) after reloading the model with new settings.
-            scheduler_config.paged_ssd_cache_dir = str(
-                Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
-            )
-
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
@@ -2641,6 +2635,83 @@ class VLMBatchedEngine(BaseEngine):
 
         self._loaded = True
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
+
+    def _attach_v41_dynamic_residency(self, loaded: Any) -> None:
+        """Arm the model-agnostic dynamic budget over V4.1 native slots.
+
+        The fraction setting becomes the INITIAL per-layer budget; the
+        governor then grows/shrinks it from pressure + decode hunger.
+        Precedence: explicit ``expert_streaming_dynamic`` > env > auto-ON.
+        Generic budget pins are ignored here on purpose: they are inert
+        for V4.1 mechanics, and honoring them as "manual mode" would
+        static-ify V4.1 by accident (the bench CLI defaults to a pinned
+        budget). Only expert_streaming_dynamic=false opts out. Fail-clean:
+        without a plan or on any error the static adapter keeps serving.
+        """
+        try:
+            model = loaded[0] if isinstance(loaded, tuple) else loaded
+            plan = getattr(model, "_moe_offload_plan", None)
+            if plan is None:
+                return
+            from ..patches.deepseek_v41.moe_offload import OffloadedExpert
+            from ..patches.deepseek_v41.streaming_backing import (
+                V41StreamingBacking,
+            )
+            from ..patches.expert_streaming import _dynamic_armed
+
+            layers = []
+            for idx, layer in enumerate(model.language_model.layers):
+                experts = getattr(getattr(layer, "ffn", None), "experts", None)
+                if isinstance(experts, OffloadedExpert):
+                    layers.append((idx, experts.slots))
+            if not layers:
+                return
+            settings = self._model_settings
+            # settings=None: skip the generic pinned-budget rule (see
+            # docstring). Env opt-out still applies inside _dynamic_armed.
+            dyn = _dynamic_armed(
+                getattr(settings, "expert_streaming_dynamic", None), None
+            )
+            max_gib = getattr(
+                settings, "expert_streaming_dynamic_max_gib", None
+            )
+            min_gib = getattr(
+                settings, "expert_streaming_dynamic_min_gib", None
+            )
+            stall = getattr(
+                settings, "expert_streaming_dynamic_stall_target", None
+            )
+            backing = V41StreamingBacking(
+                plan,
+                layers,
+                dynamic=bool(dyn),
+                max_budget_bytes=(
+                    int(max_gib * 1024**3) if max_gib is not None else None
+                ),
+                min_budget_bytes=(
+                    int(min_gib * 1024**3) if min_gib is not None else None
+                ),
+                stall_target=stall,
+            )
+            self._expert_streaming_backing = backing
+            try:
+                model._expert_streaming_backing = backing  # type: ignore[attr-defined]
+            except Exception:
+                # The engine-side reference above still works, but the
+                # scheduler's guard/admission path resolves the backing off
+                # the model — surface the miss instead of silently degrading.
+                logger.warning(
+                    "V4.1 dynamic residency: could not stamp "
+                    "_expert_streaming_backing on the model",
+                    exc_info=True,
+                )
+            logger.info(
+                "V4.1 dynamic expert residency %s (per-layer %d slots)",
+                "armed" if backing.governor is not None else "static",
+                backing.base_cap,
+            )
+        except Exception:
+            logger.debug("V4.1 dynamic residency attach failed", exc_info=True)
 
     def set_vlm_mtp_drafter(self, drafter: Any) -> None:
         """Attach a loaded MTP drafter for VLM MTP decoding.

@@ -35,6 +35,41 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
     }
 
+    func testExpertStreamingBlocksSpeculativeTogglesExceptMtpOnDeepseekV41() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "moe", configModelType: "qwen3_5_moe")
+        vm.expertStreamingEnabled = true
+
+        XCTAssertNotNil(vm.mtpConflictReason)
+        XCTAssertNotNil(vm.vlmMtpConflictReason)
+
+        // deepseek_v41 runs DSpark verify under frozen residency — the
+        // backend permits Lightning MTP under expert offload there
+        // (validate_moe_expert_offload); VLM MTP is never exempt.
+        vm.model = makeModel(id: "v41", configModelType: "deepseek_v41")
+        XCTAssertNil(vm.mtpConflictReason)
+        XCTAssertNotNil(vm.vlmMtpConflictReason)
+    }
+
+    func testLightningMtpBlocksExpertStreamingUnlessSupportedOrV41() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        vm.expertStreamingSupported = false
+        vm.model = makeModel(id: "legacy", configModelType: "olmoe")
+        XCTAssertNotNil(vm.expertStreamingConflictReason)
+
+        // The unified streaming backend converts MTP-stage MoE banks on
+        // the types it owns, so MTP+streaming is supported there.
+        vm.expertStreamingSupported = true
+        XCTAssertNil(vm.expertStreamingConflictReason)
+
+        // deepseek_v41 stays exempt even though only the legacy adapter
+        // serves it (expertStreamingSupported is false for that type).
+        vm.expertStreamingSupported = false
+        vm.model = makeModel(id: "v41", configModelType: "deepseek_v41")
+        XCTAssertNil(vm.expertStreamingConflictReason)
+    }
+
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
         let vm = ModelSettingsScreenVM()
         vm.modelID = "Qwopus3.6-35B-A3B-v1-4bit-MLXVLM-Target"
@@ -307,6 +342,54 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen4_ple_ssd_offload"] as? Bool, true)
     }
 
+    func testExpertBankWireKeysAndCompatibility() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "jang4m", configModelType: "qwen4_exp")
+        vm.expertStreamingSupported = true
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let dto = try decoder.decode(
+            ModelSettingsDTO.self,
+            from: Data(#"{"expert_streaming_bank_enabled":true,"expert_streaming_bank_path":"/volumes/bank"}"#.utf8)
+        )
+        XCTAssertEqual(dto.expertStreamingBankEnabled, true)
+        XCTAssertEqual(dto.expertStreamingBankPath, "/volumes/bank")
+
+        var patch = ModelSettingsPatch()
+        patch.expertStreamingBankEnabled = true
+        patch.expertStreamingBankPath = .some("/volumes/bank")
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(
+            with: encoder.encode(patch)
+        ) as? [String: Any]
+        XCTAssertEqual(object?["expert_streaming_bank_enabled"] as? Bool, true)
+        XCTAssertEqual(object?["expert_streaming_bank_path"] as? String, "/volumes/bank")
+
+        // Toggling off sends JSON null to clear the override server-side.
+        var offPatch = ModelSettingsPatch()
+        offPatch.expertStreamingBankEnabled = false
+        offPatch.expertStreamingBankPath = .some(nil)
+        let offObject = try JSONSerialization.jsonObject(
+            with: encoder.encode(offPatch)
+        ) as? [String: Any]
+        XCTAssertEqual(offObject?["expert_streaming_bank_enabled"] as? Bool, false)
+        XCTAssertTrue(
+            (offObject?["expert_streaming_bank_path"] as? NSNull) == NSNull()
+        )
+
+        // The model payload carries the capability + bank health fields.
+        let modelDTO = try decoder.decode(
+            ModelDTO.self,
+            from: Data(#"{"id":"jang4m","loaded":false,"is_loading":false,"estimated_size":0,"expert_streaming_supported":true,"expert_bank_available":true,"expert_bank_status":"ok","expert_bank_default_path":"/m/.omlx/expert_bank"}"#.utf8)
+        )
+        XCTAssertEqual(modelDTO.expertStreamingSupported, true)
+        XCTAssertEqual(modelDTO.expertBankAvailable, true)
+        XCTAssertEqual(modelDTO.expertBankStatus, "ok")
+        XCTAssertEqual(modelDTO.expertBankDefaultPath, "/m/.omlx/expert_bank")
+    }
+
     func testQwenAneSettingsDecodeFromServerAndEncodeForPatch() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -473,6 +556,15 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             qwen4PleSsdOffloadForced: nil,
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
+            expertStreamingSupported: nil,
+            expertBankAvailable: nil,
+            expertBankStatus: nil,
+            expertBankDefaultPath: nil,
+            moeExpertOffloadSupported: nil,
+            deepseekV41EngramSsdOffloadSupported: nil,
+            deepseekV41EngramSsdOffloadForced: nil,
+            deepseekV41EngramResidentBytes: nil,
+            deepseekV41EngramMmapBytes: nil,
             virtual: nil,
             settings: nil
         )

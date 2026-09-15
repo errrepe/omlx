@@ -1823,6 +1823,16 @@
                     || !!ms.moe_expert_offload_enabled;
             },
 
+            // deepseek_v41* config types: DSpark verify runs under frozen
+            // residency, so the backend permits Lightning MTP under MoE
+            // offload there (model_settings.validate_moe_expert_offload).
+            isDeepseekV41Model(model) {
+                const type = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                return type.startsWith('deepseek_v41');
+            },
+
             // Coerce a raw kwarg string from the panel into its JSON type:
             // 'true'/'false' -> boolean, finite numeric strings -> number.
             coerceKwargValue(v) {
@@ -1907,10 +1917,6 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
-                    deepseek_v41_ced_prefill_enabled:
-                        s.deepseek_v41_ced_prefill_enabled === true,
-                    deepseek_v41_ced_prefill_supported:
-                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
                     expert_streaming_supported:
                         model?.expert_streaming_supported === true,
                     expert_bank_available: model?.expert_bank_available === true,
@@ -2932,8 +2938,6 @@
                                     this.modelSettings.qwen4_ple_ssd_offload_forced
                                         ? !!this.modelSettings.qwen4_ple_ssd_offload_requested
                                         : !!this.modelSettings.qwen4_ple_ssd_offload,
-                                deepseek_v41_ced_prefill_enabled:
-                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
                                 // Tri-state: null = never chosen — the key is
                                 // omitted below so the stored value / env
                                 // fallback is preserved (not collapsed to

@@ -292,16 +292,14 @@ class TestSpeculativeExclusivity:
             model_type="qwen4_exp",
         )
 
-    def test_mtp_rejected_on_deepseek_v41(self):
+    def test_mtp_allowed_on_deepseek_v41(self):
         from omlx.model_settings import validate_moe_expert_offload
 
-        # The V4.1 adapter's frozen-residency verify scope lands with its
-        # own payload; until then v41 keeps the stock MTP+offload veto.
-        with pytest.raises(ValueError, match="Lightning MTP"):
-            validate_moe_expert_offload(
-                {"moe_expert_offload_enabled": True, "mtp_enabled": True},
-                model_type="deepseek_v41",
-            )
+        # Native DSpark verify runs under frozen residency (verify_scope).
+        validate_moe_expert_offload(
+            {"moe_expert_offload_enabled": True, "mtp_enabled": True},
+            model_type="deepseek_v41",
+        )
 
     def test_mtp_rejected_on_legacy_only_types(self):
         from omlx.model_settings import validate_moe_expert_offload

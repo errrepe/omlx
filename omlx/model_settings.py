@@ -95,6 +95,11 @@ def validate_moe_expert_offload(
                 "MTP; disable speculative decoding first."
             )
         if settings.get("mtp_enabled"):
+            if mtype.startswith("deepseek_v41"):
+                # DSpark verify runs under frozen residency: the V4.1
+                # adapter suspends LRU reordering inside verify blocks
+                # (see moe_offload.verify_scope), so native MTP is safe.
+                return
             try:
                 from .patches.expert_streaming.residency import (
                     SUPPORTED_TYPES as _STREAMING_TYPES,
@@ -529,10 +534,6 @@ class ModelSettings:
     # resolve against the model dir.
     expert_streaming_bank_path: Optional[str] = None
     deepseek_v41_engram_ssd_offload: bool = False
-    # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
-    # last window-size tokens; decoder global KV is the encoder-final
-    # projection already produced by the midpoint CSA2 layer.
-    deepseek_v41_ced_prefill_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

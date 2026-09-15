@@ -70,6 +70,17 @@ def _glm_weighted_sum() -> Any | None:
     return getattr(mod, "glm_moe_weighted_sum", None) if mod is not None else None
 
 
+def _v41_verify_scope() -> Any | None:
+    """DeepSeek V4.1 verify-scope context manager, resolved lazily.
+
+    ``deepseek_v41.moe_offload`` imports ``expert_streaming.slot_cache``
+    at module level, so a top-level import here would be a cycle — the
+    resolver runs at verify time, when everything is already loaded.
+    """
+    mod = _import("omlx.patches.deepseek_v41.moe_offload")
+    return getattr(mod, "verify_scope", None) if mod is not None else None
+
+
 # Checkpoint key prefix templates for stacked expert banks, covering the
 # LLM (``model.layers``) and every observed VLM wrapper spelling
 # (``model.language_model``, ``language_model.model``, ``language_model``).
@@ -138,6 +149,7 @@ class ModelHooks:
     moe_attr_chain: tuple[str, ...] = ("mlp", "ffn")
     prefix_templates: tuple[str, ...] | None = None
     mtp_owner_chain: tuple[str, ...] = ("language_model", "model")
+    verify_scope: Callable[[], Any | None] | None = None
 
 
 _QWEN_STREAM_EVAL = (
@@ -198,6 +210,7 @@ _HOOKS: dict[str, ModelHooks] = {
     "deepseek_v41": ModelHooks(
         moe_attr_chain=_FFN_FIRST_CHAIN,
         prefix_templates=_FFN_FIRST_TEMPLATES,
+        verify_scope=_v41_verify_scope,
     ),
 }
 
@@ -207,6 +220,17 @@ _DEFAULT = ModelHooks()
 def hooks_for(model_type: object) -> ModelHooks:
     """Hooks for *model_type* (empty hooks for unlisted families)."""
     return _HOOKS.get(normalize_model_type(model_type), _DEFAULT)
+
+
+def resolve_verify_scope(model_type: object) -> Any | None:
+    """The family's draft-verify context manager factory, or None."""
+    resolver = hooks_for(model_type).verify_scope
+    if resolver is None:
+        return None
+    try:
+        return resolver()
+    except Exception:
+        return None
 
 
 def all_stream_eval_targets() -> list[tuple[str, Any]]:

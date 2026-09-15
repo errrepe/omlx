@@ -161,6 +161,7 @@ class TestModelHooks:
         assert h.moe_attr_chain == ("mlp", "ffn")
         assert h.prefix_templates is None  # → DEFAULT_PREFIX_TEMPLATES
         assert h.mtp_owner_chain == ("language_model", "model")
+        assert h.verify_scope is None
         assert DEFAULT_PREFIX_TEMPLATES  # non-empty shared default
 
     def test_ffn_families_get_ffn_first_chain(self):
@@ -170,6 +171,16 @@ class TestModelHooks:
             h = hooks_for(mt)
             assert h.moe_attr_chain[0] == "ffn"
             assert h.prefix_templates[0].endswith("ffn.switch_mlp")
+
+    def test_v41_verify_scope_resolves(self):
+        from omlx.patches.expert_streaming.model_hooks import (
+            resolve_verify_scope,
+        )
+
+        scope = resolve_verify_scope("deepseek_v41")
+        assert callable(scope)  # context manager factory
+        assert resolve_verify_scope("llama") is None
+
 
 class TestFindMoeContainer:
     class _Box:
@@ -369,20 +380,20 @@ class TestSlotBookkeeping:
 
 class TestDecodeVisitStats:
     def test_shared_contract(self):
-        # _V41CacheStats (deepseek_v41 adapter, separate payload) shares
-        # the same contract; here we cover the legacy adapter's class.
+        from omlx.patches.deepseek_v41.streaming_backing import _V41CacheStats
         from omlx.patches.expert_streaming.slot_cache import DecodeVisitStats
         from omlx.patches.moe_expert_offload import _LegacyCacheStats
 
-        st = _LegacyCacheStats()
-        assert isinstance(st, DecodeVisitStats)
-        st.note_visit(3, missed=True)
-        st.note_visit(3, missed=False)
-        assert st.decode_layers == 2
-        assert st.decode_layers_missed == 1
-        assert st.decode_misses_by_layer == {3: 1}
-        st.reset_visits()
-        assert st.decode_layers == 0 and not st.decode_misses_by_layer
+        for cls in (_V41CacheStats, _LegacyCacheStats):
+            st = cls()
+            assert isinstance(st, DecodeVisitStats)
+            st.note_visit(3, missed=True)
+            st.note_visit(3, missed=False)
+            assert st.decode_layers == 2
+            assert st.decode_layers_missed == 1
+            assert st.decode_misses_by_layer == {3: 1}
+            st.reset_visits()
+            assert st.decode_layers == 0 and not st.decode_misses_by_layer
 
 
 class TestAdmissionDelegation:

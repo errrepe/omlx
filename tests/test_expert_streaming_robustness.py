@@ -1,14 +1,178 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fase 3 audit fixes: legacy cache fetch-first install + serialization
-marker, cold-reader cleanup, atomic transition-profile writes
-(2.2, 2.4, 2.7-2.9, N5-N7). The DSv4.1 rollback/floor/compact cases live
-with the deepseek_v41 adapter tests."""
+"""Fase 3 audit fixes: DSv4.1 rollback/atomicity/lock/floor/close, legacy
+cache fetch-first install + serialization marker, cold-reader cleanup,
+atomic transition-profile writes (2.1-2.4, 2.7-2.9, N5-N7)."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+from test_deepseek_v41 import write_checkpoint
+
+
+def _loaded_v41(tmp_path, *, n_routed=16, n_activated=4, fraction=0.25):
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        n_routed_experts=n_routed,
+        n_activated_experts=n_activated,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        model, _ = executor.submit(
+            load_v41, source, fraction
+        ).result()
+    return model
+
+
+def load_v41(source, fraction):
+    from omlx.patches.deepseek_v41.loading import load
+
+    return load(source, moe_expert_offload_resident_fraction=fraction)
+
+
+def _slots(model, layer=0):
+    return model.language_model.layers[layer].ffn.experts.slots
+
+
+class TestV41FetchRollback:
+    """2.2: a fetch failure must not orphan rows or drop the victim."""
+
+    def test_failed_fetch_restores_victim(self, tmp_path):
+        model = _loaded_v41(tmp_path)
+        try:
+            slots = _slots(model)
+            # Fill the cache, then miss: the miss evicts the LRU victim
+            # before fetching — the failing fetch must restore it.
+            slots.ensure(mx.array([[0, 1]]))
+            slots.ensure(mx.array([[2, 3]]))
+            victim = next(iter(slots.slot_of))
+            before = dict(slots.slot_of)
+
+            orig = slots.plan.fetch
+
+            def _boom(prefix, proj, expert):
+                if expert == 9:
+                    raise OSError("injected shard failure")
+                return orig(prefix, proj, expert)
+
+            slots.plan.fetch = _boom
+            with pytest.raises(OSError, match="injected"):
+                slots.ensure(mx.array([[9, 0]]))
+            # Every row accounted for; the evicted victim kept residency
+            # (its bytes were never overwritten).
+            assert len(slots.slot_of) + len(slots.free) == slots.rooms
+            assert victim in slots.slot_of
+            assert set(slots.slot_of) == set(before)
+        finally:
+            model.close()
+
+    def test_failed_fetch_keeps_free_rows_consistent(self, tmp_path):
+        model = _loaded_v41(tmp_path)
+        try:
+            slots = _slots(model)
+            slots.ensure(mx.array([[0, 1]]))  # fill 2 of cap rooms
+            free_before = sorted(slots.free)
+
+            def _boom(prefix, proj, expert):
+                raise OSError("injected shard failure")
+
+            slots.plan.fetch = _boom
+            with pytest.raises(OSError):
+                slots.ensure(mx.array([[7]]))
+            assert len(slots.slot_of) + len(slots.free) == slots.rooms
+            assert sorted(slots.free) == free_before  # fresh row returned
+            assert 7 not in slots.slot_of
+        finally:
+            model.close()
+
+
+class TestV41GovernorFloor:
+    """2.1: the dynamic floor is one decode working set, not min(8, cap)."""
+
+    def test_floor_tracks_n_activated(self, tmp_path):
+        from omlx.patches.deepseek_v41.streaming_backing import (
+            V41StreamingBacking,
+        )
+        from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+
+        model = _loaded_v41(tmp_path, n_routed=16, n_activated=10)
+        try:
+            layers = [
+                (i, l.ffn.experts.slots)
+                for i, l in enumerate(model.language_model.layers)
+                if isinstance(getattr(l.ffn, "experts", None), OffloadedExpert)
+            ]
+            backing = V41StreamingBacking(
+                model._moe_offload_plan, layers, dynamic=True
+            )
+            try:
+                assert backing.governor is not None
+                # Slot floor = one decode working set (old code: min(8, cap)
+                # — top-k 10 models shrank below the working set and
+                # _ensure_locked raised mid-generation).
+                assert backing.governor.min_cap == 10
+                assert backing.governor._min_cap_slots() >= 10
+            finally:
+                backing.close()
+        finally:
+            model.close()
+
+    def test_capacity_property_and_guard_info(self, tmp_path):
+        from omlx.patches.deepseek_v41.streaming_backing import (
+            V41StreamingBacking,
+        )
+        from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
+
+        model = _loaded_v41(tmp_path)
+        try:
+            layers = [
+                (i, l.ffn.experts.slots)
+                for i, l in enumerate(model.language_model.layers)
+                if isinstance(getattr(l.ffn, "experts", None), OffloadedExpert)
+            ]
+            backing = V41StreamingBacking(
+                model._moe_offload_plan, layers, dynamic=False
+            )
+            # N7: the duplicate property is gone; one definition remains.
+            assert backing.capacity == backing.base_cap
+            # N6: documented-None — V4.1 slots are persistent buffers, not
+            # the generic path's lazy mini-banks.
+            assert backing.streaming_guard_info is None
+            backing.close()
+            assert model._moe_offload_plan._closed
+            backing.close()  # idempotent
+        finally:
+            model.close()
+
+
+class TestV41CompactAtomic:
+    """2.3: compact/_grow evaluate all projections before rebinding."""
+
+    def test_compact_failure_leaves_consistent_state(self, tmp_path, monkeypatch):
+        model = _loaded_v41(tmp_path)
+        try:
+            slots = _slots(model)
+            slots.ensure(mx.array([[0, 1]]))
+            slots.ensure(mx.array([[2, 3]]))
+            before = dict(slots.slot_of)
+
+            orig_stack = mx.stack
+
+            def _boom(*a, **k):
+                raise RuntimeError("injected compact failure")
+
+            monkeypatch.setattr(mx, "stack", _boom)
+            with pytest.raises(RuntimeError, match="injected compact"):
+                slots.compact(1)
+            monkeypatch.undo()
+            # Nothing rebound: slot map untouched, module still serves.
+            assert slots.slot_of == before
+            rows = slots.ensure(mx.array([[0, 1]]))
+            mx.eval(rows)
+        finally:
+            model.close()
 
 
 class TestLegacyCacheAtomicity:

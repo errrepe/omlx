@@ -1,25 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded expert residency for V4.1, preserving its projection arithmetic.
+"""Bounded expert residency for V4.1, preserving its projection arithmetic."""
 
-Non-resident experts are read from the checkpoint's own safetensors shards
-with positional ``os.preadv`` calls on a small reader pool of their own. An
-expert slab is megabytes of contiguous bytes, the opposite access pattern
-from the sparse Engram row gathers that ``storage.TensorFile`` serves through
-an ``MADV_RANDOM`` mapping: a faulting gather reads one page per fault, while
-a positional read lets the kernel issue large requests. Routing is computed
-exactly as shipped; a miss changes when an expert's weights are read, never
-which expert runs.
-"""
-
-import contextlib
+import contextvars
 import json
 import math
 import os
-from collections import namedtuple
+import struct
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from threading import Lock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -27,49 +18,192 @@ import numpy as np
 
 from .convert import repack_weight
 from .quantization import QuantizedProjection
-from .residency import (
-    checkpoint_signature,
-    deepseek_v41_residency_estimate,
-    header_with_offset,
+from .storage import TensorFile, decode_array
+from ..expert_streaming.slot_cache import (
+    SlotArena,
+    working_set_step,
 )
-from .storage import SAFETENSORS_NUMPY_DTYPES, decode_array
+
+
+def _fetch_threads() -> int:
+    """Parallel miss-fetch width (0 = serial legacy path).
+
+    Opt-in via OMLX_V41_FETCH_THREADS: workers run plan.fetch (file IO +
+    CPU decode, no mx assignment/eval) while the main thread assigns the
+    joined results in deterministic order. TensorFile serializes per-file
+    reads on its own lock; threads parallelize across the 82 shard files
+    and overlap decode with waiting IO. LRU/frozen order and numerics are
+    identical to the serial path by construction (ordered join).
+    """
+    try:
+        return max(0, int(os.environ.get("OMLX_V41_FETCH_THREADS", "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stage_enabled() -> bool:
+    """Prev-token speculative staging (P8 parity with the generic path).
+
+    After a decode ensure, the next MoE layer's likely expert set (its
+    routing on the previous token) is fetched on a dedicated worker while
+    this layer's MoE compute runs. Payloads join through the same commit
+    path as demand fetches, so ordering and numerics are identical.
+    OMLX_V41_STAGE=0 disables.
+    """
+    return os.environ.get("OMLX_V41_STAGE", "1") != "0"
+
+
+def _stage_max(plan) -> int:
+    try:
+        cap = int(os.environ.get("OMLX_V41_STAGE_MAX", "0"))
+    except (TypeError, ValueError):
+        cap = 0
+    if cap <= 0:
+        cap = max(16, 2 * int(getattr(plan, "n_activated", 8) or 8))
+    return cap
+
+
+def _stage_one(plan, prefix, expert):
+    return {proj: plan.fetch(prefix, proj, expert) for proj in _PROJECTIONS}
+
+
+def _stage_span(plan, prefix, experts):
+    """Coalesced speculative read: one merged span, per-expert payloads.
+
+    ``experts`` is an ascending run (see ``_span_groups``); the shared
+    ``fetch_span`` covers [first, last] once per projection and each
+    expert decodes only its own row — gap overfetch costs I/O, not
+    decode CPU (same contract as the demand path).
+    """
+    lo, hi = experts[0], experts[-1] + 1
+    raw = {proj: plan.fetch_span(prefix, proj, lo, hi) for proj in _PROJECTIONS}
+    return {
+        expert: {
+            proj: {
+                field: decode_array(block[expert - lo], dtype)
+                for field, (block, dtype) in raw[proj].items()
+            }
+            for proj in _PROJECTIONS
+        }
+        for expert in experts
+    }
+
+
+class _StagedSpan:
+    """Per-expert handle on one coalesced staged span read.
+
+    The staging worker submits ONE task per merged run; every expert in
+    the run maps to a handle whose ``result()`` slices out its own
+    payload, so the demand join keeps its per-expert contract.
+    """
+
+    __slots__ = ("_fut", "_expert")
+
+    def __init__(self, fut, expert):
+        self._fut, self._expert = fut, int(expert)
+
+    def result(self, timeout=None):
+        got = self._fut.result(timeout)
+        return None if got is None else got.get(self._expert)
+
+    def cancel(self):
+        return self._fut.cancel()
+
+    def done(self):
+        return self._fut.done()
+
+
+class _WorkingSetOverCap(ValueError):
+    """The chunk's routed set exceeds the LIVE cap after a shrink.
+
+    ``_ensure_locked`` raises this ahead of the arena's own overflow
+    check so ``OffloadedExpert.__call__`` can tell a mid-call governor
+    shrink (retry with a finer split) from a genuinely unservable
+    working set. Subclasses ValueError and keeps the arena's message so
+    direct ``ensure`` callers keep the historical capacity contract.
+    """
+
+
+def _span_reads() -> bool:
+    """Explicit bounded demand reads (V3 default), not the mmap gather.
+
+    Logical ids are physical rows — every expert is read through the
+    shared ExpertBackingStore (stateless preadv into caller buffers)
+    instead of the legacy mmap page-fault gather. Measured on the
+    original V4.1 layout: decode 0.0955 -> 0.574 tok/s and TTFT 234s ->
+    32.9s vs the gather, bit-exact tokens; the co-activation order added
+    nothing beyond this mechanism change, so repacking was removed.
+    OMLX_V41_SPAN_READS=0 keeps the legacy per-expert gather as an
+    escape hatch.
+    """
+    return os.environ.get("OMLX_V41_SPAN_READS", "1") != "0"
+
+
+def _span_gap() -> int:
+    """Max physical-row gap merged into one span read (overfetch rows).
+
+    Default 1 — merges strictly adjacent rows only (diff <= 1 means
+    contiguous bytes: zero dead bytes, one fewer command, same file
+    lock). gap >= 2 bridges holes and reads unrouted experts (dead
+    bytes), a measured net loss on NVMe (GLM co-act A/B 2026-09-13:
+    -18% ops but +11% bytes -> slower decode). Env override stays for
+    per-machine tuning on slower-seek disks."""
+    try:
+        return max(0, int(os.environ.get("OMLX_V41_SPAN_GAP", "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _span_max_rows() -> int:
+    """Cap on merged span length in rows (bounds one read's overfetch)."""
+    try:
+        return max(1, int(os.environ.get("OMLX_V41_SPAN_MAX", "64")))
+    except (TypeError, ValueError):
+        return 64
+
+
+def _span_groups(rows, gap, cap_rows):
+    """Ascending expert rows -> merged span lists.
+
+    Neighbors merge while ``row - prev <= gap`` and the run stays within
+    ``cap_rows`` rows. ``gap`` bounds the DIFFERENCE between adjacent ids:
+    0 disables merging entirely (adjacent ids differ by 1 > 0); only
+    gap >= 1 joins strictly contiguous rows. This is NOT the generic
+    path's ``merge_gap`` (missing rows bridged) — V4.1 gap=1 corresponds
+    to generic merge_gap=0.
+    """
+    groups, cur = [], []
+    for row in rows:
+        if cur and (row - cur[-1] > gap or row - cur[0] + 1 > cap_rows):
+            groups.append(cur)
+            cur = []
+        cur.append(row)
+    if cur:
+        groups.append(cur)
+    return groups
+
+# Layer 3 seam (clean-split design): the DSpark verify driver enters
+# verify_scope() around the draft-block forward. While set, _ExpertSlots
+# serves verify traffic WITHOUT disturbing decode-hot LRU order — hits
+# skip the move-to-end reorder and misses land on the oldest slot. The
+# shared block kernels (layer 1) and plan builders (layer 2) are never
+# touched; only this adapter's recency accounting changes.
+_verify_frozen: contextvars.ContextVar = contextvars.ContextVar(
+    "v41_verify_frozen", default=False
+)
+
+
+@contextmanager
+def verify_scope():
+    """Freeze expert-slot recency for one DSpark verify block."""
+    token = _verify_frozen.set(True)
+    try:
+        yield
+    finally:
+        _verify_frozen.reset(token)
 
 _PROJECTIONS = ("w1", "w3", "w2")
 _FLOAT_BYTES = {"BF16": 2, "F16": 2, "F32": 4}
-# Host bytes one residency update may hold in flight before the serial slot
-# writes drain them (about 32 oQ3e experts).
-INFLIGHT_BYTES = 512 * 1024 * 1024
-# Expert reads get their own pool: the Engram page pool runs long sequential
-# page touches that would otherwise queue ahead of a layer's misses.
-EXPERT_IO_WORKERS = 24
-_EXPERT_IO_POOL = ThreadPoolExecutor(
-    max_workers=EXPERT_IO_WORKERS, thread_name_prefix="v41-expert-io"
-)
-
-# One positional read: a whole tensor, or one leading-axis row of it.
-Slab = namedtuple("Slab", "key expert fd offset nbytes dtype shape")
-
-
-def _fields(spec):
-    """Tensor fields of a projection: packed weights plus quantization metadata."""
-    if not spec:
-        return ["weight"]
-    return ["weight", "scales"] + (["biases"] if spec["mode"] == "affine" else [])
-
-
-def _to_numpy(slab, raw):
-    return np.frombuffer(raw, dtype=SAFETENSORS_NUMPY_DTYPES[slab.dtype]).reshape(
-        slab.shape
-    )
-
-
-def _to_array(slab, raw):
-    array = _to_numpy(slab, raw)
-    if slab.dtype == "BF16":
-        return mx.array(array).view(mx.bfloat16)
-    if slab.dtype.startswith("F8_"):
-        return decode_array(array, slab.dtype)
-    return mx.array(array)
 
 
 class ExpertOffloadPlan:
@@ -82,19 +216,38 @@ class ExpertOffloadPlan:
         self.mapping = mapping
         self.converted = raw.get("omlx_deepseek_v41")
         self.count = config.n_routed_experts
-        self.floor = config.n_activated_experts
-        self.capacity = min(self.count, max(self.floor, round(self.count * fraction)))
+        self.n_activated = int(config.n_activated_experts)
+        self.capacity = min(
+            self.count, max(config.n_activated_experts, round(self.count * fraction))
+        )
         self.layers = {}
-        self.layer_bytes = {}
         self.excluded_keys = set()
+        self.resident_bytes = 0
         self.full_bytes = 0
         self._headers = {}
-        self._data_start = {}
-        self._fds = {}
-        self._lock = Lock()
+        self._readers = {}
+        self._readers_lock = threading.Lock()
+        self._store = None
         self._closed = False
+        self._stage_pool = None
         self.draft_bytes = 0
-        if self.converted is not None:
+        # A dir carrying expert_order.json is a repacked co-activation
+        # checkpoint — ordering support was removed; serving it as
+        # identity would silently return permuted experts. Refuse loudly.
+        if (self.path / "expert_order.json").is_file():
+            raise ValueError(
+                "repacked co-activation checkpoint (expert_order.json): "
+                "ordering support was removed — use the original checkpoint"
+            )
+        # Draft weights count as savings only when they are actually
+        # excluded. A preserved DSpark head loads its language_model.mtp.*
+        # tensors like any other — excluding them here made
+        # preserve_mtp + offload + converted checkpoints fail the
+        # completeness check, and counting them in draft_bytes
+        # overstated estimate_expert_savings by the resident head size.
+        if self.converted is not None and not getattr(
+            config, "preserve_mtp", False
+        ):
             for key in mapping:
                 if key.startswith("language_model.mtp."):
                     entry = self._entry(key)
@@ -104,7 +257,6 @@ class ExpertOffloadPlan:
         for layer in range(config.n_layers):
             prefix = f"language_model.layers.{layer}.ffn.experts"
             specs = {}
-            self.layer_bytes[prefix] = 0
             for proj in _PROJECTIONS:
                 shape = (
                     (config.dim, config.moe_inter_dim)
@@ -113,23 +265,16 @@ class ExpertOffloadPlan:
                 )
                 specs[proj] = self._projection(prefix, proj, shape)
             self.layers[prefix] = specs
-        self.expert_bytes = (
-            self.full_bytes // (self.count * len(self.layers)) if self.layers else 0
-        )
-
-    def _header(self, filename):
-        if filename not in self._headers:
-            full = self.path / filename
-            stat = full.stat()
-            header, start = header_with_offset(
-                str(full), stat.st_size, stat.st_mtime_ns
-            )
-            self._headers[filename] = header
-            self._data_start[filename] = start
-        return self._headers[filename]
 
     def _entry(self, key):
-        entry = self._header(self.mapping[key])[key]
+        filename = self.mapping[key]
+        if filename not in self._headers:
+            path = self.path / filename
+            with path.open("rb") as file:
+                length = struct.unpack("<Q", file.read(8))[0]
+                header = json.loads(file.read(length))
+            self._headers[filename] = header
+        entry = self._headers[filename][key]
         self.excluded_keys.add(key)
         return entry
 
@@ -137,7 +282,10 @@ class ExpertOffloadPlan:
         if self.converted is not None:
             name = f"{prefix}.{proj}"
             spec = self.converted.get("quantized_modules", {}).get(name)
-            entries = {f: self._entry(f"{name}.{f}") for f in _fields(spec)}
+            fields = ["weight"]
+            if spec:
+                fields += ["scales"] + (["biases"] if spec["mode"] == "affine" else [])
+            entries = {f: self._entry(f"{name}.{f}") for f in fields}
             for field, entry in entries.items():
                 shape = (self.count, *logical)
                 dtype = entry["dtype"]
@@ -205,122 +353,210 @@ class ExpertOffloadPlan:
                     raise ValueError(f"Mixed expert formats within {prefix}.{proj}")
                 signature, spec = item, current
         self.full_bytes += size
-        self.layer_bytes[prefix] += size
+        self.resident_bytes += size * self.capacity // self.count
         return spec
 
-    def resident_bytes_at(self, capacity):
-        """Expert bytes resident with ``capacity`` slots per layer."""
-        return sum(size * capacity // self.count for size in self.layer_bytes.values())
+    def _backing(self):
+        """Shared ExpertBackingStore for converted stacked expert rows.
 
-    @property
-    def resident_bytes(self):
-        return self.resident_bytes_at(self.capacity)
+        Lazy: only the converted path resolves stacked keys through it;
+        whole-tensor resident fills and unconverted checkpoints keep the
+        TensorFile path below.
 
-    def _fd(self, filename):
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("MoE expert store is closed")
-            fd = self._fds.get(filename)
-            if fd is None:
-                fd = self._fds[filename] = os.open(self.path / filename, os.O_RDONLY)
-            return fd
+        ``_closed`` is re-checked inside ``_readers_lock`` for the same
+        reason ``_read``/``_stage_executor`` do: close() swaps
+        ``_store`` out under that lock, so a caller that passed the
+        unlocked check just before close must not create a store no
+        close() will ever reap.
+        """
+        store = self._store
+        if store is None:
+            with self._readers_lock:
+                if self._closed:
+                    raise RuntimeError("MoE expert store is closed")
+                store = self._store
+                if store is None:
+                    from ..expert_streaming.shard_bank import (
+                        ExpertBackingStore,
+                    )
 
-    def slab(self, key, expert=None):
-        """Read plan for one tensor, or for one leading-axis row of it."""
-        filename = self.mapping[key]
-        entry = self._header(filename)[key]
-        dtype = entry["dtype"]
-        if dtype not in SAFETENSORS_NUMPY_DTYPES:
-            raise ValueError(f"Unsupported source tensor dtype: {dtype}")
-        shape = tuple(entry["shape"])
-        start, end = entry["data_offsets"]
-        nbytes = end - start
-        itemsize = np.dtype(SAFETENSORS_NUMPY_DTYPES[dtype]).itemsize
-        if nbytes != math.prod(shape) * itemsize:
-            raise ValueError(f"Invalid tensor byte length: {key}")
+                    store = self._store = ExpertBackingStore(self.path)
+        return store
+
+    def _read(self, key, expert=None):
+        if self._closed:
+            raise RuntimeError("MoE expert store is closed")
         if expert is not None:
-            if not shape or not 0 <= expert < shape[0]:
-                raise IndexError(f"Expert {expert} outside {key}")
-            nbytes //= shape[0]
-            start += expert * nbytes
-            shape = shape[1:]
-        return Slab(
-            key,
-            expert,
-            self._fd(filename),
-            self._data_start[filename] + start,
-            nbytes,
-            dtype,
-            shape,
+            # Stacked expert rows ride the shared backing store — preadv
+            # into caller buffers, run coalescing, read telemetry.
+            store = self._backing()
+            reader = store._reader_for_key(key, int(expert))
+            return (
+                store.load_expert_slice(key, int(expert)),
+                reader.header[key]["dtype"],
+            )
+        filename = self.mapping[key]
+        reader = self._readers.get(filename)
+        if reader is None:
+            # Get-or-create under a lock: parallel miss-fetch workers may
+            # race here; TensorFile.read itself is already thread-safe.
+            # Re-check _closed inside the lock so close() cannot clear the
+            # registry and then leak a reader created just after it.
+            with self._readers_lock:
+                if self._closed:
+                    raise RuntimeError("MoE expert store is closed")
+                reader = self._readers.get(filename)
+                if reader is None:
+                    reader = self._readers[filename] = TensorFile(
+                        self.path / filename
+                    )
+        return reader.read(key, rows=expert)
+
+    def _read_span(self, key, lo, hi):
+        if self._closed:
+            raise RuntimeError("MoE expert store is closed")
+        store = self._backing()
+        reader = store._reader_for_key(key, lo)
+        rp = reader._rp_for(key)
+        block = np.empty((hi - lo, rp.expert_bytes), dtype=np.uint8)
+        if not store.read_expert_into(
+            [(key, list(range(lo, hi)))], [block]
+        ):
+            raise ValueError(f"Span read failed: {key}[{lo}:{hi}]")
+        return (
+            block.view(rp.np_dtype).reshape(hi - lo, *rp.per_shape),
+            reader.header[key]["dtype"],
         )
 
-    @staticmethod
-    def read(slab):
-        """The slab's bytes. Positional reads only, so any thread may call it."""
-        buffer = bytearray(slab.nbytes)
-        view = memoryview(buffer)
-        done = 0
-        while done < slab.nbytes:
-            count = os.preadv(slab.fd, [view[done:]], slab.offset + done)
-            if count <= 0:
-                raise ValueError(f"Truncated tensor data: {slab.key}")
-            done += count
-        return buffer
-
-    def slabs(self, prefix, proj, expert):
-        """Read plans for one expert's projection, in decode order."""
-        if self.converted is not None:
-            return [
-                self.slab(f"{prefix}.{proj}.{field}", expert)
-                for field in _fields(self.layers[prefix][proj])
-            ]
-        name = f"{prefix.removeprefix('language_model.')}.{expert}.{proj}"
-        slabs = [self.slab(name + ".weight")]
-        if name + ".scale" in self.mapping:
-            slabs.append(self.slab(name + ".scale"))
-        return slabs
-
-    def decode(self, slabs, raws):
-        """Projection arrays from the slabs' bytes, keyed by field."""
-        if self.converted is not None:
-            return {
-                slab.key.rsplit(".", 1)[1]: _to_array(slab, raw)
-                for slab, raw in zip(slabs, raws)
-            }
-        scale = _to_numpy(slabs[1], raws[1]) if len(slabs) > 1 else None
-        return repack_weight(
-            _to_numpy(slabs[0], raws[0]),
-            slabs[0].dtype,
-            scale,
-            slabs[1].dtype if scale is not None else None,
-        )[0]
-
     def fetch(self, prefix, proj, expert):
-        slabs = self.slabs(prefix, proj, expert)
-        return self.decode(slabs, [self.read(slab) for slab in slabs])
+        if self.converted is not None:
+            spec = self.layers[prefix][proj]
+            fields = ["weight"]
+            if spec:
+                fields += ["scales"] + (["biases"] if spec["mode"] == "affine" else [])
+            row = int(expert)
+            return {
+                field: decode_array(*self._read(f"{prefix}.{proj}.{field}", row))
+                for field in fields
+            }
+        name = f"{prefix.removeprefix('language_model.')}.{expert}.{proj}"
+        raw, dtype = self._read(name + ".weight")
+        scale, scale_dtype = (
+            self._read(name + ".scale")
+            if name + ".scale" in self.mapping
+            else (None, None)
+        )
+        return repack_weight(raw, dtype, scale, scale_dtype)[0]
+
+    def fetch_span(self, prefix, proj, lo, hi):
+        """Read physical rows ``[lo, hi)`` of one projection contiguously.
+
+        Returns raw ``{field: (np_block, dtype)}`` — the caller decodes
+        only the requested rows, so gap-merged overfetch costs I/O but
+        no decode CPU. Converted checkpoints only (stacked dim-0 rows).
+        """
+        spec = self.layers[prefix][proj]
+        fields = ["weight"]
+        if spec:
+            fields += ["scales"] + (["biases"] if spec["mode"] == "affine" else [])
+        return {
+            field: self._read_span(f"{prefix}.{proj}.{field}", lo, hi)
+            for field in fields
+        }
+
+    def _fetch_executor(self):
+        """Miss-fetch pool: the generic per-depth executor registry.
+
+        io_pool_for keeps one shared executor per worker depth
+        process-wide (the B1 discipline: device depth is global, not
+        per-model) so V4.1 rides the same pools as every other streamed
+        family and engine reloads don't respawn threads. Only reached
+        when OMLX_V41_FETCH_THREADS > 0 — callers guard on it.
+        """
+        from ..expert_streaming.streaming_switch import io_pool_for
+
+        return io_pool_for(_fetch_threads())
+
+    def _stage_executor(self):
+        """Dedicated single-worker staging pool (P8).
+
+        Speculative next-layer fetches queue behind each other here
+        instead of competing with demand workers on the fetch pool —
+        and stay available when ``OMLX_V41_FETCH_THREADS`` is 0.
+
+        ``_closed`` and ``_stage_pool`` move together under
+        ``_readers_lock`` (close() takes the same lock), so a
+        stage_predicted racing engine stop gets None and no-ops instead
+        of resurrecting a pool only a second close() would reap.
+        """
+        with self._readers_lock:
+            if self._closed:
+                return None
+            if self._stage_pool is None:
+                self._stage_pool = ThreadPoolExecutor(max_workers=1)
+            return self._stage_pool
 
     def close(self):
-        """Release the shard descriptors.
-
-        Reads in flight must have drained: the engine closes a model after its
-        executor is idle, and ``ensure_ids`` waits for every read it started
-        before it returns or raises.
-        """
-        with self._lock:
+        with self._readers_lock:
             self._closed = True
-            fds, self._fds = self._fds, {}
-        for fd in fds.values():
-            with contextlib.suppress(OSError):
-                os.close(fd)
+            # Only the stage pool is plan-owned; the fetch pool is the
+            # shared io_pool_for registry — shutting it would break other
+            # users. _read()/_backing()/_stage_executor() re-check
+            # _closed inside this lock, so none can leak a reader, store
+            # or pool past it.
+            pool = self._stage_pool
+            self._stage_pool = None
+            readers = list(self._readers.values())
+            self._readers.clear()
+            # ``_store`` moves with ``_closed`` under the same lock —
+            # _backing() re-checks _closed inside it, so a store cannot
+            # be created after this swap and leak past close().
+            store = self._store
+            self._store = None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        # _read() can still be opening readers on fetch workers; the
+        # registry swap above ran under the lock so close can't race a
+        # late insert.
+        for reader in readers:
+            reader.close()
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
 
 
 class _ExpertSlots:
     def __init__(self, expert, plan, prefix):
         self.expert, self.plan, self.prefix = expert, plan, prefix
-        self.slot_of = {}
-        self.free = list(range(plan.capacity))
-        self.hits = self.misses = 0
-        self.fetched_bytes = 0
+        # Working ceiling (governor-driven) vs physical rooms (array rows).
+        # Without a backing both stay pinned at the plan capacity: behavior
+        # is exactly the legacy static-fraction adapter.
+        # Residency lives in the shared SlotArena (V4-2a): slot map,
+        # lock, grow/compact and the acquire/commit/rollback protocol are
+        # the same primitive the unified streaming linears use.
+        self.specs = {}
+        self.arena = SlotArena(
+            plan.capacity,
+            _PROJECTIONS,
+            self._arrays,
+            lambda proj, values: self._bind(proj, values, self.specs[proj]),
+            lambda: mx.eval(expert.parameters()),
+        )
+        self.book = self.arena.book
+        self._slots_lock = self.arena.lock
+        self.backing = None
+        self.layer = None
+        # V2-2 span-read telemetry: merged contiguous fetches per ensure.
+        self.span_reads = 0
+        self.span_demand_rows = 0
+        self.span_phys_rows = 0
+        self.span_fallbacks = 0  # merged reads that degraded to per-expert
+        self.staged_failures = 0  # staged futures that yielded no payload
         for proj in _PROJECTIONS:
             sample = plan.fetch(prefix, proj, 0)
             values = {
@@ -328,95 +564,311 @@ class _ExpertSlots:
                 for field, array in sample.items()
             }
             spec = plan.layers[prefix][proj]
-            if spec:
-                setattr(expert, proj, QuantizedProjection(**values, **spec))
-            else:
-                getattr(expert, proj).weight = values["weight"]
+            self.specs[proj] = spec
+            self._bind(proj, values, spec)
         mx.eval(expert.parameters())
         expert.eval()
 
-    def ensure(self, indices):
-        slots = self.ensure_ids(indices.reshape(-1).tolist())
-        return mx.array(slots, dtype=mx.int32).reshape(indices.shape)
+    # SlotBookkeeping aliases — the bookkeeping fields moved to ``book``;
+    # these keep a READ-ONLY attribute surface for callers and tests.
+    # Residency mutations go through ``book``/``arena`` explicitly (or
+    # ``clear_residency`` below) so they stay visible at the call site.
+    @property
+    def slot_of(self):
+        return self.book.slot_of
 
-    def ensure_ids(self, ids):
-        """Make every expert in ``ids`` resident; return their slots in order.
+    @property
+    def free(self):
+        return self.book.free
 
-        Two passes. The first starts the misses' reads on the reader pool,
-        at most ``INFLIGHT_BYTES`` of payload ahead of the installs; the
-        second installs them serially in the order the misses were seen, so
-        eviction victims, counters and resident bytes match a serial fetch
-        exactly. A failed read or decode leaves completed installs intact, and
-        every read this call started is drained before it raises.
+    @property
+    def rooms(self):
+        return self.book.rooms
+
+    @property
+    def cap(self):
+        return self.book.cap
+
+    @property
+    def hits(self):
+        return self.book.hits
+
+    @property
+    def misses(self):
+        return self.book.misses
+
+    @property
+    def evictions(self):
+        return self.book.evictions
+
+    # Staging aliases — the side dict and counters live on the arena.
+    @property
+    def _staged(self):
+        return self.arena.staged
+
+    @property
+    def staged_hits(self):
+        return self.arena.staged_hits
+
+    @property
+    def staged_drops(self):
+        return self.arena.staged_drops
+
+    def clear_residency(self):
+        """Drop all residency and cancel pending staged fetches."""
+        with self._slots_lock:
+            self.book.reset()
+            staged = list(self._staged.values())
+            self._staged.clear()
+        for fut in staged:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+
+    def _bind(self, proj, values, spec):
+        if spec:
+            setattr(self.expert, proj, QuantizedProjection(**values, **spec))
+        else:
+            getattr(self.expert, proj).weight = values["weight"]
+
+    def _arrays(self, proj):
+        lin = getattr(self.expert, proj)
+        if isinstance(lin, dict):
+            return lin
+        names = ["weight"]
+        if getattr(lin, "scales", None) is not None:
+            names.append("scales")
+        if getattr(lin, "biases", None) is not None:
+            names.append("biases")
+        return {name: getattr(lin, name) for name in names}
+
+    def compact(self, keep):
+        """Keep the most-recent ``keep`` entries, remap rows 0..k-1."""
+        return self.arena.compact(keep)
+
+    def ensure(self, indices, phase=None):
+        verify = bool(_verify_frozen.get())
+        if verify:
+            phase = "verify"
+        elif phase is None:
+            # Direct-call fallback only; OffloadedExpert.__call__ decides
+            # once from the pre-chunk route count (a 1-row prefill tail
+            # chunk is not decode). A flat 1-D list is one token's route
+            # set — the same single-row case a (1, top_k) array encodes.
+            phase = (
+                "decode"
+                if indices.ndim <= 1 or indices.shape[0] == 1
+                else "prefill"
+            )
+        # Per-layer lock: fetch IO runs inside, but only serializes THIS
+        # layer — the governor's resize and other layers proceed. Stats
+        # are reported to the backing after the lock is released so the
+        # lock order stays slots->(nothing) and resize's
+        # backing._lock->slots._slots_lock cannot deadlock against it.
+        with self._slots_lock:
+            rows, missed = self._ensure_locked(
+                indices, frozen=verify or phase == "prefill"
+            )
+        if phase == "decode" and self.backing is not None:
+            self.backing.note_visit(self.layer, missed)
+            # P8: record this token's routing as the predictor for the
+            # same layer next token, then stage the NEXT MoE layer's
+            # predicted set while this layer's compute runs. Frozen
+            # (verify) ensures skip both — verify traffic would pollute
+            # the decode predictor and draft cycles race the schedule.
+            self.backing.note_routing(
+                self.layer, {int(e) for e in indices.reshape(-1).tolist()}
+            )
+            self.backing.stage_next(self.layer)
+        return rows
+
+    def stage_predicted(self, experts):
+        """Submit speculative fetches for predicted demand (P8).
+
+        Runs under this layer's slots lock so residency checks and the
+        staged dict stay coherent with a concurrent ensure; payloads are
+        pure data — slot assignment, eviction and commit order still
+        happen only inside ``_ensure_locked``. Converted checkpoints
+        coalesce the predicted set into merged span reads under the same
+        ``_span_groups`` bounds as demand — one ``fetch_span`` per run on
+        the single staging worker instead of three per-expert fetches.
         """
-        needed = list(dict.fromkeys(ids))
-        if len(needed) > self.plan.capacity:
-            raise ValueError("Expert working set exceeds resident capacity")
-        # Protect the entire working set, including hits encountered after misses.
-        misses = []
-        for expert in needed:
-            if expert in self.slot_of:
-                self.hits += 1
-                self.slot_of[expert] = self.slot_of.pop(expert)
+        if not _stage_enabled():
+            return
+        with self._slots_lock:
+            room = _stage_max(self.plan) - len(self._staged)
+            todo = sorted(
+                {
+                    int(e)
+                    for e in experts
+                    if int(e) not in self.book and int(e) not in self._staged
+                }
+            )[: max(0, room)]
+            if not todo:
+                return
+            pool = self.plan._stage_executor()
+            if pool is None:
+                # Plan closed between the residency check and here —
+                # staging is a hint, never on the demand path; drop it.
+                return
+            if self.plan.converted is not None:
+                for group in _span_groups(todo, _span_gap(), _span_max_rows()):
+                    try:
+                        fut = pool.submit(
+                            _stage_span, self.plan, self.prefix, group
+                        )
+                    except Exception:
+                        break
+                    for expert in group:
+                        self._staged[expert] = _StagedSpan(fut, expert)
             else:
-                misses.append(expert)
-        protected = set(needed)
-        pending = {}
-        window = max(1, INFLIGHT_BYTES // max(1, self.plan.expert_bytes))
-        submitted = 0
+                for expert in todo:
+                    try:
+                        self._staged[expert] = pool.submit(
+                            _stage_one, self.plan, self.prefix, expert
+                        )
+                    except Exception:
+                        break
 
-        def submit(limit):
-            nonlocal submitted
-            while submitted < min(limit, len(misses)):
-                expert = misses[submitted]
-                submitted += 1
-                pending[expert] = []
-                for proj in _PROJECTIONS:
-                    slabs = self.plan.slabs(self.prefix, proj, expert)
-                    futures = []
-                    pending[expert].append((proj, slabs, futures))
-                    for slab in slabs:
-                        futures.append(_EXPERT_IO_POOL.submit(self.plan.read, slab))
+    def _ensure_locked(self, indices, frozen):
+        needed = set(indices.reshape(-1).tolist())
+        if len(needed) > self.book.cap:
+            # A governor shrink can land between the caller's chunk-size
+            # read and this ensure: surface the overflow as a marker so
+            # __call__ re-splits the tail and retries instead of dying
+            # on the arena's hard check mid-prefill. Runs under
+            # _slots_lock, so book.cap is the live post-shrink value.
+            raise _WorkingSetOverCap(
+                "Expert working set exceeds resident capacity"
+            )
+        # ``frozen`` commits land at the eviction-candidate end and hits
+        # skip LRU promotion. Verify blocks use it so draft-only experts
+        # leave first; prefill chunks use it as scan resistance — a long
+        # prompt then churns its own cold-end rows instead of sweeping
+        # the decode-hot set (the generic path's _prefill_cap pair plays
+        # the same role on its shared pool).
+        missed = self.arena.ensure_set(needed, frozen, self._produce)
+        return (
+            self.arena.rows_for(indices.reshape(-1).tolist()).reshape(
+                indices.shape
+            ),
+            missed,
+        )
 
-        try:
-            submit(window)
-            for done, expert in enumerate(misses):
-                # Refill before this expert's writes so at most ``window``
-                # experts' bytes exist at once, counting the one written here.
-                submit(done + window)
-                arrays, nbytes = {}, 0
-                for proj, slabs, futures in pending[expert]:
-                    raws = [future.result() for future in futures]
-                    arrays[proj] = self.plan.decode(slabs, raws)
-                    nbytes += sum(slab.nbytes for slab in slabs)
-                    del raws, futures
-                slot = (
-                    self.free.pop()
-                    if self.free
-                    else self.slot_of.pop(
-                        next(e for e in self.slot_of if e not in protected)
-                    )
-                )
+    def _produce(self, fetch_list):
+        """Pass 2: fetch (IO + CPU decode, no mx assignment/eval). Serial by
+        default; worker threads when OMLX_V41_FETCH_THREADS>0. Workers
+        only touch plan.fetch; the ordered join keeps commit order (and
+        hence LRU/frozen order and numerics) identical to serial.
+        """
+
+        def _one(item):
+            expert, _slot, _victim = item
+            fut = self._staged.pop(expert, None)
+            if fut is not None:
+                payload = None
                 try:
-                    for proj, fields in arrays.items():
-                        lin = getattr(self.expert, proj)
-                        for field, array in fields.items():
-                            lin[field][slot] = array
-                except BaseException:
-                    self.free.append(slot)  # Unmapped, so any partial write is inert.
-                    raise
-                self.slot_of[expert] = slot
-                self.misses += 1
-                self.fetched_bytes += nbytes
-                # Completed futures own their payloads; release them before refill.
-                del pending[expert]
-        finally:
-            for projections in pending.values():
-                for _, _, futures in projections:
-                    for future in futures:
-                        if not future.cancel():
-                            future.exception()
-        return [self.slot_of[e] for e in ids]
+                    payload = fut.result()
+                except Exception:
+                    pass
+                if payload:
+                    self.arena.staged_hits += 1
+                    return payload
+                self.staged_failures += 1
+            return {
+                proj: self.plan.fetch(self.prefix, proj, expert)
+                for proj in _PROJECTIONS
+            }
+
+        threads = _fetch_threads()
+        if (
+            _span_reads()
+            and fetch_list
+            and self.plan.converted is not None
+        ):
+            return self._fetch_spans(fetch_list)
+        if threads > 0 and len(fetch_list) > 1:
+            pool = self.plan._fetch_executor()
+            return list(pool.map(_one, fetch_list))
+        return [_one(item) for item in fetch_list]
+
+    def _fetch_spans(self, fetch_list):
+        """Contiguous-row fetch for missed experts (V3 default path).
+
+        Logical ids are physical rows (no reordering — repack removed).
+        Sorts the misses and merges runs under ``OMLX_V41_SPAN_GAP``
+        (bounded by SPAN_MAX — a row-DIFFERENCE bound, so gap=0 never
+        merges and only gap>=1 joins strictly adjacent ids; the generic
+        ``merge_gap`` counts bridged holes instead, so V4.1 gap=1 ==
+        generic merge_gap=0), reads each span once per projection
+        through ``fetch_span`` (bounded readinto), and returns payloads
+        aligned with ``fetch_list`` — commit order and per-expert
+        numerics are identical to the per-expert path by construction.
+        A span that fails degrades its rows to the per-expert path
+        (``span_fallbacks``) instead of failing the whole ensure.
+        """
+        gap = _span_gap()
+        cap_rows = _span_max_rows()
+        # Staged futures keep their contract: consume them per expert and
+        # span-fetch only true demand misses.
+        demand = []
+        resolved = {}
+        for item in fetch_list:
+            expert = item[0]
+            fut = self._staged.pop(expert, None)
+            if fut is None:
+                demand.append(item)
+                continue
+            payload = None
+            try:
+                payload = fut.result()
+            except Exception:
+                pass
+            if payload:
+                self.arena.staged_hits += 1
+                resolved[expert] = payload
+            else:
+                self.staged_failures += 1
+                demand.append(item)
+        demand.sort(key=lambda item: int(item[0]))
+        spans = _span_groups([int(item[0]) for item in demand], gap, cap_rows)
+
+        def _one_span(span):
+            lo, hi = span[0], span[-1] + 1
+            payloads = {}
+            for proj in _PROJECTIONS:
+                raw = self.plan.fetch_span(self.prefix, proj, lo, hi)
+                for expert in span:
+                    payloads.setdefault(expert, {})[proj] = {
+                        field: decode_array(block[expert - lo], dtype)
+                        for field, (block, dtype) in raw.items()
+                    }
+            return payloads
+
+        failed = []
+        if _fetch_threads() > 0 and len(spans) > 1:
+            pool = self.plan._fetch_executor()
+            futures = [pool.submit(_one_span, span) for span in spans]
+            for span, fut in zip(spans, futures):
+                try:
+                    resolved.update(fut.result())
+                except Exception:
+                    failed.append(span)
+        else:
+            for span in spans:
+                try:
+                    resolved.update(_one_span(span))
+                except Exception:
+                    failed.append(span)
+        for span in failed:
+            self.span_fallbacks += 1
+            for expert in span:
+                resolved[expert] = _stage_one(self.plan, self.prefix, expert)
+        self.span_reads += len(spans)
+        self.span_demand_rows += len(demand)
+        self.span_phys_rows += sum(span[-1] - span[0] + 1 for span in spans)
+        return [resolved[expert] for expert, _s, _v in fetch_list]
 
 
 class OffloadedExpert(nn.Module):
@@ -438,69 +890,80 @@ class OffloadedExpert(nn.Module):
         if indices.size == 0:
             return mx.zeros((*indices.shape, 1, x.shape[-1]), dtype=x.dtype)
         if sorted_indices:
-            outputs = self._sorted(x, indices, weights, input_quantized)
+            flat_i = indices.reshape(-1, 1)
+            flat_x = x.reshape(-1, 1, x.shape[-1])
         else:
-            outputs = self._routed(x, indices, weights, input_quantized)
-        return mx.concatenate(outputs, axis=0).reshape(*indices.shape, 1, x.shape[-1])
-
-    def _routed(self, x, indices, weights, input_quantized):
-        """Per-token top-k routes: bound each chunk by its route count."""
-        flat_i = indices.reshape(-1, indices.shape[-1])
-        flat_x = x.reshape(-1, 1, 1, x.shape[-1])
+            flat_i = indices.reshape(-1, indices.shape[-1])
+            flat_x = x.reshape(-1, 1, 1, x.shape[-1])
         flat_w = None if weights is None else weights.reshape(flat_i.shape)
-        step = max(1, self.slots.plan.capacity // flat_i.shape[-1])
-        outputs = []
-        for start in range(0, flat_i.shape[0], step):
-            idx = flat_i[start : start + step]
-            slots = self.slots.ensure(idx)
-            out = self.slots.expert(
-                flat_x[start : start + step],
-                slots,
-                None if flat_w is None else flat_w[start : start + step],
-                sorted_indices=False,
-                input_quantized=input_quantized,
-            )
-            mx.eval(out)
-            outputs.append(out)
-        return outputs
-
-    def _sorted(self, x, indices, weights, input_quantized):
-        """Routes sorted by expert: chunk on expert boundaries.
-
-        A chunk holds every route of up to ``capacity`` distinct experts, so a
-        prefill reads each expert once per layer and runs one kernel per
-        chunk instead of one per ``capacity`` routes.
-        """
-        ids = indices.reshape(-1).tolist()
-        rows = x.reshape(-1, 1, x.shape[-1])
-        scores = None if weights is None else weights.reshape(-1)
-        capacity = self.slots.plan.capacity
+        # Phase is decided once per call from the pre-chunk route count:
+        # per-chunk inference scored a single-row prefill TAIL chunk as
+        # decode — a spurious governor visit plus a prev_uniq predictor
+        # overwritten by a one-expert set.
+        phase = "decode" if flat_i.shape[0] == 1 else "prefill"
         outputs = []
         start = 0
-        while start < len(ids):
-            end, distinct = start, 0
-            while end < len(ids) and distinct < capacity:
-                run = end + 1
-                while run < len(ids) and ids[run] == ids[end]:
-                    run += 1
-                end, distinct = run, distinct + 1
-            slots = mx.array(self.slots.ensure_ids(ids[start:end]), dtype=mx.int32)
-            order = mx.argsort(slots)
-            inverse = mx.argsort(order)
+        while start < flat_i.shape[0]:
+            # Bound each chunk by route count without an O(prompt^2)
+            # search. Governor-driven ceiling, not the plan's initial
+            # capacity — read under the slots lock so it cannot tear
+            # against a mid-call resize, and re-read per chunk so a
+            # governor shrink re-splits the remaining rows instead of
+            # leaving a chunk's routed set wider than the live cap
+            # (needed > book.cap aborts ensure mid-prefill).
+            with self.slots._slots_lock:
+                step = working_set_step(self.slots.cap, flat_i.shape[-1])
+            idx = flat_i[start : start + step]
+            try:
+                slots = self.slots.ensure(idx, phase=phase)
+            except _WorkingSetOverCap:
+                # A shrink landed between the step read and the ensure:
+                # re-read the live cap and re-split the tail rather than
+                # aborting the request. The finer step always makes
+                # progress (needed <= step*top_k <= old cap); when it
+                # cannot shrink further the working set is unservable.
+                with self.slots._slots_lock:
+                    shrunk = working_set_step(
+                        self.slots.cap, flat_i.shape[-1]
+                    )
+                if shrunk >= step:
+                    raise
+                continue
+            value = flat_x[start : start + step]
+            scores = None if flat_w is None else flat_w[start : start + step]
+            if sorted_indices:
+                slots = slots.reshape(-1)
+                order = mx.argsort(slots)
+                inverse = mx.argsort(order)
+                value, slots = value[order], slots[order]
+                scores = None if scores is None else scores.reshape(-1)[order]
             out = self.slots.expert(
-                rows[start:end][order],
-                slots[order],
-                None if scores is None else scores[start:end][order],
-                sorted_indices=True,
+                value,
+                slots,
+                scores,
+                sorted_indices=sorted_indices,
                 input_quantized=input_quantized,
-            )[inverse]
+            )
+            if sorted_indices:
+                out = out[inverse]
             mx.eval(out)
             outputs.append(out)
-            start = end
-        return outputs
+            start += step
+        return mx.concatenate(outputs, axis=0).reshape(*indices.shape, 1, x.shape[-1])
 
 
-def _plan(path, fraction):
+def estimate_expert_savings(path, fraction):
+    path = Path(path)
+    files = [path / "config.json", path / "model.safetensors.index.json"]
+    files.extend(path.glob("*.safetensors"))
+    signature = tuple(
+        (str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(files)
+    )
+    return _estimate_expert_savings(str(path), fraction, signature)
+
+
+@lru_cache(maxsize=32)
+def _estimate_expert_savings(path, fraction, signature):
     from .config import ModelConfig
 
     path = Path(path)
@@ -508,81 +971,6 @@ def _plan(path, fraction):
     mapping = json.loads((path / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
-    return ExpertOffloadPlan(path, raw, mapping, ModelConfig.from_dict(raw), fraction)
-
-
-def estimate_expert_savings(path, fraction):
-    return _estimate_expert_savings(str(path), fraction, checkpoint_signature(path))
-
-
-@lru_cache(maxsize=32)
-def _estimate_expert_savings(path, fraction, signature):
-    plan = _plan(path, fraction)
+    plan = ExpertOffloadPlan(path, raw, mapping, ModelConfig.from_dict(raw), fraction)
     # Keep the existing residency estimator's 5% nonexpert safety allowance.
     return plan.full_bytes - plan.resident_bytes + plan.draft_bytes
-
-
-def _admission(plan, capacity, estimate, engram_ssd_offload, file_bytes):
-    """``EnginePool._entry_runtime_resident_size`` for one expert capacity.
-
-    With Engram tables: the header residency estimate for the selected
-    Engram mode, less 1.05 times the expert savings. Without them the pool
-    has no residency estimate and discounts the savings from the discovery
-    size (shard file sizes with a 5% allowance) instead.
-    """
-    saved = plan.full_bytes - plan.resident_bytes_at(capacity) + plan.draft_bytes
-    if estimate.supported:
-        base = estimate.mmap_bytes if engram_ssd_offload else estimate.resident_bytes
-        return max(0, base - int(saved * 1.05))
-    return max(0, file_bytes() - saved)
-
-
-def _file_bytes(path):
-    from ...model_discovery import estimate_model_size
-
-    return lambda: estimate_model_size(Path(path))
-
-
-def admission_bytes(path, fraction, *, engram_ssd_offload=True):
-    """The engine pool's admission estimate for expert offload at ``fraction``."""
-    return _admission_bytes(
-        str(path), float(fraction), bool(engram_ssd_offload), checkpoint_signature(path)
-    )
-
-
-@lru_cache(maxsize=32)
-def _admission_bytes(path, fraction, engram_ssd_offload, signature):
-    plan = _plan(path, fraction)
-    estimate = deepseek_v41_residency_estimate(path)
-    return _admission(
-        plan, plan.capacity, estimate, engram_ssd_offload, _file_bytes(path)
-    )
-
-
-def fit_resident_fraction(path, budget_bytes, *, engram_ssd_offload=True):
-    """Largest resident fraction whose admission estimate fits ``budget_bytes``.
-
-    Returns ``None`` when even the routing floor does not fit. The result is
-    a whole number of experts per layer expressed as a fraction, so passing
-    it back as the setting reproduces the same capacity.
-    """
-    return _fit_resident_fraction(
-        str(path),
-        int(budget_bytes),
-        bool(engram_ssd_offload),
-        checkpoint_signature(path),
-    )
-
-
-@lru_cache(maxsize=32)
-def _fit_resident_fraction(path, budget_bytes, engram_ssd_offload, signature):
-    plan = _plan(path, 1.0)
-    estimate = deepseek_v41_residency_estimate(path)
-    file_bytes = _file_bytes(path)
-    for capacity in range(plan.count, plan.floor - 1, -1):
-        if (
-            _admission(plan, capacity, estimate, engram_ssd_offload, file_bytes)
-            <= budget_bytes
-        ):
-            return capacity / plan.count
-    return None
