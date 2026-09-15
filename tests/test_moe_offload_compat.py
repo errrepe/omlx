@@ -93,11 +93,18 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
     assert error.value.status_code == 400
 
 
-@pytest.mark.parametrize(
-    "kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4", "qwen3_5_moe"]
-)
-def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
+@pytest.mark.parametrize("kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4"])
+def test_streaming_owned_types_follow_the_estimate(tmp_path, kind):
+    # Plan 1.4: the compat gate used to keep its own 4-type allowlist and
+    # hide every other streaming-supported family. One allowlist now —
+    # the converter's structural estimate decides.
     _checkpoint(tmp_path, kind)
+    assert moe_offload_compatibility(tmp_path)[0] is True
+
+
+def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path):
+    # qwen3_5_moe is in NEITHER allowlist: matching experts cannot rescue it.
+    _checkpoint(tmp_path, "qwen3_5_moe")
     assert moe_offload_compatibility(tmp_path)[0] is False
 
 
@@ -111,7 +118,11 @@ def test_dense_gemma_is_hidden(tmp_path):
 
 
 def test_checkpoint_replacement_invalidates_eligibility(tmp_path):
-    tensors = _checkpoint(tmp_path)
+    # Legacy path (olmoe): _inspect's per-tensor completeness check still
+    # runs for legacy-owned types — a swapped checkpoint must re-fail.
+    # (Streaming-owned types like qwen4_exp gate on the structural estimate;
+    # a missing bank there fails at conversion via _resolve_stacked_key.)
+    tensors = _checkpoint(tmp_path, "olmoe")
     assert moe_offload_compatibility(tmp_path)[0] is True
     tensors.pop(next(iter(tensors)))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
@@ -122,7 +133,10 @@ def test_unsupported_saved_setting_rejected_before_load(tmp_path):
     from omlx.model_settings import ModelSettings
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
-    _checkpoint(tmp_path, "glm5_next")
+    # qwen3_5_moe is in neither the streaming allowlist nor the legacy one,
+    # so the saved setting still rejects before load (glm5_next moved to
+    # the streaming allowlist — it now passes this gate legitimately).
+    _checkpoint(tmp_path, "qwen3_5_moe")
     with pytest.raises(ValueError, match="not supported for this model type"):
         maybe_apply_pre_load_patches(
             str(tmp_path), ModelSettings(moe_expert_offload_enabled=True)

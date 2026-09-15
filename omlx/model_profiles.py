@@ -67,6 +67,40 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_oq_a8_min_tokens",
     "moe_expert_offload_enabled",
     "moe_expert_offload_resident_fraction",
+    # Validation scope for model-dependent rules (e.g. the DSpark offload
+    # exception). Per-model only — never templates. Always re-derived
+    # from the checkpoint at validation time, so a copied profile cannot
+    # carry a stale scope.
+    "model_type",
+    # Bank/IO/pinning/policy tunables. Per-model by construction: several
+    # are checkpoint- or hardware-bound (bank_path, pins, seed) and must
+    # never propagate across models via templates.
+    "expert_streaming_bank_enabled",
+    "expert_streaming_bank_path",
+    "expert_streaming_cache_policy",
+    "expert_streaming_cache_prior",
+    "expert_streaming_coalesce",
+    "expert_streaming_cold_tier",
+    "expert_streaming_hot_fraction",
+    "expert_streaming_io_depth",
+    "expert_streaming_per_layer_eval",
+    "expert_streaming_pin_gib",
+    "expert_streaming_pin_regime",
+    "expert_streaming_pin_sync",
+    "expert_streaming_pins",
+    "expert_streaming_readahead",
+    "expert_streaming_seed",
+    "expert_streaming_topk_threshold",
+    # Unified expert-streaming backend (canonical keys; the moe_* pair above
+    # stays as load-time aliases served by the same backend).
+    "expert_streaming_enabled",
+    "expert_streaming_budget_gib",
+    "expert_streaming_budget_auto",
+    "expert_streaming_dynamic",
+    "expert_streaming_dynamic_max_gib",
+    "expert_streaming_dynamic_min_gib",
+    "expert_streaming_dynamic_stall_target",
+    "expert_streaming_prefill_budget_gib",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",

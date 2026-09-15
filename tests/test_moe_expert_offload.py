@@ -28,6 +28,7 @@ if HAS_MLX:
     from omlx.patches.moe_expert_offload import (
         CheckpointExpertStore,
         OffloadSwitchGLU,
+        _apply_legacy_adapter,
         apply_moe_expert_offload,
         moe_offload_stats,
     )
@@ -671,7 +672,9 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
             }
         )
     )
-    assert apply_moe_expert_offload(model, tmp_path, 0.125) == 1
+    # Legacy-unit scope: qwen4_exp routes to streaming via the public entry,
+    # so pin the legacy adapter directly for its cache/eviction assertions.
+    assert _apply_legacy_adapter(model, tmp_path, 0.125) == 1
     cache = layer.mlp.switch_mlp.cache
     assert cache.capacity == 64
     for _ in range(5):
