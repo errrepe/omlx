@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -691,6 +690,7 @@ def maybe_apply_pre_load_patches(
                     key: getattr(model_settings, key, False)
                     for key in (
                         "moe_expert_offload_enabled",
+                        "expert_streaming_enabled",
                         "mtp_enabled",
                         "vlm_mtp_enabled",
                         "dflash_enabled",
@@ -1254,11 +1254,7 @@ def maybe_apply_pre_load_patches(
     # Unified backend: either key (legacy alias or canonical) triggers it.
     from ..model_settings import moe_offload_requested
 
-    if (
-        model_settings is not None
-        and moe_offload_requested(model_settings)
-        and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-    ):
+    if model_settings is not None and moe_offload_requested(model_settings):
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
         supported, reason = moe_offload_compatibility(model_name)

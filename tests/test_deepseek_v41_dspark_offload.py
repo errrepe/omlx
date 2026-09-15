@@ -260,10 +260,13 @@ def test_backing_governor_shrink_and_grow(tmp_path):
         gov = backing.governor
         slots = disk.language_model.layers[0].ffn.experts.slots
         # Fixture-scale floors: drop the RAM-sized defaults so one slot
-        # of pressure/hunger moves the needle deterministically.
+        # of pressure/hunger moves the needle deterministically. Zero the
+        # clear band too — the host's real free memory would otherwise
+        # route observe() to the clear branch on a loaded machine.
         gov.min_budget_bytes = 0
         gov.min_cap = 1
         gov.grow_add_frac = 1.0
+        gov.low_free_bytes = 0
         # Pressure: shrink halves the per-layer base.
         gov.target_free_bytes = 10**18
         gov.observe(force=True)
@@ -390,6 +393,10 @@ def test_backing_stage_suppressed_without_headroom(tmp_path):
         assert gov is not None
         gov.min_budget_bytes = 0
         gov.min_cap = 2  # = plan capacity = the fixture working set
+        # Keep the desperate-free band off until the explicit check below —
+        # the host's real free memory would otherwise suppress staging
+        # nondeterministically on a loaded machine.
+        gov.low_free_bytes = 0
         slots0 = disk.language_model.layers[0].ffn.experts.slots
         slots1 = disk.language_model.layers[1].ffn.experts.slots
         # First ensure populates gov._last_free_gib via tick->observe.

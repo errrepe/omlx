@@ -30,7 +30,6 @@ from .hyper_connection import (
 from .kernels import packed_index_scores, packed_index_topk, packed_sparse_attention
 from .mtp import DSparkMixin
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
-from ..expert_streaming import hstrace as _hstrace
 from .routing import combine_sorted_experts
 
 
@@ -608,13 +607,6 @@ class MoE(nn.Module):
 
     def __call__(self, x, image_mask):
         idx, weights = self.gate(x, image_mask)
-        _slots = getattr(self.experts, "slots", None)
-        if _hstrace.enabled() and x.shape[1] == 1:
-            _hstrace.record(
-                getattr(_slots, "layer", -1),
-                x[0, -1],
-                idx.reshape(-1),
-            )
         routed_quantized = self.experts.quantizes_input
         shared_quantized = self.shared_experts.quantizes_input
         # Quantization is row-local; reuse it before routing duplicates token rows.

@@ -379,6 +379,90 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
     return out
 
 
+def resolve_streaming_backing(engine: Any) -> Any | None:
+    """Return the engine's streaming backing, walking the holder chain.
+
+    The unified converter stamps the backing on engine and model; the
+    legacy adapter (and the alias' streaming fallback) stamps its store
+    on the model only. Used by the engine stop paths so legacy fds/mmaps
+    release on teardown instead of whenever GC gets around to it.
+    """
+    backing = getattr(engine, "_expert_streaming_backing", None)
+    if backing is None:
+        for holder in (
+            getattr(engine, "_model", None),
+            getattr(engine, "_vlm_model", None),
+        ):
+            backing = getattr(holder, "_expert_streaming_backing", None)
+            if backing is not None:
+                break
+    return backing
+
+
+def streaming_summary_backing(engine: Any) -> Any | None:
+    """The object owning governor + summary for this engine.
+
+    The legacy adapter aggregates its per-layer caches under a
+    governor-facing state stamped as ``_moe_offload_legacy_state`` (same
+    duck-type as the V4.1 backing); when present it overrides the plain
+    backing for reporting.
+    """
+    for holder in (
+        engine,
+        getattr(engine, "_model", None),
+        getattr(engine, "_vlm_model", None),
+    ):
+        state = getattr(holder, "_moe_offload_legacy_state", None)
+        if state is not None:
+            return state
+    return resolve_streaming_backing(engine)
+
+
+def log_expert_streaming_summary(
+    engine: Any, *, prompt_tokens: int = 0, completion_tokens: int = 0
+) -> None:
+    """One-line MoE streaming health log per completed request.
+
+    No-op unless expert streaming is active. Also drives the dynamic
+    governor's per-request observation. Never raises.
+    """
+    try:
+        backing = streaming_summary_backing(engine)
+        if backing is None:
+            return
+        # Dynamic residency: revisit cache capacity from free memory
+        # once per request boundary (opt-in; never raises).
+        governor = getattr(backing, "governor", None)
+        if governor is not None:
+            try:
+                action = governor.observe()
+            except Exception:
+                logger.debug("governor observe failed", exc_info=True)
+            else:
+                logger.info("expert_streaming governor: %s", action)
+        cache = getattr(backing, "_streaming_cache", None)
+        summary = expert_streaming_summary(cache, backing)
+        if not summary:
+            return
+        logger.info(
+            "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
+            "(h=%d m=%d evict=%d size=%d/%d) advised=%d "
+            "ctx_fallbacks=%s",
+            prompt_tokens,
+            completion_tokens,
+            summary.get("lru_hit_rate", 0.0),
+            summary.get("lru_hits", 0),
+            summary.get("lru_misses", 0),
+            summary.get("lru_evictions", 0),
+            summary.get("lru_size", 0),
+            summary.get("lru_capacity", 0),
+            summary.get("advised", 0),
+            summary.get("ctx_fallbacks", {}),
+        )
+    except Exception:
+        pass
+
+
 def ensure_streaming_backing_or_raise(
     model: Any,
     backing: Any | None,

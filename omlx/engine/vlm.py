@@ -1961,14 +1961,6 @@ class VLMBatchedEngine(BaseEngine):
 
                     if moe_offload_requested(self._model_settings):
                         load_kwargs["lazy"] = True
-                    # Expert offload wraps BEFORE materialization so non-resident
-                    # experts never load; keep the load lazy only when the feature
-                    # is on. Threads into main's load_kwargs path (lazy is idempotent
-                    # with the QWEN4_EXP case above).
-                    if getattr(
-                        self._model_settings, "moe_expert_offload_enabled", False
-                    ):
-                        load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
                         **load_kwargs,
@@ -2746,27 +2738,14 @@ class VLMBatchedEngine(BaseEngine):
         # Persist the learned expert-pin profile while the backing is still
         # reachable (teardown below drops it with the model).
         from omlx.patches.expert_streaming import (
+            resolve_streaming_backing,
             save_expert_pin_profile,
             shutdown_expert_streaming,
         )
 
         save_expert_pin_profile(self)
         try:
-            # The unified converter stamps the same backing on engine and
-            # model, but the legacy offload adapter (and the alias' streaming
-            # fallback) stamps its CheckpointExpertStore on the model only —
-            # walk the same holder chain _log_streaming_summary uses so those
-            # fds/mmaps release here instead of whenever GC gets around to it.
-            backing = getattr(self, "_expert_streaming_backing", None)
-            if backing is None:
-                for holder in (
-                    getattr(self, "_model", None),
-                    getattr(self, "_vlm_model", None),
-                ):
-                    backing = getattr(holder, "_expert_streaming_backing", None)
-                    if backing is not None:
-                        break
-            shutdown_expert_streaming(backing)
+            shutdown_expert_streaming(resolve_streaming_backing(self))
         except Exception:
             pass
         try:
@@ -4288,70 +4267,14 @@ class VLMBatchedEngine(BaseEngine):
     def _log_streaming_summary(
         self, *, prompt_tokens: int = 0, completion_tokens: int = 0
     ) -> None:
-        """Parity with BatchedEngine: one-line MoE streaming health log.
+        """Parity with BatchedEngine: one-line MoE streaming health log."""
+        from ..patches.expert_streaming import log_expert_streaming_summary
 
-        No-op unless expert streaming is active (VLM wrappers serve the
-        largest streaming checkpoints — qwen4_exp/glm5_next).
-        """
-        try:
-            # Resolve like the bench/telemetry does: the loader attaches
-            # the backing to itself and the model, but chat may serve from
-            # a pooled wrapper, so walk the holder chain (a self-only
-            # lookup silently missed V4.1 entirely: actions stayed 0).
-            backing = getattr(self, "_expert_streaming_backing", None)
-            if backing is None:
-                for holder in (
-                    getattr(self, "_model", None),
-                    getattr(self, "_vlm_model", None),
-                ):
-                    backing = getattr(holder, "_expert_streaming_backing", None)
-                    if backing is not None:
-                        break
-            # The legacy adapter's governor-facing state (same duck-type
-            # as the V4.1 backing) owns governor + summary when present.
-            for holder in (
-                self,
-                getattr(self, "_model", None),
-                getattr(self, "_vlm_model", None),
-            ):
-                state = getattr(holder, "_moe_offload_legacy_state", None)
-                if state is not None:
-                    backing = state
-                    break
-            if backing is None:
-                return
-            # Dynamic residency: parity with BatchedEngine (opt-in).
-            governor = getattr(backing, "governor", None)
-            if governor is not None:
-                try:
-                    action = governor.observe()
-                except Exception:
-                    logger.debug("governor observe failed", exc_info=True)
-                else:
-                    logger.info("expert_streaming governor: %s", action)
-            from ..patches.expert_streaming import expert_streaming_summary
-
-            cache = getattr(backing, "_streaming_cache", None)
-            summary = expert_streaming_summary(cache, backing)
-            if not summary:
-                return
-            logger.info(
-                "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
-                "(h=%d m=%d evict=%d size=%d/%d) advised=%d "
-                "ctx_fallbacks=%s",
-                prompt_tokens,
-                completion_tokens,
-                summary.get("lru_hit_rate", 0.0),
-                summary.get("lru_hits", 0),
-                summary.get("lru_misses", 0),
-                summary.get("lru_evictions", 0),
-                summary.get("lru_size", 0),
-                summary.get("lru_capacity", 0),
-                summary.get("advised", 0),
-                summary.get("ctx_fallbacks", {}),
-            )
-        except Exception:
-            pass
+        log_expert_streaming_summary(
+            self,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     async def chat(
         self,

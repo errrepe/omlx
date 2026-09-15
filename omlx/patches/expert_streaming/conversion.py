@@ -127,8 +127,6 @@ def _wire_streaming_io_overrides(
 # SwitchGLU bank key prefixes per main layer. The registry owns the list
 # (``ModelHooks.prefix_templates``) so a family can reorder or narrow it;
 # this alias keeps the shared default importable from the package root.
-_MAIN_SWITCH_PREFIX_TEMPLATES = DEFAULT_PREFIX_TEMPLATES
-
 
 def _candidate_stacked_keys(
     layer_idx: int,
@@ -1103,7 +1101,7 @@ def _build_expert_backing(
 
             cold_root = _resolve_cold_tier_root(model_path, model_settings)
             backing = ExpertBackingStore(model_path, cold_root=cold_root)
-            _spill_absorbed = _absorb_dsv4_spill(backing, model_path)
+            _absorb_dsv4_spill(backing, model_path)
             hot_ids_by_layer = _apply_hobbit_split(
                 backing, model_path, io_ov, estimate, cold_root
             )

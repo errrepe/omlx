@@ -1214,8 +1214,6 @@
   "modal.model_settings.expert_streaming": "Streaming de experts",
   "modal.model_settings.expert_streaming_hint": "Serve experts MoE do SSD com orçamento de memória e governador dinâmico. Substitui o toggle legado — configurações antigas continuam funcionando e migram ao salvar. Requer reload.",
   "modal.model_settings.expert_streaming_legacy_note": "Configurações legadas detectadas — servidas por este backend unificado. Salvar faz a migração.",
-  "modal.model_settings.streaming_budget_auto": "Orçamento automático",
-  "modal.model_settings.streaming_budget_auto_hint": "Escala com a RAM livre; o governador adapta ao vivo.",
   "modal.model_settings.streaming_budget_gib": "Orçamento fixo (GiB)",
   "modal.model_settings.streaming_dynamic": "Governador dinâmico",
   "modal.model_settings.streaming_dynamic_auto": "Auto",

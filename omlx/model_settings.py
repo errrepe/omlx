@@ -744,6 +744,35 @@ class ModelSettings:
         return cls(**filtered_data)
 
 
+# The expert_streaming_* tunable family consumed at engine construction
+# (everything except the `enabled` switch). Shared by the diffusion-lane
+# sanitizers (these keys must not survive on a diffusion model) and by
+# EnginePool's reload signature (a changed value must force a reload).
+EXPERT_STREAMING_TUNABLE_KEYS = (
+    "expert_streaming_budget_gib",
+    "expert_streaming_budget_auto",
+    "expert_streaming_dynamic",
+    "expert_streaming_dynamic_max_gib",
+    "expert_streaming_dynamic_min_gib",
+    "expert_streaming_dynamic_stall_target",
+    "expert_streaming_prefill_budget_gib",
+    "expert_streaming_io_depth",
+    "expert_streaming_coalesce",
+    "expert_streaming_readahead",
+    "expert_streaming_seed",
+    "expert_streaming_per_layer_eval",
+    "expert_streaming_pins",
+    "expert_streaming_pin_gib",
+    "expert_streaming_pin_sync",
+    "expert_streaming_pin_regime",
+    "expert_streaming_cold_tier",
+    "expert_streaming_hot_fraction",
+    "expert_streaming_cache_policy",
+    "expert_streaming_topk_threshold",
+    "expert_streaming_cache_prior",
+)
+
+
 class ModelSettingsManager:
     """Manager for per-model settings with file persistence.
 

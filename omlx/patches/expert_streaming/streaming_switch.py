@@ -27,14 +27,9 @@ import mlx.nn as nn
 import numpy as np
 
 from .slot_cache import DecodeVisitStats, SlotArena
-from .speculation import SpeculationState, _STAGED_MAX_IDS, _STAGED_ENV
-from .telemetry import ProfileAccumulator, _PROFILE_ENV, _TRACE_PATH, _trace_row
+from .speculation import SpeculationState, _STAGED_MAX_IDS
 
 logger = logging.getLogger(__name__)
-# Opt-in per-layer / per-projection Metal memory trace. Null-tracer by
-# default: call sites cost one attribute lookup.
-from .memtrace import memtrace  # noqa: E402
-
 
 _COALESCE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_COALESCE", "") != "0"
 # Suppress speculative staging when residency has no headroom
@@ -132,14 +127,6 @@ _CTX_UNION_MAX_BYTES = max(
     0,
     int(os.environ.get("OMLX_EXPERT_STREAMING_CTX_UNION_MAX_BYTES", str(1024**3))),
 )
-# Completion-ordered union: submit one read future per projection
-# in compute order (self.linears is already ordered gate_up→down /
-# up→gate→down) and have each ensure() join only ITS projection, so the
-# first-ready projection promotes + enqueues gather_qmm while the rest are
-# still in flight. 0 keeps the all-or-nothing pool.map latch.
-_UNION_PIPE_ENV = (
-    os.environ.get("OMLX_EXPERT_STREAMING_UNION_PIPE", "0") == "1"
-)
 # Batch the per-expert cache.get under one lock in _split, and the
 # staged-hit writeback through put_many — ~60 lookups x 3 projections x 48
 # layers of RLock churn per decode token. 0 restores per-key get/put.
@@ -193,9 +180,7 @@ _CTX_PREFETCH_MAX_BYTES = max(
 # Prefill attribution diag: sync the GPU at every prefill-sized MoE GLU call
 # and record the drain as a per-layer gpu bucket. Serializes CPU/GPU overlap
 # (wall inflates), so use it for attribution only — never for latency claims.
-_PREFILL_DIAG_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PREFILL_DIAG", "") == "1"
 # Routes above this count are treated as prefill-sized for the diag sync.
-_PREFILL_DIAG_MIN_ROUTES = 512
 
 # Scan-resistant admission filter: when OMLX_EXPERT_STREAMING_ADMISSION=1,
 # only experts seen >=2 times in the recent window enter the LRU (off by
@@ -426,18 +411,6 @@ def io_pool_for(depth: int | None) -> ThreadPoolExecutor:
         return pool
 
 
-try:
-    from .shard_bank import ExpertBackingStore
-except ImportError as _ebs_exc:  # pragma: no cover
-    # Soft dependency only (isinstance/type-narrowing); a missing or
-    # platform-incompatible shard_bank must not kill the switch — but a
-    # real import failure should never be silent.
-    logger.debug(
-        "expert_streaming: shard_bank import unavailable (%s)", _ebs_exc
-    )
-    ExpertBackingStore = Any  # type: ignore
-
-
 @dataclass
 class CacheStats(DecodeVisitStats):
     # decode_layers / decode_layers_missed / decode_misses_by_layer are
@@ -610,7 +583,6 @@ class ExpertLRUCache:
         # re-entrant so the internal helpers can keep calling each other,
         # and it is never held across mx.eval or a blocking future wait.
         self._lock = threading.RLock()
-        self.budget_bytes = int(budget_bytes)
         # ``per_expert_bytes`` is the deprecated name: one slot is ONE
         # projection's share of an expert, not a whole expert.
         if per_slot_bytes is None:
@@ -656,7 +628,6 @@ class ExpertLRUCache:
         # the base policy.
         self._layer_orders: dict[int, OrderedDict] = {}
         self.stats = CacheStats()
-        self.profile = ProfileAccumulator(enabled=_PROFILE_ENV)
         # Per-conversion speculation state (set by the converter).
         self.spec_state: SpeculationState | None = None
         # Scan-resistant frequency window (only when env set); no capacity
@@ -723,9 +694,6 @@ class ExpertLRUCache:
         # the lock makes the increment atomic.
         with self._lock:
             self._ctx_fallbacks[reason] = self._ctx_fallbacks.get(reason, 0) + 1
-        if memtrace.enabled:
-            memtrace.record("ctx.fallback", reason=reason)
-
     def ctx_fallback_stats(self) -> dict[str, int]:
         with self._lock:
             return dict(self._ctx_fallbacks)
@@ -899,11 +867,6 @@ class ExpertLRUCache:
         order = self._layer_orders.get(layer)
         if order is not None:
             order.pop(key, None)
-
-    def _evict_layer(self, layer: int) -> bool:
-        """Locked entry point (governor shrink path); see _evict_layer_unlocked."""
-        with self._lock:
-            return self._evict_layer_unlocked(layer)
 
     def _evict_layer_unlocked(self, layer: int) -> bool:
         """Evict the least-recently-used entry of `layer`; True if one went.
@@ -1377,10 +1340,6 @@ class _LayerLoadContext:
         self._loaded = False
         # Completion-ordered union state: per-projection futures joined
         # lazily by ensure(), in compute order.
-        self._ufutures: dict[int, Any] = {}
-        self._ujobs: dict[int, list[int]] = {}
-        self._ujob_projs: dict[int, Any] = {}
-        self._uresolved: set[int] = set()
 
         # Per-layer stall accounting (flushed once by close()).
         self._closed = False
@@ -1524,14 +1483,6 @@ class _LayerLoadContext:
         if self._closed:
             return
         self._closed = True
-        # Drain any union futures a mid-layer raise never joined —
-        # an abandoned read holds its bank buffer alive until it lands.
-        for f in self._ufutures.values():
-            try:
-                f.result()
-            except Exception:
-                pass
-        self._ufutures.clear()
         if self.positions is None:
             return
         any_miss = any(v > 0 for v in self.misses.values())
@@ -1671,15 +1622,6 @@ class _LayerLoadContext:
                     if not _BANK_CHUNK_ENV and bank_bytes > _BANK_MAX_BYTES
                     else "read_failure"
                 )
-                if memtrace.enabled:
-                    memtrace.record(
-                        "ctx.ensure.fail",
-                        layer=linear.layer_idx,
-                        proj=getattr(linear, "proj_name", "?"),
-                        uniq=len(ids),
-                        miss=len(missing),
-                        reason=self.fallback_reason,
-                    )
                 return
             self.bundles[lid].update(zip(missing, rows))
             # Single-promotion is only valid when the read covered the
@@ -1691,23 +1633,6 @@ class _LayerLoadContext:
                 self.bank_ids[lid] = list(missing)
 
         self._prefetch(linear)
-        if memtrace.enabled:
-            memtrace.record(
-                "ctx.ensure.exit",
-                layer=linear.layer_idx,
-                proj=getattr(linear, "proj_name", "?"),
-                ctx_mode=self.mode,
-                positions=len(ids),
-                uniq=len(ids),
-                miss=len(missing),
-                ctx_bank_bytes=int(linear._tier_bank_bytes_for(missing)),
-                bank_bytes=int(linear._tier_bank_bytes_for(missing)),
-                ctx_inflight_bytes=self._inflight_bytes,
-                inflight_bytes=self._inflight_bytes,
-                ctx_prefetch_count=len(self._futures),
-                inflight=len(self._futures),
-            )
-
     # -- union path ---------------------------------------------------------
 
     def _admit_rows(self, proj: Any, ids: list[int], rows: list) -> None:
@@ -1736,67 +1661,10 @@ class _LayerLoadContext:
             for eid, row in zip(ids, rows):
                 self.cache.put(proj.bundle_key(eid), row)
 
-    def _join_union_proj(self, linear: Any) -> None:
-        """Join only this projection's union read future.
-
-        The first ensure() submits one future per projection in compute
-        order; every later ensure() parks only behind its own projection's
-        read, so an early projection can promote + enqueue gather_qmm while
-        later projections are still in flight. Result is deterministic —
-        each projection waits on its own future regardless of the order the
-        workers finish in.
-        """
-        lid = id(linear)
-        if self.failed or lid in self._uresolved:
-            return
-        fut = self._ufutures.pop(lid, None)
-        self._uresolved.add(lid)
-        if fut is None:
-            # No misses for this projection — bundles were filled at submit.
-            return
-        ids = self._ujobs.get(lid, ())
-        try:
-            rows = fut.result()
-        except Exception:
-            rows = None
-        if rows is None or len(rows) != len(ids):
-            self.failed = True
-            self.fallback_reason = (
-                "bank_too_large"
-                if not _BANK_CHUNK_ENV
-                and any(
-                    self._ujob_projs[l]._tier_bank_bytes_for(ids_)
-                    > _BANK_MAX_BYTES
-                    for l, ids_ in self._ujobs.items()
-                )
-                else "read_failure"
-            )
-            # Drain the remaining futures so an abandoned read does not
-            # keep bank buffers pinned behind the fallback path.
-            for f in self._ufutures.values():
-                try:
-                    f.result()
-                except Exception:
-                    pass
-            self._ufutures.clear()
-            return
-        self.bundles[lid].update(zip(ids, rows))
-        self._admit_rows(linear, ids, rows)
-
     def _ensure_union(self, linear: Any, expert_ids: list[int]) -> None:
         if self._loaded:
-            if _UNION_PIPE_ENV:
-                self._join_union_proj(linear)
             return
         self._loaded = True
-        layer = self.linears[0].layer_idx if self.linears else -1
-        if memtrace.enabled:
-            memtrace.record(
-                "ctx.ensure.enter",
-                layer=layer,
-                n_proj=len(self.linears),
-                uniq=len(expert_ids),
-            )
         jobs: list[tuple[Any, list[int]]] = []
         for proj in self.linears:
             cached, missing = self._split(proj, expert_ids)
@@ -1817,19 +1685,6 @@ class _LayerLoadContext:
         if _CTX_UNION_MAX_BYTES > 0 and live > _CTX_UNION_MAX_BYTES:
             self.declined = True
             return
-        if _UNION_PIPE_ENV:
-            # One future per projection, in compute order
-            # (self.linears is ordered gate_up→down / up→gate→down). Each
-            # ensure() joins only its own — the first projection promotes
-            # and enqueues while the later reads are still in flight.
-            self._ujobs = {id(p): ids for p, ids in jobs}
-            self._ujob_projs = {id(p): p for p, _ids in jobs}
-            for job in jobs:
-                self._ufutures[id(job[0])] = pool.submit(
-                    job[0]._load_expert_bank_np, job[1]
-                )
-            self._join_union_proj(linear)
-            return
         results = list(pool.map(lambda job: job[0]._load_expert_bank_np(job[1]), jobs))
         for (proj, ids), rows in zip(jobs, results):
             if rows is None or len(rows) != len(ids):
@@ -1846,22 +1701,6 @@ class _LayerLoadContext:
                 return
             self.bundles[id(proj)].update(zip(ids, rows))
             self._admit_rows(proj, ids, rows)
-        if memtrace.enabled:
-            memtrace.record(
-                "ctx.ensure.exit",
-                layer=layer,
-                ctx_mode=self.mode,
-                n_proj=len(self.linears),
-                positions=len(expert_ids),
-                uniq=len(expert_ids),
-                n_loaded=len(jobs),
-                miss_per_proj=[len(ids) for _, ids in jobs],
-                ctx_bank_bytes=live,
-                bank_bytes=live,
-                ctx_inflight_bytes=0,
-                ctx_prefetch_count=0,
-            )
-
     # -- public API ---------------------------------------------------------
 
     def ensure(self, linear: Any, expert_ids: list[int]) -> None:
@@ -1907,7 +1746,6 @@ class _RemapPlan:
     arena_rhs: Any = None
     arena_hits: int = 0
     arena_misses: int = 0
-    arena_load_s: float = 0.0
 
 
 def _build_plan_into(plan: _RemapPlan, indices) -> None:
@@ -1989,13 +1827,6 @@ class StreamingSwitchLinear(nn.Module):
     def output_dims(self) -> int:
         return self._output_dims
 
-    def _load_expert_weight(self, expert_id: int) -> mx.array:
-        key = (self.layer_idx, expert_id, self.stacked_key)
-        cached = self.cache.get(key)
-        if cached is not None:
-            return cached
-        return self._read_expert_weight(key, expert_id)
-
     def _read_expert_weight(self, key, expert_id: int) -> mx.array:
         """Backing fetch + cache put for a demand miss — the caller already
         ran the ``get`` that produced the miss, so hit/miss telemetry
@@ -2018,31 +1849,20 @@ class StreamingSwitchLinear(nn.Module):
         self._bias = bias
 
     def __call__(self, x, indices, sorted_indices=False, plan: _RemapPlan | None = None):
-        p = self.cache.profile
         if plan is None:
             plan = _RemapPlan()
-        built = plan.flat_np is None
-        if built:
+        if plan.flat_np is None:
             _build_plan_into(plan, indices)
-        t2 = time.perf_counter()
         # Load each unique expert weight
         mini_weights = []
-        t_load = 0.0
-        hits = 0
-        misses = 0
         for eid in plan.uniq_list:
             key = (self.layer_idx, int(eid), self.stacked_key)
-            t_l = time.perf_counter()
             # Derive hit/miss from the get() result actually used for the
             # load — a probe-then-load read can go stale when a concurrent
             # eviction lands between the two (TOCTOU).
             w = self.cache.get(key)
             if w is None:
                 w = self._read_expert_weight(key, int(eid))
-                misses += 1
-            else:
-                hits += 1
-            t_load += time.perf_counter() - t_l
             mini_weights.append(w)
         # Stack into mini-bank (U, O, I)
         if len(mini_weights) == 1:
@@ -2055,19 +1875,6 @@ class StreamingSwitchLinear(nn.Module):
         if self._bias is not None and self._has_bias:
             b_mini = mx.stack([self._bias[int(e)] for e in plan.uniq_list], axis=0)  # (U,O)
             out = out + mx.expand_dims(b_mini[remapped], -2)
-        t4 = time.perf_counter()
-        p.record_observed(self.layer_idx, plan.uniq_list)
-        p.add(
-            self.layer_idx,
-            gate=plan.gate_s if built else 0.0,
-            unique=plan.unique_s if built else 0.0,
-            load=t_load,
-            stack=t4 - t2 - t_load,
-            hits=hits,
-            misses=misses,
-            experts=len(plan.uniq_list),
-            positions=plan.positions,
-        )
         return out
 
 
@@ -2093,16 +1900,11 @@ class _ResolvedDemand(NamedTuple):
     Output of ``StreamingQuantizedSwitchLinear._resolve_demand``: the raw
     NumPy bundles keyed by expert id, the cache hit/miss split, the
     single-promoted bank when the whole demand set was one contiguous
-    read, and the resolution wall time.
+    read.
     """
 
     bundles: Dict[int, tuple]
-    hits: int
-    misses: int
-    missing_count: int
     banked: Any
-    from_ctx: bool
-    t_load: float
 
 
 class StreamingQuantizedSwitchLinear(nn.Module):
@@ -2398,14 +2200,12 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 by_id = {int(e): r for e, r in zip(flat, rows)}
                 rows = [by_id[int(e)] for e in expert_ids]
             return segments, rows
-        except Exception as exc:
+        except Exception:
             # Bank-read failures fall back to per-expert loads — count
             # them (with the layer) instead of failing silently, so a
             # rotting backing shows up in the per-request summary.
             try:
                 self.cache._count_ctx_fallback(f"bank_read_l{self.layer_idx}")
-                if memtrace.enabled:
-                    memtrace.record("bank.read_fail", layer=self.layer_idx, n=len(expert_ids), err=str(exc)[:120])
             except Exception:
                 pass
             return None
@@ -2479,12 +2279,10 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     one.append(None)
                 promoted.append((one[0], one[1], one[2]))
             return promoted
-        except Exception as exc:
+        except Exception:
             # Same noisy-fallback contract as _read_expert_banks.
             try:
                 self.cache._count_ctx_fallback("bank_promote_fail")
-                if memtrace.enabled:
-                    memtrace.record("bank.promote_fail", layer=self.layer_idx, err=str(exc)[:120])
             except Exception:
                 pass
             return None
@@ -2994,7 +2792,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         if resolved is not None:
             return resolved  # type: ignore[return-value]
         # 3) synchronous load from backing
-        t_sy = time.perf_counter()
         if hasattr(self.backing, "load_expert_slice"):
             # Async-friendly: store plain np.ndarray slices in the cache and
             # promote them to mx.array on the inference thread at use time
@@ -3030,14 +2827,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 b = bb if isinstance(bb, mx.array) else mx.array(bb)
         bundle = (w, s, b)
         self.cache.put(key, bundle)  # type: ignore[arg-type]
-        if getattr(self.cache, "profile", None) is not None:
-            self.cache.profile.add_load_source(
-                self.layer_idx, staged=False, dt=time.perf_counter() - t_sy
-            )
         return bundle
 
     def __call__(self, x, indices, sorted_indices=False, plan: _RemapPlan | None = None):
-        p = self.cache.profile
         if plan is None:
             plan = _RemapPlan()
         # Speculation for layer+1, deduped per layer call
@@ -3074,27 +2866,13 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             getattr(self.cache, "prefill_bypass", False)
             and plan.positions > _PREFILL_SHAPE_MIN_ROWS
         )
-        t2 = time.perf_counter()
         if getattr(plan, "arena_rhs", None) is not None:
-            return self._arena_call(
-                x, plan, sorted_indices, built, t2, p, _spec_state
-            )
-        res = self._resolve_demand(plan, cache_result, p)
-        if memtrace.enabled:
-            memtrace.record(
-                "linear.resolve",
-                layer=self.layer_idx,
-                proj=self.proj_name,
-                uniq=len(plan.uniq_list),
-                hits=res.hits,
-                misses=res.misses,
-                bank_bytes=self._bank_bytes_for(res.missing_count),
-                from_ctx=res.from_ctx,
-            )
+            return self._arena_call(x, plan, sorted_indices)
+        res = self._resolve_demand(plan, cache_result)
         out = self._assemble_banks(x, plan, res, sorted_indices)
-        return self._finish(plan, out, built, t2, res, p, _spec_state)
+        return self._finish(plan, out)
 
-    def _arena_call(self, x, plan, sorted_indices, built, t2, p, spec_state):
+    def _arena_call(self, x, plan, sorted_indices):
         """Arena path: residents were bound into fixed slot rows at
         admission, so gather_qmm reads the persistent bank by slot index —
         a hit costs zero assembly (the bundle path re-stacks every call)."""
@@ -3111,18 +2889,9 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             mode=self.mode,
             sorted_indices=sorted_indices,
         )
-        res = _ResolvedDemand(
-            {},
-            int(plan.arena_hits),
-            int(plan.arena_misses),
-            0,
-            None,
-            False,
-            float(plan.arena_load_s),
-        )
-        return self._finish(plan, out, built, t2, res, p, spec_state)
+        return self._finish(plan, out)
 
-    def _resolve_demand(self, plan, cache_result, p) -> _ResolvedDemand:
+    def _resolve_demand(self, plan, cache_result) -> _ResolvedDemand:
         """Cover ``plan.uniq_list`` with raw ``(w, s, b)`` bundles.
 
         Order: the layer context (which prefetches projections in the
@@ -3130,10 +2899,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         full miss -> the coalesced/per-expert fallback.
         """
         bundles: Dict[int, tuple] = {}
-        hits = 0
-        misses = 0
         missing: list[int] = []
-        t_res_start = time.perf_counter()
         context_bundles = None
         if plan.ctx is not None:
             # Resolve *this* projection through the layer context; the
@@ -3153,8 +2919,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 self.cache._count_ctx_fallback("bank_too_large")
             else:
                 context_bundles = plan.ctx.bundles.get(id(self))
-                hits = plan.ctx.hits.get(id(self), 0)
-                misses = plan.ctx.misses.get(id(self), 0)
                 if context_bundles is not None and len(context_bundles) == len(plan.uniq_list):
                     bundles.update(context_bundles)
                 else:
@@ -3166,9 +2930,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 b = self._bundle_cached_or_staged(eid)
                 if b is not None:
                     bundles[eid] = b
-                    hits += 1
                 else:
-                    misses += 1
                     missing.append(eid)
         banked = None
         if missing:
@@ -3187,15 +2949,10 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 banked = self._load_expert_bank_mx(missing)
             if banked is not None:
                 rows = banked[1]
-                dt_per = time.perf_counter() - t_res_start
                 for eid, raw in zip(missing, rows):
                     bundles[eid] = raw
                     if cache_result:
                         self._admit(self.bundle_key(eid), raw)
-                    if p is not None:
-                        p.add_load_source(
-                            self.layer_idx, staged=False, dt=dt_per / len(missing)
-                        )
             elif hasattr(self.backing, "load_expert_slice"):
                 # Prefill-shaped calls may use the separate pool.
                 io_pool = io_pool_for_positions(self, plan.positions)
@@ -3248,7 +3005,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                                 raws[idx_of[eid]] = raw
                     else:
                         raws = list(io_pool.map(self._load_expert_np, missing))
-                dt_per = time.perf_counter() - t_res_start
                 for eid, raw in zip(missing, raws):
                     if raw is None:
                         bundles[eid] = self._load_expert_bundle(eid)
@@ -3266,22 +3022,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                         # never alias in the LRU — a mixed-width bundle
                         # served to the wrong tier crashes mx.stack.
                         self._admit(self.bundle_key(eid), raw)
-                    if p is not None:
-                        p.add_load_source(self.layer_idx, staged=False, dt=dt_per / len(missing))
             else:
                 # dict-backed test doubles: sequential fallback
                 for eid in missing:
                     bundles[eid] = self._load_expert_bundle(eid)
-        t_load = time.perf_counter() - t_res_start
-        return _ResolvedDemand(
-            bundles=bundles,
-            hits=hits,
-            misses=misses,
-            missing_count=len(missing),
-            banked=banked,
-            from_ctx=context_bundles is not None,
-            t_load=t_load,
-        )
+        return _ResolvedDemand(bundles=bundles, banked=banked)
 
     def _assemble_banks(self, x, plan, res: _ResolvedDemand, sorted_indices):
         """Promote the resolved rows into the bank(s) gather_qmm consumes."""
@@ -3322,18 +3067,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 tier = self._tier_of(ids_t[0]) if split else 0
                 tier_single[tier] = triple
 
-        if memtrace.enabled:
-            # Sampled *before* the QMM runs: at this instant the U promoted
-            # per-expert mx copies and the freshly stacked bank coexist,
-            # which is the transient double-buffer that single-promotion
-            # removes.
-            memtrace.record(
-                "linear.stack",
-                layer=self.layer_idx,
-                proj=self.proj_name,
-                uniq=len(plan.uniq_list),
-                bank_bytes=self._bank_bytes_for(len(plan.uniq_list)),
-            )
         if split:
             return self._qmm_dual_tier(x, plan, res.bundles, tier_single, dt, sorted_indices)
         return self._qmm_uniform(x, plan, res.bundles, tier_single, dt, sorted_indices)
@@ -3401,22 +3134,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         uniq = [int(e) for e in plan.uniq_list]
         hot_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 0]
         cold_idx = [i for i, e in enumerate(uniq) if self._tier_of(e) == 1]
-        # Per-tier byte attribution for the whole layer call.
-        hot_req = [uniq[i] for i in hot_idx]
-        cold_req = [uniq[i] for i in cold_idx]
-        hot_bank_bytes = self._tier_bank_bytes_for(hot_req) if hot_req else 0
-        cold_bank_bytes = self._tier_bank_bytes_for(cold_req) if cold_req else 0
-        if memtrace.enabled:
-            memtrace.record(
-                "dual_tier.enter",
-                layer=self.layer_idx,
-                proj=self.proj_name,
-                positions=len(plan.uniq_list),
-                hot_positions=len(hot_idx),
-                cold_positions=len(cold_idx),
-                hot_bank_bytes=hot_bank_bytes,
-                cold_bank_bytes=cold_bank_bytes,
-            )
         hot_idx_set = set(hot_idx)  # hoisted: per-iter set() was O(n^2)
         for i, eid in enumerate(uniq):
             t = 0 if i in hot_idx_set else 1  # hot_rank lookup
@@ -3462,31 +3179,12 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 w_b, s_b, b_b = _stack_tier(t)
             bits_ = self.bits if t == 0 else self._cold_bits
             gs_ = self.group_size if t == 0 else self._cold_gs
-            if memtrace.enabled:
-                # One bank_ready event per tier, so the trace can
-                # attribute the peak to hot or cold residency.
-                memtrace.record(
-                    "dual_tier.%s.bank_ready" % ("hot" if t == 0 else "cold"),
-                    layer=self.layer_idx,
-                    proj=self.proj_name,
-                    tier=t,
-                    experts=len(idxs),
-                    bank_bytes=self._tier_bank_bytes_for(idxs),
-                )
             # expert-id -> rank within THIS tier's bank (flat ids here,
             # not compact uniq ranks); -1 where the other tier owns it.
             tier_map = np.full((self.num_experts,), -1, dtype=np.int32)
             for rank, i in enumerate(idxs):
                 tier_map[uniq[i]] = rank
             tier_remapped_np = tier_map[flat_np].reshape(plan.indices_shape)
-            if memtrace.enabled:
-                memtrace.record(
-                    "dual_tier.%s.qmm_submitted" % ("hot" if t == 0 else "cold"),
-                    layer=self.layer_idx,
-                    proj=self.proj_name,
-                    tier=t,
-                    positions=int((tier_remapped_np >= 0).sum()),
-                )
             # gather_qmm takes UNSIGNED row indices — -1 wraps to a huge
             # OOB index (garbage/nan) that the keep mask cannot undo
             # (nan * 0 = nan). Clamp the gather indices to 0 (any valid
@@ -3513,34 +3211,8 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             keep_np = (tier_remapped_np >= 0).astype(np.float32)
             keep_shape = tuple(plan.indices_shape) + (1,) * (tier_out.ndim - len(plan.indices_shape))
             keep = mx.array(keep_np).reshape(keep_shape)
-            if memtrace.enabled:
-                memtrace.record(
-                    "dual_tier.mask_ready",
-                    layer=self.layer_idx,
-                    proj=self.proj_name,
-                    tier=t,
-                )
             tier_out = tier_out * keep
-            if memtrace.enabled:
-                memtrace.record(
-                    "dual_tier.add_submitted",
-                    layer=self.layer_idx,
-                    proj=self.proj_name,
-                    tier=t,
-                    first_add=(out is None),
-                )
             out = tier_out if out is None else out + tier_out
-        if memtrace.enabled:
-            memtrace.record(
-                "dual_tier.layer_exit",
-                layer=self.layer_idx,
-                proj=self.proj_name,
-                positions=len(plan.uniq_list),
-                hot_positions=len(hot_idx),
-                cold_positions=len(cold_idx),
-                hot_bank_bytes=hot_bank_bytes,
-                cold_bank_bytes=cold_bank_bytes,
-            )
         if out is None:
             # Degenerate: every unique expert hot (hot bank == full uniq
             # order) — identical to the uniform path.
@@ -3555,29 +3227,11 @@ class StreamingQuantizedSwitchLinear(nn.Module):
             )
         return out
 
-    def _finish(self, plan, out, built, t2, res: _ResolvedDemand, p, spec_state):
-        """Shared tail: residual bias, profiling, next-layer speculation."""
+    def _finish(self, plan, out):
+        """Shared tail: residual bias."""
         if self._bias is not None and self._has_bias:
             b_mini = mx.take(self._bias, plan.uniq_mx, axis=0)
             out = out + mx.expand_dims(b_mini[plan.remapped], -2)
-        t4 = time.perf_counter()
-        p.record_observed(self.layer_idx, plan.uniq_list)
-        p.add(
-            self.layer_idx,
-            gate=plan.gate_s if built else 0.0,
-            unique=plan.unique_s if built else 0.0,
-            load=res.t_load,
-            # clamp: arena-mode t_load was spent in the GLU engage, before
-            # this linear's t2 — never let the stack bucket go negative.
-            stack=max(0.0, t4 - t2 - res.t_load),
-            hits=res.hits,
-            misses=res.misses,
-            experts=len(plan.uniq_list),
-            positions=plan.positions,
-        )
-        # record_prev lives in StreamingSwitchGLU.__call__: the 2-3
-        # projections of one layer share plan.uniq_list, so recording here
-        # would triple-count every layer's routing.
         return out
 
 
@@ -3602,7 +3256,6 @@ class StreamingSwitchGLU(nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
-        self.fused_gate_up = fused_gate_up
         self.inverse_scatter = inverse_scatter
         self.quantized = quantized
         # Original SwitchGLU activation (e.g. DeepSeek V4's LimitedSwiGLU with
@@ -3610,19 +3263,11 @@ class StreamingSwitchGLU(nn.Module):
         # Underscore attr keeps it out of the nn.Module parameter tree.
         self._activation = activation
 
-        # We will be populated by the converter after construction
-        # Placeholder attributes for introspection
-        self._input_dims = input_dims
-        self._hidden_dims = hidden_dims
+        # Populated by the converter after construction; dims/quant
+        # metadata live on the linears, not here.
         self._num_experts = num_experts
         self._backing = backing
         self._cache = cache
-        self._group_size = group_size
-        self._bits = bits
-        self._mode = mode
-
-        # Create streaming linears lazily; actual keys set by converter
-        self._initialized = False
 
     @property
     def activation(self) -> Any:
@@ -3712,26 +3357,6 @@ class StreamingSwitchGLU(nn.Module):
                 self.layer_idx, plan.uniq_list, plan.positions, counts
             )
 
-    def _record_predicted(self, p, plan) -> None:
-        # The readahead advisor's prev-token prediction for THIS layer is
-        # the previous token's routing (recorded in spec_state by the last
-        # token). Register it as 'predicted' so profile.report() measures
-        # prediction precision/recall (observed is recorded by every
-        # linear path below).
-        try:
-            _spec = getattr(getattr(self, "_cache", None), "spec_state", None)
-            _prev = getattr(_spec, "prev_uniq_by_layer", None) if _spec is not None else None
-            if p is not None and p.enabled and _prev:
-                _pp = _prev.get(self.layer_idx)
-                if _pp:
-                    p.record_predicted(self.layer_idx, list(_pp))
-        except Exception:
-            logger.debug(
-                "expert_streaming: record_predicted skipped for layer %d",
-                getattr(self, "layer_idx", -1),
-                exc_info=True,
-            )
-
     def _engage_arena_and_ctx(self, plan, idx, indices, has_fused, seq_len) -> None:
         # Arena mode: engage before the layer-ctx decision — when the
         # demand set fits the slot bank, gather_qmm reads slot rows and the
@@ -3808,32 +3433,14 @@ class StreamingSwitchGLU(nn.Module):
                     exc_info=True,
                 )
 
-    def _prefill_diag(self, p, x_out, indices) -> None:
-        if (
-            _PREFILL_DIAG_ENV
-            and p is not None
-            and p.enabled
-            and int(indices.size) >= _PREFILL_DIAG_MIN_ROUTES
-        ):
-            # Force-eval the layer's graph (everything upstream is a lazy
-            # dependency of x_out, so with a sync at every MoE GLU each eval
-            # covers exactly one layer's segment: attention + dense + GLU
-            # QMMs). CPU buckets measured inside the linears remain valid;
-            # absolute wall inflates because the CPU/GPU overlap is gone.
-            t_gpu0 = time.perf_counter()
-            mx.eval(x_out)
-            p.add_gpu(self.layer_idx, time.perf_counter() - t_gpu0)
-
     def _call_prologue(self, x, indices):
-        """-> (profile, t_wall0, has_fused, hook, seq_len).
+        """-> (has_fused, hook, seq_len).
 
         Call shape for hooks/phase: seq_len (indices.shape[-2]) is the
         token count — the authoritative decode-vs-prefill signal (a
         1-token top_k=8 decode is 8 routed rows, not "prefill").
         """
         # Mirror SwitchGLU.__call__ but route through streaming linears
-        p = getattr(self, "_cache", None).profile if hasattr(self, "_cache") else None
-        t_wall0 = time.perf_counter() if (p is not None and p.enabled) else None
         # Determine fused vs split by presence of gate_up_proj
         has_fused = hasattr(self, "gate_up_proj")
         # Opt-in warm/pin hook (warmer.py): fires previous-token reads for
@@ -3844,7 +3451,7 @@ class StreamingSwitchGLU(nn.Module):
             if getattr(indices, "ndim", 0) >= 2
             else None
         )
-        return p, t_wall0, has_fused, hook, _seq_len
+        return has_fused, hook, _seq_len
 
     def _sort_call_inputs(self, x, indices):
         """Expand + gather-sort the call inputs -> (x_exp, idx, do_sort,
@@ -3864,7 +3471,7 @@ class StreamingSwitchGLU(nn.Module):
         return x_out.squeeze(-2)
 
     def __call__(self, x, indices, scores=None, weighted_sum: bool = False):
-        p, t_wall0, has_fused, hook, _seq_len = self._call_prologue(x, indices)
+        has_fused, hook, _seq_len = self._call_prologue(x, indices)
         if hook is not None:
             self._notify_layer_start(hook, int(indices.size), _seq_len)
         x_exp, idx, do_sort, inv_order = self._sort_call_inputs(x, indices)
@@ -3876,13 +3483,7 @@ class StreamingSwitchGLU(nn.Module):
         # than routed rows.
         plan = _RemapPlan()
         plan.seq_len = _seq_len
-        self._record_predicted(p, plan)
         self._engage_arena_and_ctx(plan, idx, indices, has_fused, _seq_len)
-        if memtrace.enabled:
-            memtrace.record(
-                'glu.enter', layer=self.layer_idx, positions=int(indices.size)
-            )
-
         # The projection block is the whole lifetime of the layer context:
         # close() in a finally so a raising projection still flushes the
         # per-layer stall counters (a partial layer is still a stalled layer).
@@ -3896,10 +3497,6 @@ class StreamingSwitchGLU(nn.Module):
         self._record_prev(plan)
         if hook is not None:
             self._notify_layer_plan(hook, plan, _seq_len)
-        if _TRACE_PATH is not None:
-            _trace_row(self.layer_idx, plan.uniq_list, plan.positions)
-
-        self._prefill_diag(p, x_out, indices)
 
         # Weighted-sum fast path: the family's fused kernel, injected by the
         # converter from model_hooks (glm_moe_dsa.fast.glm_moe_weighted_sum,
@@ -3922,8 +3519,6 @@ class StreamingSwitchGLU(nn.Module):
                     )
 
         out = self._unsort_output(x_out, inv_order, do_sort, indices)
-        if t_wall0 is not None and p is not None:
-            p.add_wall(self.layer_idx, time.perf_counter() - t_wall0)
         return out
 
     # ------------------------------------------------------------------
@@ -4004,7 +3599,6 @@ class StreamingSwitchGLU(nn.Module):
         if len(uniq) > arena.book.cap:
             return False
         h0, m0 = arena.book.hits, arena.book.misses
-        t0 = time.perf_counter()
         with arena.lock:
             # frozen for non-decode calls: verify/prefill
             # experts commit at the eviction-candidate end and hits skip
@@ -4018,16 +3612,6 @@ class StreamingSwitchGLU(nn.Module):
             plan.arena_rhs = arena.rows_for(uniq)[plan.remapped]
         plan.arena_hits = arena.book.hits - h0
         plan.arena_misses = arena.book.misses - m0
-        plan.arena_load_s = time.perf_counter() - t0
-        if memtrace.enabled:
-            memtrace.record(
-                "arena.engage",
-                layer=self.layer_idx,
-                uniq=len(uniq),
-                hits=plan.arena_hits,
-                misses=plan.arena_misses,
-                rooms=arena.book.rooms,
-            )
         # The layer-ctx close() feeds these counters in bundle mode; arena
         # skips the ctx, so report the same visit signal directly — the
         # governor's dynamic-budget loop stays informed either way. The

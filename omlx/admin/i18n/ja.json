@@ -1214,8 +1214,6 @@
   "modal.model_settings.expert_streaming": "Expert streaming",
   "modal.model_settings.expert_streaming_hint": "Serve MoE experts from SSD under a memory budget with a live governor. Replaces the legacy offload toggle — old settings keep working and migrate on save. Requires reload.",
   "modal.model_settings.expert_streaming_legacy_note": "Legacy offload settings detected — now served by this unified backend. Saving migrates them.",
-  "modal.model_settings.streaming_budget_auto": "Automatic budget",
-  "modal.model_settings.streaming_budget_auto_hint": "Scale with free RAM; the governor adapts it live.",
   "modal.model_settings.streaming_budget_gib": "Pinned budget (GiB)",
   "modal.model_settings.streaming_dynamic": "Dynamic governor",
   "modal.model_settings.streaming_dynamic_auto": "Auto",

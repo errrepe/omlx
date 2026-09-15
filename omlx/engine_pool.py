@@ -53,6 +53,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .model_settings import (
+    EXPERT_STREAMING_TUNABLE_KEYS,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
@@ -952,29 +953,7 @@ class EnginePool:
             # Every expert-streaming knob consumed at engine construction
             # belongs here so changing one reloads while a stale value never
             # forces a reload once the feature is off.
-            for key in (
-                "expert_streaming_budget_gib",
-                "expert_streaming_budget_auto",
-                "expert_streaming_dynamic",
-                "expert_streaming_dynamic_max_gib",
-                "expert_streaming_dynamic_min_gib",
-                "expert_streaming_dynamic_stall_target",
-                "expert_streaming_prefill_budget_gib",
-                "expert_streaming_io_depth",
-                "expert_streaming_coalesce",
-                "expert_streaming_readahead",
-                "expert_streaming_seed",
-                "expert_streaming_per_layer_eval",
-                "expert_streaming_pins",
-                "expert_streaming_pin_gib",
-                "expert_streaming_pin_sync",
-                "expert_streaming_pin_regime",
-                "expert_streaming_cold_tier",
-                "expert_streaming_hot_fraction",
-                "expert_streaming_cache_policy",
-                "expert_streaming_topk_threshold",
-                "expert_streaming_cache_prior",
-            ):
+            for key in EXPERT_STREAMING_TUNABLE_KEYS:
                 # budget_gib is canonicalized: the WebUI writes an explicit 0
                 # for page-cache mode, and 0 must hash the same as unset so
                 # flipping auto/page-cache never forces a reload.
@@ -3558,27 +3537,12 @@ class EnginePool:
         if engine is None:
             return None
         try:
-            # Same holder walk the engines use in _log_streaming_summary:
-            # the converter stamps the backing on the engine and/or model,
-            # and the legacy adapter exposes its governor-facing state.
-            backing = getattr(engine, "_expert_streaming_backing", None)
-            if backing is None:
-                for holder in (
-                    getattr(engine, "_model", None),
-                    getattr(engine, "_vlm_model", None),
-                ):
-                    backing = getattr(holder, "_expert_streaming_backing", None)
-                    if backing is not None:
-                        break
-            for holder in (
-                engine,
-                getattr(engine, "_model", None),
-                getattr(engine, "_vlm_model", None),
-            ):
-                state = getattr(holder, "_moe_offload_legacy_state", None)
-                if state is not None:
-                    backing = state
-                    break
+            # Same holder walk the engines use per request: the converter
+            # stamps the backing on the engine and/or model, and the legacy
+            # adapter exposes its governor-facing state.
+            from .patches.expert_streaming import streaming_summary_backing
+
+            backing = streaming_summary_backing(engine)
             cache = getattr(backing, "_streaming_cache", None)
 
             sched = self._resolve_scheduler_from_engine(engine)

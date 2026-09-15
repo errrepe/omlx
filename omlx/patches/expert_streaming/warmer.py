@@ -129,7 +129,7 @@ class PageCacheWarmer:
         self.last_uniq: Dict[int, list[int]] = {}
         # These two are bumped from _WARM_POOL workers (_advise_one runs
         # inside the submitted _run), so a bare ``+=`` loses updates —
-        # same reason RunPoolTelemetry / ReadTelemetry lock theirs.
+        # same reason the read path's counters lock theirs.
         self._stats_lock = threading.Lock()
         self.advised = 0
         self.advise_failures = 0

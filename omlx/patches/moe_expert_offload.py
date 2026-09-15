@@ -709,19 +709,10 @@ class LegacyOffloadState:
     def evictions(self) -> int:
         return sum(c.evictions for c in self.caches)
 
-    @property
-    def streaming_guard_info(self):
-        """None on purpose.
-
-        The scheduler's prefill-bank transient exists for the generic
-        streaming path's lazy per-layer mini-banks; the legacy slot
-        buffers are persistent and pre-allocated, so that term does not
-        apply. Backing presence still matters: ``_streaming_backing_of``
-        finds the store marker and serializes requests, which the
-        per-layer LRU needs.
-        """
-        return None
-
+    # No ``streaming_guard_info``: the scheduler's prefill-bank transient
+    # exists for the generic path's lazy mini-banks; the legacy slot
+    # buffers are persistent and pre-allocated, so that term does not
+    # apply. The scheduler reads it via getattr-with-default.
     def note_visit(self, layer_idx: int, missed: bool) -> None:
         # Called by OffloadSwitchGLU.__call__ AFTER the cache lock is
         # released — taking the state lock here keeps the order

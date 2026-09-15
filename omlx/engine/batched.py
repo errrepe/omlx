@@ -314,46 +314,17 @@ class BatchedEngine(BaseEngine):
             from ..model_settings import moe_offload_requested
 
             if moe_offload_requested(self._model_settings):
-                # One predicate for "this checkpoint can stream", shared with
-                # EnginePool (which forces streaming) and the converter below
-                # (which does the conversion): the structural estimate.
-                #
-                # This used to test the model_type allowlist instead, which
-                # disagreed with the estimate: any checkpoint with stacked
-                # switch_mlp banks outside the list was forced into streaming
-                # by EnginePool while this gate declined the lazy load, so
-                # mlx_lm materialized the full multi-hundred-GB MoE banks and
-                # the process was OOM-killed before the converter ran. The
-                # estimate itself now requires the allowlist (residency.py),
-                # so a single check cannot diverge from itself.
-                from ..patches.expert_streaming.residency import (
-                    expert_streaming_estimate,
-                )
-
-                if expert_streaming_estimate(self._model_name).supported:
-                    # Lazy-load so giant MoE checkpoints (DeepSeek V4 Flash
-                    # oQ4e ~166G) stream from SSD instead of materializing
-                    # fully in RAM; expert streaming replaces the MoE banks
-                    # before materialize_lazy_state runs.
-                    load_kwargs["lazy"] = True
+                # Lazy-load so giant MoE checkpoints (DeepSeek V4 Flash
+                # oQ4e ~166G) stream from SSD instead of materializing
+                # fully in RAM; expert streaming replaces the MoE banks
+                # before materialize_lazy_state runs.
+                load_kwargs["lazy"] = True
 
             return lm_load_compat(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
-                # With expert offload the load stays lazy so the wrap below
-                # can drop non-resident expert tensors BEFORE anything
-                # materializes them; materialize_lazy_state then evaluates
-                # what remains. Without offload, load eagerly as before.
-                # Merged: our streaming path already stages lazy=True in
-                # load_kwargs above, so OR the flags into it (a second
-                # lazy= kwarg alongside **load_kwargs would collide).
-                # Unified backend: either key (legacy alias or canonical).
-                **{
-                    **load_kwargs,
-                    "lazy": load_kwargs.get("lazy", False)
-                    or moe_offload_requested(self._model_settings),
-                },
+                **load_kwargs,
             )
 
         loop = asyncio.get_running_loop()
@@ -892,27 +863,14 @@ class BatchedEngine(BaseEngine):
         # Persist the learned expert-pin profile while the backing is still
         # reachable (teardown below drops it with the model).
         from omlx.patches.expert_streaming import (
+            resolve_streaming_backing,
             save_expert_pin_profile,
             shutdown_expert_streaming,
         )
 
         save_expert_pin_profile(self)
         try:
-            # The unified converter stamps the same backing on engine and
-            # model, but the legacy offload adapter (and the alias' streaming
-            # fallback) stamps its CheckpointExpertStore on the model only —
-            # walk the same holder chain _log_streaming_summary uses so those
-            # fds/mmaps release here instead of whenever GC gets around to it.
-            backing = getattr(self, "_expert_streaming_backing", None)
-            if backing is None:
-                for holder in (
-                    getattr(self, "_model", None),
-                    getattr(self, "_vlm_model", None),
-                ):
-                    backing = getattr(holder, "_expert_streaming_backing", None)
-                    if backing is not None:
-                        break
-            shutdown_expert_streaming(backing)
+            shutdown_expert_streaming(resolve_streaming_backing(self))
         except Exception:
             pass
         try:
@@ -1201,62 +1159,17 @@ class BatchedEngine(BaseEngine):
     def _log_streaming_summary(
         self, *, prompt_tokens: int = 0, completion_tokens: int = 0
     ) -> None:
-        """P2: one-line MoE streaming health log per completed request.
+        """One-line MoE streaming health log per completed request.
 
-        No-op unless expert streaming is active. Uses the counters the
-        implementation already keeps (see expert_streaming_summary).
+        No-op unless expert streaming is active.
         """
-        try:
-            backing = getattr(self, "_expert_streaming_backing", None)
-            if backing is None:
-                # The legacy adapter stamps the store on the model, not
-                # the engine — without the walk its summary never logs
-                # and its governor never observes.
-                backing = getattr(
-                    getattr(self, "_model", None),
-                    "_expert_streaming_backing",
-                    None,
-                )
-            # The legacy path aggregates its per-layer caches under a
-            # governor-facing state (same duck-type as the V4.1 backing):
-            # it owns the governor and the summary.
-            state = getattr(
-                getattr(self, "_model", None),
-                "_moe_offload_legacy_state",
-                None,
-            )
-            if state is not None:
-                backing = state
-            if backing is None:
-                return
-            # Dynamic residency: revisit cache capacity from free memory
-            # once per request boundary (opt-in; never raises).
-            governor = getattr(backing, "governor", None)
-            if governor is not None:
-                governor.observe()
-            from ..patches.expert_streaming import expert_streaming_summary
+        from ..patches.expert_streaming import log_expert_streaming_summary
 
-            cache = getattr(backing, "_streaming_cache", None)
-            summary = expert_streaming_summary(cache, backing)
-            if not summary:
-                return
-            logger.info(
-                "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
-                "(h=%d m=%d evict=%d size=%d/%d) advised=%d "
-                "ctx_fallbacks=%s",
-                prompt_tokens,
-                completion_tokens,
-                summary.get("lru_hit_rate", 0.0),
-                summary.get("lru_hits", 0),
-                summary.get("lru_misses", 0),
-                summary.get("lru_evictions", 0),
-                summary.get("lru_size", 0),
-                summary.get("lru_capacity", 0),
-                summary.get("advised", 0),
-                summary.get("ctx_fallbacks", {}),
-            )
-        except Exception:
-            pass
+        log_expert_streaming_summary(
+            self,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     async def stream_generate(
         self,

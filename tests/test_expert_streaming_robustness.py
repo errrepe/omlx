@@ -137,9 +137,10 @@ class TestV41GovernorFloor:
             )
             # capacity resolves to base_cap through a single property.
             assert backing.capacity == backing.base_cap
-            # Documented-None — V4.1 slots are persistent buffers, not
-            # the generic path's lazy mini-banks.
-            assert backing.streaming_guard_info is None
+            # Absent on purpose — V4.1 slots are persistent buffers, not
+            # the generic path's lazy mini-banks; the scheduler reads the
+            # missing attr as None.
+            assert getattr(backing, "streaming_guard_info", None) is None
             backing.close()
             assert model._moe_offload_plan._closed
             backing.close()  # idempotent
@@ -423,7 +424,7 @@ class TestLegacyOffloadState:
             summary = state.summary()
             assert summary["layers"] == 1
             # Persistent slot buffers: no mini-bank transient term.
-            assert state.streaming_guard_info is None
+            assert getattr(state, "streaming_guard_info", None) is None
         finally:
             store.close()
 

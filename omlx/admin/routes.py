@@ -42,6 +42,7 @@ from ..model_profiles import (
     filter_universal_fields,
 )
 from ..model_settings import (
+    EXPERT_STREAMING_TUNABLE_KEYS,
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
     ModelSettings,
     resolve_vlm_mtp_conflicts,
@@ -783,32 +784,11 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_verify_mode",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
-        # Whole expert-streaming tunable family: the diffusion lane never
-        # builds the streaming backend, so stored values must not survive
-        # a save/profile-apply on this lane.
-        "expert_streaming_budget_gib",
-        "expert_streaming_budget_auto",
-        "expert_streaming_dynamic",
-        "expert_streaming_dynamic_max_gib",
-        "expert_streaming_dynamic_min_gib",
-        "expert_streaming_dynamic_stall_target",
-        "expert_streaming_prefill_budget_gib",
-        "expert_streaming_io_depth",
-        "expert_streaming_coalesce",
-        "expert_streaming_readahead",
-        "expert_streaming_seed",
-        "expert_streaming_per_layer_eval",
-        "expert_streaming_pins",
-        "expert_streaming_pin_gib",
-        "expert_streaming_pin_sync",
-        "expert_streaming_pin_regime",
-        "expert_streaming_cold_tier",
-        "expert_streaming_hot_fraction",
-        "expert_streaming_cache_policy",
-        "expert_streaming_topk_threshold",
-        "expert_streaming_cache_prior",
     )
-    for key in unsupported_none_fields:
+    # Whole expert-streaming tunable family: the diffusion lane never
+    # builds the streaming backend, so stored values must not survive
+    # a save/profile-apply on this lane.
+    for key in (*unsupported_none_fields, *EXPERT_STREAMING_TUNABLE_KEYS):
         settings[key] = None
 
     settings["force_sampling"] = False
@@ -903,27 +883,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     # streaming backend (mirrors _sanitize_diffusion_settings_dict and the
     # WebUI's DIFFUSION_UNSUPPORTED_PROFILE_FIELDS).
     settings.expert_streaming_enabled = False
-    settings.expert_streaming_budget_gib = None
-    settings.expert_streaming_budget_auto = None
-    settings.expert_streaming_dynamic = None
-    settings.expert_streaming_dynamic_max_gib = None
-    settings.expert_streaming_dynamic_min_gib = None
-    settings.expert_streaming_dynamic_stall_target = None
-    settings.expert_streaming_prefill_budget_gib = None
-    settings.expert_streaming_io_depth = None
-    settings.expert_streaming_coalesce = None
-    settings.expert_streaming_readahead = None
-    settings.expert_streaming_seed = None
-    settings.expert_streaming_per_layer_eval = None
-    settings.expert_streaming_pins = None
-    settings.expert_streaming_pin_gib = None
-    settings.expert_streaming_pin_sync = None
-    settings.expert_streaming_pin_regime = None
-    settings.expert_streaming_cold_tier = None
-    settings.expert_streaming_hot_fraction = None
-    settings.expert_streaming_cache_policy = None
-    settings.expert_streaming_topk_threshold = None
-    settings.expert_streaming_cache_prior = None
+    for key in EXPERT_STREAMING_TUNABLE_KEYS:
+        setattr(settings, key, None)
     settings.qwen4_ple_ssd_offload = False
     settings.deepseek_v41_engram_ssd_offload = False
     settings.specprefill_enabled = False
@@ -2363,42 +2324,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                     model_info.get("model_path", "")
                 )
                 if moe_offload_requested(settings):
-                    entry = engine_pool.get_entry(model_id)
-                    if entry is not None:
-                        _, _, adjusted = engine_pool._deepseek_v41_engram_offload_status(
-                            entry, settings, ceiling=residency_ceiling
-                        )
-                        if adjusted is not None:
-                            estimate = adjusted
-                deepseek_v41_engram_ssd_offload_supported = estimate.supported
-                deepseek_v41_engram_ssd_offload_forced = estimate.force_ssd_offload(
-                    residency_ceiling
-                )
-                v41_resident_bytes = estimate.resident_bytes
-                v41_mmap_bytes = estimate.mmap_bytes
-            except (KeyError, OSError, TypeError, ValueError):
-                logger.debug(
-                    "Could not inspect DeepSeek V4.1 Engram residency for %s",
-                    model_id,
-                    exc_info=True,
-                )
-
-        deepseek_v41_engram_ssd_offload_supported = False
-        deepseek_v41_engram_ssd_offload_forced = False
-        v41_resident_bytes = 0
-        v41_mmap_bytes = 0
-        if (model_info.get("config_model_type") or "").replace(
-            "-", "_"
-        ).lower() == "deepseek_v41":
-            try:
-                from ..patches.deepseek_v41.residency import (
-                    deepseek_v41_residency_estimate,
-                )
-
-                estimate = deepseek_v41_residency_estimate(
-                    model_info.get("model_path", "")
-                )
-                if getattr(settings, "moe_expert_offload_enabled", False):
                     entry = engine_pool.get_entry(model_id)
                     if entry is not None:
                         _, _, adjusted = engine_pool._deepseek_v41_engram_offload_status(

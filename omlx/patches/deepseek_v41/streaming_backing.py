@@ -27,7 +27,6 @@ import logging
 import os
 import threading
 
-from ..expert_streaming.memtrace import memtrace
 from ..expert_streaming.slot_cache import DecodeVisitStats
 
 logger = logging.getLogger(__name__)
@@ -241,19 +240,10 @@ class V41StreamingBacking:
         # aggregates.
         return sum(s.evictions for s in self.slots_of.values())
 
-    @property
-    def streaming_guard_info(self):
-        """None on purpose.
-
-        The scheduler's prefill-bank transient exists for the generic
-        streaming path's lazy per-layer mini-banks. V4.1 expert slots are
-        persistent pre-allocated buffers, so that term does not apply;
-        the chunked gather outputs are bounded by the existing chunk
-        machinery. Backing presence still matters: _streaming_backing_of
-        finds it and serializes requests, which the per-layer LRU needs.
-        """
-        return None
-
+    # No ``streaming_guard_info``: the scheduler's prefill-bank transient
+    # exists for the generic path's lazy mini-banks; V4.1 expert slots are
+    # persistent pre-allocated buffers, so that term does not apply. The
+    # scheduler reads it via getattr-with-default.
     def close(self) -> None:
         """Release the plan's shard readers and fetch pool.
 
@@ -309,21 +299,6 @@ class V41StreamingBacking:
                 + (1.0 - _STAGED_RECALL_DECAY) * obs
             )
         self.prev_uniq[li] = now
-        # Routing trace: decode-only by contract (ensure() calls this
-        # solely on the decode branch — verify/prefill never pollute it).
-        # A tracer write failure must never propagate into ensure() —
-        # tracing is observability, not the demand path.
-        try:
-            memtrace.record(
-                "routing",
-                _light=True,
-                src="v41",
-                layer=int(layer_idx),
-                experts=sorted(int(e) for e in experts),
-                positions=1,
-            )
-        except Exception:
-            logger.debug("v41 routing memtrace failed", exc_info=True)
 
     def stage_next(self, layer_idx: int) -> None:
         """Stage the NEXT MoE layer's predicted set.
@@ -374,24 +349,8 @@ class V41StreamingBacking:
         if gov is None:
             return True
         try:
-            # Public governor accessors when present (contract API);
-            # fall back to the private reads otherwise.
-            at_floor = getattr(gov, "at_floor", None)
-            floor_hit = (
-                at_floor()
-                if callable(at_floor)
-                else self.base_cap <= gov._min_cap_slots()
-            )
-            if floor_hit:
+            if gov.at_floor() or gov.in_desperate_band():
                 return False
-            desperate = getattr(gov, "in_desperate_band", None)
-            if callable(desperate):
-                if desperate():
-                    return False
-            else:
-                free = float(getattr(gov, "_last_free_gib", 0.0) or 0.0)
-                if 0.0 < free < gov.low_free_bytes / 1024**3:
-                    return False
         except Exception:
             return True
         return True

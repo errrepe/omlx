@@ -25,7 +25,6 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from .memtrace import memtrace
 
 _TRANSITION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_TRANSITION", "1") != "0"
 _TRANSITION_TOP = 8  # entries kept per (layer, expert) source
@@ -136,19 +135,9 @@ class SpeculationState:
         """Remember this layer's routing for the next token's speculation."""
         now = [int(e) for e in ids]
         li = int(layer_idx)
-        # Routing trace: one event per MoE layer-call (emitted from
-        # StreamingSwitchGLU.__call__ — the projections share the plan's
-        # uniq_list, so a per-projection record would triple-count every
-        # layer). _light skips the memory sampler: this fires on the
-        # inference hot path.
-        memtrace.record(
-            "routing",
-            _light=True,
-            src="generic",
-            layer=li,
-            experts=now,
-            positions=positions,
-        )
+        # Called once per MoE layer-call from StreamingSwitchGLU.__call__ —
+        # the projections share the plan's uniq_list, so a per-projection
+        # record would triple-count every layer.
         with self.lock:
             if self.closed:
                 return
@@ -304,11 +293,6 @@ class SpeculationState:
 
     def stage_enabled(self) -> bool:
         return _STAGED_ENV
-
-    def stage_recall(self, layer_idx: int) -> float:
-        with self.lock:
-            return float(self.recall_ewma.get(int(layer_idx), 0.0))
-
     def stage_gate(self, layer_idx: int) -> bool:
         """True when this layer's prediction earns its reads — the
         prev-token EWMA gates staging."""
