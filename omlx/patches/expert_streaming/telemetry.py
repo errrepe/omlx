@@ -65,28 +65,12 @@ _pyapi.PyObject_GetBuffer.argtypes = [ctypes.py_object, ctypes.POINTER(_PyBuffer
 _pyapi.PyObject_GetBuffer.restype = ctypes.c_int
 _pyapi.PyBuffer_Release.argtypes = [ctypes.POINTER(_PyBuffer)]
 
-# Page-cache residency probe. Off by default: mincore(2) costs one syscall
-# per expert read and this exists to SETTLE A CONTRADICTION, not to run in
-# production. The mihailescu2m/llama.cpp logs measured that "the page cache
-# serves a few percent of expert reads" for multi-MiB expert slabs, and
-# concluded all F_NOCACHE/L2 work there is dead -- while explicitly noting
-# the opposite for 90-byte PLE rows, where the page cache "genuinely helps".
-# Our own decode profile instead inferred "75% of expert bytes come from the
-# page cache at 82 GiB/s" by FITTING 1/10.55 = 0.75/82 + 0.25/D, which is a
-# model, not a measurement. Both cannot be true on the same hardware; this
-# counter is what decides it.
-# Sampling rate, not just an on/off flag: mincore(2) is one syscall per
-# expert read, and measuring every read costs 3.6% decode throughput
-# (bench/results/ab_mincore.json, qwen-jang, 4 reps) -- far too much for a
-# diagnostic. 1-in-N sampling keeps the estimate: at N=32 the residency
-# fraction is still +-0.2% absolute over ~150k reads per run, for ~0.1% of
-# the cost. 0 disables; 1 samples every read (the original behaviour).
-#
-# MEASURED RESULT (warm page cache, qwen-jang, 4 reps, 38 GB sampled/run):
-# hot_byte_frac = 0.563 +- 0.002. So on this hardware the page cache serves
-# ~56% of expert read BYTES -- neither the fork's "a few percent" nor our
-# fitted 75%. Their conclusion that page-cache work is dead does not
-# transfer; ours was directionally right and numerically optimistic.
+# Page-cache residency probe: measures whether expert reads hit the page
+# cache. Off by default — mincore(2) costs one syscall per expert read,
+# far too much for production, so this is a diagnostic.
+# The value is a sampling rate, not just an on/off flag: 1-in-N sampling
+# keeps the residency estimate within ~0.2% absolute over a run's reads
+# at ~0.1% of the cost. 0 disables; 1 samples every read.
 _PCACHE_PROBE_ENV = max(
     0, int(os.environ.get("OMLX_EXPERT_STREAMING_MINCORE", "") or 0)
 )
@@ -233,7 +217,7 @@ def _mincore_resident_bytes(mm: mmap.mmap, offset: int, length: int) -> int | No
         return None
 
 
-# Fase 2/M3: demand-read telemetry. The env gates the DEFAULT enabled
+# Demand-read telemetry. The env gates the DEFAULT enabled
 # state of every backing's telemetry (the bench sets PROFILE=1); each
 # ExpertBackingStore owns a ReadTelemetry instance, so engines never mix
 # sessions. Zero instrumentation cost when a backing's telemetry is off:
@@ -274,15 +258,13 @@ def arm_read_telemetry(enabled: bool = True) -> bool:
             tel.enabled = _PROFILE_READS
     return prev
 
-# Fase M2/A3 stage buckets (recorded per component except the per-run
-# ones). A3 renamed the ambiguous window metrics and cut the old names
-# directly (every pre-A artifact is archived as un-comparable):
-#   queue_wait_us  -> worker_start_delay_us (submit -> worker start)
-#   preadv_us      -> read_duration_us (inside _read_into: SSD/kernel)
-#   future_tail_us -> last_future_wait_us (caller wait for the FINAL run)
-# plus NEW window_wait_us (all caller blocks on window futures together).
+# Stage buckets (recorded per component except the per-run ones):
+#   worker_start_delay_us  submit -> worker start
+#   read_duration_us       inside _read_into: SSD/kernel
+#   last_future_wait_us    caller wait for the FINAL run
+#   window_wait_us         all caller blocks on window futures together
 # compare_results.py refuses comparisons whose stage-key vocabularies
-# differ; tests/ snapshot this canonical set (Fase A6).
+# differ; tests/ snapshot this canonical set.
 _READ_METRICS = (
     "component_e2e_us",
     "reader_resolve_us",
@@ -300,8 +282,8 @@ _RUN_SIZE_CAP = 512
 
 
 def read_stats(backing: Any = None) -> dict | None:
-    """Fase M3: demand-read telemetry snapshot of one backing (None when
-    unarmed or no backing given — telemetry is per-backing now)."""
+    """Demand-read telemetry snapshot of one backing (None when
+    unarmed or no backing given — telemetry is per-backing)."""
     if backing is None:
         return None
     tel = getattr(backing, "read_telemetry", None)
@@ -410,7 +392,7 @@ class _ReadAccum:
 
 
 class ReadTelemetry:
-    """Fase M3: per-backing, phase-scoped, memory-bounded read telemetry.
+    """Per-backing, phase-scoped, memory-bounded read telemetry.
 
     Ownership: ONE instance per ExpertBackingStore — two engines never
     share counters. Scopes: begin_phase(phase, request_id, engine_id,
@@ -569,7 +551,7 @@ class ReadTelemetry:
 
 
 class RunPoolTelemetry:
-    """Fase M4/A4: OBSERVED concurrency of the process-wide run pool.
+    """OBSERVED concurrency of the process-wide run pool.
 
     requested_inflight (the caller's window size) is not the effective
     depth: the pool is shared process-wide, so queued tasks may wait for
@@ -577,7 +559,7 @@ class RunPoolTelemetry:
     attribute a phase from before/after samples. The worker wrapper takes
     two tiny locks (start/finish) and never covers the preadv itself.
 
-    Fase A4 OWNERS: every task may carry an owner tag (e.g. id(backing)).
+    OWNERS: every task may carry an owner tag (e.g. id(backing)).
     The per-owner counters mirror the global ones and reconcile with them
     (submitted_A + submitted_B == submitted_total), so a multi-engine
     process can attribute pool activity to ONE engine. Callers pass an
@@ -638,10 +620,10 @@ class RunPoolTelemetry:
 
         def _w(*a, **k):
             t0 = time.perf_counter_ns()
-            # P1-8: bound `ost` up front. It used to be assigned inside the
-            # `with self._lock` block, so if that block raised, the
-            # `except BaseException` arm below hit an unbound `ost` and a
-            # NameError replaced the real error.
+            # `ost` must be bound before the lock: if the `with self._lock`
+            # block raises, the `except BaseException` arm below would
+            # otherwise hit an unbound `ost` and a NameError would replace
+            # the real error.
             ost = None
             with self._lock:
                 self.queued = max(0, self.queued - 1)
@@ -692,7 +674,7 @@ class RunPoolTelemetry:
 
     def snapshot(self, owner: Any = None) -> dict:
         """Cumulative counters of one owner, or of the whole process pool
-        when owner is None (the pre-A4 behavior)."""
+        when owner is None."""
         with self._lock:
             if owner is not None:
                 ost = self._owner_state(owner)
@@ -745,7 +727,7 @@ class RunPoolTelemetry:
 
 
 # ---------------------------------------------------------------------------
-# Per-layer stage profiler + routing trace (moved from streaming_switch).
+# Per-layer stage profiler + routing trace.
 # ---------------------------------------------------------------------------
 
 _PROFILE_ENV = os.environ.get("OMLX_EXPERT_STREAMING_PROFILE", "") == "1"
@@ -775,7 +757,7 @@ class LayerProfile:
 
 
 class ProfileAccumulator:
-    """Per-layer stage timing for the streaming switch (Fase 0 instrumentation).
+    """Per-layer stage timing for the streaming switch.
 
     Buckets per layer, per token:
       gate_eval  – mx.eval(indices) + device->host copy
@@ -939,7 +921,7 @@ class ProfileAccumulator:
         }
 
 
-# Routing trace (Fase I3): when OMLX_EXPERT_STREAMING_TRACE is set, append one
+# Routing trace: when OMLX_EXPERT_STREAMING_TRACE is set, append one
 # JSONL row per MoE layer call ({call, layer, positions, uniq}) so
 # bench/lrc_analysis.py can compute routing-consistency (SRP/SCH) offline.
 _TRACE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_TRACE", "") or None

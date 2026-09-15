@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ExpertBackingStore bounds and pin accounting (audit fixes).
+"""ExpertBackingStore bounds and pin accounting.
 
 - ``expert_run`` rejects out-of-range runs instead of silently clamping
-  (the old ``max(1, min(count, E - first))`` served the WRONG experts
-  under the requested ids).
+  (clamping would serve the WRONG experts under the requested ids).
 - ``pin_expert`` counts only newly wired pages — adjacent experts share
-  the boundary page and must not double-charge ``pinned_bytes`` (the
-  accounting path read an undefined ``phys_id`` and always fell back to
-  the coarse estimate).
+  the boundary page and must not double-charge ``pinned_bytes``.
 """
 import json
 
@@ -56,7 +53,7 @@ def test_expert_run_rejects_out_of_range(tmp_path):
             store.load_expert_run(key, e - 1, 2)
         with pytest.raises(ValueError, match="exceeds"):
             store.load_expert_run(key, 0, 0)
-        # Edge values that used to be silently clamped now must be exact.
+        # Edge values must be exact, never clamped.
         with pytest.raises(ValueError):
             store.load_expert_run(key, 0, e + 1)
     finally:
@@ -74,7 +71,7 @@ def test_expert_run_full_tensor_ok(tmp_path):
 
 def test_pin_counts_unique_pages(tmp_path, monkeypatch):
     """Adjacent experts share the boundary page: pinning both must count
-    the shared page once — the undefined-phys_id path never ran."""
+    the shared page once."""
     store, key, e = _store(tmp_path)
     try:
         locked_calls = []

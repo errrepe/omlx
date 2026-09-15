@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """S3FIFOExpertCache — per-queue layer indexes, drain/resize accounting,
-and the non-counting peek probes (audit fixes).
+and the non-counting peek probes.
 
-Before the fix the policy kept no index over either queue: the per-layer
-victim eviction scanned _small + _store in full, resize() left the small
-FIFO sized for the old capacity, and peek() never saw the small queue at
-all (a staged small-queue row read as a miss).
+The per-layer indexes keep victim eviction O(1) (no _small + _store
+scan), resize() re-bounds the small FIFO to the new capacity, and peek()
+sees the small queue so a staged small-queue row does not read as a
+miss.
 """
 import omlx.patches.expert_streaming.cache_policies as cp
 from omlx.patches.expert_streaming.cache_policies import S3FIFOExpertCache

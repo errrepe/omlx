@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""O2 cross-layer speculation state (per conversion).
+"""Cross-layer speculation state (per conversion).
 
 Owns the routing history, converted-linears registry, advise stats and
 the transition table that feed the next-layer F_RDADVISE advisor. Lives
 in its own module so ``streaming_switch`` keeps the demand path; nothing
 here imports the switch — this is a leaf like ``slot_cache``.
 
-Fase K correction K1/K7: the O2 advisor's speculation state is PER
-CONVERSION (one instance per backing/cache pair), never module-global.
-Two engines (different checkpoints, same tensor keys) can never share
-routing history or linears registries: the state dies with
-the owning store, and close() drains the speculation workers the same
-way ExpertBackingStore.close drains its readers.
-FU1: transition-table overfetch. The (layer, expert) -> next-token expert
+The speculation state is PER CONVERSION (one instance per backing/cache
+pair), never module-global. Two engines (different checkpoints, same
+tensor keys) can never share routing history or linears registries: the
+state dies with the owning store, and close() drains the speculation
+workers the same way ExpertBackingStore.close drains its readers.
+
+Transition-table overfetch: the (layer, expert) -> next-token expert
 distribution (EWMA, temporal: same layer, token t-1 -> t) feeds the RA
 advisor with one extra candidate per demanded expert (k+1 overfetch).
 Hints only (F_RDADVISE), never changes output. 0 disables.
@@ -31,8 +31,7 @@ _TRANSITION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_TRANSITION", "1") != "0"
 _TRANSITION_TOP = 8  # entries kept per (layer, expert) source
 _TRANSITION_OVERFETCH = 1  # extra candidates per demanded expert
 
-# Fase 1 (megaplan): staged decode prefetch — real reads into NumPy rows
-# ahead of demand, replacing the dead stash and the hint-only F_RDADVISE.
+# Staged decode prefetch — real reads into NumPy rows ahead of demand.
 # The predictor is prev_uniq_by_layer (previous token's routing for the
 # next layer) plus transition-table candidates; a per-layer EWMA recall
 # gate stops prefetching layers whose routing diverges, so a bad predictor
@@ -49,9 +48,8 @@ _STAGED_MIN_RECALL = float(
 )
 _STAGED_RECALL_DECAY = 0.9
 
-# P7 (megaplan): advise hygiene. The decode advisory re-issues F_RDADVISE
-# for nearly the same prev-set every token — measured ~1.6x demand bytes
-# in hints on a 256-token decode (325 GB advised / ~200 GB demand).
+# Advise hygiene: the decode advisory would otherwise re-issue F_RDADVISE
+# for nearly the same prev-set every token (~1.6x demand bytes in hints).
 # _ADVISE_TTL dedupes per (layer, expert) across a window of layer-calls
 # (~2 tokens at 48 layers). _ADVISE_TRANS_MIN_PRECISION gates the
 # transition-table extras by their measured precision (the share of last
@@ -65,7 +63,7 @@ _ADVISE_TRANS_MIN_PRECISION = float(
 
 
 class SpeculationState:
-    """Per-conversion O2 speculation state (Fase K K1/K7).
+    """Per-conversion speculation state.
 
     Owns the routing history used by the next-layer advisor, the
     converted-linears registry, the advise stats, and the transition
@@ -89,13 +87,13 @@ class SpeculationState:
             "advice_failures": 0,
             "advice_tier_segments": 0,
         }
-        # FU1: transition table (layer, expert) -> {next_expert: weight}.
+        # Transition table (layer, expert) -> {next_expert: weight}.
         # Temporal only (same layer, token t-1 -> t); cross-layer same-token
-        # transitions are not observable without a model-loop hook (PILOT
-        # covers glm5_next). Bounded: TOP entries per source, pruned on write.
+        # transitions are not observable without a model-loop hook.
+        # Bounded: TOP entries per source, pruned on write.
         self.trans: Dict[Tuple[int, int], Dict[int, float]] = {}
         self.trans_updates = 0
-        # Fase 1 staged prefetch state. `staged` holds completed NumPy rows
+        # Staged prefetch state. `staged` holds completed NumPy rows
         # keyed by the TARGET linear's bundle_key; `staged_futs` maps the
         # same keys to (future, ids, linear) while the set read is in
         # flight — demand joins the in-flight read instead of re-issuing it.
@@ -103,7 +101,7 @@ class SpeculationState:
         self.staged: Dict[Any, Any] = {}
         self.staged_futs: Dict[Any, Tuple[Any, list, Any]] = {}
         self.recall_ewma: Dict[int, float] = {}
-        # P7: advise TTL dedup + transition-overfetch precision. The clock
+        # Advise TTL dedup + transition-overfetch precision. The clock
         # advances one step per record_prev call (one MoE layer-call), so
         # TTL units are layer-calls (≈ num_layers per decode token).
         self._advise_seen: Dict[Tuple[int, int], int] = {}
@@ -138,9 +136,9 @@ class SpeculationState:
         """Remember this layer's routing for the next token's speculation."""
         now = [int(e) for e in ids]
         li = int(layer_idx)
-        # V2-0 routing trace: one event per MoE layer-call (emitted from
+        # Routing trace: one event per MoE layer-call (emitted from
         # StreamingSwitchGLU.__call__ — the projections share the plan's
-        # uniq_list, so a per-projection record triple-counted every
+        # uniq_list, so a per-projection record would triple-count every
         # layer). _light skips the memory sampler: this fires on the
         # inference hot path.
         memtrace.record(
@@ -177,7 +175,7 @@ class SpeculationState:
                         )
                         self._xlayer_ewma[key] = new
                         self.stats[key + "_recall"] = new
-            # P7: transition-overfetch precision — score last call's extras
+            # Transition-overfetch precision: score last call's extras
             # for this layer against what this call actually demanded.
             pend = self._trans_pending.pop(int(layer_idx), None)
             if pend:
@@ -185,10 +183,10 @@ class SpeculationState:
                 self._trans_hits += len(set(now) & pend)
             prev = self.prev_uniq_by_layer.get(int(layer_idx))
             if prev and now:
-                # Fase 1: recall of the prev-token prediction for THIS call —
-                # the gate that decides whether staging this layer pays.
+                # Recall of the prev-token prediction for THIS call — the
+                # gate that decides whether staging this layer pays.
                 inter = len(set(prev) & set(now))
-                # PAR-7 (measure-only): speculative-MoE feasibility. A
+                # Speculative-MoE feasibility counters (measure-only): a
                 # predicted-set execution recomputes every expert the
                 # prediction missed (now \ prev) and wastes the extras it
                 # loaded (prev \ now); full cover = zero-recompute calls.
@@ -270,7 +268,7 @@ class SpeculationState:
             return 0
 
     def predict_next(self, layer_idx: int, ids: list[int], k: int = _TRANSITION_OVERFETCH) -> list[int]:
-        """FU1: top-k next-token candidates for this layer's demand set.
+        """Top-k next-token candidates for this layer's demand set.
 
         Scores sum the transition rows of the demanded experts; the demanded
         ids themselves are excluded (the demand path already loads them).
@@ -302,7 +300,7 @@ class SpeculationState:
                 return
             self.stats[key] = self.stats.get(key, 0) + amount
 
-    # -- staged decode prefetch (Fase 1) ------------------------------------
+    # -- staged decode prefetch ---------------------------------------------
 
     def stage_enabled(self) -> bool:
         return _STAGED_ENV
@@ -387,9 +385,8 @@ class SpeculationState:
         if entry is None:
             return None
         fut, ids, linear = entry
-        # PAR-0: measure how long the demand path parks behind an in-flight
-        # staged read — the signal that decides whether deeper staging
-        # (PAR-4) or two-phase splits (PAR-2) are worth building.
+        # Measure how long the demand path parks behind an in-flight
+        # staged read.
         _waited = not fut.done()
         _wt0 = time.perf_counter() if _waited else 0.0
         try:
@@ -452,7 +449,7 @@ class SpeculationState:
             except Exception:
                 pass
 
-    # -- advise hygiene (P7) ----------------------------------------------
+    # -- advise hygiene ----------------------------------------------------
 
     def advise_fresh(self, layer_idx: int, eids: list) -> list:
         """Drop experts advised within the TTL window; mark the survivors."""
@@ -477,7 +474,7 @@ class SpeculationState:
             return keep
 
     def trans_overfetch_ok(self) -> bool:
-        """True while the transition extras earn their hints (P7).
+        """True while the transition extras earn their hints.
 
         Precision = share of last call's extras that this call actually
         demanded. Until enough evidence accumulates the extras stay on

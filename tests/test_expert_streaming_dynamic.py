@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Dynamic budget (auto default) + V2 phase-aware caps."""
+"""Dynamic budget (auto default) + phase-aware caps."""
 from types import SimpleNamespace
 
 from omlx.patches.expert_streaming import (
@@ -245,8 +245,8 @@ def test_summary_reports_hunger():
     assert "window_stall" in s and "layer_overrides" in s
 
 
-# -- public governor accessors (audit: out-of-tree consumers must not
-# reach into _min_cap_slots / _last_free_gib) ---------------------------
+# -- public governor accessors (out-of-tree consumers must not reach
+# into _min_cap_slots / _last_free_gib) --------------------------------
 
 def test_public_accessors():
     c = _FakeCache(capacity=400)
@@ -360,7 +360,7 @@ def test_dynamic_armed_matrix(monkeypatch):
     assert _dynamic_armed(None, None) is True
 
 
-# -- V2-4: watermark env fractions + generic staging headroom ----------
+# -- watermark env fractions + generic staging headroom ----------------
 
 def test_watermark_envs_scale_with_ram(monkeypatch):
     import omlx.patches.expert_streaming.governor as G

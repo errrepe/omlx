@@ -35,7 +35,7 @@ def _expert_pin_fingerprint(
     cold_root: Any,
     hot_fraction: float | None,
 ) -> dict:
-    """Fase L: profile-identity fields for a loaded model.
+    """Profile-identity fields for a loaded model.
 
     A v2 pin profile applies only when these fields match the model: a
     mismatch logs and ignores the profile (never a silent apply). The
@@ -170,10 +170,9 @@ def _stacked_key_candidates(backing: Any, mid: str) -> list[str]:
 
     A 3-component bucket index covers the canonical terminal spelling
     (``switch_mlp.<proj>.<suffix>``); the first miss on a given mid runs
-    one legacy full scan and folds exotic spellings (mid as a strict
+    one full scan and folds exotic spellings (mid as a strict
     substring of a longer component) into the same bucket. Every later
-    call for that mid is O(bucket), not O(|weight map|) — the old code
-    re-scanned the map per layer × projection × suffix.
+    call for that mid is O(bucket), not O(|weight map|).
     """
     idx = getattr(backing, "_stacked_key_index", None)
     if idx is None:
@@ -213,8 +212,8 @@ def _resolve_stacked_key(
     Prefers exact candidates present in the weight map, then any key
     containing *needle* (layer/scope disambiguation) plus the
     ``switch_mlp.<proj>.<suffix>`` middle. With a real (non-empty) weight
-    map a missing *required* key fails the conversion now — falling back
-    to the first candidate used to point the streaming linear at a key
+    map a missing *required* key fails the conversion now — a first-
+    candidate fallback could point the streaming linear at a key
     the checkpoint does not have, surfacing only on the first fetch.
     RAM dicts / empty maps keep the first-candidate fallback; optional
     suffixes (``biases``) pass ``required=False`` since mxfp checkpoints
@@ -233,9 +232,8 @@ def _resolve_stacked_key(
         # Exotic-spelling fallback: the bucket index covers the canonical
         # ``switch_mlp.<proj>.<suffix>`` terminal; a key where mid is a
         # strict substring of a longer component (e.g. ``.weights``) lands
-        # in a different bucket. One legacy scan per (mid, needle) miss
-        # keeps semantics identical; hits merge into the bucket so the
-        # next lookup stays O(bucket).
+        # in a different bucket. One full scan per (mid, needle) miss;
+        # hits merge into the bucket so the next lookup stays O(bucket).
         scanned = getattr(backing, "_stacked_key_scanned", None)
         if scanned is None:
             scanned = set()
@@ -270,7 +268,7 @@ def _source_packing(src: Any, group_size: int, bits: int, mode: str) -> tuple[in
     JANGQ checkpoints mix precisions inside one layer (e.g. a 2-bit gate
     with 3-bit up/down). Each streaming linear keeps its own source
     projection's packing; the layer-level values stay as fallback only.
-    P1: a projection missing any packing attr fails loudly (same rule
+    A projection missing any packing attr fails loudly (same rule
     as the layer-level detection above) — never inherits silently.
     """
     for _name in ("group_size", "bits", "mode"):
@@ -310,7 +308,7 @@ def _resolve_moe_dims(cfg_candidates: list[Any], estimate: Any = None) -> tuple[
     Sources, in order: the runtime model config candidates, then the
     checkpoint's own header-derived estimate (``residency`` measures the
     projection out-dims). There is deliberately no per-family defaults
-    table anymore — a guessed moe_intermediate mis-slices every expert
+    table — a guessed moe_intermediate mis-slices every expert
     bank silently, so an unresolvable pair fails loudly here instead.
     """
     hidden: int | None = None
@@ -371,9 +369,9 @@ def _convert_switch_mlp_module(
 
     ``candidates_for(proj, suffix)`` yields the checkpoint key candidates for
     this module's stacked banks; ``needle`` disambiguates weight-map fallback
-    scans (e.g. ``layers.5.`` or ``mtp.2.``). ``hot_ids`` (Fase I6) keeps
+    scans (e.g. ``layers.5.`` or ``mtp.2.``). ``hot_ids`` keeps
     those experts at the SOURCE packing with a dual-tier gather; absent/empty
-    keeps the uniform I5 tier (bits overridden to the cold packing).
+    keeps the uniform cold tier (bits overridden to the cold packing).
     """
     import mlx.core as mx
 
@@ -407,9 +405,7 @@ def _convert_switch_mlp_module(
     # Real dims cross-check: the resolved (hidden, moe_hidden) must match
     # the source projections' out dims — shape[1] of the stacked bank is
     # the true out dim whether the tensor is packed or dense. A wrong
-    # guess mis-slices every expert bank, so fail loudly here. (The old
-    # post-conversion check compared the resolved dims to the values the
-    # GLU had just been stamped with — it could never fire.)
+    # guess mis-slices every expert bank, so fail loudly here.
     try:
         _down = getattr(switch_mlp, "down_proj", None)
         _gate = getattr(
@@ -436,7 +432,7 @@ def _convert_switch_mlp_module(
     except Exception:
         pass
 
-    # P1: no silent packing defaults. A quantized projection MUST expose
+    # No silent packing defaults. A quantized projection MUST expose
     # its group_size/bits/mode — guessing 64/4/affine for an unknown future
     # quant silently mis-slices every expert bank. Fail loudly instead.
     group_size: int | None = None
@@ -466,11 +462,11 @@ def _convert_switch_mlp_module(
     def _proj_packing(src):
         return _source_packing(src, group_size, bits, mode)
 
-    # Cold precision tier (I5): when the backing serves this layer's banks
+    # Cold precision tier: when the backing serves this layer's banks
     # from expert_cold/, every projection of the layer computes at the
     # tier's packing — override the source bits/group size once, here, so
     # the fused and split branches both build with the tier parameters.
-    # HOBBIT split (I6): with a hot set for this layer the linear keeps the
+    # HOBBIT split: with a hot set for this layer the linear keeps the
     # SOURCE packing (hot experts) and the cold packing is attached per
     # linear below (dual gather_qmm).
     hobbit_cold_params: tuple[int, int] | None = None
@@ -626,7 +622,7 @@ def _convert_switch_mlp_module(
                 continue
             setattr(streaming_glu, proj_name, _make_proj(proj_name, src, in_dim, out_dim))
 
-    # HOBBIT dual-tier gate (Fase I6): wire the split into every quantized
+    # HOBBIT dual-tier gate: wire the split into every quantized
     # streaming linear of this module — fused AND split projections. With a
     # hot set, the linear keeps the SOURCE packing for hot experts and the
     # cold tier's (hobbit_cold_params) for the rest; the backing already
@@ -640,15 +636,15 @@ def _convert_switch_mlp_module(
             if lin_ is not None and hasattr(lin_, "set_hobbit_split"):
                 lin_.set_hobbit_split(hot_ids, hobbit_cold_params[0], hobbit_cold_params[1])
 
-    # Fase K F1: register this layer's quantized streaming linears for the
-    # O2 next-layer advisor. P3: MTP/DSpark stages register too — they live
+    # Register this layer's quantized streaming linears for the
+    # next-layer advisor. MTP/DSpark stages register too — they live
     # in their own layer-id space (len(layers)+stage, no collision with the
     # trunk), so stage s advises s+1 within the draft chain exactly like
     # trunk layers do. Trunk->stage cross-talk stays off (separate spaces,
     # separate routing), which is correct: draft and verify route distinctly.
     if needle.startswith("layers.") or needle.startswith("mtp."):
-        # Fase K K1: register on the per-conversion speculation state — the
-        # global registry would let one engine's advisor target another
+        # Register on the per-conversion speculation state — a global
+        # registry would let one engine's advisor target another
         # engine's linears.
         _spec_state = getattr(cache, "spec_state", None)
         if _spec_state is not None:
@@ -661,7 +657,7 @@ def _convert_switch_mlp_module(
                 ],
             )
 
-    # P0: per-GLU projection count for cache slot reconciliation. A fused
+    # Per-GLU projection count for cache slot reconciliation. A fused
     # gate_up GLU holds 2 projections (gate_up + down), a split GLU 3 —
     # the global cache was sized for the majority layout, so the convert
     # loop below reconciles any drift (see _reconcile_cache_slots).
@@ -678,7 +674,7 @@ def _convert_switch_mlp_module(
         ) or 1
     streaming_glu.n_proj = n_proj  # type: ignore[attr-defined]
 
-    # Fase J Etapa E: the per-layer load context's projection list (2 fused
+    # The per-layer load context's projection list (2 fused
     # gate_up+down, 3 split) — consumed by the scheduler's guard accounting
     # (_glu_projection_count).
     streaming_glu.linears = [  # type: ignore[attr-defined]
@@ -748,9 +744,8 @@ def _plan_conversion(
     """
     # Canonical kill switch, checked at the converter itself (not just the
     # callers): the engines gate this path on expert_streaming_enabled
-    # alone, so OMLX_MOE_EXPERT_OFFLOAD=0 used to leave it running while
-    # the legacy adapter and admission paths honored the env. Defense in
-    # depth for every entry point, including direct callers.
+    # alone. Defense in depth for every entry point, including direct
+    # callers.
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         logger.info(
             "Expert streaming: disabled by OMLX_MOE_EXPERT_OFFLOAD=0 (%s)",
@@ -772,8 +767,8 @@ def _plan_conversion(
     per_expert = estimate.per_expert_bytes or 0
     # One cache slot holds ONE projection's slice (gate/up/down are separate
     # keys), so slot sizing must divide by the projections per expert —
-    # otherwise the LRU holds a third of the budget it was promised (F2).
-    # Per-GLU detection below (P0): fused gate_up GLUs carry 2 projections
+    # otherwise the LRU holds a third of the budget it was promised.
+    # Per-GLU detection below: fused gate_up GLUs carry 2 projections
     # (gate_up + down), not 3 — dividing a fused model by 3 over-commits
     # the budget by 1.5x. The global per_slot uses the majority layout;
     # _convert_switch_mlp_module reconciles per-GLU drift after conversion.
@@ -781,8 +776,7 @@ def _plan_conversion(
 
     # Report slots and experts separately: `slots_for_budget` counts EXPERTS
     # (it divides by the whole per_expert_bytes), while the cache counts
-    # SLOTS. Logging the former under the latter's name is what let the
-    # n_proj sizing bug stay invisible — the numbers looked self-consistent.
+    # SLOTS — the units differ by n_proj.
     _experts_resident = estimate.slots_for_budget(budget_bytes)
     _slots_resident = (
         (budget_bytes // per_slot) if per_slot else 0
@@ -883,18 +877,18 @@ def _make_streaming_cache_and_governor(
         except Exception:
             logger.debug("governor arming failed", exc_info=True)
             _governor = None
-    # V2 phase-aware prefill budget: explicit pin wins, else the cache
+    # Phase-aware prefill budget: explicit pin wins, else the cache
     # derives prefill caps from the decode pair (see _derive_prefill_caps).
     # The pin is applied AFTER the slot reconciliation below — converting
     # GiB to slots with the pre-reconciliation per_slot (per_expert // 3)
-    # over-pins fused models (2 projections) by 1.5x (same class as P1-5).
+    # over-pins fused models (2 projections) by 1.5x.
 
     return cache, io_ov, _governor
 
 
 
 def _resolve_cold_tier_root(model_path, model_settings) -> "Path | None":
-    """Cold precision tier (I5) resolution → the active tier dir or None.
+    """Cold precision tier resolution → the active tier dir or None.
 
     expert_streaming_cold_tier ("2".."8") routes expert reads to
     <model>/expert_cold/ — a requantized full expert set that cuts the
@@ -904,9 +898,8 @@ def _resolve_cold_tier_root(model_path, model_settings) -> "Path | None":
     """
     cold_root = None
     cold_setting = getattr(model_settings, "expert_streaming_cold_tier", None)
-    # Gap fix: accept any 2..8-bit label and validate against the
-    # tier's own __metadata__ (omlx_cold_bits) — the old ("2","3")
-    # tuple rejected tiers the requant tool can already produce.
+    # Accept any 2..8-bit label and validate against the
+    # tier's own __metadata__ (omlx_cold_bits).
     # Mismatch disables with a warning, never silently.
     _cold_bits_label = str(cold_setting).strip() if cold_setting else ""
     if cold_setting and _cold_bits_label.isdigit() and 2 <= int(_cold_bits_label) <= 8:
@@ -923,11 +916,8 @@ def _resolve_cold_tier_root(model_path, model_settings) -> "Path | None":
         ok, why = _cold_tier_status_dir(cold_dir, Path(model_path))
         if ok:
             # Validate the requested label against the tier metadata.
-            # The helper lives in residency.py — importing it from
-            # shard_bank raised ImportError which the blanket except
-            # below swallowed, leaving this validation dead. The
-            # import now sits outside the try so a future regression
-            # fails loudly instead of silently skipping validation.
+            # The import sits outside the try so a regression fails
+            # loudly instead of silently skipping validation.
             from .residency import _safetensors_header as _cold_hdr
 
             try:
@@ -961,7 +951,7 @@ def _resolve_cold_tier_root(model_path, model_settings) -> "Path | None":
                 why,
             )
     elif cold_setting:
-        # Gap fix: an unparsable label used to fall through silently.
+        # An unparsable label must warn rather than fall through silently.
         logger.warning(
             "Expert streaming: cold tier %r not understood "
             "(want 2..8) — disabled",
@@ -1001,10 +991,10 @@ def _absorb_dsv4_spill(backing, model_path) -> int:
 def _apply_hobbit_split(
     backing, model_path, io_ov, estimate, cold_root
 ) -> dict[int, set]:
-    """HOBBIT per-expert hot/cold split (Fase I6): with a cold tier
+    """HOBBIT per-expert hot/cold split: with a cold tier
     active, the top fraction of experts per layer (by learned
     pin-profile frequency) keeps the ORIGINAL packing while the
-    rest compute at the tier. No profile = uniform I5 tier.
+    rest compute at the tier. No profile = uniform cold tier.
 
     Returns the per-layer hot id sets (empty dict without a split)."""
     from . import shard_bank as _shard_mod
@@ -1012,7 +1002,7 @@ def _apply_hobbit_split(
     hot_ids_by_layer: dict[int, set] = {}
     if cold_root is not None:
         # Contract (UI/bench): None/unset hot fraction = UNIFORM tier
-        # (I5) — the split is opt-in per model, like the tier itself.
+        # — the split is opt-in per model, like the tier itself.
         # The env default (OMLX_EXPERT_STREAMING_HOT_FRACTION) stays
         # the bench/developer override and wins only when the
         # setting is unset.
@@ -1062,10 +1052,9 @@ def _stamp_guard_info(backing, estimate) -> None:
     until the chunk-end eval, so the peak carries ~one bank per
     layer simultaneously. Without this term the guard under-predicts
     and admits chunks whose real peak reaches ~26 GB on qwen4_exp
-    (48 layers x ~215 uniq experts x ~2.5 MB) and squeezes the
-    machine (docs F-series F1).
+    (48 layers x ~215 uniq experts x ~2.5 MB).
 
-    Fase J Etapa E: boundary_active starts False — the per-layer
+    boundary_active starts False — the per-layer
     bank charge is the safe default, and it is only relaxed once a
     per-layer eval boundary has actually been installed on a
     decoder class (set below, after conversion). projections is
@@ -1104,20 +1093,14 @@ def _build_expert_backing(
     # Backing store
     backing = None
     backing_kind = "ram"
-    # HOBBIT split state (Fase I6): populated only when a complete cold tier
+    # HOBBIT split state: populated only when a complete cold tier
     # exists AND a learned pin profile provides frequencies; otherwise the
-    # convert keeps the uniform I5 tier semantics.
+    # convert keeps the uniform cold tier semantics.
     hot_ids_by_layer: dict[int, set] = {}
     if use_file_backing:
         try:
             from .shard_bank import ExpertBackingStore
 
-            # Removed (audit 2026-09-09, P2-13): OMLX_EXPERT_STREAMING_EXTRA_ROOTS,
-            # the dual-SSD striping opt-in. Striping across a second disk only
-            # pays when that disk is as fast as the primary; striping a 3.7 GB/s
-            # NVMe with an 875 MB/s one measured ~1.85x SLOWER than the primary
-            # alone. `ExpertBackingStore(extra_roots=...)` stays — it is the
-            # same mechanism dsv4 spill-stacking uses via absorb_extra_map().
             cold_root = _resolve_cold_tier_root(model_path, model_settings)
             backing = ExpertBackingStore(model_path, cold_root=cold_root)
             _spill_absorbed = _absorb_dsv4_spill(backing, model_path)
@@ -1154,7 +1137,7 @@ def _build_expert_backing(
 
 def _attach_speculation(cache: Any, backing: Any, _governor: Any) -> None:
     """Wire one SpeculationState (and the governor) onto cache+backing."""
-    # Fase K K1: one speculation state per conversion. It hangs off the
+    # One speculation state per conversion. It hangs off the
     # cache (always) and off the backing store (file backing) so close()
     # drains the speculation workers with the readers.
     from .streaming_switch import SpeculationState
@@ -1178,7 +1161,7 @@ def _attach_speculation(cache: Any, backing: Any, _governor: Any) -> None:
                 "Expert streaming: transition profile load failed",
                 exc_info=True,
             )
-        # P2: the engine reaches the shared cache through the backing it
+        # The engine reaches the shared cache through the backing it
         # already holds (for the per-request summary log).
         try:
             backing._streaming_cache = cache  # type: ignore[attr-defined]
@@ -1227,7 +1210,7 @@ def _find_decoder_layers(model: Any) -> tuple[Any, Any]:
                 continue
     if layers is None:
         logger.warning("Expert streaming: could not find model.layers")
-        # N1: a live backing with zero converted layers makes the engine
+        # A live backing with zero converted layers makes the engine
         # believe streaming is active (serialization + guard) while
         # materialize_lazy_state then evaluates every expert bank — the
         # silent-OOM path the feature exists to avoid. Return no backing.
@@ -1344,7 +1327,7 @@ def _reconcile_cache(
         cache.num_layers = converted
         cache._per_layer_cap = max(1, cache.capacity // converted)  # type: ignore[attr-defined]
 
-    # P0: reconcile cache slots with the converted projection layout. The
+    # Reconcile cache slots with the converted projection layout. The
     # cache was sized for 3 projections/expert (split); every converted
     # GLU records its real n_proj (2 fused, 3 split). A uniform fused
     # model sized //3 over-commits the budget by 1.5x — resize so
@@ -1379,7 +1362,7 @@ def _reconcile_cache(
                         "(per_slot=%d B, capacity=%d)",
                         _majority, _want_slot, cache.capacity,
                     )
-                # P1-5: the governor was armed with the pre-reconciliation
+                # The governor was armed with the pre-reconciliation
                 # per_slot (per_expert // 3). Without this its first grow
                 # computes cap = budget // stale_per_slot and pins a fused
                 # model ~1.5x over the user budget, past max_budget_bytes.
@@ -1394,12 +1377,12 @@ def _reconcile_cache(
         except Exception:
             logger.debug("Expert streaming: slot reconciliation skipped", exc_info=True)
 
-    # V2 phase-aware prefill budget: explicit pin wins, else the cache
+    # Phase-aware prefill budget: explicit pin wins, else the cache
     # derives prefill caps from the decode pair (see _derive_prefill_caps).
     # Runs AFTER the slot reconciliation above so the GiB->slots conversion
     # uses the reconciled per_slot_bytes — converting with the
-    # pre-reconciliation value (per_expert // 3) over-pins fused models
-    # (2 projections) by 1.5x (same class as the P1-5 governor fix).
+    # pre-reconciliation value (per_expert // 3) would over-pin fused
+    # models (2 projections) by 1.5x.
     if converted:
         try:
             _prefill_gib = io_ov.get("expert_streaming_prefill_budget_gib")
@@ -1441,7 +1424,7 @@ def _stamp_instance_routing(
     cache-prior rerank. Exact (None/1.0, bonus 0.0) by default — no
     patch engagement, zero overhead.
 
-    Per-model routing isolation (PR #3468): resolve WITHOUT touching
+    Per-model routing isolation: resolve WITHOUT touching
     the module globals, then stamp every MoE block. The shared Qwen /
     GLM classes must not observe another model's settings via global.
     """
@@ -1493,7 +1476,7 @@ def _stamp_instance_routing(
 
 
 def _wire_stream_eval_boundary(layers, io_ov, _moe_chain, _hooks, backing) -> None:
-    """Qwen3.5/3.8 prefill eval boundary (G4): the installed qwen decoder
+    """Qwen3.5/3.8 prefill eval boundary: the installed qwen decoder
     ignores _stream_eval; wrap it so long prefill chunks evaluate per
     layer instead of pinning every layer's mini-bank in the lazy graph
     and retaining an allocator pool big enough to evict the page cache.
@@ -1602,13 +1585,13 @@ def _attach_warm_pin_hooks(
             pinner = None
             if pins_enabled and backing is not None and not isinstance(backing, dict):
                 # Per-model learned-pin profile so the hot set is wired
-                # from token 1 on the next load (E3). The env path (bench
+                # from token 1 on the next load. The env path (bench
                 # override) wins when set; otherwise a .omlx sidecar in
                 # the model directory.
                 pin_profile_path = _warmer_mod.PIN_PROFILE_PATH or str(
                     Path(model_path) / ".omlx" / "expert_pin_profile.json"
                 )
-                # Fase M1: effective pin sync/regime — the model setting
+                # Effective pin sync/regime: the model setting
                 # wins when set; env constants remain the fallback for
                 # unset models (server compatibility).
                 _pin_regime_eff = io_ov["expert_streaming_pin_regime"]
@@ -1617,7 +1600,7 @@ def _attach_warm_pin_hooks(
                 _pin_sync_eff = io_ov["expert_streaming_pin_sync"]
                 if _pin_sync_eff is None:
                     _pin_sync_eff = _warmer_mod.PIN_SYNC_ENABLED
-                # Fase L: the pin profile applies only when the loaded
+                # The pin profile applies only when the loaded
                 # model's fingerprint matches the one it was learned from.
                 # hot_fraction resolves inside the cold-tier branch above;
                 # resolve it again here so the fingerprint is stable even
@@ -1644,7 +1627,7 @@ def _attach_warm_pin_hooks(
                     observe_calls=_warmer_mod.PIN_OBSERVE_CALLS,
                     per_expert_bytes=estimate.per_expert_bytes,
                     profile_path=pin_profile_path,
-                    # I6: expert width — sizes the per-token bincount
+                    # Expert width — sizes the per-token bincount
                     # payloads from on_layer_plan and validates them.
                     num_experts=estimate.experts_per_layer,
                     model_fingerprint=_pin_fp,
@@ -1742,7 +1725,7 @@ def convert_model_to_streaming(
 
     layers, layers_owner = _find_decoder_layers(model)
     if layers is None:
-        # N1: a live backing with zero converted layers makes the engine
+        # A live backing with zero converted layers makes the engine
         # believe streaming is active (serialization + guard) while
         # materialize_lazy_state then evaluates every expert bank — the
         # silent-OOM path the feature exists to avoid. Return no backing.
@@ -1777,19 +1760,19 @@ def convert_model_to_streaming(
         logger.info("Expert streaming: no MoE layers converted")
 
     if not converted and not mtp_converted:
-        # N1: never hand the engine a live backing when nothing converted —
+        # Never hand the engine a live backing when nothing converted —
         # its presence alone enables request serialization and the prefill
         # guard while every expert bank still materializes.
         return model, None
     try:
         # Stamped so ensure_streaming_backing_or_raise can verify real
-        # conversion — backing presence alone is not evidence (N1).
+        # conversion — backing presence alone is not evidence.
         backing.streaming_converted = converted + mtp_converted  # type: ignore[attr-defined]
     except Exception:
         pass
 
     # ram-dict backing is internal only — never part of the public return
-    # (existing contract; file-backed store is the only returned backing).
+    # (the file-backed store is the only returned backing).
     return model, backing if not isinstance(backing, dict) else None
 
 

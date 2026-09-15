@@ -7,11 +7,6 @@ hooks — only the victim-selection order differs. Selected via
 OMLX_EXPERT_STREAMING_CACHE (or the per-model
 ``expert_streaming_cache_policy`` setting) in
 ``streaming_switch.make_expert_cache``; the default stays ``lru``.
-
-Measured evidence for the design choices lives in
-``docs/expert-streaming-ab.md``. The route_frequency policy was removed:
-its own decay diagnostics showed counters too cold to rank anything —
-indistinguishable from LRU at every measured window.
 """
 
 from __future__ import annotations
@@ -23,7 +18,7 @@ from .streaming_switch import ExpertLRUCache
 
 
 class S3FIFOExpertCache(ExpertLRUCache):
-    """P2: S3-FIFO eviction behind the ExpertLRUCache interface.
+    """S3-FIFO eviction behind the ExpertLRUCache interface.
 
     LRU keeps recency; MoE routing is skewed (heavy hitters + scan-like
     prefill demand), where S3-FIFO's scan resistance wins: a small FIFO
@@ -51,11 +46,10 @@ class S3FIFOExpertCache(ExpertLRUCache):
         self._small: OrderedDict = OrderedDict()
         self._ghost: OrderedDict = OrderedDict()
         # Per-queue, per-layer victim indexes: the base class's
-        # _layer_orders only covers _store, and S3FIFO never maintained
-        # any index — its per-layer eviction scanned both queues in full.
-        # _small_layers[layer] / _main_layers[layer] order each queue's
-        # keys for one layer; a layer-local victim takes the small queue's
-        # head first (probation semantics: one-hit wonders leave before
+        # _layer_orders only covers _store. _small_layers[layer] /
+        # _main_layers[layer] order each queue's keys for one layer; a
+        # layer-local victim takes the small queue's head first
+        # (probation semantics: one-hit wonders leave before
         # re-referenced main entries).
         self._small_layers: Dict[int, OrderedDict] = {}
         self._main_layers: Dict[int, OrderedDict] = {}
@@ -64,13 +58,11 @@ class S3FIFOExpertCache(ExpertLRUCache):
     def _derive_queue_caps(self) -> None:
         """Re-derive the small/ghost bounds from the current capacity."""
         cap = max(1, self.capacity)
-        # A/B offline finding (traces jang4m/jang4s, 2026-09): a 10% small
-        # FIFO holds ~300 slots against a ~1440-key decode working set, so
-        # every small entry churns before its re-reference and main stays
-        # empty (hit ~0 vs LRU ~0.43-0.75). Small must cover a full decode
-        # token across all layers: per_layer_cap slots x num_layers. With
-        # per-layer caps active this approaches capacity (documented limit
-        # of S3-FIFO under per-layer quotas — see docs/expert-streaming-ab.md).
+        # Small must cover a full decode token across all layers —
+        # per_layer_cap slots x num_layers — or every small entry churns
+        # before its re-reference and main stays empty. With per-layer
+        # caps active this approaches capacity (a documented limit of
+        # S3-FIFO under per-layer quotas).
         per_layer = max(1, self._per_layer_cap) if self.num_layers > 0 else 0
         working = per_layer * max(1, self.num_layers) if self.num_layers > 0 else cap // 10
         self._small_cap = max(1, min(cap - 1, max(cap // 10, working)))
@@ -252,9 +244,8 @@ class S3FIFOExpertCache(ExpertLRUCache):
     def _resize_unlocked(self, capacity: int, per_layer_cap: int | None = None) -> None:
         super()._resize_unlocked(capacity, per_layer_cap)
         # The queue bounds derive from capacity: a shrink that left them
-        # stale would refill the small FIFO to the OLD bound before the
-        # global drain could act — the cache never really shrank (the
-        # same class of bug as the _store-only drain).
+        # stale would refill the small FIFO to the old bound before the
+        # global drain could act — the cache never really shrank.
         self._derive_queue_caps()
         while len(self._small) > self._small_cap:
             old_k, _ = self._small.popitem(last=False)
@@ -270,11 +261,8 @@ class S3FIFOExpertCache(ExpertLRUCache):
     def _drain_to_unlocked(self, cap: int) -> None:
         """S3-FIFO: drain both queues, demoting small victims to ghost.
 
-        The governor used to drain only ``_store``, so under
-        ``OMLX_EXPERT_STREAMING_CACHE=s3fifo`` a shrink left the small FIFO
-        at full size and the cache never reached the requested capacity
-        (audit 2026-09-09, P0-2). ``size`` takes the lock (re-entrant under
-        the caller's) so both queues count.
+        ``size`` takes the lock (re-entrant under the caller's) so both
+        queues count toward the target.
         """
         while self.size > cap:
             self._evict_one_global_unlocked()

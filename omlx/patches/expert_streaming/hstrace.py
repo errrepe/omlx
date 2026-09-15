@@ -1,4 +1,4 @@
-"""Hidden-state capture for offline prerouter training (V2-6).
+"""Hidden-state capture for offline prerouter training.
 
 ``OMLX_EXPERT_STREAMING_HSTRACE=/path/prefix`` turns it on; unset it
 costs a single env lookup per MoE call. Each record stores the router

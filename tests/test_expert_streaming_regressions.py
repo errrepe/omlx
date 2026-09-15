@@ -1,4 +1,5 @@
-"""Focused regressions for PR #3468 review (4 issues)."""
+"""Regression coverage: SSD-backing failure, per-model top-k isolation,
+spill manifest invalidation, prefill stand-in LRU probe."""
 
 import json
 import struct
@@ -46,7 +47,7 @@ def _write_supported_checkpoint(tmp: Path) -> None:
 
 
 def test_ssd_backing_failure_fails_clean_not_ram_fallback():
-    """Issue 1: SSD backing failure must raise, never retain banks in RAM."""
+    """SSD backing failure must raise, never retain banks in RAM."""
     from omlx.patches.expert_streaming import convert_model_to_streaming
 
     with tempfile.TemporaryDirectory() as td:
@@ -62,7 +63,7 @@ def test_ssd_backing_failure_fails_clean_not_ram_fallback():
 
 
 def test_topk_per_model_isolation():
-    """Issue 2: one model's threshold must not move a resident block."""
+    """One model's threshold must not move a resident block."""
     from omlx.patches.expert_streaming import adaptive_topk as at
 
     # Resolver must be pure (no global write).
@@ -95,7 +96,7 @@ def test_topk_per_model_isolation():
 
 
 def test_topk_patch_uses_per_instance():
-    """Issue 2 (runtime): patched Qwen call prefers the block's own setting."""
+    """Runtime: patched Qwen call prefers the block's own setting."""
     pytest.importorskip("mlx_vlm")
     import mlx.core as mx
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
@@ -134,7 +135,7 @@ def test_topk_patch_uses_per_instance():
 
 
 def test_spill_source_change_invalidates_and_empty_manifest_rejected(tmp_path):
-    """Issue 3: checkpoint change must not serve previous weights."""
+    """Checkpoint change must not serve previous weights."""
     from omlx.patches.deepseek_v4 import spill as S
 
     model_dir = tmp_path / "model"
@@ -154,7 +155,7 @@ def test_spill_source_change_invalidates_and_empty_manifest_rejected(tmp_path):
 
 
 def test_prefill_standin_carries_lru_probe():
-    """Issue 4: _record_chunk_transient needs _streaming_lru_heap_growth."""
+    """_record_chunk_transient needs _streaming_lru_heap_growth."""
     from omlx.prefill_transient_tracker import PrefillTransientTracker
     from omlx.scheduler import Scheduler
 
@@ -168,4 +169,4 @@ def test_prefill_standin_carries_lru_probe():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(ns, Scheduler)
     ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(ns, Scheduler)
     ns._record_chunk_transient(512, 0, 1024, request_id="r", loop_label="t", kv_len=0, requested_step=512)
-    # No AttributeError is the regression: the stand-in carries the LRU probe.
+    # No AttributeError: the stand-in carries the LRU probe.

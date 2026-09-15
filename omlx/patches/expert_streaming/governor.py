@@ -2,8 +2,7 @@
 """Dynamic expert-residency governor (auto default).
 
 A fixed streaming budget is decided at load time and never revisited, but
-system free memory keeps moving (observed on the 36-cell matrix: RSS peak
-~25-27G on 51G while decode runs mostly under 50% utilization). The
+system free memory keeps moving. The
 governor revisits the cache capacity at request boundaries from TWO
 signals — pressure (free memory) and hunger (windowed decode stall):
 
@@ -44,13 +43,13 @@ logger = logging.getLogger(__name__)
 
 _DYNAMIC_ENV = os.environ.get("OMLX_EXPERT_STREAMING_DYNAMIC", "").strip() == "1"
 
-# P3 (megaplan): mid-request ticks. The request-boundary observe() plus the
-# 30s cooldown allowed ~1 action per long decode — the budget never caught
-# the working set inside one request. tick() runs from
-# _LayerLoadContext.close() (once per MoE layer-call on the inference
-# thread) with its own throttle; actions keep the normal pressure/hunger
-# rules but use a shorter spacing so the cap converges in ~15 s instead of
-# never. OMLX_EXPERT_STREAMING_GOV_TICK=0 restores boundary-only behavior.
+# Mid-request ticks: request-boundary observe() plus the 30s cooldown
+# allowed ~1 action per long decode — the budget never caught the working
+# set inside one request. tick() runs from _LayerLoadContext.close() (once
+# per MoE layer-call on the inference thread) with its own throttle;
+# actions keep the normal pressure/hunger rules but use a shorter spacing
+# so the cap converges in ~15 s. OMLX_EXPERT_STREAMING_GOV_TICK=0 restores
+# boundary-only behavior.
 _GOV_TICK_ENV = os.environ.get("OMLX_EXPERT_STREAMING_GOV_TICK", "1") != "0"
 _GOV_TICK_S = float(
     os.environ.get("OMLX_EXPERT_STREAMING_GOV_TICK_S", "1.0") or 1.0
@@ -71,10 +70,10 @@ def _max_dynamic_budget_bytes(default_gib: float = 0.0) -> int:
     except ValueError:
         gib = default_gib
     if gib <= 0:
-        # Dynamic ceiling: a quarter of RAM, bounded. Measured optimum on
-        # a 48 GB machine is ~12 GiB — a bigger private LRU squeezes the
-        # OS page cache and turns the remaining misses into physical SSD
-        # reads (~7x slower), which costs more than the extra hits save.
+        # Dynamic ceiling: a quarter of RAM, bounded — a bigger private
+        # LRU squeezes the OS page cache and turns the remaining misses
+        # into physical SSD reads, which costs more than the extra hits
+        # save.
         gib = min(24.0, _total_ram_bytes() / 1024**3 * 0.25)
     return max(0, int(gib * 1024**3))
 
@@ -154,11 +153,11 @@ class ExpertResidencyGovernor:
         grow_add_frac: float = 0.25,
         min_window_layers: int = 16,
     ) -> None:
-        # Thresholds default scale with PHYSICAL memory (observed on the
-        # 51G box: a dirty page cache from prior benches normalizes
-        # available to ~24G, so absolute 24G-high never fires). Fractions:
-        # 10% desperate, 20% shrink, 40% grow — portable defaults; envs
-        # OMLX_GOV_*_FRAC tune per machine (explicit kwargs always win).
+        # Thresholds scale with PHYSICAL memory: absolute watermarks
+        # misfire when a dirty page cache keeps "available" permanently
+        # low. Fractions: 10% desperate, 20% shrink, 40% grow — portable
+        # defaults; envs OMLX_GOV_*_FRAC tune per machine (explicit
+        # kwargs always win).
         ram = _total_ram_bytes()
         self.cache = cache
         self.per_slot = max(1, int(per_slot))
@@ -228,7 +227,7 @@ class ExpertResidencyGovernor:
         self.cache.resize(cap, per_layer if self.num_layers > 0 else None)
 
     def reconcile_per_slot(self, per_slot: int) -> None:
-        """Adopt the post-conversion per-slot bytes (audit P1-5).
+        """Adopt the post-conversion per-slot bytes.
 
         The converter picks ``per_slot`` before it knows the majority
         projection layout (``__init__.py`` hardcodes ``per_expert // 3``),
@@ -370,7 +369,7 @@ class ExpertResidencyGovernor:
                 # Proportional correction: shed only what restores the
                 # target headroom. Halving on a small overshoot caused a
                 # grow/shrink sawtooth that evicted tens of thousands of
-                # hot entries mid-decode (measured -7% tok/s).
+                # hot entries mid-decode.
                 give_back = self.target_free_bytes - free
                 want = max(
                     floor,
@@ -437,7 +436,7 @@ class ExpertResidencyGovernor:
             return ""
 
     def tick(self) -> str:
-        """Mid-request observation point (P3).
+        """Mid-request observation point.
 
         Called once per MoE layer-call from ``_LayerLoadContext.close()``
         on the inference thread — so it must be cheap: a monotonic

@@ -7,8 +7,7 @@ and fetch the rest on demand from the model's own safetensors shards (mmap
 slab reads — no converted copy of the checkpoint, no write path). Routing is
 computed exactly as shipped; a cache miss changes *when* an expert's weights
 are read, never *which* expert runs. Accuracy is therefore preserved by
-construction, at a latency cost (measured on a 26B/128-expert model: accuracy
-flat down to 12% residency, throughput falling roughly as memory^0.5).
+construction, at a latency cost.
 
 Applied once post-load, before lazy weights materialize: each stock
 ``SwitchGLU`` whose projections are quantized and fully covered by the
@@ -317,10 +316,9 @@ class ExpertCache:
         self.book.evictions = int(v)
 
     def _install(self, e: int) -> int:
-        # Fetch every field BEFORE touching slot_of/free/map: the old
-        # order evicted the LRU victim first, so a mid-fetch failure left
-        # the row orphaned (not in free, not in slot_of) and the victim
-        # half-overwritten (2.2).
+        # Fetch every field BEFORE touching slot_of/free/map: a mid-fetch
+        # failure must not orphan a row (not in free, not in slot_of) or
+        # leave a victim half-overwritten.
         payload = {}
         for name in self.projs:
             rb = self.resident[name][2]
@@ -369,7 +367,7 @@ class ExpertCache:
 
         The ``.tolist()`` is a device->host readback and therefore a sync per
         MoE layer per step. Removing it needs prefetch (resolve layer L+1's
-        residency during layer L's compute) — deliberately not in v1.
+        residency during layer L's compute).
         """
         if self.warm:  # nothing can miss; skip it
             return
@@ -499,8 +497,8 @@ class OffloadSwitchGLU(nn.Module):
         of up to ``capacity`` distinct experts, the same shape as the
         DeepSeek V4.1 adapter's sorted prefill: an expert's routes all land
         in one chunk, so each expert is installed at most once per call
-        (the token-chunked path re-fetched an expert in every chunk that
-        touched it, evicting on the way). Routes within a chunk are
+        (token-chunked would re-fetch an expert in every chunk that touched
+        it, evicting on the way). Routes within a chunk are
         independent — the cross-expert weighted sum happens in the caller —
         so the chunk runs with one expert index per route, under the kernel
         the resident model would choose for the whole call (sorted at or
@@ -649,7 +647,7 @@ class LegacyOffloadState:
             # Never shrink a layer below one token's decode working set:
             # the wrap-time capacity already floors at the model's routing
             # top-k, and going below it turns every step into a fetch
-            # storm (same failure class as the V4.1 floor fix, 2.1).
+            # storm.
             floor = (
                 int(min_cap)
                 if min_cap is not None
@@ -867,8 +865,8 @@ def _resolve_store_view(
     # Stacked scheme first (exact spelling, then de-nested checkpoint
     # spelling), then per-expert. The first probe hit wins; the loop below
     # validates it strictly. Falling through to an exact-spelling
-    # per-expert view preserves the historical decline reason when the
-    # checkpoint has neither scheme.
+    # per-expert view keeps the decline reason pointing at a concrete path
+    # when the checkpoint has neither scheme.
     view: _GLUStoreView | None = None
     for cand in _checkpoint_prefixes(path):
         stacked = _GLUStoreView(store, cand)
@@ -925,7 +923,7 @@ def apply_moe_expert_offload(
     """
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         return 0
-    # Unified backend (fork): model types covered by expert_streaming route
+    # Unified backend: model types covered by expert_streaming route
     # to our stack — the resident fraction becomes the INITIAL budget and
     # the dynamic governor adapts from there. The legacy fetch-on-miss
     # adapter below stays for gemma4/olmoe (and any layout it alone
@@ -999,15 +997,14 @@ def _apply_legacy_adapter(
         wrapped_mods.append(new)
         wrapped += 1
         # Dropped source buffers land in the MLX pool, which the server pins
-        # to total RAM, so drain per layer to bound the load transient
-        # (same reasoning as the gate/up fusion patch, #2304).
+        # to total RAM, so drain per layer to bound the load transient.
         _sync_and_clear_cache()
 
     if wrapped:
         try:
-            # The scheduler serializes requests on this marker: the legacy
-            # path used to serve concurrent requests and thrash the LRU it
-            # sizes for a single stream. The store doubles as the shutdown
+            # The scheduler serializes requests on this marker — concurrent
+            # requests would thrash an LRU sized for a single stream. The
+            # store doubles as the shutdown
             # handle — shutdown_expert_streaming() calls close() on it.
             model._expert_streaming_backing = store  # type: ignore[attr-defined]
         except Exception:
@@ -1147,8 +1144,7 @@ def _apply_via_streaming(
         _, backing = convert_model_to_streaming(model, model_path, settings)
     except Exception:
         # Never crash a load the legacy adapter could still serve: fall
-        # through to it (a synthetic-fixture-only streaming bug surfaced
-        # exactly this way in the legacy test suite).
+        # through to it.
         logger.warning(
             "moe expert offload: streaming backend failed for %s; falling "
             "back to the legacy fetch-on-miss adapter",
@@ -1236,9 +1232,7 @@ def estimate_offload_admission_bytes(
         # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
         # Field completeness is tracked PER EXPERT, not container-wide: the
         # wrapper verifies every expert's tensors, so one complete expert
-        # must not vouch for 31 incomplete ones (reported: 1 complete + 31
-        # gate-only experts estimated 972,736 from 1,000,000 while zero
-        # modules wrapped).
+        # must not vouch for 31 incomplete ones.
         stacked: dict[str, dict] = {}
         per_expert: dict[str, dict] = {}
 
@@ -1307,8 +1301,7 @@ def materialize_offload_state(model) -> int:
     attributes, so the engine's ``materialize_lazy_state`` walk never reaches
     them. Left lazy, they stay bound to the loader thread's stream and the
     first request from another thread dies with ``RuntimeError: There is no
-    Stream(gpu, N) in current thread``. Reproduced live on a 24GB M5 Pro the
-    moment the VLM path ran with offload enabled. Call this right after
+    Stream(gpu, N) in current thread``. Call this right after
     ``apply_moe_expert_offload``; returns the number of layers materialized.
     """
     arrays = []

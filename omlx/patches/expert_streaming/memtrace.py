@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in per-layer / per-projection memory tracing for MoE expert streaming.
 
-Motivation (Fase J prefill-memory investigation)
-------------------------------------------------
+Motivation
+----------
 The dominant prefill memory consumer on oQ4e models is the *transient* Metal
 working set, not the mmap'd N-gram table and not the KV cache. Measuring it
 required shelling out to ``vmmap`` and eyeballing Activity Monitor, which is
@@ -22,8 +22,7 @@ layers, the four numbers that actually matter on Apple Silicon UMA:
     ``mx.get_peak_memory()`` — allocator high-water mark.
 ``footprint``
     ``get_phys_footprint()`` — the mach per-process ledger, which *includes*
-    IOAccelerator-backed (Metal) allocations. This is the number that
-    previously only ``vmmap -summary`` could produce, and it is what jetsam
+    IOAccelerator-backed (Metal) allocations. This is the number jetsam
     compares against.
 
 Usage
@@ -43,8 +42,7 @@ keeps the hot path branch-free (``memtrace.enabled`` is a class attribute).
 Consumers
 ---------
 ``bench/bench_expert_streaming.py`` reads ``memtrace.summary()`` to report the
-prefill peak footprint per phase, which is acceptance criterion #3 of the
-Fase J prefill-memory plan.
+prefill peak footprint per phase.
 """
 
 from __future__ import annotations
@@ -64,10 +62,10 @@ logger = logging.getLogger(__name__)
 _TRACE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_MEMTRACE", "") or None
 _SAMPLE_EVERY = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_MEMTRACE_EVERY", "1")))
 
-# Fase L1: numeric fields whose per-event aggregates land in summary() so a
-# bench run can report, e.g., the mean/max positions and bank bytes per
-# ctx.ensure event without post-processing the JSONL. Keep this set small and
-# fixed: aggregation is per-record overhead on the traced path only.
+# Numeric fields whose per-event aggregates land in summary() so a bench run
+# can report, e.g., the mean/max positions and bank bytes per ctx.ensure
+# event without post-processing the JSONL. Keep this set small and fixed:
+# aggregation is per-record overhead on the traced path only.
 _TRACKED_NUMERIC = frozenset(
     {
         "positions",
@@ -178,9 +176,9 @@ class MemTracer:
         self.path = path
         self.sample_every = max(1, int(sample_every))
         self._lock = threading.Lock()
-        # Fase M6: ambient context (phase, request_id, engine_id) attached
-        # to every row, and a per-(layer, proj) event sequence counter so
-        # ordering can be reconstructed without timestamp resolution.
+        # Ambient context (phase, request_id, engine_id) attached to every
+        # row, and a per-(layer, proj) event sequence counter so ordering
+        # can be reconstructed without timestamp resolution.
         self._context: dict[str, Any] = {}
         self._event_seq: dict[tuple, int] = {}
         self._file = None
@@ -188,7 +186,7 @@ class MemTracer:
         self._rows: list[dict[str, Any]] = []
         self._t0 = time.perf_counter()
         self._peaks: dict[str, int] = {}
-        # Fase L1: {event: {field: {sum, n, max}}} over _TRACKED_NUMERIC fields.
+        # {event: {field: {sum, n, max}}} over _TRACKED_NUMERIC fields.
         self._agg: dict[str, dict[str, dict[str, float]]] = {}
         # Keep at most this many rows in memory when no path is given, so an
         # unattended long run cannot grow unbounded.
@@ -220,12 +218,7 @@ class MemTracer:
                     pass
 
     def close(self) -> None:
-        """Close the trace file (P2-18).
-
-        It used to be opened lazily and never closed or flushed, so the tail
-        of a trace was lost whenever the process exited without an explicit
-        interpreter shutdown of this object.
-        """
+        """Flush and close the trace file so buffered rows are not lost."""
         with self._lock:
             if self._file is not None:
                 try:
@@ -251,8 +244,8 @@ class MemTracer:
         reads) and the file write are deliberately moved outside the lock's
         critical section for the shared counters: this is called from IO
         pool workers (streaming_switch ctx fallback path) and holding the
-        lock across the sampler serialized every worker behind one
-        process-wide probe (audit P2-18). Rows still carry a monotone
+        lock across the sampler would serialize every worker behind one
+        process-wide probe. Rows still carry a monotone
         ``seq`` assigned under the lock, so ordering is recoverable.
 
         ``_light=True`` skips the memory sampler entirely — for high-rate
@@ -265,7 +258,7 @@ class MemTracer:
                 return
             seq = self._seq
             ctx = dict(self._context) if self._context else None
-            # Fase M6: monotone per-(layer, proj) event sequence.
+            # Monotone per-(layer, proj) event sequence.
             event_seq = None
             if "layer" in fields and "proj" in fields:
                 k = (fields.get("layer"), fields.get("proj"))
@@ -305,7 +298,7 @@ class MemTracer:
                 self._rows.append(row)
 
     def set_context(self, **ctx: Any) -> None:
-        """Fase M6: ambient fields (phase, request_id...) appended to every
+        """Ambient fields (phase, request_id...) appended to every
         subsequent row until clear_context()."""
         with self._lock:
             self._context.update(ctx)
@@ -339,7 +332,6 @@ class MemTracer:
         out: dict[str, Any] = {
             "enabled": True,
             "path": self.path,
-            # P2-18: was a bare ``self._seq`` read outside the lock.
             "samples": self.samples(),
             "peaks_bytes": dict(peaks),
         }
@@ -391,9 +383,8 @@ def _build_tracer() -> MemTracer | _NullTracer:
     except OSError as e:
         logger.warning("Expert streaming memtrace disabled, cannot open %s: %s", _TRACE_PATH, e)
         return _NullTracer()
-    # P2-18: the lazily-opened trace file was never flushed or closed, so an
-    # abrupt exit truncated the tail of the trace. atexit guarantees the
-    # buffered rows land on disk.
+    # atexit guarantees the buffered tail of the trace lands on disk even
+    # when the process exits without an explicit close().
     atexit.register(tracer.close)
     return tracer
 

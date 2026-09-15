@@ -37,15 +37,12 @@ def _config_model_type(config: dict) -> str:
 
 # Model types whose MoE expert banks can be streamed from disk.
 #
-# Single source of truth — every gate reads this object. It used to be
-# re-declared as four independent tuples (three here, one in __init__.py, one
-# hardcoded in engine/vlm.py), and they drifted: a checkpoint could pass the
-# structural estimate below (which is what forces streaming in EnginePool)
-# while failing the converter's list (which is what gates lazy loading in
-# engine/batched.py). That combination materializes the full multi-hundred-GB
-# MoE banks before the converter can drop them — OOM / SIGKILL. Sharing one
-# object removes the divergence by construction rather than by keeping lists
-# in sync.
+# Single source of truth — every gate reads this object. A type that
+# passes the structural estimate below (which is what forces streaming
+# in EnginePool) must also pass this list (which is what gates lazy
+# loading in engine/batched.py): a divergence would materialize the full
+# multi-hundred-GB MoE banks before the converter can drop them —
+# OOM / SIGKILL.
 #
 # Kept in this leaf module: residency.py has no intra-package imports, so
 # every consumer (including the package __init__) can import it without a
@@ -63,7 +60,7 @@ SUPPORTED_TYPES = frozenset(
         # Wider coverage: these expose the same stacked
         # ``layers.N.mlp.switch_mlp.{gate,up,down}_proj`` layout and the
         # ``moe_intermediate_size`` key _resolve_moe_dims reads, so they pass
-        # the structural estimate as-is. They were only missing from the list.
+        # the structural estimate as-is.
         "qwen3_moe",
         "qwen2_moe",
         "deepseek_v3",
@@ -86,11 +83,11 @@ _CONFIG_DERIVABLE_MOE_LAYERS = frozenset(
         "qwen4_exp",
         "qwen4_exp_text",
         # deepseek_v3 / glm4_moe resolve through the generic
-        # first_k_dense_replace branch below (verified keys).
+        # first_k_dense_replace branch below.
         "deepseek_v3",
         "glm4_moe",
         # qwen3_moe resolves through the dedicated decoder_sparse_step +
-        # mlp_only_layers branch below (verified against mlx_lm).
+        # mlp_only_layers branch below (mirrors mlx_lm).
         "qwen3_moe",
         # qwen2_moe: its decoder is unconditionally all-MoE and its config
         # carries no pattern keys, so the generic loop below (first_k=0,
@@ -134,7 +131,7 @@ class ExpertStreamingEstimate:
     # fall back to text_config). Lets consumers scope per-family behavior
     # (e.g. adaptive top-k hooks) without re-reading config.json.
     model_type: str = ""
-    # Fase J Etapa E: text hidden size, used to charge one materialized layer
+    # Text hidden size, used to charge one materialized layer
     # activation to the prefill guard when a per-layer eval boundary is live.
     # 0 when the config does not expose it (the guard then charges the bank
     # term only — still conservative).
@@ -147,11 +144,11 @@ class ExpertStreamingEstimate:
     # per-expert layouts with unmapped projection names).
     moe_intermediate_size: int = 0
     expert_fused: bool = False
-    # P1: cold-tier awareness. When the estimate was computed against an
+    # Cold-tier awareness. When the estimate was computed against an
     # active cold tier, expert_bytes_effective measures the banks actually
     # read at decode (cold packing, smaller) instead of the source
-    # checkpoint banks; tier is "uniform" (I5, all cold), "hobbit"
-    # (I6 split, mixed — effective is a hot-fraction-weighted blend) or
+    # checkpoint banks; tier is "uniform" (all cold), "hobbit"
+    # (hot/cold split — effective is a hot-fraction-weighted blend) or
     # "none". Empty (tier "none") means effective == expert_bytes.
     tier: str = "none"
     expert_bytes_effective: int = 0
@@ -160,13 +157,13 @@ class ExpertStreamingEstimate:
     def slots_for_budget(self, budget_bytes: int) -> int:
         """**Experts** per layer that fit in *budget_bytes* — not slots.
 
-        Named for history, but the arithmetic divides by the whole
-        ``per_expert_bytes``, so the result counts complete experts. The
-        ExpertLRUCache counts *slots*, and one slot is one projection
-        (``per_expert_bytes // n_proj``), so slot capacity is ``n_proj`` times
+        The arithmetic divides by the whole ``per_expert_bytes``, so the
+        result counts complete experts. The ExpertLRUCache counts *slots*,
+        and one slot is one projection (``per_expert_bytes // n_proj``),
+        so slot capacity is ``n_proj`` times
         this number. Multiplying back by ``per_expert_bytes`` (as
-        ``streaming_bytes_for_budget`` does) is correct for bytes either way;
-        mixing the two units for anything else is the n_proj sizing bug.
+        ``streaming_bytes_for_budget`` does) is correct for bytes either
+        way; the two units must not be mixed.
         """
         if not self.supported or self.per_expert_bytes <= 0 or self.num_moe_layers <= 0:
             return 0
@@ -206,8 +203,8 @@ def _derive_expert_dims(
     ``shape[1]`` — packing only ever touches the *input* axis, so this
     reading holds for quantized and dense tensors alike. Per-expert-key
     layouts (``experts.<i>.w{1,2,3}``) carry 2-D tensors; out is
-    ``shape[0]`` there. This is what lets the converter drop the
-    per-family dim-defaults table (the old 1407/640/2048 guesses).
+    ``shape[0]`` there, so the converter needs no per-family
+    dim-defaults table.
     """
     hidden = moe_hidden = 0
     fused = False
@@ -589,10 +586,10 @@ def _cached_estimate(
     # streaming_bytes_for_budget.
     streaming_bytes = int(dense_bytes * _MODEL_OVERHEAD_FACTOR)
 
-    # P1: cold-tier effective bytes are resolved by the caller-provided
+    # Cold-tier effective bytes are resolved by the caller-provided
     # overlay (see expert_streaming_estimate): the base scan always
     # measures the source checkpoint; the overlay rescales to what decode
-    # actually reads. Defaults keep the pre-tier behavior exactly.
+    # actually reads. With no overlay the source measurements apply.
     tier = "none"
     expert_bytes_effective = expert_bytes
     if _cold_overlay is not None:
@@ -637,7 +634,7 @@ def _resolve_cold_overlay(
     cold_root: str | Path | None = None,
     hot_fraction: float | None = None,
 ) -> tuple[float | None, str | None] | None:
-    """P1: byte-scale overlay for an active cold tier (or None).
+    """Byte-scale overlay for an active cold tier (or None).
 
     Returns (scale, tier_name) where scale rescales source expert bytes
     to what decode actually reads. Uniform tier: measured from the cold
@@ -690,12 +687,11 @@ def _resolve_cold_overlay(
             hf = None if hot_fraction is None else max(0.0, min(1.0, float(hot_fraction)))
         except (TypeError, ValueError):
             hf = None
-        # P1-9: the old guard was ``0.0 < hf < 1.0``, so hf == 1.0 fell
-        # through to the fully-cold ``scale`` -- the exact opposite of what
-        # the runtime does. shard_bank elects ``n_hot = ceil(hf * width)``
-        # hot experts per layer (see _load_pin_profile), so hf == 1.0 means
-        # EVERY expert is stored at full precision: the effective per-expert
-        # bytes are the SOURCE bytes, i.e. a scale of 1.0. Under-charging
+        # hf == 1.0 must not collapse to the fully-cold ``scale``:
+        # shard_bank elects ``n_hot = ceil(hf * width)`` hot experts per
+        # layer (see _load_pin_profile), so hf == 1.0 means EVERY expert
+        # is stored at full precision — the effective per-expert bytes
+        # are the SOURCE bytes, i.e. a scale of 1.0. Under-charging
         # here under-charges expert_bytes_effective at admission.
         if hf is not None and hf > 0.0:
             return (hf * 1.0 + (1.0 - hf) * scale, "hobbit")
@@ -730,16 +726,16 @@ def expert_streaming_estimate(
 ) -> ExpertStreamingEstimate:
     """Inspect checkpoint headers without materializing tensor data.
 
-    P1: pass ``cold_root`` (and ``hot_fraction`` for a HOBBIT split) to
+    Pass ``cold_root`` (and ``hot_fraction`` for a HOBBIT split) to
     measure what decode actually reads when a cold tier is active; omit
-    both for the source-checkpoint estimate (all existing callers).
+    both for the source-checkpoint estimate.
     """
 
     p = Path(model_path).expanduser().resolve()
     sig = _sig_of(p)
     index_sig = _index_sig_of(p)
     overlay = _resolve_cold_overlay(p, cold_root, hot_fraction)
-    # Observability (Fase M): the VLM loader runs this scan on EVERY load
+    # Observability: the VLM loader runs this scan on EVERY load
     # (allowlist short-circuit + this lru_cache keep it cheap), so a timed
     # debug line records the true cost and hit rate in production logs.
     hits_before = _cached_estimate.cache_info().hits

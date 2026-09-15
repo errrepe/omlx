@@ -2,17 +2,15 @@
 """Shared expert-slot bookkeeping for the per-expert cache tracks.
 
 The two non-unified caches — DeepSeek V4.1's ``_ExpertSlots`` and the
-legacy ``ExpertCache`` — used to carry their own copies of the same
-expert-id → row machinery: an LRU-ordered ``slot_of`` dict, a free-row
-list, the rooms-vs-cap split (physical rows vs governor ceiling), and
-the acquire/commit/rollback protocol that keeps a fetch failure from
-orphaning a row or silently dropping the evicted victim's residency.
-This module is that machinery, once.
+legacy ``ExpertCache`` — share the same expert-id → row machinery: an
+LRU-ordered ``slot_of`` dict, a free-row list, the rooms-vs-cap split
+(physical rows vs governor ceiling), and the acquire/commit/rollback
+protocol that keeps a fetch failure from orphaning a row or silently
+dropping the evicted victim's residency. This module is that machinery.
 
 The unified ``ExpertLRUCache`` keeps its own internals (per-projection
-slots, s3fifo/route-frequency policies, cross-layer budget): only the
-visit-stats contract below is shared, which is the shape the governor
-duck-reads.
+slots, the s3fifo policy, cross-layer budget): only the visit-stats
+contract below is shared, which is the shape the governor duck-reads.
 
 Locking stays with the cache: ``SlotBookkeeping`` itself is not
 thread-safe; callers serialize under their own per-layer lock.
@@ -69,10 +67,10 @@ def working_set_step(cap: int, top_k: int) -> int:
     """Tokens per forward chunk so a chunk's routed rows fit in *cap*.
 
     Every token routes to at most ``top_k`` experts, so ``cap // top_k``
-    tokens can never touch more than ``cap`` distinct experts — the same
-    bound the legacy halving scan approximated with repeated device→host
-    syncs, in O(1). ``top_k <= cap`` is a caller precondition (enforced
-    upstream: a cache smaller than the routing width cannot serve).
+    tokens can never touch more than ``cap`` distinct experts — an O(1)
+    bound with no device→host syncs. ``top_k <= cap`` is a caller
+    precondition (enforced upstream: a cache smaller than the routing
+    width cannot serve).
     """
     top_k = max(1, int(top_k))
     return max(1, int(cap) // top_k)
@@ -331,7 +329,7 @@ class SlotArena:
     The host module owns the stacked ``(rooms, *row_shape)`` arrays per
     projection field, bound into whatever module layout it uses —
     QuantizedProjection fields for DeepSeek V4.1, a plain bank for the
-    unified streaming linears (V4-2b). The arena owns everything else
+    unified streaming linears. The arena owns everything else
     about *where* residents live: the ``SlotBookkeeping`` map, the
     per-arena lock, the two-phase grow/compact of physical rows, the
     demand-set acquire/commit/rollback protocol, and the speculative
@@ -342,8 +340,8 @@ class SlotArena:
     ``ensure_set``; the arena only knows rows. Because residents are
     bound into fixed rows once at admission, the consumer gathers by
     slot id (``rhs_indices``) and a cache hit costs zero assembly —
-    the ~1 ms/projection ``mx.stack`` per call the bundle-dict
-    representation pays is avoided entirely (bench_slot_arena.py).
+    the ~1 ms/projection ``mx.stack`` per call a bundle-dict
+    representation would pay is avoided entirely.
 
     Host bindings supplied at construction:
       ``arrays(proj) -> {field: mx.array}``  currently bound rows
@@ -547,8 +545,8 @@ class SlotArena:
                 if needs_grow:
                     # Safety net only: the pre-pass above opens every row
                     # the demand can need, so this cannot fire without
-                    # bookkeeping drift. Keep the historical one-row grow
-                    # rather than corrupting the book.
+                    # bookkeeping drift. Keep the one-row grow rather than
+                    # corrupting the book.
                     self.grow(self.book.rooms + 1)
                     slot = self.book.free.pop()
                 fetch_list.append((expert, slot, victim))

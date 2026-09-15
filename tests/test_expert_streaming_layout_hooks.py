@@ -1,8 +1,7 @@
-"""Phase-5 unification regressions.
+"""MoE layout resolution and model-family hook contracts.
 
 Covers:
-  * header-derived MoE geometry on the streaming estimate (the layout that
-    replaced _resolve_moe_dims' per-family defaults table);
+  * header-derived MoE geometry on the streaming estimate;
   * _resolve_moe_dims: config -> estimate -> fail loud (no guessing);
   * the model_hooks family registry (stream-eval targets, top-k
     applicability, weighted-sum kernel injection);
@@ -122,8 +121,8 @@ class TestResolveMoeDims:
             hidden_size = 64
             moe_intermediate_size = 12
 
-        # The old family-defaults table is gone: an estimate object supplies
-        # the header-derived dims when the config is silent.
+        # An estimate object supplies the header-derived dims when the
+        # config is silent.
         assert _resolve_moe_dims([{}], _Est()) == (64, 12)
 
     def test_fail_loud(self):

@@ -26,7 +26,7 @@ from ..expert_streaming.slot_cache import (
 
 
 def _fetch_threads() -> int:
-    """Parallel miss-fetch width (0 = serial legacy path).
+    """Parallel miss-fetch width (0 = serial path).
 
     Opt-in via OMLX_V41_FETCH_THREADS: workers run plan.fetch (file IO +
     CPU decode, no mx assignment/eval) while the main thread assigns the
@@ -42,7 +42,7 @@ def _fetch_threads() -> int:
 
 
 def _stage_enabled() -> bool:
-    """Prev-token speculative staging (P8 parity with the generic path).
+    """Prev-token speculative staging (parity with the generic path).
 
     After a decode ensure, the next MoE layer's likely expert set (its
     routing on the previous token) is fetched on a dedicated worker while
@@ -125,15 +125,12 @@ class _WorkingSetOverCap(ValueError):
 
 
 def _span_reads() -> bool:
-    """Explicit bounded demand reads (V3 default), not the mmap gather.
+    """Explicit bounded demand reads, not the mmap gather.
 
     Logical ids are physical rows — every expert is read through the
     shared ExpertBackingStore (stateless preadv into caller buffers)
-    instead of the legacy mmap page-fault gather. Measured on the
-    original V4.1 layout: decode 0.0955 -> 0.574 tok/s and TTFT 234s ->
-    32.9s vs the gather, bit-exact tokens; the co-activation order added
-    nothing beyond this mechanism change, so repacking was removed.
-    OMLX_V41_SPAN_READS=0 keeps the legacy per-expert gather as an
+    instead of the mmap page-fault gather.
+    OMLX_V41_SPAN_READS=0 keeps the per-expert gather as an
     escape hatch.
     """
     return os.environ.get("OMLX_V41_SPAN_READS", "1") != "0"
@@ -145,8 +142,7 @@ def _span_gap() -> int:
     Default 1 — merges strictly adjacent rows only (diff <= 1 means
     contiguous bytes: zero dead bytes, one fewer command, same file
     lock). gap >= 2 bridges holes and reads unrouted experts (dead
-    bytes), a measured net loss on NVMe (GLM co-act A/B 2026-09-13:
-    -18% ops but +11% bytes -> slower decode). Env override stays for
+    bytes), a net loss on NVMe. Env override stays for
     per-machine tuning on slower-seek disks."""
     try:
         return max(0, int(os.environ.get("OMLX_V41_SPAN_GAP", "1")))
@@ -182,7 +178,7 @@ def _span_groups(rows, gap, cap_rows):
         groups.append(cur)
     return groups
 
-# Layer 3 seam (clean-split design): the DSpark verify driver enters
+# Layer 3 seam: the DSpark verify driver enters
 # verify_scope() around the draft-block forward. While set, _ExpertSlots
 # serves verify traffic WITHOUT disturbing decode-hot LRU order — hits
 # skip the move-to-end reorder and misses land on the oldest slot. The
@@ -232,7 +228,7 @@ class ExpertOffloadPlan:
         self._stage_pool = None
         self.draft_bytes = 0
         # A dir carrying expert_order.json is a repacked co-activation
-        # checkpoint — ordering support was removed; serving it as
+        # checkpoint — expert ordering is unsupported; serving it as
         # identity would silently return permuted experts. Refuse loudly.
         if (self.path / "expert_order.json").is_file():
             raise ValueError(
@@ -241,10 +237,10 @@ class ExpertOffloadPlan:
             )
         # Draft weights count as savings only when they are actually
         # excluded. A preserved DSpark head loads its language_model.mtp.*
-        # tensors like any other — excluding them here made
-        # preserve_mtp + offload + converted checkpoints fail the
-        # completeness check, and counting them in draft_bytes
-        # overstated estimate_expert_savings by the resident head size.
+        # tensors like any other — excluding them here would fail the
+        # completeness check on preserve_mtp + offload + converted
+        # checkpoints, and counting them in draft_bytes would overstate
+        # estimate_expert_savings by the resident head size.
         if self.converted is not None and not getattr(
             config, "preserve_mtp", False
         ):
@@ -468,7 +464,7 @@ class ExpertOffloadPlan:
         """Miss-fetch pool: the generic per-depth executor registry.
 
         io_pool_for keeps one shared executor per worker depth
-        process-wide (the B1 discipline: device depth is global, not
+        process-wide (device depth is global, not
         per-model) so V4.1 rides the same pools as every other streamed
         family and engine reloads don't respawn threads. Only reached
         when OMLX_V41_FETCH_THREADS > 0 — callers guard on it.
@@ -478,7 +474,7 @@ class ExpertOffloadPlan:
         return io_pool_for(_fetch_threads())
 
     def _stage_executor(self):
-        """Dedicated single-worker staging pool (P8).
+        """Dedicated single-worker staging pool.
 
         Speculative next-layer fetches queue behind each other here
         instead of competing with demand workers on the fetch pool —
@@ -534,9 +530,9 @@ class _ExpertSlots:
     def __init__(self, expert, plan, prefix):
         self.expert, self.plan, self.prefix = expert, plan, prefix
         # Working ceiling (governor-driven) vs physical rooms (array rows).
-        # Without a backing both stay pinned at the plan capacity: behavior
-        # is exactly the legacy static-fraction adapter.
-        # Residency lives in the shared SlotArena (V4-2a): slot map,
+        # Without a backing both stay pinned at the plan capacity, matching
+        # the static-fraction adapter.
+        # Residency lives in the shared SlotArena: slot map,
         # lock, grow/compact and the acquire/commit/rollback protocol are
         # the same primitive the unified streaming linears use.
         self.specs = {}
@@ -551,7 +547,7 @@ class _ExpertSlots:
         self._slots_lock = self.arena.lock
         self.backing = None
         self.layer = None
-        # V2-2 span-read telemetry: merged contiguous fetches per ensure.
+        # Span-read telemetry: merged contiguous fetches per ensure.
         self.span_reads = 0
         self.span_demand_rows = 0
         self.span_phys_rows = 0
@@ -672,7 +668,7 @@ class _ExpertSlots:
             )
         if phase == "decode" and self.backing is not None:
             self.backing.note_visit(self.layer, missed)
-            # P8: record this token's routing as the predictor for the
+            # Record this token's routing as the predictor for the
             # same layer next token, then stage the NEXT MoE layer's
             # predicted set while this layer's compute runs. Frozen
             # (verify) ensures skip both — verify traffic would pollute
@@ -684,7 +680,7 @@ class _ExpertSlots:
         return rows
 
     def stage_predicted(self, experts):
-        """Submit speculative fetches for predicted demand (P8).
+        """Submit speculative fetches for predicted demand.
 
         Runs under this layer's slots lock so residency checks and the
         staged dict stay coherent with a concurrent ensure; payloads are
@@ -794,9 +790,9 @@ class _ExpertSlots:
         return [_one(item) for item in fetch_list]
 
     def _fetch_spans(self, fetch_list):
-        """Contiguous-row fetch for missed experts (V3 default path).
+        """Contiguous-row fetch for missed experts.
 
-        Logical ids are physical rows (no reordering — repack removed).
+        Logical ids are physical rows.
         Sorts the misses and merges runs under ``OMLX_V41_SPAN_GAP``
         (bounded by SPAN_MAX — a row-DIFFERENCE bound, so gap=0 never
         merges and only gap>=1 joins strictly adjacent ids; the generic
@@ -897,9 +893,9 @@ class OffloadedExpert(nn.Module):
             flat_x = x.reshape(-1, 1, 1, x.shape[-1])
         flat_w = None if weights is None else weights.reshape(flat_i.shape)
         # Phase is decided once per call from the pre-chunk route count:
-        # per-chunk inference scored a single-row prefill TAIL chunk as
-        # decode — a spurious governor visit plus a prev_uniq predictor
-        # overwritten by a one-expert set.
+        # a single-row prefill TAIL chunk must not score as decode —
+        # that would cause a spurious governor visit and overwrite the
+        # prev_uniq predictor with a one-expert set.
         phase = "decode" if flat_i.shape[0] == 1 else "prefill"
         outputs = []
         start = 0

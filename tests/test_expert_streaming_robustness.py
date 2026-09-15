@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fase 3 audit fixes: DSv4.1 rollback/atomicity/lock/floor/close, legacy
-cache fetch-first install + serialization marker, cold-reader cleanup,
-atomic transition-profile writes (2.1-2.4, 2.7-2.9, N5-N7)."""
+"""Robustness contracts: DSv4.1 backing rollback/atomicity/lock/floor/
+close, legacy cache fetch-first install + serialization marker,
+cold-reader cleanup, atomic transition-profile writes."""
 
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +37,7 @@ def _slots(model, layer=0):
 
 
 class TestV41FetchRollback:
-    """2.2: a fetch failure must not orphan rows or drop the victim."""
+    """A fetch failure must not orphan rows or drop the victim."""
 
     def test_failed_fetch_restores_victim(self, tmp_path):
         model = _loaded_v41(tmp_path)
@@ -89,7 +89,7 @@ class TestV41FetchRollback:
 
 
 class TestV41GovernorFloor:
-    """2.1: the dynamic floor is one decode working set, not min(8, cap)."""
+    """The dynamic floor is one decode working set, not min(8, cap)."""
 
     def test_floor_tracks_n_activated(self, tmp_path):
         from omlx.patches.deepseek_v41.streaming_backing import (
@@ -109,9 +109,9 @@ class TestV41GovernorFloor:
             )
             try:
                 assert backing.governor is not None
-                # Slot floor = one decode working set (old code: min(8, cap)
-                # — top-k 10 models shrank below the working set and
-                # _ensure_locked raised mid-generation).
+                # Slot floor = one decode working set — a smaller floor
+                # would shrink top-k 10 models below the working set and
+                # _ensure_locked would raise mid-generation.
                 assert backing.governor.min_cap == 10
                 assert backing.governor._min_cap_slots() >= 10
             finally:
@@ -135,9 +135,9 @@ class TestV41GovernorFloor:
             backing = V41StreamingBacking(
                 model._moe_offload_plan, layers, dynamic=False
             )
-            # N7: the duplicate property is gone; one definition remains.
+            # capacity resolves to base_cap through a single property.
             assert backing.capacity == backing.base_cap
-            # N6: documented-None — V4.1 slots are persistent buffers, not
+            # Documented-None — V4.1 slots are persistent buffers, not
             # the generic path's lazy mini-banks.
             assert backing.streaming_guard_info is None
             backing.close()
@@ -148,7 +148,7 @@ class TestV41GovernorFloor:
 
 
 class TestV41CompactAtomic:
-    """2.3: compact/_grow evaluate all projections before rebinding."""
+    """compact/_grow evaluate all projections before rebinding."""
 
     def test_compact_failure_leaves_consistent_state(self, tmp_path, monkeypatch):
         model = _loaded_v41(tmp_path)
@@ -176,7 +176,7 @@ class TestV41CompactAtomic:
 
 
 class TestLegacyCacheAtomicity:
-    """2.2/2.4: fetch-first install + a real lock on the legacy cache."""
+    """Fetch-first install + a real lock on the legacy cache."""
 
     def _cache(self, tmp_path, capacity=2, n=4):
         from mlx_lm.models.switch_layers import SwitchGLU
@@ -263,7 +263,7 @@ class TestLegacyCacheAtomicity:
 
 
 class TestShardBankClose:
-    """2.9: the cold-tier key memo must not hand back closed readers."""
+    """The cold-tier key memo must not hand back closed readers."""
 
     def test_close_clears_cold_key_map(self, tmp_path):
         from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
@@ -280,7 +280,7 @@ class TestShardBankClose:
 
 
 class TestTransitionProfileAtomic:
-    """N5: the profile write is tmp+replace, never a truncated dest."""
+    """The profile write is tmp+replace, never a truncated dest."""
 
     def test_save_is_atomic(self, tmp_path):
         from omlx.patches.expert_streaming import save_transition_profile
@@ -448,7 +448,7 @@ class TestLegacyOffloadState:
 
 
 class TestResolveBudgetBytes:
-    """Public budget resolver for the admission path (2.6)."""
+    """Public budget resolver for the admission path."""
 
     def test_pin_auto_and_zero(self):
         from omlx.model_settings import ModelSettings
@@ -468,7 +468,7 @@ class TestResolveBudgetBytes:
         assert resolve_budget_bytes(
             SimpleNamespace(expert_streaming_budget_mib=512)
         ) == 512 * 1024 * 1024
-        # Beyond the 64 GiB ceiling clamps (P2-16).
+        # Beyond the 64 GiB ceiling clamps.
         assert resolve_budget_bytes(
             ModelSettings(expert_streaming_budget_gib=1000)
         ) == 64 * 1024**3
@@ -502,7 +502,7 @@ class TestSummaryMergesBacking:
 
 
 class TestAliasPreservesSettings:
-    """3.3: the alias path clones the user's settings instead of
+    """The alias path clones the user's settings instead of
     building a bare ModelSettings that drops every streaming tunable."""
 
     def test_tunables_survive_and_pin_wins(self, tmp_path, monkeypatch):
@@ -549,7 +549,7 @@ class TestAliasPreservesSettings:
 
 
 class TestSchedulerStreamingFloor:
-    """2.6: the guard counts the LRU heap accounting + wired pin pages."""
+    """The guard counts the LRU heap accounting + wired pin pages."""
 
     def _sched(self, info, cache, backing):
         from omlx.scheduler import Scheduler

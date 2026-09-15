@@ -1,5 +1,4 @@
-"""Fase 1 audit fixes: conversion guard, cold-tier label validation,
-prefill pin ordering (N1/N2 + plan items 1.5/1.6)."""
+"""Conversion guard, cold-tier label validation, prefill pin ordering."""
 
 import json
 import struct
@@ -72,7 +71,7 @@ def _write_cold_tier(tmp: Path, keys: list[str], *, bits: str) -> None:
 
 
 class TestNoConversionReturnsNoBacking:
-    """N1: a backing with zero converted layers must never leave convert."""
+    """A backing with zero converted layers must never leave convert."""
 
     def test_missing_layers(self, tmp_path):
         from omlx.patches.expert_streaming import convert_model_to_streaming
@@ -146,7 +145,7 @@ class TestEnsureStreamingBackingOrRaise:
 
 
 class TestColdTierLabelValidation:
-    """Plan 1.5: the omlx_cold_bits check must actually run."""
+    """The omlx_cold_bits check must actually run."""
 
     def _spy_backing(self, monkeypatch):
         from omlx.patches.expert_streaming import shard_bank
@@ -202,7 +201,7 @@ class TestColdTierLabelValidation:
 
 
 class TestPrefillPinOrdering:
-    """N2: the GiB->slots pin must use the reconciled per_expert_bytes."""
+    """The GiB->slots pin must use the reconciled per_expert_bytes."""
 
     def test_fused_model_pins_reconciled_slots(self, tmp_path):
         import mlx.core as mx
@@ -233,7 +232,7 @@ class TestPrefillPinOrdering:
 
 
 class TestCanonicalKillSwitch:
-    """Plan 1.2: OMLX_MOE_EXPERT_OFFLOAD=0 gates the canonical path too."""
+    """OMLX_MOE_EXPERT_OFFLOAD=0 gates the canonical path too."""
 
     def test_predicate_honors_env(self, monkeypatch):
         from omlx.model_settings import moe_offload_requested
@@ -261,9 +260,9 @@ class TestCanonicalKillSwitch:
 
 
 class TestSpeculativeExclusivity:
-    """N3/plan 1.3: the canonical key shares the exclusivity contract,
-    discriminated by backend — DFlash/VLM-MTP always reject, MTP is
-    allowed where the streaming stack actually supports it."""
+    """The canonical key shares the exclusivity contract, discriminated
+    by backend — DFlash/VLM-MTP always reject, MTP is allowed where the
+    streaming stack actually supports it."""
 
     def test_canonical_key_dflash_rejected(self):
         from omlx.model_settings import validate_moe_expert_offload
@@ -323,8 +322,8 @@ class TestSpeculativeExclusivity:
 
 
 class TestCompatAllowlistUnified:
-    """Plan 1.4: streaming-owned types are gated by the converter's own
-    structural estimate, not a second allowlist."""
+    """Streaming-owned types are gated by the converter's own structural
+    estimate, not a second allowlist."""
 
     def test_streaming_type_approved_by_estimate(self, tmp_path):
         from omlx.patches.moe_offload_compat import moe_offload_compatibility
@@ -357,7 +356,7 @@ class TestCompatAllowlistUnified:
 
 
 class TestStackedKeyValidation:
-    """N4: a real weight map turns a missing required key into a
+    """A real weight map turns a missing required key into a
     conversion-time failure instead of a first-fetch failure."""
 
     def _backing(self, keys):
@@ -420,8 +419,8 @@ class TestStackedKeyValidation:
 
 
 class TestSchedulerSerializer:
-    """Plan 1.1: one wrapper-chain walk feeds both request serialization
-    and the prefill guard."""
+    """One wrapper-chain walk feeds both request serialization and the
+    prefill guard."""
 
     def test_backing_found_through_vlm_wrapper(self):
         from omlx.scheduler import _model_uses_expert_streaming, _streaming_backing_of

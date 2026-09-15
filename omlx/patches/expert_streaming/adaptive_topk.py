@@ -66,14 +66,13 @@ def is_topk_applicable(model_type: object) -> bool:
 def _coerce_threshold(threshold: Any) -> float | None:
     """Parse a threshold; return None for anything unusable (never raises).
 
-    Fail-CLOSED to exact routing (audit 2026-09-09, P0-3). This used to
-    raise ValueError on an out-of-range value, and the only callers wrap the
-    whole streaming conversion in ``except Exception`` that just logs
-    "Expert streaming conversion failed" — so a bad knob value (e.g.
-    OMLX_MOE_TOPK_THRESHOLD=2, or 0.0 in a hand-edited settings file) left
-    the model UNCONVERTED and resident: the multi-hundred-GB path streaming
-    exists to avoid, failing open into OOM/SIGKILL. A bad knob must cost
-    quality-neutral exact routing, never the conversion itself.
+    Fail-closed to exact routing: callers wrap the whole streaming
+    conversion in ``except Exception`` that just logs "Expert streaming
+    conversion failed", so raising here on a bad knob value (e.g.
+    OMLX_MOE_TOPK_THRESHOLD=2, or 0.0 in a hand-edited settings file)
+    would leave the model unconverted and resident — the
+    multi-hundred-GB path streaming exists to avoid. A bad knob must
+    cost quality-neutral exact routing, never the conversion itself.
     """
     if threshold is None:
         return None
@@ -97,9 +96,9 @@ def _coerce_threshold(threshold: Any) -> float | None:
         )
         return None
     if t > _MAX_THRESHOLD:
-        # > 1.0 is over-full mass, not "exact" -- the old docstring said
-        # ">= 1.0 = exact" but only None and exactly 1.0 are; the API layer
-        # rejects > 1.0 with a 400. Clamp to exact and say so.
+        # > 1.0 is over-full mass, not "exact" — only None and exactly
+        # 1.0 are; the API layer rejects > 1.0 with a 400. Clamp to
+        # exact and say so.
         logger.error(
             "Adaptive top-k threshold %.4g exceeds 1.0; exact routing kept "
             "(only None or exactly 1.0 select exact routing)",
@@ -126,9 +125,8 @@ def configure(threshold: float | None) -> None:
 
 
 def _safe_float_env(name: str, default: float) -> float:
-    """Fail-closed env-float parse (audit Fase 1 lesson: never bare-cast
-    at import — a malformed value must disable the knob, not brick the
-    module)."""
+    """Fail-closed env-float parse: never bare-cast at import — a
+    malformed value must disable the knob, not brick the module."""
     try:
         raw = os.environ.get(name, "")
         return float(raw) if raw.strip() else default
@@ -136,8 +134,8 @@ def _safe_float_env(name: str, default: float) -> float:
         return default
 
 
-# Fase 2 P3 (cache-conditional routing, Qualcomm 2412.00099): logit bonus
-# for LRU-resident experts before top-k. 0.0 = exact routing (default).
+# Cache-conditional routing (Qualcomm 2412.00099): logit bonus for
+# LRU-resident experts before top-k. 0.0 = exact routing (default).
 # Approximate by design — opt-in only.
 _CACHE_PRIOR = max(0.0, _safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0))
 
@@ -261,7 +259,7 @@ def apply_cache_prior_to_logits(logits: Any, resident: set[int] | None, bonus: f
         return logits
 
 
-# Per-instance routing isolation (PR #3468 review): per-model top-k / cache-prior
+# Per-instance routing isolation: per-model top-k / cache-prior
 # settings must not leak through the module globals onto the shared Qwen /
 # GLM MoE classes. Converted models carry explicit per-block attributes;
 # the patched __call__s prefer them and only fall back to the globals for

@@ -9,10 +9,9 @@ PageCacheWarmer
     During decode, right before a MoE layer loads its experts, submit
     F_RDADVISE kernel readahead hints for the PREVIOUS token's experts of
     the NEXT layer. Independent per-layer routing repeats ~35% of experts
-    across adjacent tokens (measured on FlashNext-class checkpoints); the
-    kernel prefetches those pages so the next layer's demand reads hit
-    RAM. Hints only — nothing is stored, no heap, no LRU, no userspace
-    copy.
+    across adjacent tokens, so the kernel prefetch brings those pages into
+    RAM before the next layer's demand reads. Hints only — nothing is
+    stored, no heap, no LRU, no userspace copy.
 
 PinController
     Observe routed experts for the first N decode calls, then mlock the
@@ -43,45 +42,42 @@ logger = logging.getLogger(__name__)
 _MAX_WARM_ROWS = 64
 
 PIN_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_PIN", "0") == "1"
-# F_RDADVISE readahead (Fase G): same prediction flow as the read-warmer,
-# but the submitted jobs are kernel readahead hints instead of discarded
-# reads — no userspace copy, near-zero cost, so it defaults ON (disable
-# with OMLX_EXPERT_STREAMING_RA=0).
+# F_RDADVISE readahead: the submitted jobs are kernel readahead hints,
+# not discarded reads — no userspace copy, near-zero cost, so it defaults
+# ON (disable with OMLX_EXPERT_STREAMING_RA=0).
 RA_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_RA", "1") != "0"
-# Prefill-hotness seeding (Fase G): after a streaming prefill, replace the
-# expert cache contents with the prompt's hot experts (ds4's cache seeding).
+# Prefill-hotness seeding: after a streaming prefill, replace the expert
+# cache contents with the prompt's hot experts.
 SEED_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_SEED", "1") != "0"
 SEED_BYTES = int(
     float(os.environ.get("OMLX_EXPERT_STREAMING_SEED_GIB", "2.0")) * 1024**3
 )
-# Fase L: start the pin budget small (256 MiB) — the L2 matrix tests
-# 256 MiB / 512 MiB / 1.25 GiB before any default is promoted.
+# The default pin budget is deliberately small (256 MiB).
 PIN_BUDGET_BYTES = int(
     float(os.environ.get("OMLX_EXPERT_STREAMING_PIN_GIB", "0.25")) * 1024**3
 )
 PIN_OBSERVE_CALLS = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_TOKENS", "8")))
-# Learned pin store (colibri-style): persist observed per-layer frequencies
-# to this JSON and reload them on the next load, skipping the observation
-# window so the hot set is wired from token 1.
+# Learned pin store: persist observed per-layer frequencies to this JSON
+# and reload them on the next load, skipping the observation window so
+# the hot set is wired from token 1.
 PIN_PROFILE_PATH = os.environ.get("OMLX_EXPERT_STREAMING_PIN_PROFILE", "") or None
-# Fase I6: the profile feeds the HOBBIT top-fraction split, so it must cover
-# the model's full expert width (GLM: 288 experts/layer) — 64 truncated it
-# and made the fraction's denominator meaningless. Env-tunable, JSON format
-# unchanged (a list of [expert, count] pairs per layer).
+# The profile feeds the pin hot-fraction split, so it must cover the
+# model's full expert width (GLM: 288 experts/layer) or the fraction's
+# denominator is meaningless. Env-tunable; JSON stays a list of
+# [expert, count] pairs per layer.
 _PIN_PROFILE_KEEP = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_PIN_KEEP", "512")))
 
-# Fase L: profile format version. v2 splits the learned frequencies into
+# Profile format version. v2 splits the learned frequencies into
 # per-regime counters (decode vs prefill) and refuses to apply a profile
 # whose model fingerprint does not match the loaded model. v1 (merged freq)
 # migrates to the decode regime on load. Both regimes also persist the
 # legacy top-level "freq" (= decode regime) so older consumers keep working.
 PROFILE_VERSION = 2
-# Fase L: which regime drives the pin selection. Env override for the bench
-# matrix (arm E: prefill profile applied to decode).
+# Which regime drives the pin selection (env-overridable).
 PIN_REGIME = os.environ.get("OMLX_EXPERT_STREAMING_PIN_REGIME", "decode")
-# Fase L: pin synchronously at engine load when 1. Bench arms need the
-# mlock pass finished before the first request; the server default stays
-# async (pins must never delay the request path).
+# Pin synchronously at engine load when 1, for runs that need the mlock
+# pass finished before the first request; the server default stays async
+# (pins must never delay the request path).
 PIN_SYNC_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_PIN_SYNC", "") == "1"
 
 _PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
@@ -120,9 +116,8 @@ def _proj_keys(linear: Any) -> list[str]:
 
 class PageCacheWarmer:
     """F_RDADVISE kernel readahead for the previous token's next-layer
-    experts, grouped per contiguous expert run: same prediction flow as
-    the removed warm-only discarded-read arm, zero data copied into
-    userspace.
+    experts, grouped per contiguous expert run. Hints only — zero data
+    copied into userspace.
     """
 
     def __init__(self, linears_by_layer: Dict[int, list]):
@@ -132,9 +127,9 @@ class PageCacheWarmer:
             for layer, linears in linears_by_layer.items()
         }
         self.last_uniq: Dict[int, list[int]] = {}
-        # P2-11: these two are bumped from _WARM_POOL workers (_advise_one
-        # runs inside the submitted _run), so a bare ``+=`` loses updates.
-        # RunPoolTelemetry / ReadTelemetry already lock theirs; same reason.
+        # These two are bumped from _WARM_POOL workers (_advise_one runs
+        # inside the submitted _run), so a bare ``+=`` loses updates —
+        # same reason RunPoolTelemetry / ReadTelemetry lock theirs.
         self._stats_lock = threading.Lock()
         self.advised = 0
         self.advise_failures = 0
@@ -214,7 +209,7 @@ class PageCacheWarmer:
 class PinController:
     """Observe routing per regime, then mlock the hot experts per layer.
 
-    Fase L: the learned profile is version 2 and regime-split — decode rows
+    The learned profile is version 2 and regime-split — decode rows
     (<= _MAX_WARM_ROWS positions, the union fast-path shape) accrue under
     regimes["decode"] and prefill rows under regimes["prefill"].
     The pin selection reads one regime (pin_regime, default decode), the
@@ -243,16 +238,16 @@ class PinController:
         self.budget_bytes = budget_bytes
         self.observe_calls = observe_calls
         self.per_expert_bytes = per_expert_bytes
-        # Fase I6: expert width of the routed layers — lets on_layer_plan
-        # size per-token bincounts (and validate counts payloads) without
+        # Expert width of the routed layers — lets on_layer_plan size
+        # per-token bincounts (and validate counts payloads) without
         # another call. 0 = unknown (tests / legacy wiring); the counts
         # payload then defines its own width.
         self.num_experts = int(num_experts)
-        # Fase L: per-regime learned frequencies. decode = routing calls at
-        # or below _MAX_WARM_ROWS positions; prefill = larger calls.
+        # Per-regime learned frequencies: decode = routing calls at or
+        # below _MAX_WARM_ROWS positions; prefill = larger calls.
         self.regimes: Dict[str, Dict[int, Counter]] = {"decode": {}, "prefill": {}}
-        # Fase M1: explicit wiring wins; the env constant is the fallback
-        # when the caller passes None (server defaults, tests).
+        # Explicit wiring wins; the env constant is the fallback when the
+        # caller passes None (server defaults, tests).
         if pin_regime is None:
             pin_regime = PIN_REGIME
         if pin_sync is None:
@@ -277,9 +272,9 @@ class PinController:
             # Sync only when the effective wiring says so — the server
             # default keeps pins off the request path.
             self._pin_all(sync=self.pin_sync)
-        # Fase M1: truthful load-time flags for the bench JSON — a profile
-        # was loaded at engine load, and the wired pins were applied before
-        # the first request when the effective sync is on.
+        # Load-time flags for the bench JSON: a profile was loaded at
+        # engine load, and the wired pins were applied before the first
+        # request when the effective sync is on.
         self.pins_applied_at_load = self.pinned
 
     @property
@@ -389,8 +384,8 @@ class PinController:
     def _counts_payload(counts, num_experts: int) -> Dict[int, int] | None:
         # Coerce a per-token usage histogram into {expert: count}. counts
         # is either the np.bincount(plan.flat_np, minlength=E) vector from
-        # the streaming switch (Fase I6's hotness signal: usage per token,
-        # not presence per plan) or a plain mapping expert -> usage. None
+        # the streaming switch (the hotness signal: usage per token, not
+        # presence per plan) or a plain mapping expert -> usage. None
         # when the payload is unusable so callers fall back to the
         # presence-based uniq_list signal (old wiring / tests).
         if counts is None:
@@ -416,10 +411,10 @@ class PinController:
         counts=None,
         seq_len: int | None = None,
     ) -> None:
-        # Fase L: keep recording the regime this call belongs to even after
-        # the pin pass, so the profile refreshes during the session and the
-        # stop() save reflects the latest usage. The mlock pass itself still
-        # fires only from the decode observe window or at load time.
+        # Keep recording the regime this call belongs to even after the
+        # pin pass, so the profile refreshes during the session and the
+        # stop() save reflects the latest usage. The mlock pass itself
+        # still fires only from the decode observe window or at load time.
         usage = self._counts_payload(counts, self.num_experts)
         regime = "decode" if _is_decode_call(positions, seq_len) else "prefill"
         if usage is not None:
@@ -474,11 +469,9 @@ class PinController:
             )
         freq = self.regimes[self.pin_regime]
         if not freq or per_expert <= 0:
-            # Latch only on a real pin pass: setting `pinned` before the
-            # freq/byte sanity check made an empty regime or an unknown
-            # expert width permanently suppress all later attempts (the
-            # observe window then fired _pin_all exactly once — pinned
-            # forever, zero pins applied).
+            # Latch only on a real pin pass: `pinned` set before the
+            # freq/byte sanity check would permanently suppress all later
+            # attempts (the observe window fires _pin_all exactly once).
             logger.debug(
                 "Expert streaming: pin pass skipped (freq=%d layers, "
                 "per_expert_bytes=%d) — not latching",
@@ -488,8 +481,8 @@ class PinController:
             return
         self.pinned = True
         budget = self.budget_bytes
-        # Fase L: per-layer budget proportional to usage mass, minimum one
-        # expert per layer with a valid frequency.
+        # Per-layer budget proportional to usage mass, minimum one expert
+        # per layer with a valid frequency.
         total_mass = sum(c.total() for c in freq.values()) or 1
         ranked: list[tuple[float, str, int]] = []
         for layer_idx, counter in freq.items():
@@ -553,11 +546,11 @@ def _infer_per_expert_bytes(linears_by_layer: Dict[int, list], backing: Any) -> 
 
 
 class PrefillHotnessRecorder:
-    """Seed the expert caches from prefill routing hotness (Fase G).
+    """Seed the expert caches from prefill routing hotness.
 
     The prefill demand path fills the LRU with whatever the *last* chunks
-    read, so decode starts with a nearly useless cache (F2: hit_rate 0.002
-    at budget 4 GiB). This recorder accumulates per-layer expert frequency
+    read, so decode starts with a nearly useless cache. This recorder
+    accumulates per-layer expert frequency
     over the prefill, then — on the first decode-sized call — swaps the
     cache to the prompt's hot set: LRU retain + missing-hot loads when a
     budget exists, a bounded page-cache seed burst otherwise (budget 0 =
@@ -581,8 +574,9 @@ class PrefillHotnessRecorder:
         self.backing = backing
         self.cache = cache
         if self.cache is not None and getattr(self.cache, "capacity", 0) > 0:
-            # C4: avoid filling the LRU with the final prefill chunk; C5's
-            # hotness seed repopulates it after routing frequencies are known.
+            # Avoid filling the LRU with the final prefill chunk; the
+            # hotness seed repopulates it after routing frequencies are
+            # known.
             setattr(self.cache, "prefill_bypass", True)
         self.per_expert_bytes = per_expert_bytes
         self.seed_bytes = seed_bytes
@@ -592,12 +586,9 @@ class PrefillHotnessRecorder:
         self.seeded_experts = 0
         self.seeded_s = 0.0
         self.seed_done = threading.Event()
-        # Diagnostic: the exact hot set the seed picked, per layer. Kept so a
-        # post-run comparison can separate "the ranking is bad" from "the
-        # ranking never became resident". The offline replay in
-        # bench/bench_seed_static.py says the top-k by prefill frequency
-        # should hit 0.1935 as a static seed; the e2e measurement is 0.0618.
-        # Deciding which of those two is wrong needs this set.
+        # Diagnostic: the exact hot set the seed picked, per layer. Kept so
+        # a post-run comparison can separate "the ranking is bad" from "the
+        # ranking never became resident".
         self.last_hot: dict[int, list[int]] = {}
 
     def on_layer_plan(
@@ -613,8 +604,8 @@ class PrefillHotnessRecorder:
         if not _is_decode_call(positions, seq_len):
             # Prefill-shaped call: accumulate frequency (decode rows are
             # top_k * batch and would bias toward the first token). With a
-            # per-token counts payload (I6) the accumulation is true usage;
-            # the uniq_list fallback is presence-per-plan (legacy wiring).
+            # per-token counts payload the accumulation is true usage; the
+            # uniq_list fallback is presence-per-plan (legacy wiring).
             self.saw_prefill = True
             usage = PinController._counts_payload(counts, 0)
             if usage is not None:
@@ -681,7 +672,7 @@ class PrefillHotnessRecorder:
         per_layer_cap = getattr(self.cache, "_per_layer_cap", 0) or 0
         if per_layer_cap <= 0:
             return 0
-        # V2 phase-aware caps: seeds are decode residency — force the decode
+        # Phase-aware caps: seeds are decode residency — force the decode
         # pair first so they are not admitted under (and trimmed by) the
         # smaller prefill caps at the prefill->decode transition.
         try:
@@ -692,7 +683,7 @@ class PrefillHotnessRecorder:
             pass
         # Retain the known hot entries synchronously so the first decode call
         # never evicts useful prompt-wide entries. Missing bundles are read on
-        # the warm pool; the C3 cache lock makes worker-side raw bundle puts
+        # the warm pool; the cache lock makes worker-side raw bundle puts
         # safe, and quantized linears promote them on the inference thread.
         hot = self._hot_top(max(1, per_layer_cap // self._projections_per_expert()))
         self.last_hot = hot
@@ -837,7 +828,7 @@ class WarmPinHook:
 
     @property
     def wants_usage_counts(self) -> bool:
-        # Fase I6: only the pin/recorder consumers use the per-token usage
+        # Only the pin/recorder consumers use the per-token usage
         # histogram, so the switch only pays the np.bincount when at least
         # one of them is attached. The readahead warmer keeps the plain
         # uniq_list contract (contiguous-run F_RDADVISE grouping).
@@ -860,8 +851,8 @@ class WarmPinHook:
         seq_len: int | None = None,
     ) -> None:
         if self.warmer is not None:
-            # Warmer (readahead/discarded reads) keeps the uniq-list signal:
-            # its predictions are set-based (contiguous-run grouping), and a
+            # The readahead warmer keeps the uniq-list signal: its
+            # predictions are set-based (contiguous-run grouping), and a
             # histogram adds nothing there.
             self.warmer.on_layer_plan(
                 layer_idx, uniq_list, positions, seq_len=seq_len

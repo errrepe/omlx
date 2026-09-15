@@ -95,9 +95,8 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
 
 @pytest.mark.parametrize("kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4"])
 def test_streaming_owned_types_follow_the_estimate(tmp_path, kind):
-    # Plan 1.4: the compat gate used to keep its own 4-type allowlist and
-    # hide every other streaming-supported family. One allowlist now —
-    # the converter's structural estimate decides.
+    # One allowlist: the converter's structural estimate decides
+    # streaming-owned types.
     _checkpoint(tmp_path, kind)
     assert moe_offload_compatibility(tmp_path)[0] is True
 
@@ -133,9 +132,8 @@ def test_unsupported_saved_setting_rejected_before_load(tmp_path):
     from omlx.model_settings import ModelSettings
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
-    # qwen3_5_moe is in neither the streaming allowlist nor the legacy one,
-    # so the saved setting still rejects before load (glm5_next moved to
-    # the streaming allowlist — it now passes this gate legitimately).
+    # qwen3_5_moe is in neither the streaming allowlist nor the legacy
+    # one, so the saved setting still rejects before load.
     _checkpoint(tmp_path, "qwen3_5_moe")
     with pytest.raises(ValueError, match="not supported for this model type"):
         maybe_apply_pre_load_patches(

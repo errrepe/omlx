@@ -18,10 +18,7 @@ def moe_offload_compatibility(model_path):
         raw = json.loads(config.read_text())
         mtype = raw.get("model_type")
         # Unified backend first: streaming-owned model types are eligible
-        # when the converter's own structural estimate says so. This gate
-        # used to keep its own 4-type allowlist, which rejected qwen3_moe,
-        # glm5_next, deepseek_v4, … even though the converter serves them —
-        # two lists is what let them drift apart (plan 1.4).
+        # when the converter's own structural estimate says so.
         try:
             from .expert_streaming.residency import (
                 SUPPORTED_TYPES as _STREAMING_TYPES,

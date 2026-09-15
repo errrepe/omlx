@@ -44,8 +44,8 @@ from .telemetry import (
     register_backing,
 )
 
-# Compat re-exports: the telemetry surface lived on this module before
-# the split; out-of-tree tooling may still import it from here.
+# Compat re-exports: the telemetry surface lives in .telemetry;
+# out-of-tree tooling may still import it from here.
 from .telemetry import _PROFILE_READS as _PROFILE_READS  # noqa: F401
 from .telemetry import PageCacheProbe as PageCacheProbe  # noqa: F401
 from .telemetry import arm_read_telemetry as arm_read_telemetry  # noqa: F401
@@ -55,8 +55,8 @@ logger = logging.getLogger(__name__)
 
 # macOS kernel readahead (fcntl F_RDADVISE / struct radvisory): an async hint
 # that pulls a file range into the page cache without copying into userspace
-# — the zero-copy alternative to the warmer's discarded preads (ds4's
-# metal_graph_stream_readahead). Best-effort: any failure is silent.
+# — the zero-copy alternative to the warmer's discarded preads. Best-effort:
+# any failure is silent.
 # F_RDADVISE is 44 on Darwin (not exported by Python's fcntl module).
 _F_RDADVISE = getattr(fcntl, "F_RDADVISE", 44 if sys.platform == "darwin" else None)
 _RADVISORY = struct.Struct("=qi4x")  # off_t ra_offset; int ra_count; + tail pad
@@ -100,12 +100,11 @@ def _mlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
 
 
 def _munlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
-    """Release an mlock'd page-aligned range (P1-6).
+    """Release an mlock'd page-aligned range.
 
-    Until this existed the only way wired pages came back was the implicit
-    unlock in ``munmap`` when the reader was closed -- and ``close()`` never
-    cleared the pin bookkeeping either, so ``pinned_bytes`` stayed stale
-    across an unload/reload of the same engine.
+    Exists so wired pages come back without waiting for the implicit
+    unlock in ``munmap`` at reader close; paired with pin bookkeeping so
+    ``pinned_bytes`` cannot stay stale across an unload/reload.
     """
     try:
         view = _PyBuffer()
@@ -142,41 +141,35 @@ def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
     """Promote an expert's np.ndarray slice to the MLX representation."""
     if dtype_str == "BF16":
         # bf16 is stored as raw uint16 bits — reinterpret directly. This
-        # matches mx.load's native handling exactly (the old
-        # shift->f32->astype roundtrip flushed bf16 subnormals to zero via
-        # Metal FTZ) and is ~9x faster on 4 MB slices: no numpy shift, half
-        # the copy bytes, no GPU conversion kernel.
+        # matches mx.load's native handling exactly (a
+        # shift->f32->astype roundtrip would flush bf16 subnormals to zero
+        # via Metal FTZ) and is ~9x faster on 4 MB slices: no numpy shift,
+        # half the copy bytes, no GPU conversion kernel.
         return mx.array(np_view).view(mx.bfloat16)
     if dtype_str == "F8_E4M3":
         return mx.from_fp8(mx.array(np_view), dtype=mx.bfloat16)
     return mx.array(np_view)
 
 
-# Queue depth for the per-run preadvs issued inside one read_expert_into call
-# (Fase K F6, port of faseJ 0a4d3c7). This is the depth that matters: the
-# coalesced bank read replaced the old one-job-per-run pool.map with a
-# sequential loop, which dropped effective depth to 1 and cost ~45% of decode
-# throughput on qwen4_exp. Decode demand is sparse (a handful of scattered
-# experts per layer), so it has no readahead to fall back on and depth is all
-# it has — prefill, which asks for hundreds of contiguous experts, already
-# reaches ~2.6 GB/s against this device's ~2.8 GB/s ceiling even serially.
+# Queue depth for the per-run preadvs issued inside one read_expert_into
+# call. Decode demand is sparse (a handful of scattered experts per
+# layer), so it has no readahead to fall back on and queue depth is all
+# it has — prefill, which asks for hundreds of contiguous experts,
+# already reaches the device's throughput ceiling even serially.
 #
-# Default 16: measured on qwen (2k prompt, 48 decode, single request), two
-# rounds, 2 and 3 reps per arm. QD=1 is the old sequential behaviour.
-# 16 is the peak AND by far the steadiest arm; 32 regresses (oversubscription
-# past the device's useful queue depth). +55% over depth 1, all runs
-# token-ID bit-exact.
+# Default 16 sits at the device's useful queue depth; deeper
+# oversubscribes it and regresses. OMLX_EXPERT_STREAMING_RUN_QD overrides.
 _RUN_IO_QD = max(1, int(os.environ.get("OMLX_EXPERT_STREAMING_RUN_QD", "16")))
 
-# Fase 5b: completion-order window. 'completion' pops whichever read
+# Completion-order window: 'completion' pops whichever read
 # finishes first (scatter per descriptor, rows disjoint) instead of
 # waiting on the oldest submission; default 'order' keeps submission
-# order. Merge decision held to A/B evidence (>=2-3% at 8k).
+# order.
 _RUN_WINDOW_COMPLETION = (
     os.environ.get("OMLX_EXPERT_STREAMING_RUN_WINDOW", "") == "completion"
 )
 
-# PAR-1: scatter the run's demanded rows on the worker that read it instead
+# Scatter the run's demanded rows on the worker that read it instead
 # of the inference thread. Rows are disjoint per descriptor (the contract
 # scatter_one already documents), so the byte content of `out` never
 # depends on which thread or what order the copies run in.
@@ -184,7 +177,7 @@ _SCATTER_WORKER = (
     os.environ.get("OMLX_EXPERT_STREAMING_SCATTER_WORKER", "0") == "1"
 )
 
-# PAR-6: one sliding read window across ALL components of a call instead
+# One sliding read window across ALL components of a call instead
 # of draining the window at every component boundary (w/s/b per
 # projection, and per-chunk in prefill). The device never idles between
 # components — their runs all queue behind the same _RUN_IO_QD window.
@@ -210,13 +203,11 @@ def _run_io_pool() -> ThreadPoolExecutor:
     so it always drains.
 
     The SINGLETON is bounded at _RUN_IO_QD workers PROCESS-WIDE: every
-    concurrent parent shares the same 16 run-read workers (K10 — the old
-    docstring claimed one call was capped but N parents stacked N*QD depth;
-    the executor caps the process, which is why QD32 measured slower: 32
-    workers oversubscribe the device's useful queue depth, they do not
-    multiply it). A single call keeps at most _RUN_IO_QD reads in flight
-    because its planning window is sized to the pool (K11); the bound also
-    keeps the transient buffer memory bounded.
+    concurrent parent shares the same run-read workers — the executor caps
+    the process, so extra workers oversubscribe the device's useful queue
+    depth rather than multiply it. A single call keeps at most _RUN_IO_QD
+    reads in flight because its planning window is sized to the pool; the
+    bound also keeps the transient buffer memory bounded.
     """
     global _RUN_IO_POOL_SINGLETON
     if _RUN_IO_POOL_SINGLETON is None:
@@ -226,18 +217,19 @@ def _run_io_pool() -> ThreadPoolExecutor:
                     max_workers=_RUN_IO_QD,
                     thread_name_prefix="omlx-expert-run",
                 )
-                # Fase M4: observed-concurrency telemetry of the pooled
+                # Observed-concurrency telemetry of the pooled
                 # workers (active/queued/delays), used by PROFILE arms.
                 _RUN_IO_POOL_SINGLETON.telemetry = RunPoolTelemetry()
     return _RUN_IO_POOL_SINGLETON
 
 
-# P1-8: every blocking wait on an IO future is bounded. A stalled, wedged or
-# removed NVMe used to park the MLX inference thread in fut.result() forever
-# with no recovery path and no way to cancel on request abort. Timing out
-# turns that hang into a failed read, which the existing fallback path
-# already handles. The default is deliberately generous (a cold 256 MiB bank
-# run at even 50 MB/s finishes in ~5 s); set 0 to disable.
+# Every blocking wait on an IO future is bounded. A stalled, wedged or
+# removed NVMe would otherwise park the MLX inference thread in
+# fut.result() forever with no recovery path and no way to cancel on
+# request abort. Timing out turns that hang into a failed read, which the
+# existing fallback path already handles. The default is deliberately
+# generous (a cold 256 MiB bank run at even 50 MB/s finishes in ~5 s);
+# set 0 to disable.
 def _io_timeout_s(default: float = 120.0) -> float:
     try:
         raw = os.environ.get("OMLX_EXPERT_STREAMING_IO_TIMEOUT_S", "")
@@ -289,11 +281,11 @@ def segment_runs(
     merge_gap: int = 0,
     max_run: int | None = None,
 ) -> list[tuple[int, int]]:
-    """Split ascending expert ids into (first, count) runs (Fase K K2).
+    """Split ascending expert ids into (first, count) runs.
 
     ONE shared segmentation for the demand path (_group_runs), the
     advisor and read_expert_into, so the three callers can never
-    diverge again: a run groups CONSECUTIVE ids while ``same(first, nxt)``
+    diverge: a run groups CONSECUTIVE ids while ``same(first, nxt)``
     holds (reader identity for tier-aware paths; tier match for the demand
     fallback).
 
@@ -329,8 +321,7 @@ def segment_runs(
                     add = max(1, limit - count)
                 count += add
                 # Consume nxt only when the bridge fully covers it; a
-                # clamped bridge leaves nxt for the NEXT run (the old
-                # demand planner advanced by covered row count, and the
+                # clamped bridge leaves nxt for the NEXT run (the
                 # max_run clamp must not swallow demanded ids).
                 if add == gap + 1:
                     j += 1
@@ -438,8 +429,7 @@ class _ShardReader:
         """Zero-copy read of out.nbytes bytes at abs_off into the writable
         uint8 buffer out.
 
-        os.preadv writes straight into the buffer — no intermediate heap copy
-        (the old path did pread -> bytes -> bytearray -> view, a double copy).
+        os.preadv writes straight into the buffer — no intermediate heap copy.
         Raises OSError on a short read or IO error. Falls back to os.pread +
         copy when preadv is unavailable; short reads still surface as OSError
         so the caller can fail-high.
@@ -478,7 +468,7 @@ class _ShardReader:
         rp = self._rp_for(key)
         off = rp.tensor_abs_off + expert_id * rp.expert_bytes
         # Single zero-copy preadv into a writable buffer; the typed view is a
-        # zero-copy reinterpret (no bytearray double-copy as the old path had).
+        # zero-copy reinterpret (no bytearray double-copy).
         out = np.empty(rp.expert_bytes, dtype=np.uint8)
         self._read_into(off, out)
         return np.frombuffer(out, dtype=rp.np_dtype).reshape(rp.per_shape)
@@ -523,9 +513,9 @@ class _ShardReader:
         rp = self._rp_for(key)
         first_id = int(first_id)
         count = int(count)
-        # Reject instead of silently clamping: the old max(1, min(...))
-        # made `first_id=-1` or an overflowing run read the WRONG experts
-        # while reporting them as the requested ids.
+        # Reject instead of silently clamping: a `first_id=-1` or an
+        # overflowing run would read the WRONG experts while reporting
+        # them as the requested ids.
         if first_id < 0 or first_id >= rp.num_experts:
             raise ValueError(
                 f"expert_run: first_id {first_id} out of range "
@@ -585,7 +575,7 @@ _COLD_BANK_MARKERS = (
 )
 
 
-# Fase I6: the env override is the bench/developer opt-in — an EMPTY env
+# The env override is the bench/developer opt-in — an EMPTY env
 # means "no opinion" (None) so the runtime contract stays "unset = uniform
 # tier"; the settings key (expert_streaming_hot_fraction) is the per-model UI.
 HOT_FRACTION_ENV: str | None = os.environ.get("OMLX_EXPERT_STREAMING_HOT_FRACTION", "") or None
@@ -596,25 +586,25 @@ def load_hot_set_from_profile(
     hot_fraction: float,
     num_experts: int | None = None,
 ) -> dict[str, set]:
-    """HOBBIT hot set (Fase I6) from a learned pin profile.
+    """HOBBIT hot set from a learned pin profile.
 
     The profile's `freq` maps layer -> [[expert, count], ...]; the top
     ceil(fraction * experts) by count per layer keep the ORIGINAL packing
     while the rest read the cold tier. Keys are the backing's bare layer
     keys ("layer_<i>"); MTP stages are absent from profiles (uniform cold
-    there). Missing profile → empty dict (split stays off, uniform I5).
+    there). Missing profile → empty dict (split stays off, uniform cold).
 
-    ``num_experts`` (I6 fix) is the REAL per-layer expert width from the
+    ``num_experts`` is the REAL per-layer expert width from the
     model estimate; the fraction's denominator must be it, not the number
     of recorded profile entries — the profile keep cap (and old profiles)
-    truncate the record list, which made ceil(0.25 * 64) == 16 an
-    arbitrary id-prefix selection on a 288-expert model. The hot count is
+    truncate the record list, so len(counts) would elect an arbitrary
+    id-prefix subset on a wide model. The hot count is
     still clamped to the available records (a sparse profile cannot elect
     experts it never observed)."""
     try:
         data = json.loads(Path(profile_path).read_text())
-        # Fase L profile v2: the HOBBIT hot set is the DECODE regime (the
-        # split targets decode-hot experts); v1 profiles keep the legacy
+        # Profile v2: the HOBBIT hot set is the DECODE regime (the
+        # split targets decode-hot experts); v1 profiles keep the
         # top-level freq.
         regimes = data.get("regimes")
         freq = None
@@ -704,23 +694,23 @@ class ExpertBackingStore:
         # roots listed here win for shards mirrored onto them (see
         # _resolve_file) — used to stripe a big MoE across two SSDs.
         self._extra_roots = [Path(r).expanduser().resolve() for r in (extra_roots or [])]
-        # Cold precision tier (Fase I5): when set, expert-bank keys that
+        # Cold precision tier: when set, expert-bank keys that
         # exist under <model>/expert_cold/ resolve there FIRST — the whole
         # runtime (slices, runs, pins, readahead, dtypes) reads the cold
         # packing uniformly. Same filenames/key names, lower bit width.
         self.cold_root = Path(cold_root).expanduser().resolve() if cold_root else None
         self._cold_readers: Dict[str, _ShardReader] = {}
         self._cold_key_to_reader: Dict[str, _ShardReader] = {}
-        # HOBBIT hot/cold split (Fase I6): {stacked_key_prefix -> set(expert_id)}
+        # HOBBIT hot/cold split: {stacked_key_prefix -> set(expert_id)}
         # of experts served from the ORIGINAL (higher-precision) shards while
-        # the rest read expert_cold/. Empty/absent = uniform tier (I5, every
-        # expert cold). Keyed by the bank prefix (…switch_mlp.<proj>) with a
+        # the rest read expert_cold/. Empty/absent = uniform cold tier.
+        # Keyed by the bank prefix (…switch_mlp.<proj>) with a
         # per-layer fallback key ("layer_<i>") for profile sources that only
         # know the layer.
         self._hot_experts: Dict[str, set] = {}
         self._readers: Dict[str, _ShardReader] = {}
         self._key_to_reader: Dict[str, _ShardReader] = {}
-        # P1-7: lazy reader resolution runs on the inference thread and on
+        # Lazy reader resolution runs on the inference thread and on
         # warm-pool workers at the same time. The resolve must be atomic so
         # exactly one _ShardReader per path is ever published (and the
         # duplicate gets closed instead of leaking its fd + mmap).
@@ -744,15 +734,14 @@ class ExpertBackingStore:
         self._pin_lock = threading.Lock()
         self._pinned: set = set()
         self.pinned_bytes = 0
-        # Fase L: unique locked page accounting per reader file, so
+        # Unique locked page accounting per reader file, so
         # pinned_bytes reports the true wired bytes after page dedupe.
         self._pinned_pages: dict[str, set[int]] = {}
-        # Fase M3: per-backing read telemetry (phase-scoped, bounded). The
+        # Per-backing read telemetry (phase-scoped, bounded). The
         # env gates the default enabled state; callers may arm it explicitly.
         self.read_telemetry = ReadTelemetry(enabled=profiling_enabled())
         # A dir carrying expert_order.json is a repacked co-activation
-        # checkpoint — the ordering strategy was removed (V3: the read
-        # mechanism, not the order, carried the gains). Serving it as
+        # checkpoint — expert ordering is unsupported. Serving it as
         # identity would silently return permuted experts — refuse loudly.
         if (self.model_path / "expert_order.json").is_file():
             raise ValueError(
@@ -855,7 +844,7 @@ each key to its shard filename, so stacked banks spilled outside the
         self, key: str, expert_id: int | None = None
     ) -> _ShardReader | None:
         """Cold-tier reader for *key*, or None (not in the cold root).
-        HOBBIT hot experts (I6) never resolve cold — they stay on the
+        HOBBIT hot experts never resolve cold — they stay on the
         original packing, so the demand path must fetch them from the
         source shards and compute at the source bits."""
         if self.cold_root is None:
@@ -882,7 +871,7 @@ each key to its shard filename, so stacked banks spilled outside the
                     mine = _ShardReader(cold_path)
                 except Exception:
                     return None
-                # P1-7: same canonical-instance rule as _reader_for_key_source.
+                # Same canonical-instance rule as _reader_for_key_source.
                 winner = self._cold_readers.setdefault(ckey, mine)
                 if winner is not mine:
                     try:
@@ -896,7 +885,7 @@ each key to its shard filename, so stacked banks spilled outside the
             return self._cold_key_to_reader[key]
 
     def _reader_for_key(self, key: str, expert_id: int | None = None) -> _ShardReader:
-        # expert_id routes the HOBBIT split (I6): a hot expert resolves the
+        # expert_id routes the HOBBIT split: a hot expert resolves the
         # ORIGINAL shard even when a cold copy exists; everyone else cold.
         # The no-id lookup stays tier-blind (cold-first) for dtype/metadata
         # probes — never fall into it from the id-aware path when the id is
@@ -908,7 +897,7 @@ each key to its shard filename, so stacked banks spilled outside the
                 return cached
             cold = self._cold_reader_for_key(key, int(expert_id))
             reader = cold if cold is not None else self._reader_for_key_source(key)
-            # Fase M3: concurrent lazy opens must return ONE canonical
+            # Concurrent lazy opens must return ONE canonical
             # instance — two threads resolving the same key simultaneously
             # could otherwise hand out different reader objects and the
             # tier contract (all ids -> the same reader) would reject the
@@ -952,11 +941,10 @@ each key to its shard filename, so stacked banks spilled outside the
             reader = self._readers.get(fkey)
             if reader is None:
                 reader = _ShardReader(fpath)
-                # Fase M3: canonical instance under concurrency (see
-                # _reader_for_key). P1-7: the old code setdefault()'d a
-                # freshly built reader and then adopted whatever won, so the
-                # loser's file descriptor and mmap leaked for the whole
-                # engine lifetime. Publish first, then close the loser.
+                # Canonical instance under concurrency (see
+                # _reader_for_key): publish first, then close the loser
+                # so its file descriptor and mmap do not leak for the
+                # engine lifetime.
                 winner = self._readers.setdefault(fkey, reader)
                 if winner is not reader:
                     try:
@@ -965,8 +953,8 @@ each key to its shard filename, so stacked banks spilled outside the
                         logger.debug("closing duplicate shard reader failed", exc_info=True)
                     reader = winner
             # Canonical instance, so the plain store cannot publish two
-            # different readers for one key (that silently broke the tier
-            # contract in read_expert_into: "if any(r is not reader)").
+            # different readers for one key (the tier contract in
+            # read_expert_into checks "if any(r is not reader)").
             self._key_to_reader[("src", key)] = reader
         return reader
 
@@ -1055,7 +1043,7 @@ each key to its shard filename, so stacked banks spilled outside the
         demand-assembly miss path: one reader resolution per component and one
         syscall per run instead of one resolution + one read per expert.
 
-        Fase K tier contract (HOBBIT/I6): a component's expert ids must all
+        Tier contract (HOBBIT split): a component's expert ids must all
         resolve to the SAME reader (same tier packing) — hot and cold copies
         of one key can have different per-expert byte sizes, so a mixed
         component cannot share an output buffer layout. The caller splits
@@ -1089,7 +1077,7 @@ each key to its shard filename, so stacked banks spilled outside the
     def _resolve_component_reader(self, key, eids, out, n, stages, tel_on):
         """Tier-aware single-reader resolution + output validation.
 
-        Fase K: resolve the reader per expert (tier-aware) and require
+        Resolve the reader per expert (tier-aware) and require
         ONE reader for the component — mixed tiers cannot share the
         uniform output layout. Returns ``(reader, rp)`` to proceed, or
         None — the caller fails the component.
@@ -1128,19 +1116,19 @@ each key to its shard filename, so stacked banks spilled outside the
         if tel_on and stages is not None:
             _t_pl = time.perf_counter_ns()
         # Read contiguous runs separately. This keeps sparse demand from
-        # over-reading the gap between the first and last expert. Fase K
-        # K5: with merge_gap > 0 a run may BRIDGE holes of up to
+        # over-reading the gap between the first and last expert. With
+        # merge_gap > 0 a run may BRIDGE holes of up to
         # merge_gap missing ids — the hole rows are read with the run
         # but the scatter below writes ONLY the demanded ids, so gap
         # bytes can never enter the output (or the LRU). Same shared
         # segmentation as the demand planner and the advisor.
         order = sorted(range(n), key=lambda j: eids[j])
         sorted_ids = [eids[j] for j in order]
-        # Fase 4 (megaplan): an uncapped contiguous run is ONE preadv on
+        # An uncapped contiguous run is ONE preadv on
         # ONE worker — dense prefill demand (~500 experts, ~450 MB) would
         # serialize at single-stream speed. max_run_bytes bounds each
         # run so the sliding window below keeps _RUN_IO_QD reads in
-        # flight. 0 keeps the legacy unbounded segmentation.
+        # flight. 0 keeps the unbounded segmentation.
         run_cap = (
             max(1, int(max_run_bytes) // rp.expert_bytes)
             if max_run_bytes > 0
@@ -1191,9 +1179,9 @@ each key to its shard filename, so stacked banks spilled outside the
         whole call (fallback to per-expert loads).
         """
         n = len(eids)
-        # Fase M2: per-component stage timings (host timestamps only —
+        # Per-component stage timings (host timestamps only —
         # workers never touch MLX). Collected locally, inserted as ONE
-        # aggregate record under the telemetry lock (M3).
+        # aggregate record under the telemetry lock.
         comp_t0 = time.perf_counter_ns() if tel_on else 0
         stages: dict[str, list[int]] | None = (
             {
@@ -1212,7 +1200,7 @@ each key to its shard filename, so stacked banks spilled outside the
             else None
         )
         run_times: list[tuple[int, int]] | None = [] if tel_on else None
-        # Fase A4: the owner tag attributes this backing's tasks in the
+        # The owner tag attributes this backing's tasks in the
         # process-wide pool telemetry (id(self) is stable per call).
         _owner_tag = id(self) if tel_on else None
 
@@ -1247,11 +1235,9 @@ each key to its shard filename, so stacked banks spilled outside the
         # a chain of blocking syscalls, which pins the device's I/O queue
         # depth at 1: the device idles for a full round trip between runs.
         # Prefill largely hides this — its runs are long and contiguous, so
-        # kernel readahead covers it and it already reaches ~2.6 GB/s
-        # against this device's ~2.8 GB/s ceiling. Decode has no such luck:
+        # kernel readahead covers it. Decode has no such luck:
         # its demand is a handful of scattered experts per projection and
-        # depth is all it has (measured: depth 1 gave 0.46 GiB/s and 1.86
-        # tok/s against the baseline's ~0.9 GiB/s and 3+ tok/s).
+        # queue depth is all it has.
         #
         # Batched rather than all-at-once so peak transient memory stays
         # at _RUN_IO_QD run buffers instead of one per run — a fully
@@ -1265,7 +1251,7 @@ each key to its shard filename, so stacked banks spilled outside the
                 stages["buffer_alloc_us"].append(
                     (time.perf_counter_ns() - _t_a) // 1000
                 )
-            # A3: the single-run path reads inline on the CALLER thread,
+            # The single-run path reads inline on the CALLER thread,
             # so the worker start delay is 0 by construction and the
             # read lands in read_duration_us (SSD/kernel time).
             _t_rd = time.perf_counter_ns() if tel_on else 0
@@ -1280,11 +1266,10 @@ each key to its shard filename, so stacked banks spilled outside the
                 stages["worker_start_delay_us"].append(0)
             self._scatter_run_rows(eids, out, rp, stages, tel_on, first, js, buf)
         else:
-            # Sliding window (K11 + Fase 5b): keep up to _RUN_IO_QD
-            # reads in flight continuously. The old drain-all-per-batch
-            # loop emptied the queue at every batch boundary — a
-            # sawtooth that let the device idle even though demand was
-            # waiting. Two pop orders (env OMLX_EXPERT_STREAMING_RUN_
+            # Sliding window: keep up to _RUN_IO_QD
+            # reads in flight continuously — draining the queue at every
+            # batch boundary would let the device idle even though demand
+            # was waiting. Two pop orders (env OMLX_EXPERT_STREAMING_RUN_
             # WINDOW): 'order' (default) pops the OLDEST submission;
             # 'completion' pops whichever read finished first so a slow
             # run cannot head-of-line-block the rest. Either way out
@@ -1320,7 +1305,7 @@ each key to its shard filename, so stacked banks spilled outside the
         window: dict = {}  # future -> (off, first, js, buf)
         pending_runs = iter(runs)
         ok = True
-        # Fase A3: caller-side block on the window futures. The
+        # Caller-side block on the window futures. The
         # wait that begins with only the FINAL run left is the
         # true burst tail (last_future_wait_us).
         last_wait_t0: int | None = None
@@ -1330,7 +1315,7 @@ each key to its shard filename, so stacked banks spilled outside the
             if run is None:
                 return None
             (off, first, cnt, js) = run
-            # Fase M2/M4: buffer alloc + queue/wait + preadv are
+            # Buffer alloc + queue/wait + preadv are
             # measured around the worker; the pool wrapper adds
             # observed-concurrency counters when profiling.
             _t_a = time.perf_counter_ns() if tel_on else 0
@@ -1393,7 +1378,7 @@ each key to its shard filename, so stacked banks spilled outside the
                 return_when="FIRST_COMPLETED",
             )
             if not done:
-                # P1-8: nothing completed within the budget —
+                # Nothing completed within the budget —
                 # a wedged device, not a slow one.
                 _log_io_timeout()
                 for fut in list(window):
@@ -1438,9 +1423,9 @@ each key to its shard filename, so stacked banks spilled outside the
         ok = True
 
         def _wait_future(wfut) -> bool:
-            # Fase A3: caller-side block on one window future;
+            # Caller-side block on one window future;
             # the block duration lands in window_wait_us.
-            # P1-8: bounded, so a stalled device fails the read
+            # Bounded, so a stalled device fails the read
             # instead of parking the inference thread forever.
             _t_ww = time.perf_counter_ns() if tel_on else 0
             try:
@@ -1518,14 +1503,14 @@ each key to its shard filename, so stacked banks spilled outside the
                     )
             if not ok:
                 for _o, _f, _j, _b, fut in window:
-                    # P1-8: drain instead of dropping — a read
+                    # Drain instead of dropping — a read
                     # exception in an abandoned prefetch future
-                    # used to vanish with it.
+                    # would vanish with it.
                     _await_io_future(fut)
                 return False
         # Drain: the FINAL element is the last run of the burst;
         # its block — measured from when only it remained — is
-        # the true tail (A3), distinct from the full span.
+        # the true tail, distinct from the full span.
         last_wait_t0: int | None = None
         for wi, (wo, wfirst, wjs, wbuf, wfut) in enumerate(window):
             if tel_on and wi == len(window) - 1:
@@ -1550,7 +1535,7 @@ each key to its shard filename, so stacked banks spilled outside the
     def _record_component_read(
         self, comp_t0, runs, rp, stages, run_times, tel_on
     ) -> None:
-        # Fase M2/M3/A3: one aggregate record per component. The worker
+        # One aggregate record per component. The worker
         # threads never take the telemetry lock; their per-run
         # (worker_start_delay, read_duration) samples merge here under
         # the single per-call lock. window_wait_us and
@@ -1582,7 +1567,7 @@ each key to its shard filename, so stacked banks spilled outside the
         merge_gap: int = 0,
         max_run_bytes: int = 0,
     ) -> bool:
-        """PAR-6: one sliding read window across every component.
+        """One sliding read window across every component.
 
         The per-component path drains the window at each boundary — a
         decode projection is 3 components (weight, scales, biases), so its
@@ -1631,7 +1616,7 @@ each key to its shard filename, so stacked banks spilled outside the
                 )
             return False
 
-        # Phase 1 — per-component validation and run planning. A run
+        # Per-component validation and run planning. A run
         # descriptor is (out, eids, rp, reader, off, first, count, js).
         all_runs: list[tuple] = []
         total_bytes = 0
@@ -1876,14 +1861,13 @@ each key to its shard filename, so stacked banks spilled outside the
         Row-major stacked banks make a run of ids one contiguous byte range,
         so the whole run collapses into a single F_RDADVISE — the zero-copy
         readahead counterpart of load_expert_run. Under the HOBBIT split
-        (I6) the run may straddle the hot/cold boundary; a run reads ONE
+        the run may straddle the hot/cold boundary; a run reads ONE
         reader (the one its first id resolves), so advise breaks at tier
         boundaries exactly like the demand path's _group_runs.
 
         Returns (ok, bytes_advised, tier_segments): bytes_advised is the
-        total file range covered by the accepted advisories (Fase 2
-        telemetry — the caller accumulates it, so advised_bytes stops being
-        a permanent zero in the bench output), tier_segments counts the
+        total file range covered by the accepted advisories,
+        tier_segments counts the
         reader groups the run needed. ok is False when the platform lacks
         F_RDADVISE or nothing resolved.
         """
@@ -1931,7 +1915,7 @@ each key to its shard filename, so stacked banks spilled outside the
             locked = reader.pin_expert(key, expert_id)
             if locked > 0:
                 self._pinned.add(pkey)
-                # Fase L: count only NEWLY locked pages — adjacent experts
+                # Count only NEWLY locked pages — adjacent experts
                 # share the boundary page and must not double-charge the
                 # budget.
                 try:
@@ -1947,12 +1931,12 @@ each key to its shard filename, so stacked banks spilled outside the
         return locked
 
     def unpin_all(self) -> int:
-        """munlock every pinned range and reset the pin bookkeeping (P1-6).
+        """munlock every pinned range and reset the pin bookkeeping.
 
-        Returns the number of pins released. Without this, wired memory was
-        only reclaimed by the implicit unlock inside ``munmap`` at reader
-        close, and ``pinned_bytes`` was left reporting wired bytes that no
-        longer existed after an unload/reload.
+        Returns the number of pins released. Reclaims wired memory without
+        waiting for the implicit unlock inside ``munmap`` at reader close,
+        and keeps ``pinned_bytes`` from reporting wired bytes that no
+        longer exist after an unload/reload.
         """
         with self._pin_lock:
             pins = list(self._pinned)
@@ -1980,15 +1964,15 @@ each key to its shard filename, so stacked banks spilled outside the
             return len(self._pinned)
 
     def close(self) -> None:
-        # P1-6: release wired pages BEFORE the mappings go away. munmap
+        # Release wired pages BEFORE the mappings go away. munmap
         # would unlock them implicitly, but the pin bookkeeping (_pinned,
-        # _pinned_pages, pinned_bytes) survived close() and reported wired
-        # memory that no longer existed on the next load.
+        # _pinned_pages, pinned_bytes) must be cleared too or it reports
+        # wired memory that no longer exists on the next load.
         try:
             self.unpin_all()
         except Exception:
             logger.debug("unpin_all failed during close", exc_info=True)
-        # Fase K K1: stop speculation before the readers die — a live
+        # Stop speculation before the readers die — a live
         # advisor would otherwise reference closed files past its owning
         # engine's lifetime.
         spec = getattr(self, "spec_state", None)
@@ -2001,7 +1985,7 @@ each key to its shard filename, so stacked banks spilled outside the
                 self.spec_state = None  # type: ignore[attr-defined]
             except Exception:
                 pass
-        # P2: stop the detached admission worker with the engine — it is a
+        # Stop the detached admission worker with the engine — it is a
         # daemon thread, but an explicit close keeps repeated conversions
         # from leaking idle workers.
         cache = getattr(self, "_streaming_cache", None)
@@ -2026,7 +2010,7 @@ each key to its shard filename, so stacked banks spilled outside the
             self._key_to_reader.clear()
             # Key->reader memo for the cold tier too: without this a
             # post-close lookup hands back a CLOSED reader instead of
-            # rebuilding (2.9).
+            # rebuilding.
             self._cold_key_to_reader.clear()
         for r in readers_to_close:
             try:

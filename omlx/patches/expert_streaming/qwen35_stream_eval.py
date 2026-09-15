@@ -7,22 +7,20 @@ The streaming converter flags every converted decoder layer with
 ``Qwen3_5MoeDecoderLayer`` does not, and neither does the vendored
 ``Qwen4ExpDecoderLayer`` — so on qwen4_exp the flag is inert and a long
 prefill chunk accumulates one streaming mini-bank per layer in the lazy
-graph until the chunk-end eval (~17 MB/token measured, intra-chunk pool
-peaks ~29 GiB, process phys_footprint ~35.7 GiB of which ~34.5 GiB is
-IOAccelerator). This wraps every such decoder with the DeepSeek/GLM
-boundary: evaluate the layer output as soon as the layer returns and trim
-the allocator cache so the retained pool cannot grow past the layer's
-working set and evict the OS page cache the streaming path depends on
-(the Fase G post-mortem's 341 s/8k case).
+graph until the chunk-end eval (~17 MB/token, pool peaks of tens of GiB).
+This wraps every such decoder with the DeepSeek/GLM boundary: evaluate the
+layer output as soon as the layer returns and trim the allocator cache so
+the retained pool cannot grow past the layer's working set and evict the
+OS page cache the streaming path depends on.
 
-This is the dominant term of the Fase J prefill-memory work: everything
-else (demand-set tiling, the rolling bank load) bounds a *single* layer's
-transient, but without a per-layer boundary the graph still accumulates one
-transient per layer across all 48 layers.
+Without a per-layer boundary the lazy graph accumulates one transient per
+layer across all 48 layers; demand-set tiling and the rolling bank load
+only bound a *single* layer's transient.
 
 Prefill-shaped calls only (``x.shape[1] > 1``; batch decode is [B, 1, H]):
-decode graphs are small and 48 forced syncs/token would erode the QD16 win,
-and MTP verify passes (``target_verify``) stay lazy for the same reason.
+decode graphs are small and 48 forced syncs/token would erode decode
+throughput, and MTP verify passes (``target_verify``) stay lazy for the
+same reason.
 Output is bit-identical — ``mx.eval`` only materializes what the next layer
 reads anyway; ``mx.clear_cache`` frees cached buffers back to Metal.
 """
@@ -56,8 +54,8 @@ def _cache_threshold_bytes() -> int:
     """Pool size (bytes) above which the per-layer clear is worth running.
 
     Delegates to ``omlx.utils.metal_sync.cache_clear_threshold_bytes`` so
-    the knob has one home: the scheduler's chunk-boundary clears (Etapa D)
-    gate on the same number as this per-layer clear. Imported lazily — the
+    the knob has one home: the scheduler's chunk-boundary clears gate on
+    the same number as this per-layer clear. Imported lazily — the
     model path must keep working when that module is unavailable, and the
     local parse below is the fallback.
     """
@@ -96,10 +94,10 @@ def _clear_cache_synced() -> None:
     store-cache worker from observing a half-reclaimed pool (#1106), so it is
     preferred whenever it is importable.
     """
-    # K12: the bare clear is ONLY the import-failure fallback. A failure
-    # INSIDE the synced helper (lock, sync, eval) must not fall through to
-    # the unsynchronized clear — that reintroduces the very 'clear with
-    # command buffers in flight' race this helper exists to prevent. The
+    # The bare clear is ONLY the import-failure fallback. A failure INSIDE
+    # the synced helper (lock, sync, eval) must not fall through to the
+    # unsynchronized clear — that reintroduces the very 'clear with command
+    # buffers in flight' race this helper exists to prevent. The
     # scheduler's chunk-boundary clear covers the pool in that case.
     try:
         from omlx.utils.metal_sync import _sync_and_clear_cache
@@ -194,13 +192,9 @@ def boundary_active_for_layers(layers: Any) -> bool:
     decoder class, or a decoder class that honors ``_stream_eval`` inline
     (``Glm5NextDecoderLayer``, via ``_INLINE_STREAM_EVAL_ATTR``).
 
-    ``boundary_active()`` below is process-global: it answers whether ANY
-    wrapped class exists in the process, which is true whenever an earlier
-    conversion wrapped the qwen classes — even when the model being
-    converted now is of another family. Publishing that as this model's
-    verdict over-credits models with no boundary (under-charge risk) and
-    mis-attributes the GLM inline boundary. Always prefer this helper for
-    guard metadata.
+    A process-global "any wrapped class exists" check would over-credit
+    models with no boundary (under-charge risk) and mis-attribute the GLM
+    inline boundary — use this per-model verdict for guard metadata.
     """
     if not _per_layer_eval_enabled:
         return False
@@ -227,8 +221,3 @@ def boundary_active_for_layers(layers: Any) -> bool:
     except TypeError:
         return False
 
-
-# ``boundary_active()`` (the process-global variant) was removed with the
-# 2026-09-09 audit cleanup: no caller survived the switch to
-# ``boundary_active_for_layers``, and keeping it invited exactly the bug it
-# warned about -- crediting a model for a boundary another family owns.

@@ -8,12 +8,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Re-exported from residency.py — the leaf module holds the single copy.
-# Keeping a second literal here is what allowed the gates to drift apart
-# (engine/batched.py and engine/vlm.py checked this set while the structural
-# estimate checked the checkpoint, so a mismatch forced streaming without the
-# lazy load and materialized the full MoE banks). Both names stay importable
-# from the package root; there is exactly one definition.
+# Re-exported from the leaf modules — they hold the single copy, so the
+# gates cannot drift apart. Both names stay importable from the package
+# root; there is exactly one definition.
 from .model_hooks import (
     DEFAULT_PREFIX_TEMPLATES as DEFAULT_PREFIX_TEMPLATES,
     find_moe_container as find_moe_container,
@@ -24,7 +21,7 @@ from .model_hooks import (
 from .residency import SUPPORTED_TYPES, normalize_model_type
 
 try:
-    # P2 follow-up: public cache-policy API at the package root.
+    # Public cache-policy API at the package root.
     from .governor import dynamic_residency_enabled
 except Exception:  # pragma: no cover - governor has no mlx dependency
     dynamic_residency_enabled = lambda: False  # type: ignore[assignment]
@@ -59,9 +56,9 @@ def is_supported_model_type(model_type: str | None) -> bool:
 
 
 # Upper bound on the expert LRU budget. The admin PUT handler rejects
-# anything outside 0-64 GiB (routes.py), but the loader path -- a hand-edited
-# settings file, an autotune --apply, or an env override -- had no clamp at
-# all, so a typo could ask for a heap larger than physical memory (P2-16).
+# anything outside 0-64 GiB (routes.py); the loader path -- a hand-edited
+# settings file, an autotune --apply, or an env override -- bypasses that
+# check, so clamp here too.
 MAX_EXPERT_STREAMING_BUDGET_BYTES = 64 * 1024**3
 
 
@@ -171,8 +168,8 @@ def _resolve_budget_bytes(model_settings: Any | None) -> int:
                     continue
                 return _clamp_budget_bytes(int(mib) * 1024 * 1024)
         # Auto (default): RAM-scaled starting budget for the dynamic
-        # governor. False opts back out to page-cache only (the pre-auto
-        # default — the OS file cache serves reuse from clean pages).
+        # governor. False opts out to page-cache only (the OS file cache
+        # serves reuse from clean pages).
         if getattr(model_settings, "expert_streaming_budget_auto", True) is False:
             return 0
         return _auto_budget_bytes()
@@ -185,8 +182,8 @@ def _prior_usable(cache: Any) -> bool:
     """Cache-prior needs app-level LRU residency as its signal.
 
     With a page-cache-only budget the resident set is always empty and the
-    rerank is pure overhead (autotune b0 trials regressed) — refuse it so
-    budget-0 stays on the stock path."""
+    rerank is pure overhead — refuse it so budget-0 stays on the stock
+    path."""
     try:
         return int(getattr(cache, "capacity", 0) or 0) > 0
     except (TypeError, ValueError):
@@ -203,9 +200,8 @@ def _prior_usable(cache: Any) -> bool:
 # model_settings through dedicated resolvers (adaptive_topk.resolve_*,
 # conversion._resolve_cold_tier_root) that each coerce defensively and
 # fall back to env/exact on garbage, and the admin PUT validates them at
-# the write boundary. Keeping them in this dict produced a second,
-# divergent contract (e.g. cold_tier "2"/"3" here vs 2-8 at the runtime
-# resolver) that nothing ever read.
+# the write boundary. Listing them here would create a second, divergent
+# contract.
 _IO_OVERRIDE_KEYS = (
     "expert_streaming_io_depth",
     "expert_streaming_coalesce",
@@ -304,7 +300,7 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
 
 
 def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
-    """P1: one-line request/bench summary of streaming health.
+    """One-line request/bench summary of streaming health.
 
     Aggregates the counters the implementation already keeps (LRU hits,
     advisor, ctx fallbacks) into a single
@@ -398,8 +394,8 @@ def ensure_streaming_backing_or_raise(
     checkpoint structurally supports streaming but neither the unified
     converter nor the legacy adapter claimed any MoE layer. No-op when the
     intent was off, the estimate declines the checkpoint, or real
-    conversion happened — backing presence alone is not evidence (the
-    converter used to return a live backing with zero converted layers).
+    conversion happened — backing presence alone is not evidence of
+    conversion.
     """
     if not requested:
         return
@@ -432,7 +428,7 @@ def ensure_streaming_backing_or_raise(
 
 
 def shutdown_expert_streaming(backing: Any) -> None:
-    """Release MoE streaming resources held by *backing* (P0).
+    """Release MoE streaming resources held by *backing*.
 
     Persists the transition table, then closes shard fds/mmaps.
     Idempotent; safe to call with None or a RAM-dict backing. Engines

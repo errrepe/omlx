@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model-agnostic dynamic budget over the V4.1 native expert adapter.
 
-Split of responsibilities (clean-split design):
+Split of responsibilities:
 
 - Policy (model-agnostic): ``ExpertResidencyGovernor`` from
   ``expert_streaming.governor`` decides capacity from pressure (free RAM)
@@ -62,7 +62,7 @@ class _V41CacheStats(DecodeVisitStats):
 
     The shared contract class (``expert_streaming.slot_cache``) is the
     shape ``ExpertResidencyGovernor._window`` duck-reads — same fields the
-    legacy state and the unified CacheStats expose.
+    unified CacheStats exposes.
 
     Cadence note: V4.1 notes a visit per ``ensure()`` — one per decode
     CHUNK, and a B-row batched decode splits into ceil(B/step) chunks —
@@ -96,7 +96,7 @@ class V41StreamingBacking:
             slots.backing = self
             slots.layer = int(layer_idx)
         self.num_layers = len(self.slots_of)
-        # P8 staging predictor: last decode-token routing per layer, the
+        # Staging predictor: last decode-token routing per layer, the
         # MoE layer order used to find the "next" layer to stage, and the
         # per-layer prev-token recall EWMA that gates speculative reads.
         self.prev_uniq: dict = {}
@@ -139,9 +139,9 @@ class V41StreamingBacking:
             )
             # Never shrink a layer below one token's decode working set:
             # below n_activated_experts `ensure` raises "working set
-            # exceeds resident capacity" mid-generation. The old
-            # min(8, cap) floor broke exactly that on top-k>8 models
-            # (2.1). The plan already guarantees capacity >= n_activated.
+            # exceeds resident capacity" mid-generation — a fixed floor
+            # smaller than top_k breaks on top-k>8 models.
+            # The plan already guarantees capacity >= n_activated.
             floor = (
                 int(min_cap)
                 if min_cap is not None
@@ -230,15 +230,15 @@ class V41StreamingBacking:
 
     @property
     def capacity(self) -> int:
-        # Generic-cache contract (governor line 309 gates on it): total
+        # Generic-cache contract: total
         # budget units, which for the per-layer-unit fiction equal the
         # uniform per-layer base.
         return self.base_cap
 
     @property
     def evictions(self) -> int:
-        # Per-layer counters live on the slots now (the fetch path no
-        # longer holds the global lock); the backing just aggregates.
+        # Per-layer counters live on the slots; the backing just
+        # aggregates.
         return sum(s.evictions for s in self.slots_of.values())
 
     @property
@@ -260,8 +260,7 @@ class V41StreamingBacking:
         ``shutdown_expert_streaming`` reaches this on engine stop; the
         model's own ``close()`` reaches the same plan via
         ``_moe_offload_plan`` — ``plan.close()`` is idempotent, so both
-        paths are safe (2.8: without this method the shutdown hook did
-        nothing for V4.1 and the shard fds could outlive the engine).
+        paths are safe and the shard fds cannot outlive the engine.
         """
         try:
             self.plan.close()
@@ -275,7 +274,7 @@ class V41StreamingBacking:
         # slots._slots_lock then backing._lock impossible to invert.
         with self._lock:
             self.stats.note_visit(layer_idx, missed)
-        # P8 parity with _LayerLoadContext.close(): mid-request governor
+        # Mid-request governor
         # tick — one decode visit per layer-call is the same cadence the
         # generic path uses; tick() self-throttles on _GOV_TICK_S so the
         # cost is a monotonic compare until the interval elapses. Runs
@@ -292,7 +291,7 @@ class V41StreamingBacking:
     def note_routing(self, layer_idx: int, experts) -> None:
         """Record a decode token's routed set as this layer's predictor
         for the next token (same temporal-locality assumption the generic
-        path's SpeculationState uses; measured recall ~0.8 there).
+        path's SpeculationState uses).
 
         Deliberate simplification vs the generic path: ``prev_uniq``
         keeps only last token's set — no (layer, expert) -> next-expert
@@ -310,7 +309,7 @@ class V41StreamingBacking:
                 + (1.0 - _STAGED_RECALL_DECAY) * obs
             )
         self.prev_uniq[li] = now
-        # V2-0 routing trace: decode-only by contract (ensure() calls this
+        # Routing trace: decode-only by contract (ensure() calls this
         # solely on the decode branch — verify/prefill never pollute it).
         # A tracer write failure must never propagate into ensure() —
         # tracing is observability, not the demand path.
@@ -327,7 +326,7 @@ class V41StreamingBacking:
             logger.debug("v41 routing memtrace failed", exc_info=True)
 
     def stage_next(self, layer_idx: int) -> None:
-        """Stage the NEXT MoE layer's predicted set (P8 prefetch).
+        """Stage the NEXT MoE layer's predicted set.
 
         Called after a decode ensure — while layer ``layer_idx``'s MoE
         compute runs, the next layer's likely experts read on the plan's
@@ -364,9 +363,8 @@ class V41StreamingBacking:
     def _stage_headroom(self) -> bool:
         """Speculative reads only pay when residency has slack.
 
-        Measured on the starved 48GB/422GB regime (cap pinned at the
-        working-set floor, governor clearing): staged_drops (270) >
-        staged_hits (200) — mispredicted reads competed with demand
+        On a starved regime (cap pinned at the working-set floor,
+        governor clearing) mispredicted reads compete with demand
         fetches on a saturated disk for slots that cannot hold them.
         Suppress staging when the governor has shrunk to the floor or
         last saw free memory inside the desperate-clear band; keep it
@@ -377,7 +375,7 @@ class V41StreamingBacking:
             return True
         try:
             # Public governor accessors when present (contract API);
-            # fall back to the private reads while they are pending.
+            # fall back to the private reads otherwise.
             at_floor = getattr(gov, "at_floor", None)
             floor_hit = (
                 at_floor()
@@ -404,7 +402,7 @@ class V41StreamingBacking:
     # ceilings and counts evictions.
     def _compact(self, slots, keep: int) -> None:
         # compact() takes the layer's own lock (it also runs standalone in
-        # the ensure path); eviction counts live per-layer now.
+        # the ensure path); eviction counts are per-layer.
         slots.compact(keep)
 
     def summary(self) -> dict:
