@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 import bisect
 import concurrent.futures
 import ctypes
+import errno
 import fcntl
 import json
 import math
@@ -28,7 +29,7 @@ from typing import Any, Dict, NamedTuple, Tuple
 import mlx.core as mx
 import numpy as np
 
-from ._env import env_int
+from ._env import env_float, env_int
 
 _PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
 
@@ -97,34 +98,34 @@ def _mm_page_range(mm: mmap.mmap, offset: int, length: int):
         return None
 
 
-def _mlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
+def _mlock_range(mm: mmap.mmap, offset: int, length: int) -> int:
     """mlock a page-aligned range of an existing file mapping. Zero-copy:
-    the locked pages are the file cache pages themselves."""
+    the locked pages are the file cache pages themselves. Returns the
+    locked byte count (page-rounded), 0 on failure."""
     global _MLOCK_FAILED_LOGGED
     try:
         r = _mm_page_range(mm, offset, length)
         if r is None:
-            return False
+            return 0
         base, size = r
         rc = _libc.mlock(ctypes.c_void_p(base), ctypes.c_size_t(size))
         if rc != 0 and not _MLOCK_FAILED_LOGGED:
-            import errno
-
             _MLOCK_FAILED_LOGGED = True
             logger.warning(
                 "mlock failed (errno=%s) — pinned-expert mode disabled for new pins",
                 errno.errorcode.get(ctypes.get_errno(), ctypes.get_errno()),
             )
-        return rc == 0
+        return size if rc == 0 else 0
     except Exception as e:
         if not _MLOCK_FAILED_LOGGED:
             _MLOCK_FAILED_LOGGED = True
             logger.warning("mlock unavailable: %s", e)
-        return False
+        return 0
 
 
-def _munlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
-    """Release an mlock'd page-aligned range.
+def _munlock_range(mm: mmap.mmap, offset: int, length: int) -> int:
+    """Release an mlock'd page-aligned range; returns the unlocked byte
+    count (page-rounded), 0 on failure.
 
     Exists so wired pages come back without waiting for the implicit
     unlock in ``munmap`` at reader close; paired with pin bookkeeping so
@@ -133,12 +134,14 @@ def _munlock_range(mm: mmap.mmap, offset: int, length: int) -> bool:
     try:
         r = _mm_page_range(mm, offset, length)
         if r is None:
-            return False
+            return 0
         base, size = r
-        return _libc.munlock(ctypes.c_void_p(base), ctypes.c_size_t(size)) == 0
+        if _libc.munlock(ctypes.c_void_p(base), ctypes.c_size_t(size)) == 0:
+            return size
+        return 0
     except Exception:
         logger.debug("munlock failed", exc_info=True)
-        return False
+        return 0
 
 
 _DTYPE_MAP: dict[str, tuple[np.dtype, int]] = {
@@ -219,15 +222,7 @@ def _run_io_pool() -> ThreadPoolExecutor:
 # existing fallback path already handles. The default is deliberately
 # generous (a cold 256 MiB bank run at even 50 MB/s finishes in ~5 s);
 # set 0 to disable.
-def _io_timeout_s(default: float = 120.0) -> float:
-    try:
-        raw = os.environ.get("OMLX_EXPERT_STREAMING_IO_TIMEOUT_S", "")
-        return float(raw) if raw.strip() else default
-    except (TypeError, ValueError):
-        return default
-
-
-_IO_TIMEOUT_S = max(0.0, _io_timeout_s())
+_IO_TIMEOUT_S = max(0.0, env_float("OMLX_EXPERT_STREAMING_IO_TIMEOUT_S", 120.0))
 _IO_TIMEOUT_LOGGED = False
 
 
@@ -340,14 +335,52 @@ class _ReadParams(NamedTuple):
         return self.shape[1:] if len(self.shape) > 1 else self.shape
 
 
+def _read_header(f) -> dict:
+    """Parse the safetensors JSON header from an open file at offset 0.
+
+    Leaves the file positioned at the data start (8-byte size + JSON).
+    """
+    hsize = struct.unpack("<Q", f.read(8))[0]
+    return json.loads(f.read(hsize))
+
+
+def _pread_full(fd: int, n: int, off: int) -> bytes:
+    """Full ``os.pread`` of *n* bytes; raises OSError on a short read.
+
+    The fallback for platforms/ filesystems without preadv — short reads
+    still surface as OSError so the caller can fail-high.
+    """
+    data = os.pread(fd, n, off)
+    if len(data) != n:
+        raise OSError(f"Short read at {off}: {len(data)} of {n}") from None
+    return data
+
+
+def _check_bounds(rp: _ReadParams, key: str, first: int, count: int = 1) -> None:
+    """Reject out-of-range expert slices/runs instead of silently clamping.
+
+    A ``first < 0`` or an overflowing run would read the WRONG experts
+    while reporting them as the requested ids.
+    """
+    if first < 0 or first >= rp.num_experts:
+        raise ValueError(
+            f"expert id {first} out of range "
+            f"(num_experts={rp.num_experts}) for {key}"
+        )
+    if count < 1 or first + count > rp.num_experts:
+        raise ValueError(
+            f"expert range [{first}, {first + count}) exceeds "
+            f"num_experts={rp.num_experts} for {key}"
+        )
+
+
 class _ShardReader:
     def __init__(self, path: Path):
         self.path = path
         self._file = path.open("rb")
         self._rp: dict[str, _ReadParams] = {}
-        hsize = struct.unpack("<Q", self._file.read(8))[0]
-        self.header: dict = json.loads(self._file.read(hsize))
-        self.data_start = 8 + hsize
+        self.header: dict = _read_header(self._file)
+        self.data_start = self._file.tell()
         self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
         try:
             self._mmap.madvise(mmap.MADV_RANDOM)  # type: ignore[attr-defined]
@@ -426,10 +459,7 @@ class _ShardReader:
         try:
             got = os.preadv(fd, [memoryview(out)], abs_off)
         except (AttributeError, OSError):
-            data = os.pread(fd, n, abs_off)
-            if len(data) != n:
-                raise OSError(f"Short read at {abs_off}: {len(data)} of {n}") from None
-            out[:] = np.frombuffer(data, dtype=np.uint8)
+            out[:] = np.frombuffer(_pread_full(fd, n, abs_off), dtype=np.uint8)
             return
         if got != n:
             raise OSError(f"Short read (preadv) at {abs_off}: {got} of {n}") from None
@@ -446,11 +476,7 @@ class _ShardReader:
         try:
             got = os.preadv(fd, iovecs, abs_off)
         except (AttributeError, OSError):
-            data = os.pread(fd, n, abs_off)
-            if len(data) != n:
-                raise OSError(
-                    f"Short read at {abs_off}: {len(data)} of {n}"
-                ) from None
+            data = _pread_full(fd, n, abs_off)
             pos = 0
             for iov in iovecs:
                 iov[:] = data[pos : pos + iov.nbytes]
@@ -463,11 +489,7 @@ class _ShardReader:
 
     def expert_slice(self, key: str, expert_id: int) -> np.ndarray:
         rp = self._rp_for(key)
-        if expert_id < 0 or expert_id >= rp.num_experts:
-            raise ValueError(
-                f"expert_slice: id {expert_id} out of range "
-                f"(num_experts={rp.num_experts}) for {key}"
-            )
+        _check_bounds(rp, key, expert_id)
         off = rp.tensor_abs_off + expert_id * rp.expert_bytes
         # Single zero-copy preadv into a writable buffer; the typed view is a
         # zero-copy reinterpret (no bytearray double-copy).
@@ -478,11 +500,7 @@ class _ShardReader:
     def expert_byte_range(self, key: str, expert_id: int) -> Tuple[int, int]:
         """Absolute file offsets (start, end) of one expert's slice."""
         rp = self._rp_for(key)
-        if expert_id < 0 or expert_id >= rp.num_experts:
-            raise ValueError(
-                f"expert_byte_range: id {expert_id} out of range "
-                f"(num_experts={rp.num_experts}) for {key}"
-            )
+        _check_bounds(rp, key, expert_id)
         off = rp.tensor_abs_off + expert_id * rp.expert_bytes
         return off, off + rp.expert_bytes
 
@@ -520,19 +538,7 @@ class _ShardReader:
         rp = self._rp_for(key)
         first_id = int(first_id)
         count = int(count)
-        # Reject instead of silently clamping: a `first_id=-1` or an
-        # overflowing run would read the WRONG experts while reporting
-        # them as the requested ids.
-        if first_id < 0 or first_id >= rp.num_experts:
-            raise ValueError(
-                f"expert_run: first_id {first_id} out of range "
-                f"(num_experts={rp.num_experts}) for {key}"
-            )
-        if count < 1 or first_id + count > rp.num_experts:
-            raise ValueError(
-                f"expert_run: range [{first_id}, {first_id + count}) exceeds "
-                f"num_experts={rp.num_experts} for {key}"
-            )
+        _check_bounds(rp, key, first_id, count)
         off = rp.tensor_abs_off + first_id * rp.expert_bytes
         buf = np.empty(rp.expert_bytes * count, dtype=np.uint8)
         self._read_into(off, buf)
@@ -550,13 +556,7 @@ class _ShardReader:
         committed anonymous memory (wired, though: it cannot be evicted).
         """
         off, end = self.expert_byte_range(key, expert_id)
-        length = end - off
-        ok = _mlock_range(self._mmap, off, length)
-        if not ok:
-            return 0
-        start = (off // _PAGE_SIZE) * _PAGE_SIZE
-        end_pg = min(len(self._mmap), ((end + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE)
-        return end_pg - start
+        return _mlock_range(self._mmap, off, end - off)
 
     def unpin_expert(self, key: str, expert_id: int) -> int:
         """munlock the range pinned by ``pin_expert``; 0 when nothing moved."""
@@ -564,14 +564,9 @@ class _ShardReader:
             off, end = self.expert_byte_range(key, expert_id)
         except Exception:
             return 0
-        length = end - off
-        if length <= 0:
+        if end - off <= 0:
             return 0
-        if not _munlock_range(self._mmap, off, length):
-            return 0
-        start = (off // _PAGE_SIZE) * _PAGE_SIZE
-        end_pg = min(len(self._mmap), ((end + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE)
-        return end_pg - start
+        return _munlock_range(self._mmap, off, end - off)
 
 
 _COLD_BANK_MARKERS = (
@@ -675,9 +670,46 @@ def _cold_tier_status_dir(cold_dir: Path, model_path: Path) -> tuple[bool, str]:
 
 def _read_header_keys(path: Path) -> set[str]:
     with path.open("rb") as f:
-        hsize = struct.unpack("<Q", f.read(8))[0]
-        hdr = json.loads(f.read(hsize))
+        hdr = _read_header(f)
     return {k for k in hdr if k != "__metadata__"}
+
+
+def _close_quietly(obj) -> None:
+    """Best-effort ``close()`` — teardown of attachable subsystems must
+    never mask the reader shutdown below."""
+    if obj is None:
+        return
+    try:
+        close = getattr(obj, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+def _open_canonical(
+    registry: Dict[str, _ShardReader], rkey: str, path: Path
+) -> _ShardReader:
+    """Publish-or-return the canonical ``_ShardReader`` for *path*.
+
+    Caller must hold ``_readers_lock`` and have passed the ``_closed``
+    check. Concurrent lazy opens must yield ONE canonical instance — two
+    threads resolving the same key could otherwise hand out different
+    readers and the tier contract (all ids -> the same reader) would
+    reject the component with a False. The losing duplicate is closed so
+    its file descriptor and mmap do not leak for the engine lifetime.
+    """
+    reader = registry.get(rkey)
+    if reader is None:
+        mine = _ShardReader(path)
+        winner = registry.setdefault(rkey, mine)
+        if winner is not mine:
+            try:
+                mine.close()
+            except Exception:
+                logger.debug("closing duplicate shard reader failed", exc_info=True)
+        reader = winner
+    return reader
 
 
 class ExpertBackingStore:
@@ -798,8 +830,7 @@ each key to its shard filename, so stacked banks spilled outside the
             return self._header_cache[key]
         try:
             with path.open("rb") as f:
-                hsize = struct.unpack("<Q", f.read(8))[0]
-                hdr = json.loads(f.read(hsize))
+                hdr = _read_header(f)
                 self._header_cache[key] = hdr
                 return hdr
         except Exception:
@@ -818,12 +849,10 @@ each key to its shard filename, so stacked banks spilled outside the
         """Hot-set key matching *key*/*expert_id*, or None when not hot."""
         if not self._hot_experts or expert_id is None:
             return None
-        # bank prefix: strip the trailing ".weight"/".scales"/".biases"
-        prefix = key
-        for suffix in (".biases", ".scales", ".weight"):
-            if prefix.endswith(suffix):
-                prefix = prefix[: -len(suffix)]
-                break
+        # bank prefix: strip a trailing ".weight"/".scales"/".biases" —
+        # only those leaf names, an unknown leaf keeps the full key.
+        stem, dot, leaf = key.rpartition(".")
+        prefix = stem if dot and leaf in ("weight", "scales", "biases") else key
         if prefix in self._hot_experts and int(expert_id) in self._hot_experts[prefix]:
             return prefix
         # layer_<i> fallback: any prefix containing ".layers.<i>."
@@ -859,20 +888,10 @@ each key to its shard filename, so stacked banks spilled outside the
                 # Closed store answers "no cold tier"; the source-reader
                 # path the caller falls back to raises the real error.
                 return None
-            reader = self._cold_readers.get(ckey)
-            if reader is None:
-                try:
-                    mine = _ShardReader(cold_path)
-                except Exception:
-                    return None
-                # Same canonical-instance rule as _reader_for_key_source.
-                winner = self._cold_readers.setdefault(ckey, mine)
-                if winner is not mine:
-                    try:
-                        mine.close()
-                    except Exception:
-                        logger.debug("closing duplicate cold reader failed", exc_info=True)
-                reader = winner
+            try:
+                reader = _open_canonical(self._cold_readers, ckey, cold_path)
+            except Exception:
+                return None
             if key not in reader.header:
                 return None
             self._cold_key_to_reader.setdefault(key, reader)
@@ -897,8 +916,8 @@ each key to its shard filename, so stacked banks spilled outside the
             # tier contract (all ids -> the same reader) would reject the
             # component with a False.
             return self._key_to_reader.setdefault(k2, reader)
-        if key in self._key_to_reader:
-            return self._key_to_reader[key]
+        # No-id probe: only tuple keys ((key, eid) / ("src", key)) are ever
+        # memoized in _key_to_reader, so there is nothing to look up here.
         cold = self._cold_reader_for_key(key)
         if cold is not None:
             return cold
@@ -932,20 +951,7 @@ each key to its shard filename, so stacked banks spilled outside the
                     "ExpertBackingStore is closed — cannot open reader for "
                     f"{key!r}"
                 )
-            reader = self._readers.get(fkey)
-            if reader is None:
-                reader = _ShardReader(fpath)
-                # Canonical instance under concurrency (see
-                # _reader_for_key): publish first, then close the loser
-                # so its file descriptor and mmap do not leak for the
-                # engine lifetime.
-                winner = self._readers.setdefault(fkey, reader)
-                if winner is not reader:
-                    try:
-                        reader.close()
-                    except Exception:
-                        logger.debug("closing duplicate shard reader failed", exc_info=True)
-                    reader = winner
+            reader = _open_canonical(self._readers, fkey, fpath)
             # Canonical instance, so the plain store cannot publish two
             # different readers for one key (the tier contract in
             # read_expert_into checks "if any(r is not reader)").
@@ -963,6 +969,7 @@ each key to its shard filename, so stacked banks spilled outside the
             return int(meta["omlx_cold_bits"]), int(meta["omlx_cold_group_size"])
         except (KeyError, TypeError, ValueError):
             return None
+
     def tensor_dtype(self, key: str) -> str | None:
         """Safetensors dtype string for *key* (e.g. "U32", "BF16"), or None."""
         try:
@@ -974,17 +981,14 @@ each key to its shard filename, so stacked banks spilled outside the
     def expert_bytes(self, key: str) -> int:
         """Bytes of one expert slice for a stacked (E, ...) key, or 0."""
         try:
-            entry = self._reader_for_key(key).header[key]
-            shape = entry["shape"]
-            num_experts = shape[0] if shape else 1
-            start, end = entry["data_offsets"]
-            return (end - start) // num_experts
+            return self._reader_for_key(key)._rp_for(key).expert_bytes
         except Exception:
             return 0
 
     def load_expert(self, key: str, expert_id: int) -> mx.array:
-        np_view = self.load_expert_slice(key, expert_id)
-        return _np_to_mx(key, np_view, self._reader_for_key(key, expert_id).header[key]["dtype"])
+        reader = self._reader_for_key(key, expert_id)
+        np_view = reader.expert_slice(key, expert_id)
+        return _np_to_mx(key, np_view, reader.header[key]["dtype"])
 
     def load_expert_slice(self, key: str, expert_id: int) -> np.ndarray:
         """Return a fresh np.ndarray copy of one expert's slice (mmap-backed).
@@ -1205,6 +1209,14 @@ each key to its shard filename, so stacked banks spilled outside the
         ok = True
         direct = out.flags["C_CONTIGUOUS"]
 
+        def _reap(entry, scatter: bool = True) -> bool:
+            wfirst, wjs, wbuf, wfut = entry
+            if not _await_io_future(wfut):
+                return False
+            if scatter and wbuf is not None:
+                self._scatter_run_rows(eids, out, rp, wfirst, wjs, wbuf)
+            return True
+
         for idx, (off, first, count, js) in enumerate(runs):
             if count == len(js) and direct:
                 iovecs = [memoryview(out[j]) for j in js]
@@ -1216,12 +1228,10 @@ each key to its shard filename, so stacked banks spilled outside the
                 window.append(
                     (first, js, buf, io_exec.submit(reader._read_into, off, buf))
                 )
-            if len(window) >= _RUN_IO_QD or idx == len(runs) - 1:
-                wfirst, wjs, wbuf, wfut = window.pop(0)
-                if not _await_io_future(wfut):
-                    ok = False
-                if ok and wbuf is not None:
-                    self._scatter_run_rows(eids, out, rp, wfirst, wjs, wbuf)
+            if (
+                len(window) >= _RUN_IO_QD or idx == len(runs) - 1
+            ) and not _reap(window.pop(0)):
+                ok = False
             if not ok:
                 for _f, _j, _b, fut in window:
                     # Drain instead of dropping — a read
@@ -1229,11 +1239,12 @@ each key to its shard filename, so stacked banks spilled outside the
                     # would vanish with it.
                     _await_io_future(fut)
                 return False
-        for wfirst, wjs, wbuf, wfut in window:
-            if not _await_io_future(wfut):
+        for entry in window:
+            # Once a reap failed the tail still awaits every future (an
+            # abandoned read must not leak its exception) but scatters
+            # nothing further — the caller fails the whole call anyway.
+            if not _reap(entry, scatter=ok):
                 ok = False
-            if ok and wbuf is not None:
-                self._scatter_run_rows(eids, out, rp, wfirst, wjs, wbuf)
         return ok
 
 
@@ -1259,24 +1270,21 @@ each key to its shard filename, so stacked banks spilled outside the
             if count <= 0:
                 return (False, 0, 0)
             ids = [first_id + i for i in range(count)]
-            readers = [self._reader_for_key(key, eid) for eid in ids]
+            readers = {eid: self._reader_for_key(key, eid) for eid in ids}
             ok = False
             total_bytes = 0
             segments = 0
             # group consecutive ids sharing the same reader (tier boundary)
-            i = 0
-            while i < len(ids):
-                j = i
-                reader = readers[i]
-                while j + 1 < len(ids) and readers[j + 1] is reader:
-                    j += 1
-                start, _ = reader.expert_byte_range(key, ids[i])
-                _, end = reader.expert_byte_range(key, ids[j])
+            for run_first, run_len in segment_runs(
+                ids, same=lambda a, b: readers[a] is readers[b]
+            ):
+                reader = readers[run_first]
+                start, _ = reader.expert_byte_range(key, run_first)
+                _, end = reader.expert_byte_range(key, run_first + run_len - 1)
                 if end > start:
                     ok = reader.advise_range(start, end - start) or ok
                     total_bytes += end - start
                     segments += 1
-                i = j + 1
             return (ok, total_bytes, segments)
         except Exception:
             return (False, 0, 0)
@@ -1358,28 +1366,16 @@ each key to its shard filename, so stacked banks spilled outside the
             logger.debug("unpin_all failed during close", exc_info=True)
         # Stop speculation before the readers die — a live
         # advisor would otherwise reference closed files past its owning
-        # engine's lifetime.
-        spec = getattr(self, "spec_state", None)
-        if spec is not None:
-            try:
-                spec.close()
-            except Exception:
-                pass
-            try:
-                self.spec_state = None  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        # Stop the detached admission worker with the engine — it is a
-        # daemon thread, but an explicit close keeps repeated conversions
-        # from leaking idle workers.
-        cache = getattr(self, "_streaming_cache", None)
-        if cache is not None:
-            try:
-                close = getattr(cache, "close", None)
-                if callable(close):
-                    close()
-            except Exception:
-                pass
+        # engine's lifetime. The detached admission worker (the
+        # converter's _streaming_cache) is a daemon thread, but an
+        # explicit close keeps repeated conversions from leaking idle
+        # workers.
+        for attr in ("spec_state", "_streaming_cache"):
+            _close_quietly(getattr(self, attr, None))
+        try:
+            self.spec_state = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
         # Latch + swap under _readers_lock: a lazy resolve that already
         # passed the closed check finishes with a live dict; one that
         # arrives after raises/returns before creating a reader, so no

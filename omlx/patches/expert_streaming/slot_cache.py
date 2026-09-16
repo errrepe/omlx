@@ -55,9 +55,19 @@ class DecodeVisitStats:
         self.decode_layers += 1
         if missed:
             self.decode_layers_missed += 1
-            self.decode_misses_by_layer[layer_idx] = (
-                self.decode_misses_by_layer.get(layer_idx, 0) + 1
-            )
+            self.note_miss(layer_idx)
+
+    def note_miss(self, layer_idx: int) -> None:
+        """Bump the per-layer miss tally directly.
+
+        ``note_visit`` counts one stalled layer-CALL; the unified cache
+        instead bumps per missed SLOT (each ``_get_unlocked`` miss during
+        decode) — either way ``decode_misses_by_layer`` stays the
+        governor's targeting signal.
+        """
+        self.decode_misses_by_layer[layer_idx] = (
+            self.decode_misses_by_layer.get(layer_idx, 0) + 1
+        )
 
     def reset_visits(self) -> None:
         self.decode_layers = 0
@@ -117,6 +127,10 @@ class SlotBookkeeping:
         self.verify_misses = 0
         self.verify_evict_resident = 0
 
+    @staticmethod
+    def _as_set(ids: Iterable[int]) -> set:
+        return ids if isinstance(ids, (set, frozenset)) else set(ids)
+
     def note_demand(self, needed: Iterable[int], pin_k: int) -> None:
         """Frequency-track the demanded set and refresh the pinned hot set.
 
@@ -126,17 +140,16 @@ class SlotBookkeeping:
         ``pin_k`` is clamped to ``cap - len(needed)`` so a fully demanded
         book always leaves evictable rows for the working set itself.
         """
-        needed_set = needed if isinstance(needed, (set, frozenset)) else set(needed)
+        needed_set = self._as_set(needed)
         for expert in needed_set:
             self.freq[expert] = self.freq.get(expert, 0) + 1
         self._demand_calls += 1
         if self._demand_calls >= _HOTPIN_DECAY_CALLS:
-            for expert in list(self.freq):
-                halved = self.freq[expert] >> 1
-                if halved:
-                    self.freq[expert] = halved
-                else:
-                    del self.freq[expert]
+            self.freq = {
+                expert: halved
+                for expert, count in self.freq.items()
+                if (halved := count >> 1)
+            }
             self._demand_calls = 0
         eff = min(int(pin_k), max(0, self.cap - len(needed_set)))
         if eff <= 0 or not self.freq:
@@ -170,6 +183,21 @@ class SlotBookkeeping:
             self.verify_evict_resident += 1
         self.verify_installed.discard(victim)
 
+    def _pop_victim(self, candidates, verify: bool) -> tuple[int, int] | None:
+        """Pop the first hit of *candidates* → ``(expert, row)`` or None.
+
+        *candidates* is the caller's victim policy as a lazy generator
+        over ``slot_of`` keys (scan order + predicate stay with the
+        caller); this pops the row and bookkeeps the eviction.
+        """
+        victim = next(candidates, None)
+        if victim is None:
+            return None
+        row = self.slot_of.pop(victim)
+        self.evictions += 1
+        self._note_eviction(victim, verify)
+        return victim, row
+
     def evict_oldest_outside(
         self,
         needed: Iterable[int],
@@ -177,23 +205,20 @@ class SlotBookkeeping:
         verify: bool = False,
     ) -> tuple[int, int] | None:
         """Pop the LRU-oldest expert not in *needed* → ``(expert, row)``."""
-        needed_set = needed if isinstance(needed, (set, frozenset)) else set(needed)
-        victim = next(
+        needed_set = self._as_set(needed)
+        evicted = self._pop_victim(
             (
                 e
                 for e in self.slot_of
                 if e not in needed_set and e not in self.pinned
             ),
-            None,
+            verify,
         )
-        if victim is None:
+        if evicted is None:
             return None
-        row = self.slot_of.pop(victim)
-        self.evictions += 1
-        self._note_eviction(victim, verify)
         if on_evict is not None:
-            on_evict(victim)
-        return victim, row
+            on_evict(evicted[0])
+        return evicted
 
     def trim_to_cap(
         self,
@@ -239,13 +264,13 @@ class SlotBookkeeping:
         """
         if self.free:
             return self.free.pop(), None, False
-        needed_set = needed if isinstance(needed, (set, frozenset)) else set(needed)
+        needed_set = self._as_set(needed)
         if verify and scratch:
             # Oldest verify-installed victim first: slot_of is head=cold,
             # so scan from the tail and take the LAST match — the
             # verify-installed entry nearest the decode residents is the
             # oldest-installed one (LRU-fair inside the scratch region).
-            victim = next(
+            evicted = self._pop_victim(
                 (
                     e
                     for e in reversed(self.slot_of)
@@ -253,26 +278,22 @@ class SlotBookkeeping:
                     and e not in needed_set
                     and e not in self.pinned
                 ),
-                None,
+                verify,
             )
-            if victim is not None:
-                self.evictions += 1
-                self._note_eviction(victim, verify)
-                return self.slot_of.pop(victim), victim, False
+            if evicted is not None:
+                return evicted[1], evicted[0], False
             if self.rooms < self.cap + scratch:
                 return self.rooms, None, True
-        victim = next(
+        evicted = self._pop_victim(
             (
                 e
                 for e in self.slot_of
                 if e not in needed_set and e not in self.pinned
             ),
-            None,
+            verify,
         )
-        if victim is not None:
-            self.evictions += 1
-            self._note_eviction(victim, verify)
-            return self.slot_of.pop(victim), victim, False
+        if evicted is not None:
+            return evicted[1], evicted[0], False
         return self.rooms, None, True
 
     def grew_to(self, new_rooms: int) -> None:
@@ -319,17 +340,6 @@ class SlotBookkeeping:
         Without a snapshot the restore falls back to the MRU end —
         residency and rows stay consistent, only recency is approximate.
         """
-        if order_snapshot is None:
-            for j in range(committed_through + 1, len(fetch_list)):
-                _expert, slot, victim = fetch_list[j]
-                if pass3_started and j == committed_through + 1:
-                    self.free.append(slot)
-                elif victim is not None:
-                    self.slot_of[victim] = slot
-                    self.evictions -= 1
-                else:
-                    self.free.append(slot)
-            return
         # Victims whose rows host committed experts stay evicted, as
         # does the mid-commit interruption's victim (suspect bytes).
         stay_evicted = {
@@ -337,6 +347,9 @@ class SlotBookkeeping:
             for _e, _s, victim in fetch_list[: committed_through + 1]
             if victim is not None
         }
+        # Unstarted entries still hold the victim's bytes — restore it.
+        # The entry interrupted mid-commit has suspect bytes: its row
+        # goes back to ``free`` and the victim stays evicted.
         restored: dict[int, int] = {}
         for j in range(committed_through + 1, len(fetch_list)):
             _expert, slot, victim = fetch_list[j]
@@ -349,6 +362,13 @@ class SlotBookkeeping:
                 self.evictions -= 1
             else:
                 self.free.append(slot)
+        if order_snapshot is None:
+            # No snapshot: restored victims reinsert at the MRU end —
+            # residency and rows stay consistent, only recency is
+            # approximate.
+            for victim, slot in restored.items():
+                self.slot_of[victim] = slot
+            return
         # Rebuild the order: snapshot keys keep their positions — the
         # still-resident ones at their current rows, restored victims at
         # the rows they were popped from. Entries committed before the
@@ -489,11 +509,7 @@ class SlotArena:
                 for fname, array in current.items():
                     grown[fname][: self.book.rooms] = array
                 grown_all[proj] = grown
-            mx.eval(*[a for g in grown_all.values() for a in g.values()])
-            for proj in self.projections:
-                self._bind(proj, grown_all[proj])
-            if self._eval_params is not None:
-                self._eval_params()
+            self._rebind_all(grown_all)
             self.book.grew_to(need)
             # Demand-driven growth re-bases the physical ceiling: rows
             # already committed are a paid cost, so a later set_cap must
@@ -542,16 +558,25 @@ class SlotArena:
                 }
                 for proj in self.projections
             }
-            mx.eval(*[a for s in stacked_all.values() for a in s.values()])
-            for proj in self.projections:
-                self._bind(proj, stacked_all[proj])
-            if self._eval_params is not None:
-                self._eval_params()
+            self._rebind_all(stacked_all)
             self.book.rebuild(kept)
             if target > len(kept):
                 self.book.free.extend(range(len(kept), target))
                 self.book.rooms = target
             return drop
+
+    def _rebind_all(self, new_banks: dict) -> None:
+        """Evaluate staged banks for ALL projections, then rebind.
+
+        Two-phase: the mx.eval of every built array precedes the first
+        ``_bind``, so an OOM mid-way leaves the host on the old
+        consistent storage instead of mixed-row projections.
+        """
+        mx.eval(*[a for bank in new_banks.values() for a in bank.values()])
+        for proj in self.projections:
+            self._bind(proj, new_banks[proj])
+        if self._eval_params is not None:
+            self._eval_params()
 
     @staticmethod
     def _kept_rows(array, rows, target):
@@ -649,28 +674,17 @@ class SlotArena:
             # not by this bound. Under verify+scratch the victim pool is
             # the verify-installed set only (decode-hot residents are not
             # forfeit), and growth is bounded by the scratch ceiling.
+            pool = self.book.verify_installed if verify and scratch else None
+            victims_available = sum(
+                1
+                for e in self.book.slot_of
+                if (pool is None or e in pool)
+                and e not in needed
+                and e not in self.book.pinned
+            )
+            grow_by = max(0, misses - len(self.book.free) - victims_available)
             if verify and scratch:
-                verify_victims = sum(
-                    1
-                    for e in self.book.slot_of
-                    if e in self.book.verify_installed
-                    and e not in needed
-                    and e not in self.book.pinned
-                )
-                grow_room = max(0, limit - self.book.rooms)
-                grow_by = min(
-                    max(0, misses - len(self.book.free) - verify_victims),
-                    grow_room,
-                )
-            else:
-                victims_available = sum(
-                    1
-                    for e in self.book.slot_of
-                    if e not in needed and e not in self.book.pinned
-                )
-                grow_by = max(
-                    0, misses - len(self.book.free) - victims_available
-                )
+                grow_by = min(grow_by, max(0, limit - self.book.rooms))
             if grow_by:
                 self.grow(self.book.rooms + grow_by)
             for expert in needed:

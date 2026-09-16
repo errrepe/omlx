@@ -14,7 +14,16 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Any, Dict
 
-from .streaming_switch import ExpertLRUCache
+from .streaming_switch import (
+    ExpertLRUCache,
+    _layer_index_add,
+    _layer_index_drop,
+    _layer_index_touch,
+)
+
+# Membership sentinel for the ghost queue (its stored values are all
+# None, so a plain ``pop(key, None)`` cannot detect a hit).
+_MISSING: Any = object()
 
 
 class S3FIFOExpertCache(ExpertLRUCache):
@@ -79,16 +88,12 @@ class S3FIFOExpertCache(ExpertLRUCache):
     def peek(self, key: tuple[int, int, str]) -> Any | None:
         """Non-counting probe (small queue counts as resident)."""
         with self._lock:
-            if key in self._small:
-                return self._small[key]
-            return self._store.get(key)
+            return self._small.get(key, self._store.get(key))
 
     def peek_many(self, keys: list) -> list:
         with self._lock:
             small, store = self._small, self._store
-            return [
-                small[k] if k in small else store.get(k) for k in keys
-            ]
+            return [small.get(k, store.get(k)) for k in keys]
 
     def resident_keys(self) -> set:
         """Both queues are resident: probationary ``_small`` rows serve
@@ -99,47 +104,29 @@ class S3FIFOExpertCache(ExpertLRUCache):
             return set(self._store) | set(self._small)
 
     # -- per-queue per-layer victim indexes ---------------------------------
-
-    @staticmethod
-    def _idx_add(index_map: Dict[int, OrderedDict], layer: int, key) -> None:
-        order = index_map.get(layer)
-        if order is None:
-            order = index_map[layer] = OrderedDict()
-        order[key] = None
-
-    @staticmethod
-    def _idx_touch(index_map: Dict[int, OrderedDict], layer: int, key) -> None:
-        order = index_map.get(layer)
-        if order is not None and key in order:
-            order.move_to_end(key)
-
-    @staticmethod
-    def _idx_drop(index_map: Dict[int, OrderedDict], layer: int, key) -> None:
-        order = index_map.get(layer)
-        if order is not None:
-            order.pop(key, None)
+    # _small_layers / _main_layers ride the same module-level index
+    # helpers as the base class's _layer_orders (index map as first arg).
 
     def _get_unlocked(self, key: tuple[int, int, str]) -> Any | None:
         layer = self._layer_of(key)
         if key in self._small:
             # Promote small -> main on re-reference (frequency signal).
             val = self._small.pop(key)
-            self._idx_drop(self._small_layers, layer, key)
+            _layer_index_drop(self._small_layers, layer, key)
             self._store[key] = val
-            self._idx_add(self._main_layers, layer, key)
+            _layer_index_add(self._main_layers, layer, key)
             self.stats.hits += 1
             return val
         if key in self._store:
             self._store.move_to_end(key)
-            self._idx_touch(self._main_layers, layer, key)
+            _layer_index_touch(self._main_layers, layer, key)
             self.stats.hits += 1
             return self._store[key]
         self.stats.misses += 1
         # Parity with the base class: decode-phase misses feed the
         # governor's per-layer targeting map.
         if self._active_decode:
-            by_layer = self.stats.decode_misses_by_layer
-            by_layer[layer] = by_layer.get(layer, 0) + 1
+            self.stats.note_miss(layer)
         return None
 
     def _put_unlocked(self, key: tuple[int, int, str], value: Any) -> None:
@@ -151,39 +138,33 @@ class S3FIFOExpertCache(ExpertLRUCache):
             return
         if key in self._store:
             self._store.move_to_end(key)
-            self._idx_touch(self._main_layers, layer, key)
+            _layer_index_touch(self._main_layers, layer, key)
             self._store[key] = value
             return
-        _cap = self._cap_for(layer)
-        if self.num_layers > 0 and _cap:
-            cnt = self._layer_counts.get(layer, 0)
-            if cnt >= _cap:
-                if not self._evict_layer_unlocked(layer):
-                    self._evict_one_global_unlocked()
-        # Ghost hit -> main queue (2nd chance); else small queue.
-        target_main = key in self._ghost
-        if key in self._ghost:
-            del self._ghost[key]
-        total = len(self._small) + len(self._store)
-        while total >= self._global_cap_active():
+        # Per-layer cap (governor overrides + phase pair); a cap hit that
+        # found no layer victim falls back to the global queue drain.
+        if not self._enforce_layer_cap(layer):
             self._evict_one_global_unlocked()
-            total = len(self._small) + len(self._store)
+        # Ghost hit -> main queue (2nd chance); else small queue.
+        target_main = self._ghost.pop(key, _MISSING) is not _MISSING
+        while len(self._small) + len(self._store) >= self._global_cap_active():
+            self._evict_one_global_unlocked()
         if target_main:
             self._store[key] = value
-            self._idx_add(self._main_layers, layer, key)
+            _layer_index_add(self._main_layers, layer, key)
         else:
             if len(self._small) >= self._small_cap:
                 old_k = self._pop_small_head_unlocked()
                 self.stats.evictions += 1
                 self._dec_layer_count(self._layer_of(old_k))
             self._small[key] = value
-            self._idx_add(self._small_layers, layer, key)
+            _layer_index_add(self._small_layers, layer, key)
         self._layer_counts[layer] = self._layer_counts.get(layer, 0) + 1
 
     def _pop_small_head_unlocked(self):
         """Evict the small FIFO's head into the ghost queue; return it."""
         old_k, _ = self._small.popitem(last=False)
-        self._idx_drop(self._small_layers, self._layer_of(old_k), old_k)
+        _layer_index_drop(self._small_layers, self._layer_of(old_k), old_k)
         self._ghost[old_k] = None
         while len(self._ghost) > self._ghost_cap:
             self._ghost.popitem(last=False)
@@ -195,31 +176,20 @@ class S3FIFOExpertCache(ExpertLRUCache):
             (self._small, self._small_layers.get(layer)),
             (self._store, self._main_layers.get(layer)),
         ):
-            if index:
-                for victim in list(index):
-                    del index[victim]
-                    if victim in store:
-                        store.pop(victim)
-                        self.stats.evictions += 1
-                        self._dec_layer_count(layer)
-                        return True
+            if self._evict_indexed_unlocked(layer, store, index):
+                return True
         # Fallback scan: entries that bypassed index maintenance (none
         # should exist — defensive only).
-        for store in (self._small, self._store):
-            for k in list(store.keys()):
-                if self._layer_of(k) == layer:
-                    store.pop(k)
-                    self.stats.evictions += 1
-                    self._dec_layer_count(layer)
-                    return True
-        return False
+        return self._evict_layer_scan_unlocked(
+            layer, (self._small, self._store)
+        )
 
     def _evict_one_global_unlocked(self) -> None:
         if len(self._small):
             old_k = self._pop_small_head_unlocked()
         elif len(self._store):
             old_k, _ = self._store.popitem(last=False)
-            self._idx_drop(self._main_layers, self._layer_of(old_k), old_k)
+            _layer_index_drop(self._main_layers, self._layer_of(old_k), old_k)
         else:
             return
         self.stats.evictions += 1
@@ -246,10 +216,10 @@ class S3FIFOExpertCache(ExpertLRUCache):
     def _drain_to_unlocked(self, cap: int) -> None:
         """S3-FIFO: drain both queues, demoting small victims to ghost.
 
-        ``size`` takes the lock (re-entrant under the caller's) so both
-        queues count toward the target.
+        Sizes are summed inline — ``size`` would re-acquire the (held,
+        re-entrant) lock once per iteration.
         """
-        while self.size > cap:
+        while len(self._small) + len(self._store) > cap:
             self._evict_one_global_unlocked()
 
     def _retain_hot_unlocked(self, hot_pairs: set) -> int:
@@ -262,18 +232,9 @@ class S3FIFOExpertCache(ExpertLRUCache):
                     del store[key]
                     evicted += 1
         if evicted:
-            counts: Dict[int, int] = {}
-            self._small_layers = {}
-            self._main_layers = {}
-            for store, index_map in (
-                (self._small, self._small_layers),
-                (self._store, self._main_layers),
-            ):
-                for key in store:
-                    layer = self._layer_of(key)
-                    counts[layer] = counts.get(layer, 0) + 1
-                    self._idx_add(index_map, layer, key)
-            self._layer_counts = counts
+            self._layer_counts, (self._small_layers, self._main_layers) = (
+                self._rebuild_layer_index(self._small, self._store)
+            )
             self.stats.evictions += evicted
         return evicted
 

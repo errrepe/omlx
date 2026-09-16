@@ -839,9 +839,7 @@ class ExpertLRUCache:
             return v
         self.stats.misses += 1
         if self._active_decode:
-            _miss_layer = self._layer_of(key)
-            _by_layer = self.stats.decode_misses_by_layer
-            _by_layer[_miss_layer] = _by_layer.get(_miss_layer, 0) + 1
+            self.stats.note_miss(self._layer_of(key))
         return None
 
     def admission_note(self, key: tuple[int, int, str]) -> bool:

@@ -35,6 +35,54 @@ def _config_model_type(config: dict) -> str:
     return ""
 
 
+def _text_cfg(config: dict) -> dict:
+    """The nested ``text_config`` dict ({} when absent — VLM wrappers nest
+    the language model's keys there)."""
+    text_cfg = config.get("text_config")
+    return text_cfg if isinstance(text_cfg, dict) else {}
+
+
+def _cfg(config: dict, *names: str, text_first: bool = False):
+    """First non-None config value among *names*.
+
+    Each name is tried in ``config`` then its ``text_config`` before the
+    next alias — so an alias's nested value still beats a later alias at
+    top level. ``text_first`` flips the per-name order for keys the
+    wrapper overrides at top level (a VLM's top-level ``hidden_size`` is
+    the vision tower's width, not the language model's).
+    """
+    text_cfg = _text_cfg(config)
+    if text_first:
+        for name in names:
+            v = text_cfg.get(name)
+            if v is not None:
+                return v
+            v = config.get(name)
+            if v is not None:
+                return v
+    else:
+        for name in names:
+            v = config.get(name)
+            if v is not None:
+                return v
+            v = text_cfg.get(name)
+            if v is not None:
+                return v
+    return None
+
+
+# Layer / MTP-stage index extraction for stacked-bank keys
+# (``...layers.<i>.switch_mlp...``, ``mtp.<stage>.ffn...``).
+_LAYER_RE = re.compile(r"layers\.(\d+)\.")
+_MTP_RE = re.compile(r"mtp\.(\d+)\.")
+
+
+def _layer_idx(key: str) -> int | None:
+    """Layer index inside a ``layers.<i>.`` key, or None."""
+    m = _LAYER_RE.search(key)
+    return int(m.group(1)) if m else None
+
+
 # Model types whose MoE expert banks can be streamed from disk.
 #
 # Single source of truth — every gate reads this object. A type that
@@ -160,9 +208,8 @@ class ExpertStreamingEstimate:
             return 0
         if budget_bytes <= 0:
             return 0
-        per_layer = self.per_expert_bytes
         # budget is total across all MoE layers
-        slots = budget_bytes // (self.num_moe_layers * per_layer)
+        slots = budget_bytes // (self.num_moe_layers * self.per_expert_bytes)
         # clamp to experts_per_layer
         return int(max(0, min(slots, self.experts_per_layer)))
 
@@ -226,15 +273,9 @@ def _detect_expert_keys(
 ) -> tuple[list[str], int, int]:
     """Return (expert_tensor_keys, num_moe_layers, experts_per_layer)."""
     # Prefer text_config for VLM wrappers (glm5_next, qwen4_exp)
-    text_cfg = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
-    n_routed = config.get("n_routed_experts")
-    if n_routed is None:
-        n_routed = text_cfg.get("n_routed_experts")
-    if n_routed is None:
-        # qwen4_exp uses num_experts
-        n_routed = config.get("num_experts")
-    if n_routed is None:
-        n_routed = text_cfg.get("num_experts")
+    text_cfg = _text_cfg(config)
+    # qwen4_exp uses num_experts for the routed count
+    n_routed = _cfg(config, "n_routed_experts", "num_experts")
     try:
         n_routed = int(n_routed) if n_routed is not None else 0
     except Exception:
@@ -248,10 +289,8 @@ def _detect_expert_keys(
     except Exception:
         num_layers = 0
 
-    model_type = str(config.get("model_type") or "")
-    # also check text_config type for VLM wrappers
-    if not model_type and text_cfg:
-        model_type = str(text_cfg.get("model_type") or "")
+    # also checks text_config's type for VLM wrappers (normalized)
+    model_type = _config_model_type(config)
 
     expert_keys: list[str] = []
     mtp_expert_keys: list[str] = []
@@ -282,18 +321,15 @@ def _detect_expert_keys(
             # weight_map may point to sharded files, need headers per file
             # we will check later via header shape; for now consider candidate
             is_expert = True
-        elif normalize_model_type(model_type) in SUPPORTED_TYPES and "switch_mlp" in key:
+        elif model_type in SUPPORTED_TYPES and "switch_mlp" in key:
             is_expert = True
         if not is_expert:
             continue
         if is_mtp:
             mtp_expert_keys.append(key)
-            m = re.search(r"mtp\.(\d+)\.", key)
+            m = _MTP_RE.search(key)
             if m:
-                try:
-                    mtp_stage_ids.add(int(m.group(1)))
-                except Exception:
-                    pass
+                mtp_stage_ids.add(int(m.group(1)))
         else:
             expert_keys.append(key)
 
@@ -319,46 +355,43 @@ def _detect_expert_keys(
     expert_keys = _refine(expert_keys)
     mtp_expert_keys = _refine(mtp_expert_keys)
 
-    # Determine moe layers by distinct layer indices in expert keys
-    layer_pat = re.compile(r"layers\.(\d+)\.")
-    layers = set()
+    # Determine moe layers by distinct layer indices in expert keys, and
+    # drop keys beyond num_hidden_layers in the same pass — extra
+    # MTP/nextn layers stored as model.layers.N (e.g. glm5_next layer 45)
+    # neither count as MoE layers nor stay in expert_keys, so
+    # expert_bytes excludes them.
+    layers: set[int] = set()
+    kept: list[str] = []
     for k in expert_keys:
-        m = layer_pat.search(k)
-        if m:
-            try:
-                idx = int(m.group(1))
-                # Exclude extra MTP/nextn layers beyond num_hidden_layers (e.g. glm5_next layer 45)
-                if num_layers and idx >= num_layers:
-                    continue
-                layers.add(idx)
-            except Exception:
-                pass
+        idx = _layer_idx(k)
+        if num_layers and idx is not None and idx >= num_layers:
+            continue
+        kept.append(k)
+        if idx is not None:
+            layers.add(idx)
+    expert_keys = kept
     num_moe_layers = len(layers) if layers else 0
     # fallback to config's derived count when headers incomplete
-    if num_moe_layers == 0 and normalize_model_type(model_type) in _CONFIG_DERIVABLE_MOE_LAYERS:
+    if num_moe_layers == 0 and model_type in _CONFIG_DERIVABLE_MOE_LAYERS:
         # For glm5_next: use mlp_layer_types sparse count (most accurate)
         try:
-            mlp_types = config.get("mlp_layer_types")
-            if mlp_types is None and text_cfg:
-                mlp_types = text_cfg.get("mlp_layer_types")
+            mlp_types = _cfg(config, "mlp_layer_types")
             if isinstance(mlp_types, list) and n_routed:
                 cnt = sum(1 for t in mlp_types if str(t).lower() == "sparse")
                 if cnt > 0:
                     num_moe_layers = cnt
-            if num_moe_layers == 0 and normalize_model_type(model_type) == "qwen3_moe" and n_routed:
+            if num_moe_layers == 0 and model_type == "qwen3_moe" and n_routed:
                 # qwen3_moe: a layer is MoE iff it is not dense-only and
                 # (layer_idx + 1) % decoder_sparse_step == 0, mirroring
                 # mlx_lm's Qwen3MoeDecoderLayer. Defaults (step=1, no
                 # dense-only layers) resolve to every layer being MoE.
                 try:
-                    step = int(config.get("decoder_sparse_step") or text_cfg.get("decoder_sparse_step") or 1)
+                    step = int(_cfg(config, "decoder_sparse_step") or 1)
                 except (TypeError, ValueError):
                     step = 1
                 if step < 1:
                     step = 1
-                raw_only = config.get("mlp_only_layers")
-                if raw_only is None:
-                    raw_only = text_cfg.get("mlp_only_layers")
+                raw_only = _cfg(config, "mlp_only_layers")
                 only: set[int] = set()
                 if isinstance(raw_only, (list, tuple)):
                     for v in raw_only:
@@ -371,8 +404,8 @@ def _detect_expert_keys(
                 )
             if num_moe_layers == 0 and n_routed:
                 # generic first_k/moe_freq fallback
-                first_k = int(config.get("first_k_dense_replace") or text_cfg.get("first_k_dense_replace") or 0)
-                freq = int(config.get("moe_layer_freq") or text_cfg.get("moe_layer_freq") or 1)
+                first_k = int(_cfg(config, "first_k_dense_replace") or 0)
+                freq = int(_cfg(config, "moe_layer_freq") or 1)
                 cnt = 0
                 for i in range(num_layers):
                     if i >= first_k and i % freq == 0:
@@ -381,27 +414,8 @@ def _detect_expert_keys(
                     num_moe_layers = cnt
                 # qwen4_exp / deepseek_v4: every layer is MoE when
                 # num_experts / n_routed present and no mlp types
-                if num_moe_layers == 0 and normalize_model_type(model_type) in _ALL_LAYERS_MOE and n_routed:
+                if num_moe_layers == 0 and model_type in _ALL_LAYERS_MOE and n_routed:
                     num_moe_layers = int(num_layers) if num_layers else 0
-        except Exception:
-            pass
-
-    # Filter extra layers beyond num_hidden_layers (e.g. glm5_next layer 45
-    # MTP stored as model.layers.45) so expert_bytes excludes them
-    if num_layers:
-        try:
-            filt_pat = re.compile(r"layers\.(\d+)\.")
-            filtered = []
-            for k in expert_keys:
-                m = filt_pat.search(k)
-                if m:
-                    try:
-                        if int(m.group(1)) >= num_layers:
-                            continue
-                    except Exception:
-                        pass
-                filtered.append(k)
-            expert_keys = filtered
         except Exception:
             pass
 
@@ -439,19 +453,16 @@ def _cached_estimate(
         # only need expert keys' headers for refinement; load all file headers lazily via per-file
         needed_files = set(weight_map.values())
         for fname in needed_files:
-            hdr = _safetensors_header(model_path / fname)
-            for k, v in hdr.items():
-                # headers are per-file, but weight_map keys are global; keep first occurrence
-                if k not in headers:
-                    headers[k] = v
+            # headers are per-file, but weight_map keys are global; keep first occurrence
+            for k, v in _safetensors_header(model_path / fname).items():
+                headers.setdefault(k, v)
     else:
         # single file or sharded without index: scan headers directly
         for fpath in checkpoint_files:
             hdr = _safetensors_header(fpath)
-            for k, v in hdr.items():
-                headers[k] = v
-                # weight_map synthetic
-                weight_map[k] = fpath.name
+            headers.update(hdr)
+            # weight_map synthetic
+            weight_map.update({k: fpath.name for k in hdr})
 
     expert_keys, num_moe_layers, experts_per_layer = _detect_expert_keys(
         weight_map, headers, config
@@ -467,10 +478,6 @@ def _cached_estimate(
                 expert_bytes += int(e) - int(s)
             except Exception:
                 continue
-        else:
-            # fallback: estimate via shape*itemsize (rare)
-            # we have checkpoint_bytes fallback later
-            pass
 
     model_type = _config_model_type(config)
 
@@ -486,26 +493,27 @@ def _cached_estimate(
                     except Exception:
                         pass
             if expert_keys:
-                layer_pat = re.compile(r"layers\.(\d+)\.")
-                layers = {int(m.group(1)) for k in expert_keys if (m := layer_pat.search(k))}
-                # Filter MTP extra layers
-                cfg_layers = int(config.get("num_hidden_layers") or (config.get("text_config") or {}).get("num_hidden_layers") or 0) if config.get("num_hidden_layers") or (config.get("text_config") or {}).get("num_hidden_layers") else 0
+                layers = {
+                    idx
+                    for k in expert_keys
+                    if (idx := _layer_idx(k)) is not None
+                }
+                # Filter MTP extra layers beyond num_hidden_layers
+                cfg_layers = int(_cfg(config, "num_hidden_layers") or 0)
                 if cfg_layers:
                     layers = {l for l in layers if l < cfg_layers}
                 num_moe_layers = len(layers)
                 # mtp.<stage> expert banks count as streamable MoE layers
-                mtp_pat = re.compile(r"mtp\.(\d+)\.")
                 num_moe_layers += len(
-                    {int(m.group(1)) for k in expert_keys if (m := mtp_pat.search(k))}
+                    {
+                        int(m.group(1))
+                        for k in expert_keys
+                        if (m := _MTP_RE.search(k))
+                    }
                 )
-                exp = config.get("n_routed_experts")
-                if exp is None:
-                    exp = (config.get("text_config") or {}).get("n_routed_experts")
-                if exp is None:
-                    exp = config.get("num_experts")
-                if exp is None:
-                    exp = (config.get("text_config") or {}).get("num_experts")
-                experts_per_layer = int(exp or 0)
+                experts_per_layer = int(
+                    _cfg(config, "n_routed_experts", "num_experts") or 0
+                )
 
     supported = False
     reason: str | None = None
@@ -554,17 +562,12 @@ def _cached_estimate(
     # the top level and the language model's under text_config). Fall back
     # to the header-derived down_proj out dim when the config is silent.
     hidden_size = 0
-    for src in (
-        config.get("text_config") if isinstance(config.get("text_config"), dict) else {},
-        config,
-    ):
-        raw_hidden = src.get("hidden_size")
-        if raw_hidden:
-            try:
-                hidden_size = int(raw_hidden)
-            except (TypeError, ValueError):
-                hidden_size = 0
-            break
+    raw_hidden = _cfg(config, "hidden_size", text_first=True)
+    if raw_hidden is not None:
+        try:
+            hidden_size = int(raw_hidden)
+        except (TypeError, ValueError):
+            hidden_size = 0
     if not hidden_size:
         hidden_size = hdr_hidden
 
