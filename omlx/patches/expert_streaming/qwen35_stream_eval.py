@@ -27,19 +27,18 @@ reads anyway; ``mx.clear_cache`` frees cached buffers back to Metal.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import mlx.core as mx
+
+from ._env import env_bool, env_float
 
 logger = logging.getLogger(__name__)
 
 # Default ON: prefill is where the lazy-graph accumulation hurts and the
 # boundary is bit-exact. Disable with OMLX_EXPERT_STREAMING_PER_LAYER_EVAL=0
 # or the per-model setting expert_streaming_per_layer_eval=false.
-_PER_LAYER_EVAL_DEFAULT = (
-    os.environ.get("OMLX_EXPERT_STREAMING_PER_LAYER_EVAL", "1") != "0"
-)
+_PER_LAYER_EVAL_DEFAULT = env_bool("OMLX_EXPERT_STREAMING_PER_LAYER_EVAL", True)
 _per_layer_eval_enabled = _PER_LAYER_EVAL_DEFAULT
 
 _APPLIED_FLAG = "_omlx_stream_eval_wrapped"
@@ -65,13 +64,9 @@ def _cache_threshold_bytes() -> int:
         return cache_clear_threshold_bytes()
     except Exception:  # noqa: BLE001
         pass
-    raw = os.environ.get("OMLX_EXPERT_STREAMING_CACHE_THRESH")
-    if raw:
-        try:
-            return max(0, int(float(raw) * 1024**3))
-        except ValueError:
-            logger.warning("Invalid OMLX_EXPERT_STREAMING_CACHE_THRESH=%r", raw)
-    return 2 * 1024**3
+    # Fallback for when metal_sync is unavailable: same env (GiB), same
+    # 2 GiB default, degrade-to-default on garbage via env_float.
+    return max(0, int(env_float("OMLX_EXPERT_STREAMING_CACHE_THRESH", 2.0) * 1024**3))
 
 
 def configure_from_settings(value: Any) -> bool:

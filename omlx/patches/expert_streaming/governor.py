@@ -35,13 +35,14 @@ two callers cannot interleave inside one update or deadlock a drain.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 
+from ._env import env_bool, env_float
+
 logger = logging.getLogger(__name__)
 
-_DYNAMIC_ENV = os.environ.get("OMLX_EXPERT_STREAMING_DYNAMIC", "").strip() == "1"
+_DYNAMIC_ENV = env_bool("OMLX_EXPERT_STREAMING_DYNAMIC", False)
 
 # Mid-request ticks: request-boundary observe() plus the 30s cooldown
 # allowed ~1 action per long decode — the budget never caught the working
@@ -50,13 +51,11 @@ _DYNAMIC_ENV = os.environ.get("OMLX_EXPERT_STREAMING_DYNAMIC", "").strip() == "1
 # actions keep the normal pressure/hunger rules but use a shorter spacing
 # so the cap converges in ~15 s. OMLX_EXPERT_STREAMING_GOV_TICK=0 restores
 # boundary-only behavior.
-_GOV_TICK_ENV = os.environ.get("OMLX_EXPERT_STREAMING_GOV_TICK", "1") != "0"
-_GOV_TICK_S = float(
-    os.environ.get("OMLX_EXPERT_STREAMING_GOV_TICK_S", "1.0") or 1.0
-)
-_GOV_TICK_ACTION_S = float(
-    os.environ.get("OMLX_EXPERT_STREAMING_GOV_TICK_ACTION_S", "3.0") or 3.0
-)
+_GOV_TICK_ENV = env_bool("OMLX_EXPERT_STREAMING_GOV_TICK", True)
+# Tick throttle constants (dev tunables, not envs): observe spacing and the
+# shorter mid-request action spacing tick() substitutes for cooldown_s.
+_GOV_TICK_S = 1.0
+_GOV_TICK_ACTION_S = 3.0
 
 
 def dynamic_residency_enabled() -> bool:
@@ -64,11 +63,7 @@ def dynamic_residency_enabled() -> bool:
 
 
 def _max_dynamic_budget_bytes(default_gib: float = 0.0) -> int:
-    raw = os.environ.get("OMLX_EXPERT_STREAMING_DYNAMIC_MAX_GIB", "").strip()
-    try:
-        gib = float(raw) if raw else default_gib
-    except ValueError:
-        gib = default_gib
+    gib = env_float("OMLX_EXPERT_STREAMING_DYNAMIC_MAX_GIB", default_gib)
     if gib <= 0:
         # Dynamic ceiling: a quarter of RAM, bounded — a bigger private
         # LRU squeezes the OS page cache and turns the remaining misses
@@ -78,23 +73,21 @@ def _max_dynamic_budget_bytes(default_gib: float = 0.0) -> int:
     return max(0, int(gib * 1024**3))
 
 
-def _frac_env(name: str, default: float) -> float:
-    """Watermark fraction env override (0..1); invalid values keep default."""
+def _psutil_vm(field: str) -> int | None:
+    """psutil.virtual_memory() field in bytes, or None when unavailable."""
     try:
-        v = float(os.environ.get(name, "") or default)
-    except (TypeError, ValueError):
-        return default
-    return min(0.95, max(0.0, v))
+        import psutil
+
+        return int(getattr(psutil.virtual_memory(), field))
+    except Exception:
+        return None
 
 
 def _free_bytes() -> int:
     """Best-effort system free memory (psutil.available; vm_stat fallback)."""
-    try:
-        import psutil
-
-        return int(psutil.virtual_memory().available)
-    except Exception:
-        pass
+    avail = _psutil_vm("available")
+    if avail is not None:
+        return avail
     try:
         import subprocess
 
@@ -116,12 +109,9 @@ def _free_bytes() -> int:
 
 
 def _total_ram_bytes() -> int:
-    try:
-        import psutil
-
-        return int(psutil.virtual_memory().total)
-    except Exception:
-        pass
+    total = _psutil_vm("total")
+    if total is not None:
+        return total
     try:
         import subprocess
 
@@ -131,6 +121,26 @@ def _total_ram_bytes() -> int:
         return int(out) if out else 64 * 1024**3
     except Exception:
         return 64 * 1024**3
+
+
+def _clampf(v, lo: float, hi: float, default: float) -> float:
+    """float(v) clamped to [lo, hi]; unparseable -> default."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, f))
+
+
+def _bytes_or(override, ram: int, env: str, frac: float) -> int:
+    """Explicit byte watermark wins; else ram * env-clamped fraction.
+
+    The env is a 0..1 fraction of physical RAM (``OMLX_GOV_*_FRAC``);
+    invalid values degrade to *frac* via ``env_float``.
+    """
+    if override is not None:
+        return int(override)
+    return int(ram * min(0.95, max(0.0, env_float(env, frac))))
 
 
 class ExpertResidencyGovernor:
@@ -163,34 +173,18 @@ class ExpertResidencyGovernor:
         self.per_slot = max(1, int(per_slot))
         self.num_layers = max(0, int(num_layers))
         self.max_budget_bytes = int(max_budget_bytes)
-        self.low_free_bytes = int(
-            low_free_bytes
-            if low_free_bytes is not None
-            else int(ram * _frac_env("OMLX_GOV_LOW_FRAC", 0.10))
+        self.low_free_bytes = _bytes_or(low_free_bytes, ram, "OMLX_GOV_LOW_FRAC", 0.10)
+        self.target_free_bytes = _bytes_or(
+            target_free_bytes, ram, "OMLX_GOV_TARGET_FRAC", 0.20
         )
-        self.target_free_bytes = int(
-            target_free_bytes
-            if target_free_bytes is not None
-            else int(ram * _frac_env("OMLX_GOV_TARGET_FRAC", 0.20))
-        )
-        self.high_free_bytes = int(
-            high_free_bytes
-            if high_free_bytes is not None
-            else int(ram * _frac_env("OMLX_GOV_HIGH_FRAC", 0.40))
+        self.high_free_bytes = _bytes_or(
+            high_free_bytes, ram, "OMLX_GOV_HIGH_FRAC", 0.40
         )
         self.cooldown_s = float(cooldown_s)
         self.min_cap = max(1, int(min_cap))
         self.min_budget_bytes = max(0, int(min_budget_bytes or 0))
-        try:
-            self.stall_target = float(stall_target)
-        except (TypeError, ValueError):
-            self.stall_target = 0.05
-        self.stall_target = min(0.9, max(0.0, self.stall_target))
-        try:
-            self.grow_add_frac = float(grow_add_frac)
-        except (TypeError, ValueError):
-            self.grow_add_frac = 0.25
-        self.grow_add_frac = min(4.0, max(0.0, self.grow_add_frac))
+        self.stall_target = _clampf(stall_target, 0.0, 0.9, 0.05)
+        self.grow_add_frac = _clampf(grow_add_frac, 0.0, 4.0, 0.25)
         self.min_window_layers = max(1, int(min_window_layers))
         # Governor lock: serializes observe()/tick() state updates between
         # the asyncio event loop (request boundaries) and the inference
@@ -217,14 +211,30 @@ class ExpertResidencyGovernor:
         per_layer = max(1, cap // self.num_layers) if self.num_layers > 0 else 0
         return cap, per_layer
 
-    def _apply(self, cap: int, per_layer: int) -> None:
+    def _apply(self, cap: int, per_layer: int, layers: list | None = None) -> None:
         """Retarget the cache capacity via ``cache.resize()``.
 
         The supported cache contract requires resize() so the whole
         retarget (capacity, per-layer cap, drain, per-layer trim) is one
-        atomic step under the cache lock.
+        atomic step under the cache lock. resize() resets overrides to
+        uniform, so per-layer targeting is re-applied right after: a grow
+        keeps its targeting and a shrink returns to uniform (layers
+        empty/None). Each override is bounded by the global cap
+        (overrides are ceilings; the global trim still rules), so
+        targeting can never over-admit.
         """
         self.cache.resize(cap, per_layer if self.num_layers > 0 else None)
+        try:
+            setter = getattr(self.cache, "set_layer_caps", None)
+            if not callable(setter):
+                return
+            if not layers:
+                setter({})
+                return
+            per_layer = max(1, int(per_layer))
+            setter({int(l): min(int(cap), per_layer * 2) for l in layers})
+        except Exception:
+            logger.debug("governor retarget failed", exc_info=True)
 
     def reconcile_per_slot(self, per_slot: int) -> None:
         """Adopt the post-conversion per-slot bytes.
@@ -332,18 +342,50 @@ class ExpertResidencyGovernor:
         ranked = sorted(win_by_layer.items(), key=lambda kv: kv[1], reverse=True)
         return [k for k, _ in ranked[: max(1, self.num_layers // 6)]]
 
-    def observe(self, force: bool = False) -> str:
+    def observe(self, force: bool = False, *, cooldown: float | None = None) -> str:
         """One governor step; returns the action taken (empty when idle).
 
         Serialized under the governor lock: request-boundary calls (event
         loop) and mid-request ticks (inference thread) cannot interleave
         baselines, watermarks, or the cooldown. The lock is re-entrant so
-        ``tick()`` can hold it across its throttle bookkeeping.
+        ``tick()`` can hold it across its throttle bookkeeping. ``cooldown``
+        overrides ``self.cooldown_s`` for this step only (tick's shorter
+        action spacing).
         """
         with self._lock:
-            return self._observe_locked(force)
+            return self._observe_locked(force, cooldown=cooldown)
 
-    def _observe_locked(self, force: bool) -> str:
+    def _grow(
+        self, free: int, factor: float, win_by_layer: dict | None = None
+    ) -> tuple | None:
+        """One growth step toward the budget/headroom ceiling.
+
+        Shared by the hunger branch (additive ``1 + grow_add_frac``,
+        targeted at the top-missing layers) and the abundance branch
+        (``2.0``, uniform): the ceiling is dynamic — the cache may grow
+        while free stays above ``target_free_bytes``; the static
+        ``max_budget_bytes`` remains the outer bound. Returns
+        ``(cap, target_layers)`` when the capacity grew, else None.
+        """
+        cache = self.cache
+        cap_now = cache.capacity
+        budget_now = cap_now * self.per_slot
+        headroom_budget = budget_now + max(0, free - self.target_free_bytes)
+        want_budget = min(
+            self.max_budget_bytes,
+            headroom_budget,
+            int(budget_now * factor),
+        )
+        if want_budget <= budget_now:
+            return None
+        cap, per_layer = self._caps_for(want_budget)
+        if cap <= cap_now:
+            return None
+        layers = self._target_layers(win_by_layer)
+        self._apply(cap, per_layer, layers)
+        return cap, layers
+
+    def _observe_locked(self, force: bool, cooldown: float | None = None) -> str:
         try:
             cache = self.cache
             if cache is None or getattr(cache, "capacity", 0) <= 0:
@@ -358,7 +400,8 @@ class ExpertResidencyGovernor:
             self.last_window_stall = (
                 win_missed / win_layers if win_layers > 0 else 0.0
             )
-            if not force and (now - self._last_action_at) < self.cooldown_s:
+            cooldown_s = self.cooldown_s if cooldown is None else float(cooldown)
+            if not force and (now - self._last_action_at) < cooldown_s:
                 return ""
             action = ""
             if free < self.low_free_bytes:
@@ -379,7 +422,6 @@ class ExpertResidencyGovernor:
                 if want < cache.capacity:
                     cap, per_layer = self._caps_for(want * self.per_slot)
                     self._apply(cap, per_layer)
-                    self._retarget(cache, cap, per_layer)
                     action = "shrink cap=%d (free=%.1fG)" % (cap, free / 1024**3)
             elif (
                 win_layers >= self.min_window_layers
@@ -387,44 +429,21 @@ class ExpertResidencyGovernor:
                 and free > self.target_free_bytes
             ):
                 # Hunger: proven decode stalls + headroom (not abundance).
-                # The ceiling is dynamic: the cache may grow while free
-                # stays above `target_free_bytes`; the static max_budget
-                # remains the outer bound.
-                cap_now = cache.capacity
-                budget_now = cap_now * self.per_slot
-                headroom_budget = budget_now + max(
-                    0, free - self.target_free_bytes
-                )
-                want_budget = min(
-                    self.max_budget_bytes,
-                    headroom_budget,
-                    int(budget_now * (1.0 + self.grow_add_frac)),
-                )
-                if want_budget > budget_now:
-                    cap, per_layer = self._caps_for(want_budget)
-                    if cap > cap_now:
-                        self._apply(cap, per_layer)
-                        layers = self._target_layers(win_by_layer)
-                        self._retarget(cache, cap, per_layer, layers)
-                        action = (
-                            "grow cap=%d layers=%d (stall=%.2f free=%.1fG)"
-                            % (cap, len(layers), self.last_window_stall, free / 1024**3)
-                        )
-            else:
-                cap_now = cache.capacity
-                budget_now = cap_now * self.per_slot
-                headroom_budget = budget_now + max(
-                    0, free - self.target_free_bytes
-                )
-                want_budget = min(
-                    self.max_budget_bytes, headroom_budget, budget_now * 2
-                )
-                if want_budget > budget_now and free > self.high_free_bytes:
-                    cap, per_layer = self._caps_for(want_budget)
-                    if cap > cap_now:
-                        self._apply(cap, per_layer)
-                        self._retarget(cache, cap, per_layer)
-                        action = "grow cap=%d (free=%.1fG)" % (cap, free / 1024**3)
+                grew = self._grow(free, 1.0 + self.grow_add_frac, win_by_layer)
+                if grew is not None:
+                    cap, layers = grew
+                    action = "grow cap=%d layers=%d (stall=%.2f free=%.1fG)" % (
+                        cap,
+                        len(layers),
+                        self.last_window_stall,
+                        free / 1024**3,
+                    )
+            elif free > self.high_free_bytes:
+                # Abundance: double capacity; between TGT and HIGH the
+                # band is stable (hysteresis, no churn).
+                grew = self._grow(free, 2.0)
+                if grew is not None:
+                    action = "grow cap=%d (free=%.1fG)" % (grew[0], free / 1024**3)
             if action:
                 self._last_action_at = now
                 self.actions += 1
@@ -452,34 +471,7 @@ class ExpertResidencyGovernor:
             if now - self._last_tick_at < _GOV_TICK_S:
                 return ""
             self._last_tick_at = now
-            saved = self.cooldown_s
-            self.cooldown_s = _GOV_TICK_ACTION_S
-            try:
-                return self.observe()
-            finally:
-                self.cooldown_s = saved
-
-    def _retarget(
-        self, cache, cap: int, per_layer: int, layers: list | None = None
-    ) -> None:
-        """Apply per-layer targeting after a resize (best-effort).
-
-        resize() resets overrides to uniform; re-apply here so a grow keeps
-        its targeting and a shrink returns to uniform (layers=None). Each
-        override is bounded by the global cap (overrides are ceilings; the
-global trim still rules), so targeting can never over-admit.
-        """
-        try:
-            setter = getattr(cache, "set_layer_caps", None)
-            if not callable(setter):
-                return
-            if not layers:
-                setter({})
-                return
-            per_layer = max(1, int(per_layer))
-            setter({int(l): min(int(cap), per_layer * 2) for l in layers})
-        except Exception:
-            logger.debug("governor retarget failed", exc_info=True)
+            return self.observe(cooldown=_GOV_TICK_ACTION_S)
 
     def summary(self) -> dict:
         cache = self.cache
@@ -499,3 +491,75 @@ global trim still rules), so targeting can never over-admit.
                 "stall_target": self.stall_target,
                 "layer_overrides": overrides,
             }
+
+
+def arm_dynamic(
+    cache,
+    per_slot: int,
+    base_cap: int,
+    *,
+    floor_default: int | None,
+    max_budget_bytes: int | None,
+    min_budget_bytes: int | None,
+    stall_target: float | None,
+    min_cap: int | None = None,
+    num_layers: int = 1,
+    label: str = "expert streaming",
+    **governor_kwargs,
+) -> ExpertResidencyGovernor | None:
+    """Arm an :class:`ExpertResidencyGovernor` on a dynamic cache.
+
+    Shared arm block for the governor duck-types (the V4.1 streaming
+    backing, the legacy offload state — per-layer-units caches whose
+    ``capacity`` is a per-layer slot count). Resolves the byte budgets:
+    an explicit ``max_budget_bytes`` pins the ceiling, otherwise the
+    DYNAMIC_MAX_GIB env / quarter-of-RAM default applies; the floor is
+    ``min_budget_bytes`` or a quarter of the initial total (never below
+    0.25 GiB). ``floor_default`` is the caller's model-specific min-cap
+    fallback (e.g. one token's routed working set); an explicit
+    ``min_cap`` always wins. ``num_layers`` is the governor's layer count
+    for windowing (1 for per-layer-units caches). Extra governor kwargs
+    pass through. Arming failure is soft: residency just stays static
+    (returns None).
+    """
+    try:
+        initial_total = int(base_cap) * max(1, int(per_slot))
+        gov_max = (
+            int(max_budget_bytes)
+            if max_budget_bytes is not None
+            else _max_dynamic_budget_bytes()
+        )
+        gov_min = (
+            int(min_budget_bytes)
+            if min_budget_bytes is not None
+            else max(int(0.25 * 1024**3), initial_total // 4)
+        )
+        # Never shrink a layer below one token's decode working set —
+        # explicit min_cap wins, then the caller's floor_default, then
+        # the governor's own default.
+        floor = min_cap if min_cap is not None else floor_default
+        kwargs = dict(governor_kwargs)
+        if stall_target is not None:
+            kwargs["stall_target"] = stall_target
+        if floor is not None:
+            kwargs["min_cap"] = max(1, int(floor))
+        governor = ExpertResidencyGovernor(
+            cache,
+            max(1, int(per_slot)),
+            num_layers,
+            max(gov_max, initial_total),
+            min_budget_bytes=gov_min,
+            **kwargs,
+        )
+        logger.info(
+            "%s: dynamic residency governor armed "
+            "(per-layer %d slots, min %d, max %.2f GiB)",
+            label,
+            int(base_cap),
+            governor._min_cap_slots(),
+            governor.max_budget_bytes / 1024**3,
+        )
+        return governor
+    except Exception:
+        logger.debug("%s: governor arming failed", label, exc_info=True)
+        return None

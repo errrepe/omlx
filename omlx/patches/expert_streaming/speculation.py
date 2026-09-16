@@ -20,14 +20,14 @@ Hints only (F_RDADVISE), never changes output. 0 disables.
 
 from __future__ import annotations
 
-import os
 import threading
+from collections import Counter
 from typing import Any, Dict, Tuple
 
-from ._env import env_int
+from ._env import env_bool, env_int
 
 
-_TRANSITION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_TRANSITION", "1") != "0"
+_TRANSITION_ENV = env_bool("OMLX_EXPERT_STREAMING_TRANSITION", True)
 _TRANSITION_TOP = 8  # entries kept per (layer, expert) source
 _TRANSITION_OVERFETCH = 1  # extra candidates per demanded expert
 
@@ -36,16 +36,14 @@ _TRANSITION_OVERFETCH = 1  # extra candidates per demanded expert
 # next layer) plus transition-table candidates; a per-layer EWMA recall
 # gate stops prefetching layers whose routing diverges, so a bad predictor
 # costs a bounded burst and then shuts itself off.
-_STAGED_ENV = os.environ.get("OMLX_EXPERT_STREAMING_STAGED", "1") != "0"
+_STAGED_ENV = env_bool("OMLX_EXPERT_STREAMING_STAGED", True)
 # Bound on staged rows + in-flight keys (rows are ~0.9 MB each here).
 _STAGED_MAX = env_int("OMLX_EXPERT_STREAMING_STAGED_MAX", 512, lo=16)
 # Predicted set cap per (layer call, projection).
 _STAGED_MAX_IDS = env_int("OMLX_EXPERT_STREAMING_STAGED_IDS", 48, lo=1)
 # Per-layer recall gate: stage only when the prev-token prediction has
 # covered at least this share of observed demand recently (EWMA).
-_STAGED_MIN_RECALL = float(
-    os.environ.get("OMLX_EXPERT_STREAMING_STAGED_MIN_RECALL", "0.25") or 0
-)
+_STAGED_MIN_RECALL = 0.25
 _STAGED_RECALL_DECAY = 0.9
 
 # Advise hygiene: the decode advisory would otherwise re-issue F_RDADVISE
@@ -54,12 +52,8 @@ _STAGED_RECALL_DECAY = 0.9
 # (~2 tokens at 48 layers). _ADVISE_TRANS_MIN_PRECISION gates the
 # transition-table extras by their measured precision (the share of last
 # token's extras that appeared in this token's demand). 0 disables.
-_ADVISE_TTL = max(
-    0, env_int("OMLX_EXPERT_STREAMING_ADVISE_TTL", 96)
-)
-_ADVISE_TRANS_MIN_PRECISION = float(
-    os.environ.get("OMLX_EXPERT_STREAMING_TRANS_MIN_PRECISION", "0.05") or 0
-)
+_ADVISE_TTL = 96
+_ADVISE_TRANS_MIN_PRECISION = 0.05
 
 
 class SpeculationState:
@@ -79,14 +73,10 @@ class SpeculationState:
         self.closed = False
         self.prev_uniq_by_layer: Dict[int, list[int]] = {}
         self.linears_by_layer: Dict[int, list[Any]] = {}
-        self.stats = {
-            "advised": 0,
-            "advised_runs": 0,
-            "advised_experts": 0,
-            "advised_bytes": 0,
-            "advice_failures": 0,
-            "advice_tier_segments": 0,
-        }
+        # Counter: bump() and the stage_resolve hit/miss tallies just
+        # auto-vivify; the two keys the streaming summary reads
+        # (__init__.py: "advised", "trans_overfetch") start visible at 0.
+        self.stats: Counter = Counter({"advised": 0, "trans_overfetch": 0})
         # Transition table (layer, expert) -> {next_expert: weight}.
         # Temporal only (same layer, token t-1 -> t); cross-layer same-token
         # transitions are not observable without a model-loop hook.
@@ -232,7 +222,7 @@ class SpeculationState:
         with self.lock:
             if self.closed:
                 return
-            self.stats[key] = self.stats.get(key, 0) + amount
+            self.stats[key] += amount
 
     # -- staged decode prefetch ---------------------------------------------
 
@@ -306,7 +296,7 @@ class SpeculationState:
                 return None
             row = self.staged.pop(key, None)
             if row is not None:
-                self.stats["staged_hits"] = self.stats.get("staged_hits", 0) + 1
+                self.stats["staged_hits"] += 1
                 return row
             entry = self.staged_futs.get(key)
             if entry is not None and not wait and not entry[0].done():
@@ -343,9 +333,9 @@ class SpeculationState:
                 self.staged_futs.pop(linear.bundle_key(int(eid)), None)
             row = self.staged.pop(key, None)
             if row is not None:
-                self.stats["staged_hits"] = self.stats.get("staged_hits", 0) + 1
+                self.stats["staged_hits"] += 1
             else:
-                self.stats["staged_misses"] = self.stats.get("staged_misses", 0) + 1
+                self.stats["staged_misses"] += 1
             return row
 
     def stage_drop(self, key: Any) -> None:

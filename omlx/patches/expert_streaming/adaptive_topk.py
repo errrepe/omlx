@@ -28,6 +28,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from ._env import env_float
+
 logger = logging.getLogger(__name__)
 
 _THRESHOLD: float | None = None
@@ -84,25 +86,16 @@ def _coerce_threshold(threshold: Any) -> float | None:
             threshold,
         )
         return None
-    if t != t:  # NaN
-        logger.error("Adaptive top-k threshold is NaN; exact routing kept")
-        return None
-    if t < _MIN_THRESHOLD:
+    if not (_MIN_THRESHOLD <= t <= _MAX_THRESHOLD):
+        # One bounds check catches NaN (all comparisons False), values
+        # below _MIN (would keep almost no experts), and > 1.0 — which
+        # is over-full mass, not "exact" (only None or exactly 1.0 are;
+        # the API layer rejects > 1.0 with a 400).
         logger.error(
-            "Adaptive top-k threshold %.4g is below the minimum %.2f "
-            "(it would keep almost no experts); exact routing kept",
+            "Adaptive top-k threshold %.4g outside [%.2f, %.2f]; exact routing kept",
             t,
             _MIN_THRESHOLD,
-        )
-        return None
-    if t > _MAX_THRESHOLD:
-        # > 1.0 is over-full mass, not "exact" — only None and exactly
-        # 1.0 are; the API layer rejects > 1.0 with a 400. Clamp to
-        # exact and say so.
-        logger.error(
-            "Adaptive top-k threshold %.4g exceeds 1.0; exact routing kept "
-            "(only None or exactly 1.0 select exact routing)",
-            t,
+            _MAX_THRESHOLD,
         )
         return None
     return t
@@ -121,23 +114,21 @@ def configure(threshold: float | None) -> None:
         logger.info("Adaptive top-k truncation active: threshold=%.2f", _THRESHOLD)
 
 
+def _coerce_prior(value: Any) -> float:
+    """float(value) clamped >= 0; unparseable fails closed to exact (0.0).
 
-
-
-def _safe_float_env(name: str, default: float) -> float:
-    """Fail-closed env-float parse: never bare-cast at import — a
-    malformed value must disable the knob, not brick the module."""
+    Never bare-cast: a malformed value must disable the knob, not brick
+    the module."""
     try:
-        raw = os.environ.get(name, "")
-        return float(raw) if raw.strip() else default
-    except (TypeError, ValueError, AttributeError):
-        return default
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # Cache-conditional routing (Qualcomm 2412.00099): logit bonus for
 # LRU-resident experts before top-k. 0.0 = exact routing (default).
 # Approximate by design — opt-in only.
-_CACHE_PRIOR = max(0.0, _safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0))
+_CACHE_PRIOR = _coerce_prior(env_float("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0))
 
 
 def cache_prior_bonus() -> float:
@@ -151,17 +142,10 @@ def configure_cache_prior(value: Any) -> float:
     Mirrors configure(): explicit values win, env fills the gap, garbage
     fails closed to exact. Returns the effective bonus."""
     global _CACHE_PRIOR
-    if value is None:
-        _CACHE_PRIOR = max(0.0, _safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0))
-    else:
-        try:
-            _CACHE_PRIOR = max(0.0, float(value))
-        except (TypeError, ValueError):
-            _CACHE_PRIOR = 0.0
+    _CACHE_PRIOR = _coerce_prior(
+        env_float("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0) if value is None else value
+    )
     return _CACHE_PRIOR
-
-
-
 
 
 def resident_experts(switch_mlp: Any) -> set[int]:
@@ -207,6 +191,19 @@ def resident_experts(switch_mlp: Any) -> set[int]:
         return set()
 
 
+def _resident_mask(resident: set[int], width: int):
+    """Boolean [width] mask marking cache-resident expert slots.
+
+    None when no in-range expert is resident — the callers then return
+    their input untouched (exact routing).
+    """
+    res = sorted({int(e) for e in resident if 0 <= int(e) < width})
+    if not res:
+        return None
+    anchors = mx.array(res, dtype=mx.int32)
+    return (mx.arange(width)[None, :] == anchors[:, None]).any(axis=0)
+
+
 def rerank_cache_prior(gates: Any, resident: set[int] | None, bonus: float) -> Any:
     """Boost resident experts by *bonus* in logit space before top-k.
 
@@ -217,18 +214,11 @@ def rerank_cache_prior(gates: Any, resident: set[int] | None, bonus: float) -> A
     if bonus <= 0 or not resident:
         return gates
     try:
-        width = int(gates.shape[-1])
-        res = sorted({int(e) for e in resident if 0 <= int(e) < width})
-        if not res:
+        is_res = _resident_mask(resident, int(gates.shape[-1]))
+        if is_res is None:
             return gates
-        import mlx.core as _mx
-
-        anchors = _mx.array(res, dtype=_mx.int32)
-        is_res = (
-            _mx.arange(width)[None, :] == anchors[:, None]
-        ).any(axis=0)
-        LOG = _mx.log(_mx.maximum(gates, 1e-30))
-        return _mx.softmax(LOG + is_res.astype(LOG.dtype) * float(bonus), axis=-1)
+        LOG = mx.log(mx.maximum(gates, 1e-30))
+        return mx.softmax(LOG + is_res.astype(LOG.dtype) * float(bonus), axis=-1)
     except Exception:
         return gates
 
@@ -244,17 +234,10 @@ def apply_cache_prior_to_logits(logits: Any, resident: set[int] | None, bonus: f
     if bonus <= 0 or not resident:
         return logits
     try:
-        width = int(logits.shape[-1])
-        res = sorted({int(e) for e in resident if 0 <= int(e) < width})
-        if not res:
+        is_res = _resident_mask(resident, int(logits.shape[-1]))
+        if is_res is None:
             return logits
-        import mlx.core as _mx
-
-        anchors = _mx.array(res, dtype=_mx.int32)
-        is_res = (
-            _mx.arange(width)[None, :] == anchors[:, None]
-        ).any(axis=0)
-        return logits.astype(_mx.float32) + is_res.astype(_mx.float32) * float(bonus)
+        return logits.astype(mx.float32) + is_res.astype(mx.float32) * float(bonus)
     except Exception:
         return logits
 
@@ -275,9 +258,6 @@ def set_instance_routing(block: Any, threshold: float | None, prior: float) -> N
     """Stamp per-model routing onto one MoE block (None/0.0 = exact)."""
     try:
         setattr(block, _INSTANCE_THRESHOLD_ATTR, threshold)
-    except Exception:
-        pass
-    try:
         setattr(block, _INSTANCE_PRIOR_ATTR, float(prior or 0.0))
     except Exception:
         pass
@@ -286,21 +266,17 @@ def set_instance_routing(block: Any, threshold: float | None, prior: float) -> N
 def instance_threshold(block: Any) -> float | None:
     """Effective threshold for *block*: per-instance when stamped, else global."""
     try:
-        if hasattr(block, _INSTANCE_THRESHOLD_ATTR):
-            return getattr(block, _INSTANCE_THRESHOLD_ATTR)
+        return getattr(block, _INSTANCE_THRESHOLD_ATTR, _THRESHOLD)
     except Exception:
-        pass
-    return _THRESHOLD
+        return _THRESHOLD
 
 
 def instance_prior(block: Any) -> float:
     """Effective cache-prior bonus for *block*: per-instance when stamped."""
     try:
-        if hasattr(block, _INSTANCE_PRIOR_ATTR):
-            return float(getattr(block, _INSTANCE_PRIOR_ATTR) or 0.0)
+        return float(getattr(block, _INSTANCE_PRIOR_ATTR, _CACHE_PRIOR) or 0.0)
     except Exception:
-        pass
-    return _CACHE_PRIOR
+        return _CACHE_PRIOR
 
 
 def resolve_threshold_from_settings(
@@ -336,11 +312,8 @@ def resolve_prior_from_settings(settings: Any | None) -> float:
     """Resolve the cache-prior bonus WITHOUT touching the module global."""
     v = getattr(settings, "expert_streaming_cache_prior", None) if settings else None
     if v is None:
-        return max(0.0, _safe_float_env("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0))
-    try:
-        return max(0.0, float(v))
-    except (TypeError, ValueError):
-        return 0.0
+        v = env_float("OMLX_EXPERT_STREAMING_CACHE_PRIOR", 0.0)
+    return _coerce_prior(v)
 
 
 def current_threshold() -> float | None:
