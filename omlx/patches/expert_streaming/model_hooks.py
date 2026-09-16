@@ -157,6 +157,16 @@ _QWEN_STREAM_EVAL = (
     (_qwen4_exp_language, "Qwen4ExpDecoderLayer"),
 )
 
+
+def _ffn_hooks(**kw) -> ModelHooks:
+    """Registry row for ffn-nested families (DeepSeek-style layouts)."""
+    return ModelHooks(
+        moe_attr_chain=_FFN_FIRST_CHAIN,
+        prefix_templates=_FFN_FIRST_TEMPLATES,
+        **kw,
+    )
+
+
 _HOOKS: dict[str, ModelHooks] = {
     # Qwen families: the installed decoder classes ignore _stream_eval and
     # need the wrapper; top-k truncation patches the shared
@@ -176,40 +186,28 @@ _HOOKS: dict[str, ModelHooks] = {
     # both use the fused glm_moe_weighted_sum kernel on sorted decode.
     "glm5_next": ModelHooks(
         topk_supported=True,
-        weighted_sum_kernel=lambda: _glm_weighted_sum(),
+        weighted_sum_kernel=_glm_weighted_sum,
     ),
     "glm5_next_text": ModelHooks(
         topk_supported=True,
-        weighted_sum_kernel=lambda: _glm_weighted_sum(),
+        weighted_sum_kernel=_glm_weighted_sum,
     ),
-    "glm_moe_dsa": ModelHooks(
-        weighted_sum_kernel=lambda: _glm_weighted_sum(),
-        moe_attr_chain=_FFN_FIRST_CHAIN,
-        prefix_templates=_FFN_FIRST_TEMPLATES,
+    "glm_moe_dsa": _ffn_hooks(
+        weighted_sum_kernel=_glm_weighted_sum,
     ),
     # DeepSeek V3.2 (the glm_moe_dsa patch's vendored model) calls
     # switch_mlp with weighted_sum=True the same way.
-    "deepseek_v32": ModelHooks(
-        weighted_sum_kernel=lambda: _glm_weighted_sum(),
-        moe_attr_chain=_FFN_FIRST_CHAIN,
-        prefix_templates=_FFN_FIRST_TEMPLATES,
+    "deepseek_v32": _ffn_hooks(
+        weighted_sum_kernel=_glm_weighted_sum,
     ),
     # DeepSeek V4 (unified path) and its MTP wrapper type: ffn-nested MoE,
     # DSpark stages under model.mtp via the default owner chain.
-    "deepseek_v4": ModelHooks(
-        moe_attr_chain=_FFN_FIRST_CHAIN,
-        prefix_templates=_FFN_FIRST_TEMPLATES,
-    ),
-    "deepseek_v4_mtp": ModelHooks(
-        moe_attr_chain=_FFN_FIRST_CHAIN,
-        prefix_templates=_FFN_FIRST_TEMPLATES,
-    ),
+    "deepseek_v4": _ffn_hooks(),
+    "deepseek_v4_mtp": _ffn_hooks(),
     # DeepSeek V4.1 runs its own upstream offload path — not a unified
     # family — but its checkpoint layout shares the ffn-first chain, so the
     # row documents the family wiring in one place.
-    "deepseek_v41": ModelHooks(
-        moe_attr_chain=_FFN_FIRST_CHAIN,
-        prefix_templates=_FFN_FIRST_TEMPLATES,
+    "deepseek_v41": _ffn_hooks(
         verify_scope=_v41_verify_scope,
     ),
 }
@@ -222,15 +220,20 @@ def hooks_for(model_type: object) -> ModelHooks:
     return _HOOKS.get(normalize_model_type(model_type), _DEFAULT)
 
 
-def resolve_verify_scope(model_type: object) -> Any | None:
-    """The family's draft-verify context manager factory, or None."""
-    resolver = hooks_for(model_type).verify_scope
+def _resolve_hook(model_type: object, field: str) -> Any | None:
+    """Run the family's named ModelHooks resolver field, or None."""
+    resolver = getattr(hooks_for(model_type), field, None)
     if resolver is None:
         return None
     try:
         return resolver()
     except Exception:
         return None
+
+
+def resolve_verify_scope(model_type: object) -> Any | None:
+    """The family's draft-verify context manager factory, or None."""
+    return _resolve_hook(model_type, "verify_scope")
 
 
 def all_stream_eval_targets() -> list[tuple[str, Any]]:
@@ -256,13 +259,7 @@ def all_stream_eval_targets() -> list[tuple[str, Any]]:
 
 def resolve_weighted_sum_kernel(model_type: object) -> Any | None:
     """The family's fused weighted-sum callable, or None."""
-    resolver = hooks_for(model_type).weighted_sum_kernel
-    if resolver is None:
-        return None
-    try:
-        return resolver()
-    except Exception:
-        return None
+    return _resolve_hook(model_type, "weighted_sum_kernel")
 
 
 def find_moe_container(
@@ -295,18 +292,24 @@ def find_moe_container(
     return None
 
 
-def find_moe_owner(node: Any, moe: Any | None) -> Any:
+def find_moe_owner(
+    node: Any,
+    moe: Any | None,
+    attr_chain: tuple[str, ...] = ("mlp", "ffn"),
+) -> Any:
     """The object owning *moe* — *node* or its ``.block`` child.
 
     ``_convert_switch_mlp_module`` stamps ``compile_ffn``/``_stream_eval``
     on this owner (a nested ``block.mlp`` GLU needs the flag on the block,
     not the stage). Complements find_moe_container for the one caller that
-    needs the owner identity (the MTP-stage walk).
+    needs the owner identity (the MTP-stage walk). *attr_chain* is the
+    family chain the moe was located with — passing a different chain than
+    the lookup used would mis-attribute the owner.
     """
     if moe is not None:
         block = getattr(node, "block", None)
         if block is not None and any(
-            getattr(block, attr, None) is moe for attr in ("mlp", "ffn")
+            getattr(block, attr, None) is moe for attr in attr_chain
         ):
             return block
     return node

@@ -39,8 +39,6 @@ except Exception:  # pragma: no cover - streaming_switch imports mlx
 # save_transition_profile below. conversion.py top-level only touches leaf
 # modules, so this cannot cycle.
 from .conversion import (
-    _candidate_stacked_keys as _candidate_stacked_keys,
-    _mtp_candidate_stacked_keys as _mtp_candidate_stacked_keys,
     _resolve_moe_dims as _resolve_moe_dims,
     _resolve_stacked_key as _resolve_stacked_key,
     convert_model_to_streaming as convert_model_to_streaming,
@@ -89,16 +87,18 @@ def _dynamic_armed(setting_val: Any | None, model_settings: Any | None) -> bool:
     return not _budget_is_pinned(model_settings)
 
 
+# Budget attribute spellings on the settings object — GiB pair preferred
+# over the legacy MiB pair; any explicit value pins the budget (manual
+# mode in _dynamic_armed).
+_BUDGET_GIB_ATTRS = ("expert_streaming_budget_gib", "expert_cache_budget_gib")
+_BUDGET_MIB_ATTRS = ("expert_streaming_budget_mib", "expert_cache_budget_mib")
+
+
 def _budget_is_pinned(model_settings: Any | None) -> bool:
     """True when the user pinned an explicit budget (manual mode)."""
     if model_settings is None:
         return False
-    for attr in (
-        "expert_streaming_budget_gib",
-        "expert_cache_budget_gib",
-        "expert_streaming_budget_mib",
-        "expert_cache_budget_mib",
-    ):
+    for attr in _BUDGET_GIB_ATTRS + _BUDGET_MIB_ATTRS:
         if getattr(model_settings, attr, None) is not None:
             return True
     return False
@@ -142,15 +142,11 @@ def resolve_budget_bytes(model_settings: Any | None) -> int:
     ``expert_streaming_budget_auto`` is False or no settings object
     exists.
     """
-    return _resolve_budget_bytes(model_settings)
-
-
-def _resolve_budget_bytes(model_settings: Any | None) -> int:
     if model_settings is not None:
         # Preferred name (model_settings.py:222) + legacy cache name.
         # Explicit 0 = page-cache only (no app-level LRU); None falls through
         # to the auto stack below.
-        for attr in ("expert_streaming_budget_gib", "expert_cache_budget_gib"):
+        for attr in _BUDGET_GIB_ATTRS:
             gib = getattr(model_settings, attr, None)
             if gib is not None:
                 try:
@@ -158,7 +154,7 @@ def _resolve_budget_bytes(model_settings: Any | None) -> int:
                 except (TypeError, ValueError):
                     continue
         # legacy mib
-        for attr in ("expert_streaming_budget_mib", "expert_cache_budget_mib"):
+        for attr in _BUDGET_MIB_ATTRS:
             mib = getattr(model_settings, attr, None)
             if mib is not None:
                 try:
@@ -247,26 +243,20 @@ def _bounded_float(value: Any, lo: float, hi: float, lo_open: bool) -> float | N
     return v if ok else None
 
 
-def _policy_choice(value: Any) -> str | None:
-    p = str(value).strip().lower()
-    return p if p in ("lru", "s3fifo") else None
+def _choice(*allowed: str):
+    """Lowercased-membership validator factory: returns the normalized
+    value or None."""
+
+    def _validate(value: Any) -> str | None:
+        p = str(value).strip().lower()
+        return p if p in allowed else None
+
+    return _validate
 
 
-def _pin_regime_choice(value: Any) -> str | None:
-    # Consumed as a lowercase regime name (warmer.PinController.pin_regime).
-    p = str(value).strip().lower()
-    return p if p in ("decode", "prefill") else None
-
-
-def _nonneg_float(value: Any) -> float | None:
-    """Coerce to float accepted only for finite values >= 0."""
-    if isinstance(value, bool):
-        return None
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    return v if 0 <= v < float("inf") else None
+_policy_choice = _choice("lru", "s3fifo")
+# Consumed as a lowercase regime name (warmer.PinController.pin_regime).
+_pin_regime_choice = _choice("decode", "prefill")
 
 
 _IO_OVERRIDE_VALIDATORS = {
@@ -296,7 +286,6 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
         if raw[key] is not None:
             raw[key] = validate(raw[key])
     return raw
-
 
 
 def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
@@ -346,13 +335,6 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
     except Exception:
         pass
     try:
-        spec = getattr(cache, "spec_state", None)
-        sstats = getattr(spec, "stats", None) if spec is not None else None
-        if sstats is not None:
-            out["advised"] = int(sstats.get("advised", 0) or 0)
-    except Exception:
-        pass
-    try:
         out["ctx_fallbacks"] = dict(getattr(cache, "ctx_fallback_stats", lambda: {})())
     except Exception:
         out["ctx_fallbacks"] = {}
@@ -367,16 +349,31 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
     except Exception:
         pass
     try:
+        # Speculation state: advisor counter + learned transition table.
         spec = getattr(cache, "spec_state", None)
         if spec is not None:
+            sstats = getattr(spec, "stats", None)
+            if isinstance(sstats, dict):
+                out["advised"] = int(sstats.get("advised", 0) or 0)
+                if sstats.get("trans_overfetch"):
+                    out["trans_overfetch"] = int(sstats["trans_overfetch"])
             out["trans_updates"] = int(getattr(spec, "trans_updates", 0) or 0)
             out["trans_sources"] = len(getattr(spec, "trans", {}) or {})
-            sstats = getattr(spec, "stats", None) or {}
-            if isinstance(sstats, dict) and sstats.get("trans_overfetch"):
-                out["trans_overfetch"] = int(sstats["trans_overfetch"])
     except Exception:
         pass
     return out
+
+
+def _engine_holders(engine: Any):
+    """Yield the objects that can carry streaming state for an engine:
+    the engine itself, then its ``_model`` / ``_vlm_model`` wrappers."""
+    for holder in (
+        engine,
+        getattr(engine, "_model", None),
+        getattr(engine, "_vlm_model", None),
+    ):
+        if holder is not None:
+            yield holder
 
 
 def resolve_streaming_backing(engine: Any) -> Any | None:
@@ -387,16 +384,11 @@ def resolve_streaming_backing(engine: Any) -> Any | None:
     on the model only. Used by the engine stop paths so legacy fds/mmaps
     release on teardown instead of whenever GC gets around to it.
     """
-    backing = getattr(engine, "_expert_streaming_backing", None)
-    if backing is None:
-        for holder in (
-            getattr(engine, "_model", None),
-            getattr(engine, "_vlm_model", None),
-        ):
-            backing = getattr(holder, "_expert_streaming_backing", None)
-            if backing is not None:
-                break
-    return backing
+    for holder in _engine_holders(engine):
+        backing = getattr(holder, "_expert_streaming_backing", None)
+        if backing is not None:
+            return backing
+    return None
 
 
 def streaming_summary_backing(engine: Any) -> Any | None:
@@ -407,11 +399,7 @@ def streaming_summary_backing(engine: Any) -> Any | None:
     duck-type as the V4.1 backing); when present it overrides the plain
     backing for reporting.
     """
-    for holder in (
-        engine,
-        getattr(engine, "_model", None),
-        getattr(engine, "_vlm_model", None),
-    ):
+    for holder in _engine_holders(engine):
         state = getattr(holder, "_moe_offload_legacy_state", None)
         if state is not None:
             return state
@@ -538,6 +526,7 @@ async def streaming_offload_load(
     from ..model_settings import moe_offload_requested
 
     loop = asyncio.get_running_loop()
+    offload_requested = moe_offload_requested(settings)
     backing = None
     if getattr(settings, "expert_streaming_enabled", False):
         try:
@@ -545,10 +534,7 @@ async def streaming_offload_load(
                 _, b = convert_model_to_streaming(model, model_name, settings)
                 # keep backing alive on the model
                 if b is not None:
-                    try:
-                        model._expert_streaming_backing = b  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+                    model._expert_streaming_backing = b  # type: ignore[attr-defined]
                 return b
 
             backing = await loop.run_in_executor(get_mlx_executor(), _do_streaming)
@@ -577,7 +563,7 @@ async def streaming_offload_load(
     # dies with "There is no Stream(gpu, N) in current thread" — the
     # post-apply materialize fixes that on the same executor.
     wrapped = 0
-    if moe_offload_requested(settings):
+    if offload_requested:
         from ..patches.moe_expert_offload import (
             apply_moe_expert_offload,
             materialize_offload_state,
@@ -601,7 +587,7 @@ async def streaming_offload_load(
 
     # Fail before materializing: a lazy-loaded streaming checkpoint with
     # zero converted layers would evaluate every expert bank in RAM.
-    if moe_offload_requested(settings):
+    if offload_requested:
         ensure_streaming_backing_or_raise(
             model, backing, requested=True, model_name=model_name
         )
@@ -639,13 +625,7 @@ def save_expert_pin_profile(engine: Any) -> None:
     the references. Never raises: a failed save only costs the learned hot
     set, never correctness.
     """
-    for holder in (
-        engine,
-        getattr(engine, "_model", None),
-        getattr(engine, "_vlm_model", None),
-    ):
-        if holder is None:
-            continue
+    for holder in _engine_holders(engine):
         backing = getattr(holder, "_expert_streaming_backing", None)
         pinner = getattr(backing, "_pin_controller", None)
         if pinner is not None:
@@ -658,11 +638,29 @@ def save_expert_pin_profile(engine: Any) -> None:
             return
 
 
+def teardown_expert_streaming(engine: Any) -> None:
+    """Engine-stop teardown shared by the batched and VLM wrappers.
+
+    Persists the learned pin profile while the backing is still
+    reachable, then shuts the backing down (transition profile +
+    fds/mmaps) and clears the engine-side reference so a later
+    ``resolve_streaming_backing`` cannot hand back a closed store. Each
+    piece is already never-raise.
+    """
+    save_expert_pin_profile(engine)
+    shutdown_expert_streaming(resolve_streaming_backing(engine))
+    try:
+        engine._expert_streaming_backing = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 __all__ = [
     "convert_model_to_streaming",
     "ensure_streaming_backing_or_raise",
     "resolve_budget_bytes",
     "save_expert_pin_profile",
+    "teardown_expert_streaming",
     "is_supported_model_type",
     "normalize_model_type",
     "SUPPORTED_TYPES",

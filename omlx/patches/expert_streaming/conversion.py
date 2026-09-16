@@ -3,9 +3,9 @@
 
 Everything that turns a resident MoE checkpoint into streaming layers lives
 here: stacked-key resolution, the per-module switch-MLP rewrite, the
-~900-line ``convert_model_to_streaming`` orchestrator, and the transition-
-profile persistence for its speculation state. Settings/budget resolution
-(``_io_overrides``, ``_resolve_budget_bytes`` ...) stays in the package
+``convert_model_to_streaming`` orchestrator, and the transition-profile
+persistence for its speculation state. Settings/budget resolution
+(``_io_overrides``, ``resolve_budget_bytes`` ...) stays in the package
 ``__init__`` — ``moe_expert_offload`` and the engines import it from there —
 and is lazily imported inside the functions that need it, so this module is
 import-safe at package-init time.
@@ -13,6 +13,8 @@ import-safe at package-init time.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -28,6 +30,22 @@ from .model_hooks import (
 
 logger = logging.getLogger(__name__)
 
+# SwitchGLU projection attribute names, canonical order. gate_up_proj is
+# the fused gate+up spelling — a module carries it OR gate_proj+up_proj.
+_PROJ_ATTRS = ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+
+
+def _config_sha(model_path: Any) -> str | None:
+    """sha256[:16] of the checkpoint config — the profile fingerprint
+    field (None when the file is unreadable)."""
+    try:
+        return hashlib.sha256(
+            (Path(model_path) / "config.json").read_bytes()
+        ).hexdigest()[:16]
+    except Exception:
+        return None
+
+
 def _expert_pin_fingerprint(
     model_path: str | Path,
     linears_by_layer: dict[int, list],
@@ -42,17 +60,11 @@ def _expert_pin_fingerprint(
     fingerprint covers the checkpoint (config hash), the source/cold
     packing, the HOBBIT hot fraction and the profile format version.
     """
-    import hashlib
-
     fp: dict = {
         "model": Path(model_path).name,
         "profile_format": 2,  # keep in sync with warmer.PROFILE_VERSION
+        "config_sha": _config_sha(model_path),
     }
-    cfg = Path(model_path) / "config.json"
-    try:
-        fp["config_sha"] = hashlib.sha256(cfg.read_bytes()).hexdigest()[:16]
-    except Exception:
-        fp["config_sha"] = None
     packing = None
     probe = next(
         (
@@ -108,12 +120,10 @@ def _wire_streaming_io_overrides(
     wired = 0
     targets = list(layers or []) + list(mtp_stages or [])
     for lyr in targets:
-        sm = getattr(
-            find_moe_container(lyr, attr_chain), "switch_mlp", None
-        )
+        sm = getattr(find_moe_container(lyr, attr_chain), "switch_mlp", None)
         if sm is None:
             continue
-        for proj in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+        for proj in _PROJ_ATTRS:
             lin = getattr(sm, proj, None)
             if lin is not None and hasattr(lin, "_io_pool_override"):
                 if pool is not None:
@@ -224,14 +234,16 @@ def _resolve_stacked_key(
             if cand in wm:
                 return cand
         mid = f"switch_mlp.{proj}.{suffix}"
-        for k in _stacked_key_candidates(backing, mid):
+        bucket = _stacked_key_candidates(backing, mid)
+        for k in bucket:
             if needle in k:
                 return k
         # Exotic-spelling fallback: the bucket index covers the canonical
         # ``switch_mlp.<proj>.<suffix>`` terminal; a key where mid is a
         # strict substring of a longer component (e.g. ``.weights``) lands
         # in a different bucket. One full scan per (mid, needle) miss;
-        # hits merge into the bucket so the next lookup stays O(bucket).
+        # hits merge into the live bucket so the next lookup stays
+        # O(bucket).
         scanned = getattr(backing, "_stacked_key_scanned", None)
         if scanned is None:
             scanned = set()
@@ -242,14 +254,12 @@ def _resolve_stacked_key(
         tag = (mid, needle)
         if tag not in scanned:
             scanned.add(tag)
-            extra = [
-                k for k in wm
-                if needle in k and mid in k and k not in _stacked_key_candidates(backing, mid)
-            ]
+            bucket_keys = frozenset(bucket)
+            extra = [k for k in wm if needle in k and mid in k and k not in bucket_keys]
             if extra:
-                idx = getattr(backing, "_stacked_key_index", None)
-                if idx is not None:
-                    idx.setdefault(mid, []).extend(extra)
+                # bucket IS idx[mid] — extending it folds the exotic
+                # spelling into the index for repeat lookups.
+                bucket.extend(extra)
                 return extra[0]
     if wm and required:
         raise ValueError(
@@ -281,19 +291,29 @@ def _source_packing(src: Any) -> tuple[int, int, str]:
     )
 
 
+# Attribute paths from the model root that may carry a config object with
+# hidden_size / moe_intermediate_size (LLM + VLM wrapper spellings).
+_CONFIG_ATTR_PATHS = (
+    ("args",),
+    ("model", "args"),
+    ("language_model", "args"),
+    ("language_model", "model", "args"),
+    ("config",),
+    ("config", "text_config"),
+    ("language_model", "config"),
+    ("language_model", "model", "config"),
+)
+
+
 def _model_config_candidates(model: Any) -> list[Any]:
     """Collect potential config objects for dim resolution (LLM + VLM wrappers)."""
     candidates = []
-    for obj in [
-        getattr(model, "args", None),
-        getattr(getattr(model, "model", None), "args", None),
-        getattr(getattr(model, "language_model", None), "args", None),
-        getattr(getattr(getattr(model, "language_model", None), "model", None), "args", None),
-        getattr(model, "config", None),
-        getattr(getattr(model, "config", None), "text_config", None),
-        getattr(getattr(model, "language_model", None), "config", None),
-        getattr(getattr(getattr(model, "language_model", None), "model", None), "config", None),
-    ]:
+    for path in _CONFIG_ATTR_PATHS:
+        obj = model
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
         if obj is not None:
             candidates.append(obj)
     return candidates
@@ -308,36 +328,30 @@ def _resolve_moe_dims(cfg_candidates: list[Any], estimate: Any = None) -> tuple[
     table — a guessed moe_intermediate mis-slices every expert
     bank silently, so an unresolvable pair fails loudly here instead.
     """
-    hidden: int | None = None
-    moe_hidden: int | None = None
+    found: dict[str, int | None] = {
+        "hidden_size": None,
+        "moe_intermediate_size": None,
+    }
     for cand in cfg_candidates:
         try:
-            h = getattr(cand, "hidden_size", None)
-            if h is None and isinstance(cand, dict):
-                h = cand.get("hidden_size")
-            if h is not None:
-                hidden = int(h)
-            m = getattr(cand, "moe_intermediate_size", None)
-            if m is None and isinstance(cand, dict):
-                m = cand.get("moe_intermediate_size")
-            if m is not None:
-                moe_hidden = int(m)
-            if hidden is not None and moe_hidden is not None:
+            for attr in found:
+                v = getattr(cand, attr, None)
+                if v is None and isinstance(cand, dict):
+                    v = cand.get(attr)
+                if v is not None:
+                    found[attr] = int(v)
+            if all(v is not None for v in found.values()):
                 break
         except Exception:
             continue
-    if hidden is None or hidden <= 0:
-        try:
-            h = int(getattr(estimate, "hidden_size", 0) or 0)
-            hidden = h if h > 0 else None
-        except (TypeError, ValueError):
-            hidden = None
-    if moe_hidden is None or moe_hidden <= 0:
-        try:
-            m = int(getattr(estimate, "moe_intermediate_size", 0) or 0)
-            moe_hidden = m if m > 0 else None
-        except (TypeError, ValueError):
-            moe_hidden = None
+    for attr in found:
+        if found[attr] is None or found[attr] <= 0:
+            try:
+                v = int(getattr(estimate, attr, 0) or 0)
+                found[attr] = v if v > 0 else None
+            except (TypeError, ValueError):
+                found[attr] = None
+    hidden, moe_hidden = found["hidden_size"], found["moe_intermediate_size"]
     if hidden is None or moe_hidden is None:
         raise ValueError(
             "Expert streaming: could not resolve (hidden, moe_intermediate) "
@@ -382,17 +396,19 @@ def _convert_switch_mlp_module(
     if switch_mlp is None:
         return False
 
+    # (attr, projection) pairs in canonical order — every "first present
+    # projection" lookup below reads projs[0].
+    projs = [
+        (a, p) for a in _PROJ_ATTRS if (p := getattr(switch_mlp, a, None)) is not None
+    ]
+
     # Determine quantized vs bf16: QuantizedSwitchLinear has 'scales'
-    is_quantized = False
-    for attr in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
-        proj = getattr(switch_mlp, attr, None)
-        if proj is not None:
-            if hasattr(proj, "scales") or "scales" in getattr(proj, "_data", {}):
-                is_quantized = True
-                break
-            if proj.__class__.__name__ == "QuantizedSwitchLinear":
-                is_quantized = True
-                break
+    is_quantized = any(
+        hasattr(p, "scales")
+        or "scales" in getattr(p, "_data", {})
+        or p.__class__.__name__ == "QuantizedSwitchLinear"
+        for _, p in projs
+    )
 
     n_experts = estimate.experts_per_layer
 
@@ -436,28 +452,22 @@ def _convert_switch_mlp_module(
     bits: int | None = None
     mode: str | None = None
     if is_quantized:
-        for attr in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
-            proj = getattr(switch_mlp, attr, None)
-            if proj is not None:
-                for _name in ("group_size", "bits", "mode"):
-                    if getattr(proj, _name, None) is None:
-                        raise ValueError(
-                            f"Expert streaming: quantized {attr} of layer "
-                            f"{layer_idx} lacks {(_name)!r} — refusing to guess "
-                            "packing (would mis-slice expert banks)"
-                        )
-                group_size = int(getattr(proj, "group_size"))
-                bits = int(getattr(proj, "bits"))
-                mode = str(getattr(proj, "mode"))
-                break
-        if group_size is None or bits is None or mode is None:
+        if not projs:
             raise ValueError(
                 f"Expert streaming: quantized layer {layer_idx} exposes no "
                 "projection to read packing from"
             )
-
-    def _proj_packing(src):
-        return _source_packing(src)
+        pack_attr, pack_proj = projs[0]
+        for _name in ("group_size", "bits", "mode"):
+            if getattr(pack_proj, _name, None) is None:
+                raise ValueError(
+                    f"Expert streaming: quantized {pack_attr} of layer "
+                    f"{layer_idx} lacks {_name!r} — refusing to guess "
+                    "packing (would mis-slice expert banks)"
+                )
+        group_size = int(pack_proj.group_size)
+        bits = int(pack_proj.bits)
+        mode = str(pack_proj.mode)
 
     # Cold precision tier: when the backing serves this layer's banks
     # from expert_cold/, every projection of the layer computes at the
@@ -467,29 +477,21 @@ def _convert_switch_mlp_module(
     # SOURCE packing (hot experts) and the cold packing is attached per
     # linear below (dual gather_qmm).
     hobbit_cold_params: tuple[int, int] | None = None
-    if hasattr(backing, "cold_quant_params"):
-        first_attr = next(
-            (
-                a
-                for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
-                if getattr(switch_mlp, a, None) is not None
-            ),
-            None,
+    if hasattr(backing, "cold_quant_params") and projs:
+        first_attr = projs[0][0]
+        probe_key = _resolve_stacked_key(
+            candidates_for(first_attr, "weight"),
+            first_attr,
+            "weight",
+            backing,
+            needle,
         )
-        if first_attr is not None:
-            probe_key = _resolve_stacked_key(
-                candidates_for(first_attr, "weight"),
-                first_attr,
-                "weight",
-                backing,
-                needle,
-            )
-            cold_params = backing.cold_quant_params(probe_key)
-            if cold_params is not None:
-                if hot_ids:
-                    hobbit_cold_params = cold_params
-                else:
-                    bits, group_size = cold_params
+        cold_params = backing.cold_quant_params(probe_key)
+        if cold_params is not None:
+            if hot_ids:
+                hobbit_cold_params = cold_params
+            else:
+                bits, group_size = cold_params
 
     streaming_glu = StreamingSwitchGLU(
         input_dims=hidden,
@@ -561,7 +563,7 @@ def _convert_switch_mlp_module(
             stacked_b_key = _resolve_stacked_key(
                 candidates_for(proj_name, "biases"), proj_name, "biases", backing, needle, required=False
             )
-            _p_gs, _p_bits, _p_mode = _proj_packing(src)
+            _p_gs, _p_bits, _p_mode = _source_packing(src)
             lin = StreamingQuantizedSwitchLinear(
                 layer_idx=layer_idx,
                 proj_name=proj_name,
@@ -619,10 +621,7 @@ def _convert_switch_mlp_module(
     # routes the reads (set_hot_experts). Skipping this leaves the linear
     # uniform while the backing splits — mixed packings in one mini-bank.
     if hot_ids and is_quantized and hobbit_cold_params is not None:
-        for lin_ in (
-            getattr(streaming_glu, a, None)
-            for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
-        ):
+        for lin_ in (getattr(streaming_glu, a, None) for a in _PROJ_ATTRS):
             if lin_ is not None and hasattr(lin_, "set_hobbit_split"):
                 lin_.set_hobbit_split(hot_ids, hobbit_cold_params[0], hobbit_cold_params[1])
 
@@ -641,40 +640,32 @@ def _convert_switch_mlp_module(
             _spec_state.register_linears(
                 layer_idx,
                 [
-                    getattr(streaming_glu, a, None)
-                    for a in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
-                    if isinstance(getattr(streaming_glu, a, None), StreamingQuantizedSwitchLinear)
+                    lin
+                    for a in _PROJ_ATTRS
+                    if isinstance(
+                        (lin := getattr(streaming_glu, a, None)),
+                        StreamingQuantizedSwitchLinear,
+                    )
                 ],
             )
 
-    # Per-GLU projection count for cache slot reconciliation. A fused
-    # gate_up GLU holds 2 projections (gate_up + down), a split GLU 3 —
-    # the global cache was sized for the majority layout, so the convert
-    # loop below reconciles any drift (see _reconcile_cache_slots).
-    # Discriminate on gate_up_proj, NOT on list truthiness: down_proj exists
-    # in BOTH layouts, so the fused tuple is never empty and an `or` fallback
-    # would short-circuit every split GLU to n_proj=1 (3x budget under-fill).
-    if hasattr(streaming_glu, "gate_up_proj"):
-        n_proj = len(
-            [a for a in ("gate_up_proj", "down_proj") if hasattr(streaming_glu, a)]
-        )
-    else:
-        n_proj = len(
-            [a for a in ("gate_proj", "up_proj", "down_proj") if hasattr(streaming_glu, a)]
-        ) or 1
-    streaming_glu.n_proj = n_proj  # type: ignore[attr-defined]
-
-    # The per-layer load context's projection list (2 fused
-    # gate_up+down, 3 split) — consumed by the scheduler's guard accounting
-    # (_glu_projection_count).
+    # Per-GLU projection count + the per-layer load context's projection
+    # list (2 fused gate_up+down, 3 split) — consumed by the scheduler's
+    # guard accounting (_glu_projection_count) and by cache slot
+    # reconciliation. The global cache was sized for the majority layout;
+    # the convert loop below reconciles any drift (see _reconcile_cache).
+    # Discriminate on gate_up_proj, NOT on list truthiness: down_proj
+    # exists in BOTH layouts, so an `or` fallback would short-circuit
+    # every split GLU to n_proj=1 (3x budget under-fill).
+    _lin_attrs = (
+        ("gate_up_proj", "down_proj")
+        if hasattr(streaming_glu, "gate_up_proj")
+        else ("up_proj", "gate_proj", "down_proj")
+    )
     streaming_glu.linears = [  # type: ignore[attr-defined]
-        getattr(streaming_glu, a, None)
-        for a in ("gate_up_proj", "down_proj") if hasattr(streaming_glu, "gate_up_proj")
-    ] or [
-        getattr(streaming_glu, a, None)
-        for a in ("up_proj", "gate_proj", "down_proj")
-        if getattr(streaming_glu, a, None) is not None
+        lin for a in _lin_attrs if (lin := getattr(streaming_glu, a, None)) is not None
     ]
+    streaming_glu.n_proj = len(streaming_glu.linears) or 1  # type: ignore[attr-defined]
 
     # Replace
     moe.switch_mlp = streaming_glu  # type: ignore[attr-defined]
@@ -697,6 +688,15 @@ def _convert_switch_mlp_module(
     return True
 
 
+def _switch_glus(layers: Any, attr_chain: tuple[str, ...] = ("mlp", "ffn")):
+    """Yield (layer_idx, switch_mlp) for each layer holding a switch_mlp."""
+    for layer_idx, layer in enumerate(layers or ()):
+        moe = find_moe_container(layer, attr_chain)
+        sm = getattr(moe, "switch_mlp", None)
+        if sm is not None:
+            yield layer_idx, sm
+
+
 def _glu_projection_count(layers: Any, attr_chain: tuple[str, ...] = ("mlp", "ffn")) -> int:
     """Projections sharing one per-layer load context on a converted model.
 
@@ -708,11 +708,8 @@ def _glu_projection_count(layers: Any, attr_chain: tuple[str, ...] = ("mlp", "ff
     (the conservative split case) when no converted GLU is reachable.
     """
     try:
-        for layer in layers or ():
-            moe = find_moe_container(layer, attr_chain)
-            linears = getattr(
-                getattr(moe, "switch_mlp", None), "linears", None
-            )
+        for _idx, sm in _switch_glus(layers, attr_chain):
+            linears = getattr(sm, "linears", None)
             # An empty/unsized linears is not a converted GLU — keep
             # looking rather than reporting 0 projections.
             if linears and len(linears) > 0:
@@ -720,6 +717,7 @@ def _glu_projection_count(layers: Any, attr_chain: tuple[str, ...] = ("mlp", "ff
     except Exception:  # noqa: BLE001
         pass
     return 3
+
 
 def _plan_conversion(
     model_path: str | Path,
@@ -743,7 +741,7 @@ def _plan_conversion(
         )
         return None
 
-    from . import _resolve_budget_bytes
+    from . import resolve_budget_bytes
     from .residency import expert_streaming_estimate
 
     estimate = expert_streaming_estimate(str(model_path))
@@ -752,7 +750,7 @@ def _plan_conversion(
         return None
 
     if budget_bytes is None:
-        budget_bytes = _resolve_budget_bytes(model_settings)
+        budget_bytes = resolve_budget_bytes(model_settings)
 
     per_expert = estimate.per_expert_bytes or 0
     # One cache slot holds ONE projection's slice (gate/up/down are separate
@@ -767,13 +765,6 @@ def _plan_conversion(
     # Report slots and experts separately: `slots_for_budget` counts EXPERTS
     # (it divides by the whole per_expert_bytes), while the cache counts
     # SLOTS — the units differ by n_proj.
-    _experts_resident = estimate.slots_for_budget(budget_bytes)
-    _slots_resident = (
-        (budget_bytes // per_slot) if per_slot else 0
-    )
-    _slots_per_layer = (
-        _slots_resident // estimate.num_moe_layers if estimate.num_moe_layers else 0
-    )
     logger.info(
         "Expert streaming: converting %s: budget=%.2f GiB (%s), layers=%d, experts/layer=%d, "
         "per_expert=%.2f MB, per_slot=%.2f MB, slots/layer=%d, experts resident/layer=%d",
@@ -784,12 +775,15 @@ def _plan_conversion(
         estimate.experts_per_layer,
         estimate.per_expert_bytes / 1024 / 1024,
         per_slot / 1024 / 1024,
-        _slots_per_layer,
-        _experts_resident,
+        (
+            ((budget_bytes // per_slot) // estimate.num_moe_layers)
+            if per_slot and estimate.num_moe_layers
+            else 0
+        ),
+        estimate.slots_for_budget(budget_bytes),
     )
 
     return estimate, budget_bytes, per_slot
-
 
 
 def _make_streaming_cache_and_governor(
@@ -833,17 +827,19 @@ def _make_streaming_cache_and_governor(
                 _max_dynamic_budget_bytes,
             )
 
-            _gov_max_gib = io_ov.get("expert_streaming_dynamic_max_gib")
-            _gov_max = (
-                int(_gov_max_gib * 1024**3)
-                if _gov_max_gib is not None
-                else _max_dynamic_budget_bytes()
+            def _gib(key: str, default) -> int:
+                """io_ov GiB knob -> bytes (already range-validated);
+                callable *default* stays lazy so _total_ram_bytes only
+                runs when the knob is unset."""
+                v = io_ov.get(key)
+                return default() if v is None else int(v * 1024**3)
+
+            _gov_max = _gib(
+                "expert_streaming_dynamic_max_gib", _max_dynamic_budget_bytes
             )
-            _gov_min_gib = io_ov.get("expert_streaming_dynamic_min_gib")
-            _gov_min = (
-                int(_gov_min_gib * 1024**3)
-                if _gov_min_gib is not None
-                else max(int(0.25 * 1024**3), int(budget_bytes) // 4)
+            _gov_min = _gib(
+                "expert_streaming_dynamic_min_gib",
+                lambda: max(int(0.25 * 1024**3), int(budget_bytes) // 4),
             )
             _gov_stall = io_ov.get("expert_streaming_dynamic_stall_target")
             _governor = ExpertResidencyGovernor(
@@ -852,11 +848,7 @@ def _make_streaming_cache_and_governor(
                 estimate.num_moe_layers,
                 max(_gov_max, int(budget_bytes)),
                 min_budget_bytes=_gov_min,
-                **(
-                    {"stall_target": _gov_stall}
-                    if _gov_stall is not None
-                    else {}
-                ),
+                **({"stall_target": _gov_stall} if _gov_stall is not None else {}),
             )
             logger.info(
                 "Expert streaming: dynamic residency governor armed (budget %.2f GiB, min %.2f GiB, max %.2f GiB)",
@@ -874,7 +866,6 @@ def _make_streaming_cache_and_governor(
     # over-pins fused models (2 projections) by 1.5x.
 
     return cache, io_ov, _governor
-
 
 
 def _resolve_cold_tier_root(model_path, model_settings) -> "Path | None":
@@ -900,8 +891,8 @@ def _resolve_cold_tier_root(model_path, model_settings) -> "Path | None":
         # sandboxed checkout) instead of <model>/expert_cold. The
         # runtime only requires the tier SHARDS to be complete
         # (cold_tier_status checks whichever dir is used).
-        cold_root = Path(os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT", "")) \
-            if os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT") else None
+        _cr_env = os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT")
+        cold_root = Path(_cr_env) if _cr_env else None
         cold_dir = cold_root if cold_root is not None else Path(model_path) / "expert_cold"
         ok, why = _cold_tier_status_dir(cold_dir, Path(model_path))
         if ok:
@@ -950,32 +941,20 @@ def _resolve_cold_tier_root(model_path, model_settings) -> "Path | None":
     return cold_root
 
 
-def _absorb_dsv4_spill(backing, model_path) -> int:
-    """dsv4 spill-stacking: per-expert JANGQ checkpoints serve their
-    stacked banks from spill shards outside the model dir. Absorb the
-    manifest mapping so the stacked keys resolve without header scans.
-    Returns the number of spilled banks absorbed."""
-    _spill_absorbed = 0
-    try:
-        from ..deepseek_v4 import spill as _dsv4_spill
+def _resolve_hot_fraction(io_ov: dict) -> float | None:
+    """HOBBIT hot fraction for this model.
 
-        _spill_dir = _dsv4_spill.spill_is_valid(model_path)
-        if _spill_dir is not None:
-            _spill_manifest = _dsv4_spill.read_manifest(_spill_dir) or {}
-            _absorbed = backing.absorb_extra_map(
-                _spill_dir,
-                _dsv4_spill.spill_key_to_file(_spill_manifest),
-            )
-            _spill_absorbed = int(_absorbed or 0)
-            if _absorbed:
-                logger.info(
-                    "Expert streaming: %d spilled banks absorbed from %s",
-                    _absorbed,
-                    _spill_dir,
-                )
-    except Exception:
-        logger.debug("Expert streaming: spill absorb skipped", exc_info=True)
-    return _spill_absorbed
+    Contract (UI/bench): None/unset = UNIFORM tier — the split is opt-in
+    per model, like the tier itself. The env default
+    (OMLX_EXPERT_STREAMING_HOT_FRACTION) stays the bench/developer
+    override and wins only when the setting is unset.
+    """
+    from . import shard_bank as _shard_mod
+
+    hf = io_ov.get("expert_streaming_hot_fraction")
+    if hf is None:
+        hf = _shard_mod.HOT_FRACTION_ENV or None
+    return max(0.0, min(1.0, float(hf))) if hf is not None else None
 
 
 def _apply_hobbit_split(
@@ -991,19 +970,7 @@ def _apply_hobbit_split(
 
     hot_ids_by_layer: dict[int, set] = {}
     if cold_root is not None:
-        # Contract (UI/bench): None/unset hot fraction = UNIFORM tier
-        # — the split is opt-in per model, like the tier itself.
-        # The env default (OMLX_EXPERT_STREAMING_HOT_FRACTION) stays
-        # the bench/developer override and wins only when the
-        # setting is unset.
-        hf_setting = io_ov.get("expert_streaming_hot_fraction")
-        if hf_setting is None:
-            hf_setting = _shard_mod.HOT_FRACTION_ENV or None
-        hot_fraction = (
-            None
-            if hf_setting is None
-            else max(0.0, min(1.0, float(hf_setting)))
-        )
+        hot_fraction = _resolve_hot_fraction(io_ov)
         hot_keys = (
             _shard_mod.load_hot_set_from_profile(
                 Path(model_path) / ".omlx" / "expert_pin_profile.json",
@@ -1036,35 +1003,6 @@ def _apply_hobbit_split(
     return hot_ids_by_layer
 
 
-def _stamp_guard_info(backing, estimate) -> None:
-    """Guard metadata for the scheduler's prefill chunk sizing: the
-    lazy chunk forward holds every MoE layer's assembled mini-bank
-    until the chunk-end eval, so the peak carries ~one bank per
-    layer simultaneously. Without this term the guard under-predicts
-    and admits chunks whose real peak reaches ~26 GB on qwen4_exp
-    (48 layers x ~215 uniq experts x ~2.5 MB).
-
-    boundary_active starts False — the per-layer
-    bank charge is the safe default, and it is only relaxed once a
-    per-layer eval boundary has actually been installed on a
-    decoder class (set below, after conversion). projections is
-    the number of projections sharing one per-layer load context
-    (2 fused gate_up+down, or 3 split); the guard charges
-    min(2, projections) banks. bf16/fp16 activation: one
-    materialized layer output per token. 0 when the config hid
-    hidden_size — conservative.
-    """
-    _hidden_size = int(getattr(estimate, "hidden_size", 0) or 0)
-    backing.streaming_guard_info = {
-        "num_moe_layers": estimate.num_moe_layers,
-        "experts_per_layer": estimate.experts_per_layer,
-        "per_expert_bytes": estimate.per_expert_bytes,
-        "boundary_active": False,
-        "projections": 3,
-        "activation_bytes_per_token": 2 * _hidden_size,
-    }
-
-
 def _build_expert_backing(
     model_path: str | Path,
     model_settings: Any | None,
@@ -1093,11 +1031,55 @@ def _build_expert_backing(
 
             cold_root = _resolve_cold_tier_root(model_path, model_settings)
             backing = ExpertBackingStore(model_path, cold_root=cold_root)
-            _absorb_dsv4_spill(backing, model_path)
+            # dsv4 spill-stacking: per-expert JANGQ checkpoints serve
+            # their stacked banks from spill shards outside the model
+            # dir. Absorb the manifest mapping so the stacked keys
+            # resolve without header scans.
+            try:
+                from ..deepseek_v4 import spill as _dsv4_spill
+
+                _spill_dir = _dsv4_spill.spill_is_valid(model_path)
+                if _spill_dir is not None:
+                    _spill_manifest = _dsv4_spill.read_manifest(_spill_dir) or {}
+                    _absorbed = backing.absorb_extra_map(
+                        _spill_dir,
+                        _dsv4_spill.spill_key_to_file(_spill_manifest),
+                    )
+                    if _absorbed:
+                        logger.info(
+                            "Expert streaming: %d spilled banks absorbed from %s",
+                            _absorbed,
+                            _spill_dir,
+                        )
+            except Exception:
+                logger.debug("Expert streaming: spill absorb skipped", exc_info=True)
             hot_ids_by_layer = _apply_hobbit_split(
                 backing, model_path, io_ov, estimate, cold_root
             )
-            _stamp_guard_info(backing, estimate)
+            # Guard metadata for the scheduler's prefill chunk sizing:
+            # the lazy chunk forward holds every MoE layer's assembled
+            # mini-bank until the chunk-end eval, so the peak carries
+            # ~one bank per layer simultaneously. Without this term the
+            # guard under-predicts and admits chunks whose real peak
+            # reaches ~26 GB on qwen4_exp (48 layers x ~215 uniq experts
+            # x ~2.5 MB). boundary_active starts False — the per-layer
+            # bank charge is the safe default, relaxed only once a
+            # per-layer eval boundary is actually installed (set after
+            # conversion). projections is the number of projections
+            # sharing one per-layer load context (2 fused gate_up+down,
+            # 3 split); the guard charges min(2, projections) banks.
+            # activation_bytes_per_token: one materialized bf16/fp16
+            # layer output per token; 0 when the config hid
+            # hidden_size — conservative.
+            _hidden_size = int(getattr(estimate, "hidden_size", 0) or 0)
+            backing.streaming_guard_info = {
+                "num_moe_layers": estimate.num_moe_layers,
+                "experts_per_layer": estimate.experts_per_layer,
+                "per_expert_bytes": estimate.per_expert_bytes,
+                "boundary_active": False,
+                "projections": 3,
+                "activation_bytes_per_token": 2 * _hidden_size,
+            }
             backing_kind = "mmap"
         except Exception as e:
             # Fail clean: a model admitted only because SSD streaming fits
@@ -1110,55 +1092,16 @@ def _build_expert_backing(
     # RAM dict path: only for explicit use_file_backing=False (unit tests).
     # Production (file backing) either has an mmap backing by now or raised
     # above — never silently retain all banks in RAM.
-    ram_dict: dict[tuple, Any] | None = None
     if backing is None:
         if use_file_backing:
             raise RuntimeError(
                 f"Expert streaming: SSD backing missing for {model_path} "
                 "(refusing RAM fallback that would OOM)"
             )
-        ram_dict = {}
-        backing = ram_dict  # type: ignore[assignment]
+        backing = {}
         backing_kind = "ram-dict"
 
     return backing, backing_kind, hot_ids_by_layer, cold_root
-
-
-
-def _attach_speculation(cache: Any, backing: Any, _governor: Any) -> None:
-    """Wire one SpeculationState (and the governor) onto cache+backing."""
-    # One speculation state per conversion. It hangs off the
-    # cache (always) and off the backing store (file backing) so close()
-    # drains the speculation workers with the readers.
-    from .streaming_switch import SpeculationState
-
-    _spec_state = SpeculationState()
-    cache.spec_state = _spec_state  # type: ignore[attr-defined]
-    if _governor is not None:
-        # Same reachability path as the cache: the engine finds the governor
-        # through the backing at request boundaries.
-        cache.governor = _governor  # type: ignore[attr-defined]
-    if not isinstance(backing, dict):
-        backing.spec_state = _spec_state  # type: ignore[attr-defined]
-        if _governor is not None:
-            backing.governor = _governor  # type: ignore[attr-defined]
-        # Reload the learned transition table so the k+1 overfetch is
-        # warm from token 1 (fingerprintMismatch -> ignored, never silent).
-        try:
-            load_transition_profile(backing, _spec_state)
-        except Exception:
-            logger.debug(
-                "Expert streaming: transition profile load failed",
-                exc_info=True,
-            )
-        # The engine reaches the shared cache through the backing it
-        # already holds (for the per-request summary log).
-        try:
-            backing._streaming_cache = cache  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-
 
 
 def _find_decoder_layers(model: Any) -> tuple[Any, Any]:
@@ -1209,7 +1152,6 @@ def _find_decoder_layers(model: Any) -> tuple[Any, Any]:
     return layers, layers_owner
 
 
-
 def _convert_moe_layers(
     layers: Any,
     layers_owner: Any,
@@ -1224,79 +1166,85 @@ def _convert_moe_layers(
     hidden: int,
     moe_hidden: int,
     hot_ids_by_layer: dict,
-) -> tuple[int, int, Any]:
+) -> tuple[int, Any]:
     """Convert main decoder + MTP/DSpark stage banks.
 
-    Returns (converted, mtp_converted, mtp_stages).
+    Returns (converted, mtp_stages); the converted count already
+    includes any MTP-stage conversions.
     """
+    # One worklist: main decoder layers first (whichever chain attribute
+    # holds a switch_mlp is the MoE container — ``mlp`` for GLM/Qwen,
+    # ``ffn`` for DeepSeek V4), then DeepSeek V4 MTP/DSpark stages, which
+    # carry their own SwitchGLU banks (mtp.<stage>.ffn on DSpark
+    # checkpoints, mtp.<stage>.block.ffn on the legacy MTPBlock layout).
+    # Streaming them keeps the ~3 GB/stage banks out of RAM on
+    # low-memory hosts. MTP stages live next to the decoder stack, but
+    # not always on the same owner that holds it: glm5_next VLM resolves
+    # layers through the root Model.layers property while the draft
+    # hangs off language_model.mtp. Walk nearby owners before giving up.
+    mtp_stages = find_mtp_stages((layers_owner, model), _hooks.mtp_owner_chain)
+    n_trunk = len(layers)
+    worklist = [
+        (
+            layer,
+            layer_idx,
+            (
+                lambda proj, suffix, _i=layer_idx: _candidate_stacked_keys(
+                    _i, proj, suffix, templates=_templates
+                )
+            ),
+            f"layers.{layer_idx}.",
+            hot_ids_by_layer.get(layer_idx),
+        )
+        for layer_idx, layer in enumerate(layers)
+        if layer is not None
+    ] + [
+        (
+            stage,
+            n_trunk + stage_idx,
+            (
+                lambda proj, suffix, _s=stage_idx: _mtp_candidate_stacked_keys(
+                    _s, proj, suffix, trunk_layers=n_trunk
+                )
+            ),
+            f"mtp.{stage_idx}.",
+            None,
+        )
+        for stage_idx, stage in enumerate(mtp_stages or ())
+        if stage is not None
+    ]
+
     converted = 0
-    # Main decoder layers: whichever chain attribute holds a switch_mlp is
-    # the MoE container (``mlp`` for GLM/Qwen, ``ffn`` for DeepSeek V4).
-    for layer_idx, layer in enumerate(layers):
-        if layer is None:
-            continue
-        moe = find_moe_container(layer, _moe_chain)
+    mtp_converted = 0
+    for node, conv_idx, candidates_for, needle, hot_ids in worklist:
+        moe = find_moe_container(node, _moe_chain)
         if moe is None:
             continue
         if _convert_switch_mlp_module(
             moe,
-            layer_idx,
-            candidates_for=lambda proj, suffix, _i=layer_idx: _candidate_stacked_keys(_i, proj, suffix, templates=_templates),
-            needle=f"layers.{layer_idx}.",
+            conv_idx,
+            candidates_for=candidates_for,
+            needle=needle,
             backing=backing,
             backing_kind=backing_kind,
             cache=cache,
             estimate=estimate,
             hidden=hidden,
             moe_hidden=moe_hidden,
-            layer=find_moe_owner(layer, moe),
-            hot_ids=hot_ids_by_layer.get(layer_idx),
+            layer=find_moe_owner(node, moe, _moe_chain),
+            hot_ids=hot_ids,
         ):
             converted += 1
-
-    # DeepSeek V4 MTP/DSpark stages carry their own SwitchGLU banks
-    # (mtp.<stage>.ffn on DSpark checkpoints, mtp.<stage>.block.ffn on the
-    # legacy MTPBlock layout). Streaming them keeps the ~3 GB/stage banks
-    # out of RAM on low-memory hosts.
-    # MTP stages live next to the decoder stack, but not always on the
-    # same owner that holds it: glm5_next VLM resolves layers through the
-    # root Model.layers property while the draft hangs off
-    # language_model.mtp. Walk nearby owners before giving up.
-    mtp_stages = find_mtp_stages((layers_owner, model), _hooks.mtp_owner_chain)
-    mtp_converted = 0
-    if mtp_stages:
-        for stage_idx, stage in enumerate(mtp_stages):
-            if stage is None:
-                continue
-            stage_moe = find_moe_container(stage, _moe_chain)
-            compile_owner = find_moe_owner(stage, stage_moe)
-            if stage_moe is None:
-                continue
-            if _convert_switch_mlp_module(
-                stage_moe,
-                len(layers) + stage_idx,
-                candidates_for=lambda proj, suffix, _s=stage_idx, _n=len(layers): _mtp_candidate_stacked_keys(_s, proj, suffix, trunk_layers=_n),
-                needle=f"mtp.{stage_idx}.",
-                backing=backing,
-                backing_kind=backing_kind,
-                cache=cache,
-                estimate=estimate,
-                hidden=hidden,
-                moe_hidden=moe_hidden,
-                layer=compile_owner,
-                hot_ids=None,
-            ):
+            if needle.startswith("mtp."):
                 mtp_converted += 1
-                converted += 1
-        if mtp_converted:
-            logger.info(
-                "Expert streaming: converted %d/%d MTP/DSpark stage MoE banks",
-                mtp_converted,
-                len(mtp_stages),
-            )
+    if mtp_converted:
+        logger.info(
+            "Expert streaming: converted %d/%d MTP/DSpark stage MoE banks",
+            mtp_converted,
+            len(mtp_stages),
+        )
 
-    return converted, mtp_converted, mtp_stages
-
+    return converted, mtp_stages
 
 
 def _reconcile_cache(
@@ -1326,9 +1274,7 @@ def _reconcile_cache(
     if converted and per_expert and budget_bytes > 0:
         try:
             _n_projs: list[int] = []
-            for _layer in layers or ():
-                _moe = find_moe_container(_layer, _moe_chain)
-                _sm = getattr(_moe, "switch_mlp", None)
+            for _i, _sm in _switch_glus(layers, _moe_chain):
                 _np = getattr(_sm, "n_proj", None)
                 if isinstance(_np, int) and _np > 0:
                     _n_projs.append(_np)
@@ -1385,26 +1331,6 @@ def _reconcile_cache(
                     _pin(max(0, _prefill_slots))
         except Exception:
             logger.debug("prefill budget pin failed", exc_info=True)
-
-
-
-
-def _wire_io_overrides_logged(layers, mtp_stages, io_ov, _moe_chain) -> None:
-    """Per-model IO overrides (autotune): pool depth + run coalescing ride
-    the streaming linears; unset values keep the env-var defaults.
-    (io_ov was resolved before the backing block — the HOBBIT split
-    reads hot_fraction from it during backing construction.)"""
-    io_wired = _wire_streaming_io_overrides(
-        layers, mtp_stages, io_ov["expert_streaming_io_depth"], io_ov["expert_streaming_coalesce"],
-        attr_chain=_moe_chain,
-    )
-    if io_wired:
-        logger.info(
-            "Expert streaming: IO overrides wired (io_depth=%s coalesce=%s, %d linears)",
-            io_ov["expert_streaming_io_depth"],
-            io_ov["expert_streaming_coalesce"],
-            io_wired,
-        )
 
 
 def _stamp_instance_routing(
@@ -1477,7 +1403,9 @@ def _wire_stream_eval_boundary(layers, io_ov, _moe_chain, _hooks, backing) -> No
     """
     from .qwen35_stream_eval import (
         apply_qwen35_moe_stream_eval,
+        boundary_active_for_layers as _qse_boundary_for_layers,
         configure_from_settings as configure_stream_eval,
+        wrapped_class_names as _qse_wrapped,
     )
 
     eval_on = configure_stream_eval(io_ov["expert_streaming_per_layer_eval"])
@@ -1494,19 +1422,13 @@ def _wire_stream_eval_boundary(layers, io_ov, _moe_chain, _hooks, backing) -> No
     # decoder such as Glm5NextDecoderLayer). The verdict is per-model:
     # a process-global "some qwen class is wrapped" must not credit
     # (or discredit) an unrelated family.
-    from .qwen35_stream_eval import (
-        boundary_active_for_layers as _qse_boundary_for_layers,
-    )
-    from .qwen35_stream_eval import wrapped_class_names as _qse_wrapped
 
     _guard_info = getattr(backing, "streaming_guard_info", None)
     if isinstance(_guard_info, dict):
         _guard_info["boundary_active"] = bool(
             eval_on and _qse_boundary_for_layers(layers)
         )
-        _guard_info["projections"] = _glu_projection_count(
-            layers, _moe_chain
-        )
+        _guard_info["projections"] = _glu_projection_count(layers, _moe_chain)
         if _guard_info["boundary_active"]:
             logger.info(
                 "Expert streaming: prefill guard boundary accounting on "
@@ -1529,42 +1451,33 @@ def _attach_warm_pin_hooks(
     defaults ON, as does the prefill-hotness cache seed (SEED). The
     per-model readahead/seed settings (autotune) override the env
     defaults when set."""
-    from . import shard_bank as _shard_mod
     from . import warmer as _warmer_mod
 
-    ra_setting = io_ov["expert_streaming_readahead"]
-    ra_enabled = (
-        _warmer_mod.RA_ENABLED if ra_setting is None else bool(ra_setting)
-    )
-    seed_setting = io_ov["expert_streaming_seed"]
-    seed_enabled = (
-        _warmer_mod.SEED_ENABLED if seed_setting is None else bool(seed_setting)
-    )
-    pins_setting = io_ov["expert_streaming_pins"]
-    pins_enabled = (
-        _warmer_mod.PIN_ENABLED if pins_setting is None else bool(pins_setting)
-    )
+    def _env_or(key: str, env_default: bool) -> bool:
+        """Per-model bool knob: the env default applies only when the
+        setting is unset."""
+        setting = io_ov[key]
+        return env_default if setting is None else bool(setting)
+
+    ra_enabled = _env_or("expert_streaming_readahead", _warmer_mod.RA_ENABLED)
+    seed_enabled = _env_or("expert_streaming_seed", _warmer_mod.SEED_ENABLED)
+    pins_enabled = _env_or("expert_streaming_pins", _warmer_mod.PIN_ENABLED)
     pin_gib = io_ov["expert_streaming_pin_gib"]
     pin_budget_bytes = (
         _warmer_mod.PIN_BUDGET_BYTES
         if pin_gib is None
-        else max(0, min(64.0, float(pin_gib))) * 1024**3
+        else float(pin_gib) * 1024**3  # io_ov already validated (0, 64]
     )
 
     if pins_enabled or ra_enabled or seed_enabled:
         try:
-            glus: dict[int, Any] = {}
-            for layer_idx_, layer_ in enumerate(layers):
-                moe_ = find_moe_container(layer_, _moe_chain)
-                sm_ = getattr(moe_, "switch_mlp", None)
-                if sm_ is not None and hasattr(sm_, "down_proj"):
-                    glus[layer_idx_] = sm_
+            glus: dict[int, Any] = {
+                i: sm
+                for i, sm in _switch_glus(layers, _moe_chain)
+                if hasattr(sm, "down_proj")
+            }
             linears_by_layer: dict[int, list] = {
-                i: [
-                    getattr(g, p)
-                    for p in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
-                    if hasattr(g, p)
-                ]
+                i: [getattr(g, p) for p in _PROJ_ATTRS if hasattr(g, p)]
                 for i, g in glus.items()
             }
             warmer = (
@@ -1595,14 +1508,7 @@ def _attach_warm_pin_hooks(
                 # hot_fraction resolves inside the cold-tier branch above;
                 # resolve it again here so the fingerprint is stable even
                 # when no cold tier is active.
-                _hf_setting = io_ov.get("expert_streaming_hot_fraction")
-                if _hf_setting is None:
-                    _hf_setting = _shard_mod.HOT_FRACTION_ENV or None
-                _hf = (
-                    max(0.0, min(1.0, float(_hf_setting)))
-                    if _hf_setting is not None
-                    else None
-                )
+                _hf = _resolve_hot_fraction(io_ov)
                 _pin_fp = _expert_pin_fingerprint(
                     model_path,
                     linears_by_layer,
@@ -1653,39 +1559,6 @@ def _attach_warm_pin_hooks(
             )
 
 
-def _wire_post_conversion(
-    model: Any,
-    model_path: str | Path,
-    model_settings: Any | None,
-    io_ov: dict,
-    layers: Any,
-    mtp_stages: Any,
-    _moe_chain: tuple[str, ...],
-    _hooks: Any,
-    cache: Any,
-    backing: Any,
-    estimate: Any,
-    cold_root: Any,
-    converted: int,
-    backing_kind: str,
-) -> None:
-    """Post-conversion wiring: IO overrides, adaptive top-k, eval
-    boundary, guard info, warm/pin/seed hooks."""
-    import mlx.core as mx
-
-    mx.clear_cache()
-    logger.info("Expert streaming: converted %d MoE layers (backing=%s, cache_capacity=%d experts)", converted, backing_kind, cache.capacity)
-    _wire_io_overrides_logged(layers, mtp_stages, io_ov, _moe_chain)
-    _stamp_instance_routing(
-        model_settings, layers, mtp_stages, _moe_chain, _hooks, cache, estimate
-    )
-    _wire_stream_eval_boundary(layers, io_ov, _moe_chain, _hooks, backing)
-    _attach_warm_pin_hooks(
-        model_path, layers, io_ov, _moe_chain, backing, cache, estimate,
-        cold_root,
-    )
-
-
 def convert_model_to_streaming(
     model: Any,
     model_path: str | Path,
@@ -1711,7 +1584,39 @@ def convert_model_to_streaming(
     backing, backing_kind, hot_ids_by_layer, cold_root = _build_expert_backing(
         model_path, model_settings, io_ov, estimate, use_file_backing
     )
-    _attach_speculation(cache, backing, _governor)
+
+    # Wire one SpeculationState (and the governor) onto cache+backing.
+    # One speculation state per conversion: it hangs off the cache
+    # (always) and off the backing store (file backing) so close()
+    # drains the speculation workers with the readers.
+    from .streaming_switch import SpeculationState
+
+    _spec_state = SpeculationState()
+    cache.spec_state = _spec_state  # type: ignore[attr-defined]
+    if _governor is not None:
+        # Same reachability path as the cache: the engine finds the
+        # governor through the backing at request boundaries.
+        cache.governor = _governor  # type: ignore[attr-defined]
+    if not isinstance(backing, dict):
+        backing.spec_state = _spec_state  # type: ignore[attr-defined]
+        if _governor is not None:
+            backing.governor = _governor  # type: ignore[attr-defined]
+        # Reload the learned transition table so the k+1 overfetch is
+        # warm from token 1 (fingerprint mismatch -> ignored, never
+        # silent).
+        try:
+            load_transition_profile(backing, _spec_state)
+        except Exception:
+            logger.debug(
+                "Expert streaming: transition profile load failed",
+                exc_info=True,
+            )
+        # The engine reaches the shared cache through the backing it
+        # already holds (for the per-request summary log).
+        try:
+            backing._streaming_cache = cache  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     layers, layers_owner = _find_decoder_layers(model)
     if layers is None:
@@ -1720,9 +1625,7 @@ def convert_model_to_streaming(
         # materialize_lazy_state then evaluates every expert bank — the
         # silent-OOM path the feature exists to avoid. Return no backing.
         return model, None
-    hidden, moe_hidden = _resolve_moe_dims(
-        _model_config_candidates(model), estimate
-    )
+    hidden, moe_hidden = _resolve_moe_dims(_model_config_candidates(model), estimate)
 
     # Family structural spelling (attr chain, key prefixes, owner chain)
     # comes from the hook registry — resolved once for the whole walk.
@@ -1730,34 +1633,89 @@ def convert_model_to_streaming(
     _moe_chain = _hooks.moe_attr_chain
     _templates = _hooks.prefix_templates
 
-    converted, mtp_converted, mtp_stages = _convert_moe_layers(
-        layers, layers_owner, model, _hooks, _moe_chain, _templates,
-        backing, backing_kind, cache, estimate, hidden, moe_hidden,
+    converted, mtp_stages = _convert_moe_layers(
+        layers,
+        layers_owner,
+        model,
+        _hooks,
+        _moe_chain,
+        _templates,
+        backing,
+        backing_kind,
+        cache,
+        estimate,
+        hidden,
+        moe_hidden,
         hot_ids_by_layer,
     )
     _reconcile_cache(
-        cache, _governor, layers, _moe_chain,
-        estimate.per_expert_bytes or 0, budget_bytes, io_ov, converted,
+        cache,
+        _governor,
+        layers,
+        _moe_chain,
+        estimate.per_expert_bytes or 0,
+        budget_bytes,
+        io_ov,
+        converted,
     )
 
-    if converted:
-        _wire_post_conversion(
-            model, model_path, model_settings, io_ov, layers, mtp_stages,
-            _moe_chain, _hooks, cache, backing, estimate, cold_root,
-            converted, backing_kind,
-        )
-    else:
+    if not converted:
         logger.info("Expert streaming: no MoE layers converted")
-
-    if not converted and not mtp_converted:
         # Never hand the engine a live backing when nothing converted —
         # its presence alone enables request serialization and the prefill
         # guard while every expert bank still materializes.
         return model, None
+
+    # Post-conversion wiring: IO overrides, adaptive top-k, eval
+    # boundary, guard info, warm/pin/seed hooks.
+    import mlx.core as mx
+
+    mx.clear_cache()
+    logger.info(
+        "Expert streaming: converted %d MoE layers "
+        "(backing=%s, cache_capacity=%d experts)",
+        converted,
+        backing_kind,
+        cache.capacity,
+    )
+    # Per-model IO overrides (autotune): pool depth + run coalescing ride
+    # the streaming linears; unset values keep the env-var defaults.
+    # (io_ov was resolved before the backing block — the HOBBIT split
+    # reads hot_fraction from it during backing construction.)
+    io_wired = _wire_streaming_io_overrides(
+        layers,
+        mtp_stages,
+        io_ov["expert_streaming_io_depth"],
+        io_ov["expert_streaming_coalesce"],
+        attr_chain=_moe_chain,
+    )
+    if io_wired:
+        logger.info(
+            "Expert streaming: IO overrides wired "
+            "(io_depth=%s coalesce=%s, %d linears)",
+            io_ov["expert_streaming_io_depth"],
+            io_ov["expert_streaming_coalesce"],
+            io_wired,
+        )
+    _stamp_instance_routing(
+        model_settings, layers, mtp_stages, _moe_chain, _hooks, cache, estimate
+    )
+    _wire_stream_eval_boundary(layers, io_ov, _moe_chain, _hooks, backing)
+    _attach_warm_pin_hooks(
+        model_path,
+        layers,
+        io_ov,
+        _moe_chain,
+        backing,
+        cache,
+        estimate,
+        cold_root,
+    )
+
     try:
         # Stamped so ensure_streaming_backing_or_raise can verify real
         # conversion — backing presence alone is not evidence.
-        # converted already includes mtp_converted (incremented at 1290)
+        # converted already includes the MTP-stage conversions.
         backing.streaming_converted = converted  # type: ignore[attr-defined]
     except Exception:
         pass
@@ -1765,8 +1723,6 @@ def convert_model_to_streaming(
     # ram-dict backing is internal only — never part of the public return
     # (the file-backed store is the only returned backing).
     return model, backing if not isinstance(backing, dict) else None
-
-
 
 
 def save_transition_profile(backing: Any) -> None:
@@ -1782,20 +1738,13 @@ def save_transition_profile(backing: Any) -> None:
         spec = getattr(backing, "spec_state", None)
         if spec is None or not getattr(spec, "trans_updates", 0):
             return
-        import hashlib
-        import json
 
         model_path = Path(getattr(backing, "model_path", "") or "")
         if not model_path.is_dir():
             return
-        cfg = model_path / "config.json"
-        try:
-            sha = hashlib.sha256(cfg.read_bytes()).hexdigest()[:16]
-        except Exception:
-            sha = None
         payload = spec.to_payload()
         payload["model"] = model_path.name
-        payload["config_sha"] = sha
+        payload["config_sha"] = _config_sha(model_path)
         dest = model_path / ".omlx" / "expert_transition.json"
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1814,9 +1763,6 @@ def save_transition_profile(backing: Any) -> None:
 def load_transition_profile(backing: Any, spec: Any) -> int:
     """Load a persisted transition table into *spec*; returns sources."""
     try:
-        import hashlib
-        import json
-
         if backing is None or isinstance(backing, dict) or spec is None:
             return 0
         model_path = Path(getattr(backing, "model_path", "") or "")
@@ -1824,11 +1770,7 @@ def load_transition_profile(backing: Any, spec: Any) -> int:
         if not src.is_file():
             return 0
         payload = json.loads(src.read_text())
-        cfg = model_path / "config.json"
-        try:
-            sha = hashlib.sha256(cfg.read_bytes()).hexdigest()[:16]
-        except Exception:
-            sha = None
+        sha = _config_sha(model_path)
         if payload.get("config_sha") != sha or payload.get("model") != model_path.name:
             logger.info("expert transition profile fingerprint mismatch — ignored")
             return 0
@@ -1838,4 +1780,3 @@ def load_transition_profile(backing: Any, spec: Any) -> int:
         return n
     except Exception:
         return 0
-
