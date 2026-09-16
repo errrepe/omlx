@@ -811,80 +811,70 @@ private struct AdvancedTab: View {
                     }
                 }
                 if vm.expertStreamingSupported && vm.expertStreamingEnabled {
-                Row(label: String(localized: "settings.advanced.expert_budget_auto.label",
+                    Row(label: String(localized: "settings.advanced.expert_budget_auto.label",
                                       defaultValue: "Automatic Expert Budget",
                                       comment: "Row label for the automatic expert budget toggle"),
-                    sublabel: String(localized: "settings.advanced.expert_budget_auto.sub",
-                                     defaultValue: "RAM-scaled starting budget with a governor that grows on decode stalls and shrinks under memory pressure. Off pins the Budget field below.",
-                                     comment: "Sublabel for the automatic expert budget toggle")) {
-                    RowSwitch(isOn: vm.bindProfile($vm.expertBudgetAuto))
-                }
-                if !vm.expertBudgetAuto {
-                    Row(label: String(localized: "settings.advanced.expert_budget_gib.label",
+                        sublabel: String(localized: "settings.advanced.expert_budget_auto.sub",
+                                         defaultValue: "RAM-scaled starting budget with a governor that grows on decode stalls and shrinks under memory pressure. Off pins the Budget field below.",
+                                         comment: "Sublabel for the automatic expert budget toggle")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.expertBudgetAuto))
+                    }
+                    if !vm.expertBudgetAuto {
+                        expertGibRow(
+                            label: String(localized: "settings.advanced.expert_budget_gib.label",
                                           defaultValue: "Pinned Budget",
                                           comment: "Row label for the pinned expert budget field"),
-                        sublabel: String(localized: "settings.advanced.expert_budget_gib.sub",
-                                         defaultValue: "Fixed LRU budget. Empty clears the pin back to automatic.",
-                                         comment: "Sublabel for the pinned expert budget field")) {
-                        HStack(spacing: 8) {
-                            // Working-profile binding — no PUT at all until
-                            // the user applies the draft (PUT-per-keystroke
-                            // would rebuild the engine mid-typing).
-                            TextInput(text: vm.bindProfile($vm.expertBudgetGib),
-                                      mono: true, suffix: "GiB", width: .controlCompact)
-                        }
+                            sublabel: String(localized: "settings.advanced.expert_budget_gib.sub",
+                                             defaultValue: "Fixed LRU budget. Empty clears the pin back to automatic.",
+                                             comment: "Sublabel for the pinned expert budget field"),
+                            text: $vm.expertBudgetGib, suffix: "GiB")
                     }
-                }
-                Row(label: String(localized: "settings.advanced.expert_dynamic.label",
+                    Row(label: String(localized: "settings.advanced.expert_dynamic.label",
                                       defaultValue: "Dynamic Governor",
                                       comment: "Row label for the dynamic governor mode picker"),
-                    sublabel: String(localized: "settings.advanced.expert_dynamic.sub",
-                                     defaultValue: "Auto follows the budget mode (on for automatic, off for pinned). On forces it over a pinned budget.",
-                                     comment: "Sublabel for the dynamic governor mode picker")) {
-                    Picker("", selection: vm.bindProfile($vm.expertDynamicMode)) {
-                        Text("Auto").tag(0)
-                        Text("On").tag(1)
-                        Text("Off").tag(2)
+                        sublabel: String(localized: "settings.advanced.expert_dynamic.sub",
+                                         defaultValue: "Auto follows the budget mode (on for automatic, off for pinned). On forces it over a pinned budget.",
+                                         comment: "Sublabel for the dynamic governor mode picker")) {
+                        Picker("", selection: vm.bindProfile($vm.expertDynamicMode)) {
+                            Text("Auto").tag(0)
+                            Text("On").tag(1)
+                            Text("Off").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 220)
                     }
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 220)
-                }
-                Row(label: String(localized: "settings.advanced.expert_dynamic_max.label",
+                    expertGibRow(
+                        label: String(localized: "settings.advanced.expert_dynamic_max.label",
                                       defaultValue: "Governor Ceiling",
                                       comment: "Row label for the governor max budget field"),
-                    sublabel: String(localized: "settings.advanced.expert_dynamic_max.sub",
-                                     defaultValue: "GiB cap for governor growth. Empty = 6 GiB.",
-                                     comment: "Sublabel for the governor max budget field")) {
-                    TextInput(text: vm.bindProfile($vm.expertDynamicMaxGib),
-                              mono: true, suffix: "GiB", width: .controlCompact)
-                }
-                Row(label: String(localized: "settings.advanced.expert_dynamic_min.label",
+                        sublabel: String(localized: "settings.advanced.expert_dynamic_max.sub",
+                                         defaultValue: "GiB cap for governor growth. Empty = 6 GiB.",
+                                         comment: "Sublabel for the governor max budget field"),
+                        text: $vm.expertDynamicMaxGib, suffix: "GiB")
+                    expertGibRow(
+                        label: String(localized: "settings.advanced.expert_dynamic_min.label",
                                       defaultValue: "Governor Floor",
                                       comment: "Row label for the governor min budget field"),
-                    sublabel: String(localized: "settings.advanced.expert_dynamic_min.sub",
-                                     defaultValue: "GiB floor the governor will not shrink below. Empty = auto.",
-                                     comment: "Sublabel for the governor min budget field")) {
-                    TextInput(text: vm.bindProfile($vm.expertDynamicMinGib),
-                              mono: true, suffix: "GiB", width: .controlCompact)
-                }
-                Row(label: String(localized: "settings.advanced.expert_dynamic_stall.label",
+                        sublabel: String(localized: "settings.advanced.expert_dynamic_min.sub",
+                                         defaultValue: "GiB floor the governor will not shrink below. Empty = auto.",
+                                         comment: "Sublabel for the governor min budget field"),
+                        text: $vm.expertDynamicMinGib, suffix: "GiB")
+                    expertGibRow(
+                        label: String(localized: "settings.advanced.expert_dynamic_stall.label",
                                       defaultValue: "Stall Target",
                                       comment: "Row label for the governor stall target field"),
-                    sublabel: String(localized: "settings.advanced.expert_dynamic_stall.sub",
-                                     defaultValue: "Decode-layer stall rate above this grows the cache (0–0.9, default 0.05).",
-                                     comment: "Sublabel for the governor stall target field")) {
-                    TextInput(text: vm.bindProfile($vm.expertDynamicStall),
-                              mono: true, width: .controlCompact)
-                }
-                Row(label: String(localized: "settings.advanced.expert_prefill.label",
+                        sublabel: String(localized: "settings.advanced.expert_dynamic_stall.sub",
+                                         defaultValue: "Decode-layer stall rate above this grows the cache (0–0.9, default 0.05).",
+                                         comment: "Sublabel for the governor stall target field"),
+                        text: $vm.expertDynamicStall)
+                    expertGibRow(
+                        label: String(localized: "settings.advanced.expert_prefill.label",
                                       defaultValue: "Prefill Budget",
                                       comment: "Row label for the prefill budget field"),
-                    sublabel: String(localized: "settings.advanced.expert_prefill.sub",
-                                     defaultValue: "GiB cap so prefill streams through without displacing the decode hot set. Empty = auto.",
-                                     comment: "Sublabel for the prefill budget field")) {
-                    TextInput(text: vm.bindProfile($vm.expertPrefillGib),
-                              mono: true, suffix: "GiB", width: .controlCompact)
-                }
+                        sublabel: String(localized: "settings.advanced.expert_prefill.sub",
+                                         defaultValue: "GiB cap so prefill streams through without displacing the decode hot set. Empty = auto.",
+                                         comment: "Sublabel for the prefill budget field"),
+                        text: $vm.expertPrefillGib, suffix: "GiB")
                 }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
@@ -1001,6 +991,22 @@ private struct AdvancedTab: View {
                                  comment: "Subtitle for the Experimental settings section")
             )
             ExperimentalSection(vm: vm, client: client)
+        }
+    }
+
+    /// Shared layout for the expert-streaming numeric rows: label +
+    /// sublabel on the left, a mono TextInput bound through
+    /// `bindProfile` (a working-profile edit — no PUT until Apply) on
+    /// the right. Empty field = auto/cleared server-side.
+    private func expertGibRow(
+        label: String,
+        sublabel: String,
+        text: Binding<String>,
+        suffix: String? = nil
+    ) -> some View {
+        Row(label: label, sublabel: sublabel) {
+            TextInput(text: vm.bindProfile(text),
+                      mono: true, suffix: suffix, width: .controlCompact)
         }
     }
 }

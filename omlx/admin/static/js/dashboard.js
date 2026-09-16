@@ -8,6 +8,88 @@
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
+    // The whole expert_streaming_* settings family, in two roles: the
+    // eight keys the modal editor owns as dedicated controls, and the
+    // remaining runtime tunables (autotuned / hand-edited) that the
+    // modal only surfaces read-only on its advanced summary line.
+    const EXPERT_STREAMING_EDITOR_KEYS = [
+        'expert_streaming_enabled',
+        'expert_streaming_budget_gib',
+        'expert_streaming_budget_auto',
+        'expert_streaming_dynamic',
+        'expert_streaming_dynamic_max_gib',
+        'expert_streaming_dynamic_min_gib',
+        'expert_streaming_dynamic_stall_target',
+        'expert_streaming_prefill_budget_gib',
+    ];
+    // Order matches the summary line's historical display order.
+    const EXPERT_STREAMING_ADVANCED_KEYS = [
+        'expert_streaming_io_depth',
+        'expert_streaming_coalesce',
+        'expert_streaming_readahead',
+        'expert_streaming_seed',
+        'expert_streaming_per_layer_eval',
+        'expert_streaming_pins',
+        'expert_streaming_pin_gib',
+        'expert_streaming_pin_sync',
+        'expert_streaming_pin_regime',
+        'expert_streaming_cold_tier',
+        'expert_streaming_hot_fraction',
+        'expert_streaming_cache_policy',
+        'expert_streaming_topk_threshold',
+        'expert_streaming_cache_prior',
+    ];
+    const EXPERT_STREAMING_PROFILE_KEYS = [
+        ...EXPERT_STREAMING_EDITOR_KEYS,
+        ...EXPERT_STREAMING_ADVANCED_KEYS,
+    ];
+    // Profile-form encoders for keys whose control state doesn't map 1:1
+    // onto the wire value. Each handler writes (or deliberately omits)
+    // its key on `out`; not writing keeps the key absent from the
+    // profile payload.
+    const PROFILE_FIELD_ENCODERS = {
+        thinking_budget_enabled(ms, out) {
+            if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
+        },
+        thinking_budget_tokens(ms, out) {
+            if (ms.enableThinkingBudget && ms.thinking_budget_tokens) {
+                out.thinking_budget_tokens = Number(ms.thinking_budget_tokens);
+            }
+        },
+        index_cache_freq(ms, out) {
+            if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
+        },
+        max_tool_result_tokens(ms, out) {
+            if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
+                out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
+            }
+        },
+        guided_grammar_enabled(ms, out) {
+            out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
+        },
+        guided_grammar(ms, out) {
+            const g = ms.guided_grammar_enabled ? (ms.guided_grammar || '').trim() : '';
+            if (g) out.guided_grammar = g;
+        },
+        // The modal stores the governor as a 3-state mode string; the
+        // profile key is the tri-state bool (auto = omit).
+        expert_streaming_dynamic(ms, out) {
+            if (ms.expert_streaming_dynamic_mode === 'on') out.expert_streaming_dynamic = true;
+            else if (ms.expert_streaming_dynamic_mode === 'off') out.expert_streaming_dynamic = false;
+        },
+        // 3-state budget: pinned writes the GiB value, page-cache writes
+        // budget_auto=false, auto writes budget_auto=true.
+        expert_streaming_budget_gib(ms, out) {
+            if (ms.expert_streaming_budget_mode === 'pinned'
+                && Number.isFinite(Number(ms.expert_streaming_budget_gib))) {
+                out.expert_streaming_budget_gib = Number(ms.expert_streaming_budget_gib);
+            }
+        },
+        expert_streaming_budget_auto(ms, out) {
+            if (ms.expert_streaming_budget_mode === 'pagecache') out.expert_streaming_budget_auto = false;
+            else if (ms.expert_streaming_budget_mode === 'auto') out.expert_streaming_budget_auto = true;
+        },
+    };
     const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
         'top_p',
         'top_k',
@@ -45,28 +127,7 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
-        'expert_streaming_enabled',
-        'expert_streaming_budget_gib',
-        'expert_streaming_budget_auto',
-        'expert_streaming_dynamic',
-        'expert_streaming_dynamic_max_gib',
-        'expert_streaming_dynamic_min_gib',
-        'expert_streaming_dynamic_stall_target',
-        'expert_streaming_prefill_budget_gib',
-        'expert_streaming_cache_policy',
-        'expert_streaming_cache_prior',
-        'expert_streaming_coalesce',
-        'expert_streaming_cold_tier',
-        'expert_streaming_hot_fraction',
-        'expert_streaming_io_depth',
-        'expert_streaming_per_layer_eval',
-        'expert_streaming_pin_gib',
-        'expert_streaming_pin_regime',
-        'expert_streaming_pin_sync',
-        'expert_streaming_pins',
-        'expert_streaming_readahead',
-        'expert_streaming_seed',
-        'expert_streaming_topk_threshold',
+        ...EXPERT_STREAMING_PROFILE_KEYS,
         'deepseek_v41_engram_ssd_offload',
         'qwen4_ple_ssd_offload',
         'qwen35_oq_a8_enabled',
@@ -1342,54 +1403,9 @@
                     if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
-                    if (k === 'thinking_budget_enabled') {
-                        if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
-                        continue;
-                    }
-                    if (k === 'thinking_budget_tokens') {
-                        if (ms.enableThinkingBudget && ms.thinking_budget_tokens) {
-                            out.thinking_budget_tokens = Number(ms.thinking_budget_tokens);
-                        }
-                        continue;
-                    }
-                    if (k === 'index_cache_freq') {
-                        if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
-                        continue;
-                    }
-                    if (k === 'max_tool_result_tokens') {
-                        if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
-                            out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
-                        }
-                        continue;
-                    }
-                    if (k === 'guided_grammar_enabled') {
-                        out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
-                        continue;
-                    }
-                    if (k === 'guided_grammar') {
-                        const g = ms.guided_grammar_enabled ? (ms.guided_grammar || '').trim() : '';
-                        if (g) out.guided_grammar = g;
-                        continue;
-                    }
-                    // The modal stores the governor as a 3-state mode string;
-                    // the profile key is the tri-state bool (auto = omit).
-                    if (k === 'expert_streaming_dynamic') {
-                        if (ms.expert_streaming_dynamic_mode === 'on') out.expert_streaming_dynamic = true;
-                        else if (ms.expert_streaming_dynamic_mode === 'off') out.expert_streaming_dynamic = false;
-                        continue;
-                    }
-                    // 3-state budget: pinned writes the GiB value, page-cache
-                    // writes budget_auto=false, auto writes budget_auto=true.
-                    if (k === 'expert_streaming_budget_gib') {
-                        if (ms.expert_streaming_budget_mode === 'pinned'
-                            && Number.isFinite(Number(ms.expert_streaming_budget_gib))) {
-                            out.expert_streaming_budget_gib = Number(ms.expert_streaming_budget_gib);
-                        }
-                        continue;
-                    }
-                    if (k === 'expert_streaming_budget_auto') {
-                        if (ms.expert_streaming_budget_mode === 'pagecache') out.expert_streaming_budget_auto = false;
-                        else if (ms.expert_streaming_budget_mode === 'auto') out.expert_streaming_budget_auto = true;
+                    const encodeProfileField = PROFILE_FIELD_ENCODERS[k];
+                    if (encodeProfileField) {
+                        encodeProfileField(ms, out);
                         continue;
                     }
                     // Standard field: omit unset values entirely — the server
@@ -1931,31 +1947,12 @@
                     // Read-only surface for the runtime-consumed advanced
                     // keys (autotune/hand-edited settings) that have no
                     // editor controls.
-                    expert_streaming_advanced_summary: (() => {
-                        const parts = [];
-                        const adv = {
-                            io_depth: s.expert_streaming_io_depth,
-                            coalesce: s.expert_streaming_coalesce,
-                            readahead: s.expert_streaming_readahead,
-                            seed: s.expert_streaming_seed,
-                            per_layer_eval: s.expert_streaming_per_layer_eval,
-                            pins: s.expert_streaming_pins,
-                            pin_gib: s.expert_streaming_pin_gib,
-                            pin_sync: s.expert_streaming_pin_sync,
-                            pin_regime: s.expert_streaming_pin_regime,
-                            cold_tier: s.expert_streaming_cold_tier,
-                            hot_fraction: s.expert_streaming_hot_fraction,
-                            cache_policy: s.expert_streaming_cache_policy,
-                            topk_threshold: s.expert_streaming_topk_threshold,
-                            cache_prior: s.expert_streaming_cache_prior,
-                        };
-                        for (const [k, v] of Object.entries(adv)) {
-                            if (v !== undefined && v !== null && v !== '') {
-                                parts.push(`${k}=${v}`);
-                            }
-                        }
-                        return parts.join(' · ');
-                    })(),
+                    expert_streaming_advanced_summary:
+                        EXPERT_STREAMING_ADVANCED_KEYS
+                            .map(k => [k.slice('expert_streaming_'.length), s[k]])
+                            .filter(([, v]) => v !== undefined && v !== null && v !== '')
+                            .map(([k, v]) => `${k}=${v}`)
+                            .join(' · '),
                     expert_streaming_dynamic_mode: s.expert_streaming_dynamic === true ? 'on' : (s.expert_streaming_dynamic === false ? 'off' : 'auto'),
                     expert_streaming_dynamic_max_gib: s.expert_streaming_dynamic_max_gib ?? null,
                     expert_streaming_dynamic_min_gib: s.expert_streaming_dynamic_min_gib ?? null,
@@ -2956,10 +2953,17 @@
                                         ? (Number.isFinite(Number(this.modelSettings.expert_streaming_budget_gib)) ? Number(this.modelSettings.expert_streaming_budget_gib) : null)
                                         : (this.modelSettings.expert_streaming_budget_mode === 'pagecache' ? 0 : null)),
                                 expert_streaming_dynamic: this.modelSettings.expert_streaming_enabled ? (this.modelSettings.expert_streaming_dynamic_mode === 'on' ? true : (this.modelSettings.expert_streaming_dynamic_mode === 'off' ? false : null)) : null,
-                                expert_streaming_dynamic_max_gib: this.modelSettings.expert_streaming_enabled && Number.isFinite(Number(this.modelSettings.expert_streaming_dynamic_max_gib)) ? Number(this.modelSettings.expert_streaming_dynamic_max_gib) : null,
-                                expert_streaming_dynamic_min_gib: this.modelSettings.expert_streaming_enabled && Number.isFinite(Number(this.modelSettings.expert_streaming_dynamic_min_gib)) ? Number(this.modelSettings.expert_streaming_dynamic_min_gib) : null,
-                                expert_streaming_dynamic_stall_target: this.modelSettings.expert_streaming_enabled && Number.isFinite(Number(this.modelSettings.expert_streaming_dynamic_stall_target)) ? Number(this.modelSettings.expert_streaming_dynamic_stall_target) : null,
-                                expert_streaming_prefill_budget_gib: this.modelSettings.expert_streaming_enabled && Number.isFinite(Number(this.modelSettings.expert_streaming_prefill_budget_gib)) ? Number(this.modelSettings.expert_streaming_prefill_budget_gib) : null,
+                                // Governor/prefill numerics: send the parsed
+                                // value only while streaming is on and the
+                                // input parses; otherwise explicit null.
+                                ...Object.fromEntries(
+                                    ['expert_streaming_dynamic_max_gib',
+                                     'expert_streaming_dynamic_min_gib',
+                                     'expert_streaming_dynamic_stall_target',
+                                     'expert_streaming_prefill_budget_gib']
+                                        .map(k => [k, this.modelSettings.expert_streaming_enabled
+                                            && Number.isFinite(Number(this.modelSettings[k]))
+                                            ? Number(this.modelSettings[k]) : null])),
                                 qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
                                 qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,

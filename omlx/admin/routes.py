@@ -2774,34 +2774,13 @@ async def update_model_settings(
         current_settings.expert_streaming_enabled = bool(
             request.expert_streaming_enabled
         )
-    # Dynamic budget: direct assignment (None clears back to auto — never
-    # bool()/float() here, which would collapse the auto sentinel).
-    if "expert_streaming_budget_gib" in sent:
-        current_settings.expert_streaming_budget_gib = (
-            request.expert_streaming_budget_gib
-        )
-    if "expert_streaming_budget_auto" in sent:
-        current_settings.expert_streaming_budget_auto = (
-            request.expert_streaming_budget_auto
-        )
-    if "expert_streaming_dynamic" in sent:
-        current_settings.expert_streaming_dynamic = request.expert_streaming_dynamic
-    if "expert_streaming_dynamic_max_gib" in sent:
-        current_settings.expert_streaming_dynamic_max_gib = (
-            request.expert_streaming_dynamic_max_gib
-        )
-    if "expert_streaming_dynamic_min_gib" in sent:
-        current_settings.expert_streaming_dynamic_min_gib = (
-            request.expert_streaming_dynamic_min_gib
-        )
-    if "expert_streaming_dynamic_stall_target" in sent:
-        current_settings.expert_streaming_dynamic_stall_target = (
-            request.expert_streaming_dynamic_stall_target
-        )
-    if "expert_streaming_prefill_budget_gib" in sent:
-        current_settings.expert_streaming_prefill_budget_gib = (
-            request.expert_streaming_prefill_budget_gib
-        )
+    # Dynamic budget + routing/IO tunables: direct assignment (None clears
+    # back to auto — never bool()/float() here, which would collapse the
+    # auto sentinel). extra="forbid" keeps `sent` inside the declared
+    # ModelSettingsRequest fields, and every tunable key is a ModelSettings
+    # attribute (the diffusion sanitizer setattr()s the same tuple).
+    for key in sent & set(EXPERT_STREAMING_TUNABLE_KEYS):
+        setattr(current_settings, key, getattr(request, key))
     if "deepseek_v41_engram_ssd_offload" in sent:
         is_deepseek_v41 = (entry.config_model_type or "").replace(
             "-", "_"
@@ -3559,18 +3538,6 @@ def _validate_expert_streaming_bounds(settings: dict) -> None:
     reported back; the admin contract rejects them instead. Raises
     ValueError -> HTTP 400.
     """
-
-    def _check_float(name: str, lo: float, hi: float, *, lo_open: bool = False):
-        value = settings.get(name)
-        if value is None:
-            return
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(f"{name} must be a number (GiB).")
-        ok = (lo < value <= hi) if lo_open else (lo <= value <= hi)
-        if not ok:
-            bound = f"({lo}, {hi}]" if lo_open else f"[{lo}, {hi}]"
-            raise ValueError(f"{name} must be in {bound} GiB.")
-
     # The advanced toggles are strict booleans: the runtime treats any
     # truthy/falsy value as a flag, so silently accepting "true"/1/[] would
     # persist a value the load path interprets differently from what the
@@ -3587,80 +3554,55 @@ def _validate_expert_streaming_bounds(settings: dict) -> None:
         if value is not None and not isinstance(value, bool):
             raise ValueError(f"{name} must be a boolean.")
 
-    # Explicit 0 is valid: page-cache only (no app-level LRU pin).
-    _check_float("expert_streaming_budget_gib", 0, 64)
-    _check_float("expert_streaming_dynamic_max_gib", 0, 64, lo_open=True)
-    _check_float("expert_streaming_dynamic_min_gib", 0, 64)
-    _check_float("expert_streaming_prefill_budget_gib", 0, 64, lo_open=True)
-    _check_float("expert_streaming_pin_gib", 0, 64, lo_open=True)
-
-    value = settings.get("expert_streaming_dynamic_stall_target")
-    if value is not None:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not 0.0 <= value <= 0.9
-        ):
+    # (name, lo, hi, lo_open, integral, unit). lo/hi = closed bounds unless
+    # lo_open; hi=None means "no upper bound". Explicit 0 is valid for the
+    # GiB fields: page-cache only (no app-level LRU pin).
+    numeric_bounds = (
+        ("expert_streaming_budget_gib", 0, 64, False, False, " GiB"),
+        ("expert_streaming_dynamic_max_gib", 0, 64, True, False, " GiB"),
+        ("expert_streaming_dynamic_min_gib", 0, 64, False, False, " GiB"),
+        ("expert_streaming_prefill_budget_gib", 0, 64, True, False, " GiB"),
+        ("expert_streaming_pin_gib", 0, 64, True, False, " GiB"),
+        ("expert_streaming_dynamic_stall_target", 0, 0.9, False, False, ""),
+        ("expert_streaming_io_depth", 1, 64, False, True, ""),
+        ("expert_streaming_topk_threshold", 0, 1, True, False, ""),
+        ("expert_streaming_cache_prior", 0, None, False, False, ""),
+        ("expert_streaming_hot_fraction", 0, 1, False, False, ""),
+    )
+    for name, lo, hi, lo_open, integral, unit in numeric_bounds:
+        value = settings.get(name)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(
-                "expert_streaming_dynamic_stall_target must be in [0, 0.9]."
+                f"{name} must be an integer in [{lo}, {hi}]."
+                if integral
+                else f"{name} must be a number."
             )
+        if integral and int(value) != value:
+            raise ValueError(f"{name} must be an integer in [{lo}, {hi}].")
+        if hi is None:
+            if value < lo:
+                raise ValueError(f"{name} must be >= {lo}.")
+            continue
+        ok = (lo < value <= hi) if lo_open else (lo <= value <= hi)
+        if not ok:
+            bound = f"({lo}, {hi}]" if lo_open else f"[{lo}, {hi}]"
+            raise ValueError(f"{name} must be in {bound}{unit}.")
 
-    value = settings.get("expert_streaming_io_depth")
-    if value is not None:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not 1 <= int(value) <= 64
-            or int(value) != value
-        ):
-            raise ValueError(
-                "expert_streaming_io_depth must be an integer in [1, 64]."
-            )
-
-    value = settings.get("expert_streaming_topk_threshold")
-    if value is not None:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not 0 < value <= 1
-        ):
-            raise ValueError(
-                "expert_streaming_topk_threshold must be in (0, 1]."
-            )
-
-    value = settings.get("expert_streaming_cache_prior")
-    if value is not None:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or value < 0
-        ):
-            raise ValueError("expert_streaming_cache_prior must be >= 0.")
-
-    value = settings.get("expert_streaming_hot_fraction")
-    if value is not None:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not 0 <= value <= 1
-        ):
-            raise ValueError("expert_streaming_hot_fraction must be in [0, 1].")
-
-    value = settings.get("expert_streaming_cache_policy")
-    if value is not None and str(value).strip().lower() not in ("lru", "s3fifo"):
-        raise ValueError(
-            'expert_streaming_cache_policy must be "lru" or "s3fifo".'
-        )
-
-    value = settings.get("expert_streaming_pin_regime")
-    if value is not None and str(value).strip().lower() not in ("decode", "prefill"):
-        raise ValueError(
-            'expert_streaming_pin_regime must be "decode" or "prefill".'
-        )
-
-    value = settings.get("expert_streaming_cold_tier")
-    if value is not None and str(value).strip() not in ("", "2", "3"):
-        raise ValueError('expert_streaming_cold_tier must be "2" or "3".')
+    # Choice fields normalize case/whitespace; cold_tier's "" stays legal.
+    choice_fields = (
+        ("expert_streaming_cache_policy", ("lru", "s3fifo")),
+        ("expert_streaming_pin_regime", ("decode", "prefill")),
+        ("expert_streaming_cold_tier", ("", "2", "3")),
+    )
+    for name, choices in choice_fields:
+        value = settings.get(name)
+        if value is None:
+            continue
+        if str(value).strip().lower() not in choices:
+            shown = " or ".join(f'"{c}"' for c in choices if c)
+            raise ValueError(f"{name} must be {shown}.")
 
 
 def _validate_model_settings(entry, settings):
@@ -3669,18 +3611,15 @@ def _validate_model_settings(entry, settings):
     try:
         # Scoped DSpark exception needs the model type; fall back to
         # strict validation when the checkpoint config is unreadable.
+        # (config.json re-read is deliberate: text_config.model_type is a
+        # valid fallback scope for composite checkpoints.)
         entry_type = None
         try:
-            import json as _json
-            from pathlib import Path as _Path
-
-            _cfg = _json.loads(
-                (_Path(entry.model_path) / "config.json").read_text()
-            )
+            _cfg = json.loads((Path(entry.model_path) / "config.json").read_text())
             _text = _cfg.get("text_config") or {}
             entry_type = _cfg.get("model_type") or _text.get("model_type")
         except Exception:
-            entry_type = None
+            pass
         validate_moe_expert_offload(settings, model_type=entry_type)
         _validate_expert_streaming_bounds(settings)
         if entry_type is not None:

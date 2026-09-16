@@ -29,10 +29,7 @@ final class ModelSettingsScreenVM {
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, qwen4PleSsdOffload
-        case expertStreamingEnabled, moeExpertResidentFraction, engramSsdOffload
-        case expertBudgetAuto, expertBudgetGib
-        case expertDynamicMode, expertDynamicMaxGib
-        case expertDynamicMinGib, expertDynamicStall, expertPrefillGib
+        case engramSsdOffload
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -491,11 +488,7 @@ final class ModelSettingsScreenVM {
         case .enableThinking, .qwen4PleSsdOffload,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
-        case .expertStreamingEnabled, .moeExpertResidentFraction,
-             .engramSsdOffload,
-             .expertBudgetAuto, .expertBudgetGib,
-             .expertDynamicMode, .expertDynamicMaxGib,
-             .expertDynamicMinGib, .expertDynamicStall, .expertPrefillGib:
+        case .engramSsdOffload:
             // MoE expert streaming targets MoE language models; the
             // fused bank never applies to diffusion models.
             return true
@@ -823,90 +816,10 @@ final class ModelSettingsScreenVM {
             guard isQwen4Exp, qwen4PleSsdOffloadSupported,
                   !qwen4PleSsdOffloadForced else { return }
             patch.qwen4PleSsdOffload = qwen4PleSsdOffload
-        case .expertStreamingEnabled:
-            guard expertStreamingSupported || moeExpertOffloadSupported else { return }
-            // Mirror the server contract — never arm streaming while an
-            // incompatible speculative decoder is on (validate_*
-            // would reject the PUT after the switch already flipped).
-            if expertStreamingEnabled, expertStreamingConflictReason != nil { return }
-            patch.expertStreamingEnabled = expertStreamingEnabled
-            // Migrate the legacy alias off on every explicit save so a
-            // stored `true` cannot re-arm offload (WebUI sends the same pair).
-            patch.moeExpertOffloadEnabled = false
-        case .moeExpertResidentFraction:
-            guard moeExpertOffloadSupported else { return }
-            guard let v = Double(moeExpertResidentFraction), v > 0, v <= 1 else {
-                lastError = "Resident fraction must be a number in (0, 1]."
-                return
-            }
-            patch.moeExpertOffloadResidentFraction = v
         case .engramSsdOffload:
             guard isDeepseekV41, engramSsdOffloadSupported,
                   !engramSsdOffloadForced else { return }
             patch.deepseekV41EngramSsdOffload = engramSsdOffload
-        case .expertBudgetAuto:
-            guard expertStreamingSupported else { return }
-            patch.expertStreamingBudgetAuto = expertBudgetAuto
-        case .expertBudgetGib:
-            guard expertStreamingSupported else { return }
-            // Empty clears the pin back to auto (JSON null); a number pins
-            // manual mode (an explicit budget always wins over auto
-            // server-side, including 0 = page-cache only).
-            if expertBudgetGib.isEmpty {
-                patch.expertStreamingBudgetGib = .some(nil)
-            } else if let v = Double(expertBudgetGib), v >= 0, v <= 64 {
-                patch.expertStreamingBudgetGib = .some(v)
-            } else {
-                lastError = "Expert budget must be a number in [0, 64] GiB."
-                return
-            }
-        case .expertDynamicMode:
-            guard expertStreamingSupported else { return }
-            switch expertDynamicMode {
-            case 1: patch.expertStreamingDynamic = .some(true)
-            case 2: patch.expertStreamingDynamic = .some(false)
-            default: patch.expertStreamingDynamic = .some(nil) // auto
-            }
-        case .expertDynamicMaxGib:
-            guard expertStreamingSupported else { return }
-            if expertDynamicMaxGib.isEmpty {
-                patch.expertStreamingDynamicMaxGib = .some(nil)
-            } else if let v = Double(expertDynamicMaxGib), v > 0, v <= 64 {
-                patch.expertStreamingDynamicMaxGib = .some(v)
-            } else {
-                lastError = "Governor ceiling must be a number in (0, 64] GiB."
-                return
-            }
-        case .expertDynamicMinGib:
-            guard expertStreamingSupported else { return }
-            if expertDynamicMinGib.isEmpty {
-                patch.expertStreamingDynamicMinGib = .some(nil)
-            } else if let v = Double(expertDynamicMinGib), v >= 0, v <= 64 {
-                patch.expertStreamingDynamicMinGib = .some(v)
-            } else {
-                lastError = "Governor floor must be a number in [0, 64] GiB."
-                return
-            }
-        case .expertDynamicStall:
-            guard expertStreamingSupported else { return }
-            if expertDynamicStall.isEmpty {
-                patch.expertStreamingDynamicStallTarget = .some(nil)
-            } else if let v = Double(expertDynamicStall), v >= 0, v <= 0.9 {
-                patch.expertStreamingDynamicStallTarget = .some(v)
-            } else {
-                lastError = "Stall target must be a number in [0, 0.9]."
-                return
-            }
-        case .expertPrefillGib:
-            guard expertStreamingSupported else { return }
-            if expertPrefillGib.isEmpty {
-                patch.expertStreamingPrefillBudgetGib = .some(nil)
-            } else if let v = Double(expertPrefillGib), v > 0, v <= 64 {
-                patch.expertStreamingPrefillBudgetGib = .some(v)
-            } else {
-                lastError = "Prefill budget must be a number in (0, 64] GiB."
-                return
-            }
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:

@@ -222,25 +222,12 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var ttlSeconds: Int? = nil
     var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
-    // Unified MoE expert streaming switch. Saving always pairs it with
-    // moeExpertOffloadEnabled=false so a stored legacy alias cannot
-    // re-arm offload against an explicit canonical off (migration-on-save,
-    // same pair the WebUI sends).
-    var expertStreamingEnabled: Bool? = nil
-    var moeExpertOffloadEnabled: Bool? = nil
-    // Legacy-adapter resident fraction (0,1] — v41/gemma4/olmoe only.
-    var moeExpertOffloadResidentFraction: Double? = nil
+    // MoE expert streaming fields are profile-eligible: they reach the
+    // server inside the free-form `settings` dict on profile apply, never
+    // through this patch. (The WebUI's per-model save still sends the
+    // canonical enabled key + migrated legacy alias pair itself.)
     // DeepSeek V4.1 Engram SSD offload (per-model; never in profiles).
     var deepseekV41EngramSsdOffload: Bool? = nil
-    // Dynamic expert budget: Double??/Bool?? so the editor can send JSON
-    // null to clear a pin back to auto (nil omits the key).
-    var expertStreamingBudgetGib: Double?? = nil
-    var expertStreamingBudgetAuto: Bool? = nil
-    var expertStreamingDynamic: Bool?? = nil
-    var expertStreamingDynamicMaxGib: Double?? = nil
-    var expertStreamingDynamicMinGib: Double?? = nil
-    var expertStreamingDynamicStallTarget: Double?? = nil
-    var expertStreamingPrefillBudgetGib: Double?? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil

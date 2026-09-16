@@ -67,18 +67,6 @@ struct ModelSettingsSnapshot: Equatable {
 
     var chatTemplateEntries: [ChatTemplateKwargEntry]
 
-    // Unified MoE expert streaming (bank + budget + governor + the
-    // legacy-adapter resident fraction).
-    var expertStreamingEnabled: Bool
-    var moeExpertResidentFraction: String
-    var expertBudgetAuto: Bool
-    var expertBudgetGib: String
-    var expertDynamicMode: Int
-    var expertDynamicMaxGib: String
-    var expertDynamicMinGib: String
-    var expertDynamicStall: String
-    var expertPrefillGib: String
-
     var turboquantKvEnabled: Bool
     var turboquantKvBits: String
     var qwen35AnePrefillEnabled: Bool
