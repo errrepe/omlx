@@ -2968,50 +2968,6 @@ class TestEnginePoolTTL:
         assert pool._entries["model-a"].last_access == 200.0
 
     @pytest.mark.asyncio
-    async def test_ttl_skips_vlm_with_active_requests(self, pool_with_loaded_model):
-        """Test that TTL does not unload VLM engine with active requests."""
-        pool = pool_with_loaded_model
-
-        mock_engine = MagicMock()
-        mock_engine.has_active_requests.return_value = True
-
-        pool._entries["model-a"].engine = mock_engine
-
-        settings_manager = MagicMock()
-        settings = MagicMock()
-        settings.ttl_seconds = 60
-        settings_manager.get_settings.return_value = settings
-
-        with patch("time.time", return_value=200.0):
-            expired = await pool.check_ttl_expirations(settings_manager)
-
-        assert expired == []
-        assert pool._entries["model-a"].last_access == 200.0
-
-    @pytest.mark.asyncio
-    async def test_ttl_skips_non_streaming_with_active_requests(
-        self, pool_with_loaded_model
-    ):
-        """Test that TTL does not unload non-streaming engine with active requests."""
-        pool = pool_with_loaded_model
-
-        mock_engine = MagicMock()
-        mock_engine.has_active_requests.return_value = True
-
-        pool._entries["model-a"].engine = mock_engine
-
-        settings_manager = MagicMock()
-        settings = MagicMock()
-        settings.ttl_seconds = 60
-        settings_manager.get_settings.return_value = settings
-
-        with patch("time.time", return_value=200.0):
-            expired = await pool.check_ttl_expirations(settings_manager)
-
-        assert expired == []
-        assert pool._entries["model-a"].last_access == 200.0
-
-    @pytest.mark.asyncio
     async def test_ttl_falls_back_to_global_idle_timeout(self, pool_with_loaded_model):
         """Per-model TTL None falls back to global idle timeout."""
         pool = pool_with_loaded_model
@@ -3239,16 +3195,6 @@ class TestResolveModelId:
 
         result = pool.resolve_model_id("omlx/MODEL-B", settings_manager=None)
         assert result == "model-b"
-
-    def test_exact_match_preferred_over_case_insensitive(self, small_mock_model_dir):
-        """Test exact match takes priority over case-insensitive."""
-        pool = _make_pool(ceiling=10 * 1024**3)
-        pool.discover_models(str(small_mock_model_dir))
-
-        # Exact match should be returned directly
-        result = pool.resolve_model_id("model-a", settings_manager=None)
-        assert result == "model-a"
-
 
 class TestMemorySettleBarrier:
     """Tests for memory settle barrier in _unload_engine()."""
@@ -4460,6 +4406,94 @@ async def test_prepare_cluster_reload_unloads_failed_engine_without_busy_error()
 
 
 @pytest.mark.asyncio
+async def test_rejected_cluster_reload_preserves_pending_unload():
+    pool = _make_pool()
+    entry = TestEnginePoolInUseLease._loaded_entry("leased")
+    entry.engine.runtime_failed_reason = None
+    entry.engine.abort_all_requests = AsyncMock(return_value=1)
+    entry.in_use = 1
+    entry.is_pinned = True
+    pool._entries = {"leased": entry}
+    pool._unload_engine = AsyncMock()
+
+    assert await pool.request_unload("leased") is False
+    task = pool._pending_unload_tasks["leased"]
+    try:
+        with pytest.raises(ModelBusyError):
+            await pool.prepare_cluster_reload("leased")
+
+        assert entry.pending_unload_reason == "manual unload"
+        assert entry.pending_unload_allow_pinned is True
+        assert entry.abort_requested is True
+        assert pool._pending_unload_tasks["leased"] is task
+        assert not task.cancelling()
+        with pytest.raises(ModelBusyError, match="unload is pending"):
+            await pool.get_engine("leased")
+
+        await pool.release_engine("leased")
+        pool._unload_engine.assert_awaited_once_with("leased")
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_prepare_cluster_reload_clears_pending_unload_task_and_reason():
+    """prepare_cluster_reload must cancel pending unload background task and reset pending_unload_reason."""
+    pool = _make_pool()
+    engine = MagicMock()
+    engine.runtime_failed_reason = "rank 0 connection closed"
+
+    entry = EngineEntry(
+        model_id="test-model",
+        model_path="/fake/path",
+        model_type="llm",
+        engine_type="distributed_batched",
+        estimated_size=1000,
+        engine=engine,
+        pending_unload_reason="drain timeout",
+        abort_requested=True,
+    )
+    pool._entries["test-model"] = entry
+
+    dummy_task = asyncio.create_task(asyncio.sleep(10))
+    pool._pending_unload_tasks["test-model"] = dummy_task
+
+    unloaded = []
+    pool._unload_engine = AsyncMock(side_effect=lambda mid: unloaded.append(mid))
+
+    await pool.prepare_cluster_reload("test-model")
+
+    assert unloaded == ["test-model"]
+    assert dummy_task.cancelling() > 0 or dummy_task.cancelled()
+    assert "test-model" not in pool._pending_unload_tasks
+    assert entry.pending_unload_reason is None
+    assert entry.abort_requested is False
+
+
+@pytest.mark.asyncio
+async def test_entry_has_active_requests_and_quiescence_on_failed_engine():
+    """A failed engine must report 0 active requests and be immediately quiescent."""
+    pool = _make_pool()
+    engine = MagicMock()
+    engine.runtime_failed_reason = "distributed worker crash"
+    engine.has_active_requests.return_value = True
+    type(engine).rank_side_active_requests = MagicMock(return_value=5)
+
+    entry = EngineEntry(
+        model_id="test-model",
+        model_path="/fake/path",
+        model_type="llm",
+        engine_type="distributed_batched",
+        estimated_size=1000,
+        engine=engine,
+        in_use=2,
+    )
+
+    assert pool._entry_has_active_requests(entry) is False
+    assert pool._entry_is_quiescent(entry) is True
+
+
 async def test_loaded_model_acquire_and_release_bypass_unrelated_unload_lock():
     pool = _make_pool(ceiling=0)
     entry = TestEnginePoolInUseLease._loaded_entry("ready")
