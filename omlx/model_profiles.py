@@ -41,6 +41,36 @@ UNIVERSAL_PROFILE_FIELDS = (
     "forced_ct_kwargs",
 )
 
+# The expert_streaming_* tunable family consumed at engine construction
+# (everything except the `enabled` switch). Single source of truth: spliced
+# into MODEL_SPECIFIC_PROFILE_FIELDS below so a new knob cannot drift out
+# of the profile allowlist, and re-exported through model_settings for
+# EnginePool's reload signature (a changed value must force a reload) and
+# the admin sanitizers (these keys must not survive on a diffusion model).
+EXPERT_STREAMING_TUNABLE_KEYS = (
+    "expert_streaming_budget_gib",
+    "expert_streaming_budget_auto",
+    "expert_streaming_dynamic",
+    "expert_streaming_dynamic_max_gib",
+    "expert_streaming_dynamic_min_gib",
+    "expert_streaming_dynamic_stall_target",
+    "expert_streaming_prefill_budget_gib",
+    "expert_streaming_io_depth",
+    "expert_streaming_coalesce",
+    "expert_streaming_readahead",
+    "expert_streaming_seed",
+    "expert_streaming_per_layer_eval",
+    "expert_streaming_pins",
+    "expert_streaming_pin_gib",
+    "expert_streaming_pin_sync",
+    "expert_streaming_pin_regime",
+    "expert_streaming_cold_tier",
+    "expert_streaming_hot_fraction",
+    "expert_streaming_cache_policy",
+    "expert_streaming_topk_threshold",
+    "expert_streaming_cache_prior",
+)
+
 # Model-specific fields — eligible for per-model profiles only (never templates).
 MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
@@ -72,33 +102,14 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     # from the checkpoint at validation time, so a copied profile cannot
     # carry a stale scope.
     "model_type",
-    # IO/pinning/policy tunables. Per-model by construction: several are
-    # checkpoint- or hardware-bound (pins, seed) and must never propagate
-    # across models via templates.
-    "expert_streaming_cache_policy",
-    "expert_streaming_cache_prior",
-    "expert_streaming_coalesce",
-    "expert_streaming_cold_tier",
-    "expert_streaming_hot_fraction",
-    "expert_streaming_io_depth",
-    "expert_streaming_per_layer_eval",
-    "expert_streaming_pin_gib",
-    "expert_streaming_pin_regime",
-    "expert_streaming_pin_sync",
-    "expert_streaming_pins",
-    "expert_streaming_readahead",
-    "expert_streaming_seed",
-    "expert_streaming_topk_threshold",
     # Unified expert-streaming backend (canonical keys; the moe_* pair above
-    # stays as load-time aliases served by the same backend).
+    # stays as load-time aliases served by the same backend). `enabled` is
+    # the routing switch and stays spelled out; the IO/pinning/policy
+    # tunables splice in from EXPERT_STREAMING_TUNABLE_KEYS. Per-model by
+    # construction: several are checkpoint- or hardware-bound (pins, seed)
+    # and must never propagate across models via templates.
     "expert_streaming_enabled",
-    "expert_streaming_budget_gib",
-    "expert_streaming_budget_auto",
-    "expert_streaming_dynamic",
-    "expert_streaming_dynamic_max_gib",
-    "expert_streaming_dynamic_min_gib",
-    "expert_streaming_dynamic_stall_target",
-    "expert_streaming_prefill_budget_gib",
+    *EXPERT_STREAMING_TUNABLE_KEYS,
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",

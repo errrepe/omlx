@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
+    EXPERT_STREAMING_TUNABLE_KEYS as EXPERT_STREAMING_TUNABLE_KEYS,
     MODEL_SPECIFIC_PROFILE_FIELDS,
     UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
@@ -69,53 +70,52 @@ def validate_moe_expert_offload(
     settings: dict, *, model_type: str | None = None
 ) -> None:
     # The resident fraction is consumed only while a request is actually
-    # routed to the offload backend (either spelling). Validating it
+    # routed to the offload backend (either spelling), and the exclusivity
+    # contract applies to the unified backend as a whole — the canonical
+    # expert_streaming_enabled key must not evade it (it used to: only the
+    # legacy alias was checked, so canonical+DFlash passed). Validating
     # unconditionally used to reject unrelated saves/settings files that
-    # merely carried a stored (inert) fraction.
-    if moe_offload_requested(settings):
-        fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
-        if (
-            isinstance(fraction, bool)
-            or not isinstance(fraction, (int, float))
-            or not 0 < fraction <= 1
-        ):
-            raise ValueError(
-                "moe_expert_offload_resident_fraction must be in (0, 1]"
+    # merely carried a stored (inert) fraction, so both clauses gate on the
+    # single intent check.
+    if not moe_offload_requested(settings):
+        return
+    fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not 0 < fraction <= 1
+    ):
+        raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
+    mtype = (model_type or "").lower().replace("-", "_")
+    # DFlash and VLM MTP never run the streaming converter: the MoE
+    # banks would materialize fully with nothing guarding them.
+    if settings.get("dflash_enabled") or settings.get("vlm_mtp_enabled"):
+        raise ValueError(
+            "MoE expert offload cannot be combined with DFlash or VLM "
+            "MTP; disable speculative decoding first."
+        )
+    if settings.get("mtp_enabled"):
+        if mtype.startswith("deepseek_v41"):
+            # DSpark verify runs under frozen residency: the V4.1
+            # adapter suspends LRU reordering inside verify blocks
+            # (see moe_offload.verify_scope), so native MTP is safe.
+            return
+        try:
+            from .patches.expert_streaming.residency import (
+                SUPPORTED_TYPES as _STREAMING_TYPES,
+                normalize_model_type,
             )
-    # Exclusivity contract applies to the unified backend as a whole: the
-    # canonical expert_streaming_enabled key must not evade it (it used to —
-    # only the legacy alias was checked, so canonical+DFlash passed).
-    if moe_offload_requested(settings):
-        mtype = (model_type or "").lower().replace("-", "_")
-        # DFlash and VLM MTP never run the streaming converter: the MoE
-        # banks would materialize fully with nothing guarding them.
-        if settings.get("dflash_enabled") or settings.get("vlm_mtp_enabled"):
-            raise ValueError(
-                "MoE expert offload cannot be combined with DFlash or VLM "
-                "MTP; disable speculative decoding first."
-            )
-        if settings.get("mtp_enabled"):
-            if mtype.startswith("deepseek_v41"):
-                # DSpark verify runs under frozen residency: the V4.1
-                # adapter suspends LRU reordering inside verify blocks
-                # (see moe_offload.verify_scope), so native MTP is safe.
-                return
-            try:
-                from .patches.expert_streaming.residency import (
-                    SUPPORTED_TYPES as _STREAMING_TYPES,
-                    normalize_model_type,
-                )
 
-                if normalize_model_type(mtype) in _STREAMING_TYPES:
-                    # Unified streaming converts MTP-stage MoE banks too and
-                    # verify runs under SpeculationState — MTP is supported.
-                    return
-            except Exception:
-                pass
-            raise ValueError(
-                "MoE expert offload cannot be combined with Lightning MTP "
-                "on this model; disable speculative decoding first."
-            )
+            if normalize_model_type(mtype) in _STREAMING_TYPES:
+                # Unified streaming converts MTP-stage MoE banks too and
+                # verify runs under SpeculationState — MTP is supported.
+                return
+        except Exception:
+            pass
+        raise ValueError(
+            "MoE expert offload cannot be combined with Lightning MTP "
+            "on this model; disable speculative decoding first."
+        )
 
 
 def ane_prefill_backend(model_type: str | None) -> str | None:
@@ -744,33 +744,9 @@ class ModelSettings:
         return cls(**filtered_data)
 
 
-# The expert_streaming_* tunable family consumed at engine construction
-# (everything except the `enabled` switch). Shared by the diffusion-lane
-# sanitizers (these keys must not survive on a diffusion model) and by
-# EnginePool's reload signature (a changed value must force a reload).
-EXPERT_STREAMING_TUNABLE_KEYS = (
-    "expert_streaming_budget_gib",
-    "expert_streaming_budget_auto",
-    "expert_streaming_dynamic",
-    "expert_streaming_dynamic_max_gib",
-    "expert_streaming_dynamic_min_gib",
-    "expert_streaming_dynamic_stall_target",
-    "expert_streaming_prefill_budget_gib",
-    "expert_streaming_io_depth",
-    "expert_streaming_coalesce",
-    "expert_streaming_readahead",
-    "expert_streaming_seed",
-    "expert_streaming_per_layer_eval",
-    "expert_streaming_pins",
-    "expert_streaming_pin_gib",
-    "expert_streaming_pin_sync",
-    "expert_streaming_pin_regime",
-    "expert_streaming_cold_tier",
-    "expert_streaming_hot_fraction",
-    "expert_streaming_cache_policy",
-    "expert_streaming_topk_threshold",
-    "expert_streaming_cache_prior",
-)
+# EXPERT_STREAMING_TUNABLE_KEYS is defined in model_profiles (the leaf that
+# also splices it into the profile allowlist) and re-exported here for the
+# engine_pool / admin import sites.
 
 
 class ModelSettingsManager:

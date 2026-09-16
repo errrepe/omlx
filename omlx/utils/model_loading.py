@@ -20,6 +20,10 @@ _VLM_TEXT_PREFIX = "language_model."
 _CKPT_TEXT_PREFIX = "model.language_model."
 _RUNTIME_TEXT_PREFIX = "language_model.model."
 
+# MoE expert projection renames shared by the quant normalizers below:
+# checkpoint w1/w2/w3 → runtime gate/down/up_proj.
+_W_PROJ = (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
+
 _MATERIALIZE_EVAL_CHUNK = 8
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
@@ -467,7 +471,7 @@ def normalize_dsv4_mixed_moe_quant(cfg: dict) -> dict:
         return cfg
     default_bits = int(plan.get("default_bits", quant.get("bits", 2)) or 2)
     mode = plan.get("codec", quant.get("mode", "affine")) or "affine"
-    for proj, dst in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+    for proj, dst in _W_PROJ:
         gs = int(group_sizes.get(proj, quant.get("group_size", 64)) or 64)
         per_layer_bits = layer_bits.get(proj) or {}
         per_layer_gs = layer_groups.get(proj) or {}
@@ -488,7 +492,7 @@ def normalize_dsv4_mixed_moe_quant(cfg: dict) -> dict:
     # gate/down/up_proj under `model.layers.N`, so copy the spec to the
     # runtime path (same bare-vs-runtime miss as the bookends).
     for n in range(n_layers):
-        for proj, dst in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+        for proj, dst in _W_PROJ:
             bare = f"layers.{n}.ffn.shared_experts.{proj}"
             spec = quant.get(bare)
             if not isinstance(spec, dict):
@@ -674,13 +678,12 @@ def maybe_apply_pre_load_patches(
     if model_settings is not None:
         # Model type for the scoped DSpark exception (V4.1 native MTP +
         # offload runs under frozen residency). Read here: the shared
-        # config load below has not run yet at this point.
-        try:
-            _pre_cfg = json.loads((Path(model_name) / "config.json").read_text())
-            _pre_text = _pre_cfg.get("text_config") or {}
-            _pre_mtype = _pre_cfg.get("model_type") or _pre_text.get("model_type")
-        except Exception:
-            _pre_mtype = None
+        # config load below has not run yet at this point. The offload
+        # patch's reader also resolves HF repo dirs, so a non-local
+        # model_name still gets its config model_type.
+        from ..patches.moe_expert_offload import _read_config_model_type
+
+        _pre_mtype = _read_config_model_type(model_name)
         validate_moe_expert_offload(
             {
                 "moe_expert_offload_resident_fraction": getattr(

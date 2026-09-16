@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -17,31 +16,21 @@ from mlx_lm.models.mla import MultiLinear
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
     Model as DSV32Model,
-    _dequant_mla_proj_mode,
     group_expert_select,
+    split_kv_b_proj_heads,
 )
 from omlx.patches.glm_moe_dsa.sparse_mla import (
     exact_block_token_attention,
     q8_vup_flat,
     sparse_mla_attention,
 )
+from omlx.utils.metal_sync import cache_clear_threshold_bytes
 from .config import ModelConfig, TextConfig
 from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
-_STREAM_CACHE_THRESH_ENV = "OMLX_EXPERT_STREAMING_CACHE_THRESH"
-
-
-def _stream_cache_threshold_bytes() -> int:
-    raw = os.environ.get(_STREAM_CACHE_THRESH_ENV)
-    if raw:
-        try:
-            return max(0, int(float(raw) * 1024**3))
-        except ValueError:
-            logger.warning("Invalid %s=%r; using 2 GiB", _STREAM_CACHE_THRESH_ENV, raw)
-    return 2 * 1024**3
 
 
 def glm5_next_cast_predicate(key: str) -> bool:
@@ -909,7 +898,10 @@ class Glm5NextDecoderLayer(nn.Module):
             # Keep eval load-bearing, but avoid flushing MLX's allocator cache
             # on every layer when the free pool is small.
             get_cache_memory = getattr(mx, "get_cache_memory", None)
-            if get_cache_memory is None or get_cache_memory() >= _stream_cache_threshold_bytes():
+            if (
+                get_cache_memory is None
+                or get_cache_memory() >= cache_clear_threshold_bytes()
+            ):
                 mx.clear_cache()
         return out
 
@@ -957,7 +949,7 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+        for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
 
@@ -1014,67 +1006,18 @@ class LanguageModel(nn.Module):
         # JANG draft head (``mtp.<i>.block.*``): the parent sanitize fuses
         # ``kv_b_proj`` into the ``embed_q``/``unembed_out`` MultiLinears
         # only for ``model.layers.{0..n-1}``. Mirror the same fusion for
-        # the draft's sparse attention (deepseek_v32.py lines 1007-1043
-        # verbatim, with the mtp prefix) so the strict load sees exactly
-        # the modules ``Glm5NextDecoderLayer`` constructs. No-ops on
-        # head-less loads (no ``mtp.`` keys survive above).
-        _deq_mode = _dequant_mla_proj_mode(self.args)
-        _dequant_embed_q = _deq_mode in {
-            "1",
-            "true",
-            "all",
-            "both",
-            "embed",
-            "embed_q",
-        }
-        _dequant_unembed_out = _deq_mode in {
-            "1",
-            "true",
-            "all",
-            "both",
-            "unembed",
-            "unembed_out",
-            "out",
-        }
+        # the draft's sparse attention via the shared split_kv_b_proj_heads
+        # helper (deepseek_v32.py) so the strict load sees exactly the
+        # modules ``Glm5NextDecoderLayer`` constructs. No-ops on head-less
+        # loads (no ``mtp.`` keys survive above).
         for _key in list(weights.keys()):
             if not _key.startswith("mtp.") or not _key.endswith(
                 ".self_attn.kv_b_proj.weight"
             ):
                 continue
-            _prefix = _key[: -len(".kv_b_proj.weight")]
-            _quantized = f"{_prefix}.kv_b_proj.scales" in weights
-            _v = weights.pop(f"{_prefix}.kv_b_proj.weight")
-            _head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
-            if _quantized:
-                _dims = self.args.kv_lora_rank
-                _scales = weights.pop(f"{_prefix}.kv_b_proj.scales")
-                _biases = weights.pop(f"{_prefix}.kv_b_proj.biases")
-                _bits = (_v.shape[-1] * 32) // _dims
-                _group_size = _dims // _scales.shape[-1]
-                _v = mx.dequantize(
-                    _v, _scales, _biases, bits=_bits, group_size=_group_size
-                )
-            _num_heads = self.args.num_attention_heads
-            _v = _v.reshape(_num_heads, _head_dim, -1)
-            _wk = mx.contiguous(
-                _v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+            split_kv_b_proj_heads(
+                self.args, _key[: -len(".kv_b_proj.weight")], weights
             )
-            _wv = mx.contiguous(_v[:, self.args.qk_nope_head_dim :, :])
-            if _quantized:
-                if not _dequant_embed_q:
-                    _wk, _wk_scales, _wk_biases = mx.quantize(
-                        _wk, bits=_bits, group_size=_group_size
-                    )
-                    weights[f"{_prefix}.embed_q.scales"] = _wk_scales
-                    weights[f"{_prefix}.embed_q.biases"] = _wk_biases
-                if not _dequant_unembed_out:
-                    _wv, _wv_scales, _wv_biases = mx.quantize(
-                        _wv, bits=_bits, group_size=_group_size
-                    )
-                    weights[f"{_prefix}.unembed_out.scales"] = _wv_scales
-                    weights[f"{_prefix}.unembed_out.biases"] = _wv_biases
-            weights[f"{_prefix}.embed_q.weight"] = _wk
-            weights[f"{_prefix}.unembed_out.weight"] = _wv
 
         remapped = {}
         conv_parts = {}

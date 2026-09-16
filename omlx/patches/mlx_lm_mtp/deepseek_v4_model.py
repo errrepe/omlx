@@ -22,6 +22,7 @@ difference via a small adapter (see ``batch_generator._slice_hidden``).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 from pathlib import Path
@@ -882,21 +883,13 @@ def _patch_model(dsv4: Any) -> None:
                 # claiming them for the new source (PR #3468). Clear stale
                 # shards first; an interrupted spill simply re-stacks (safe,
                 # ~1 layer transient) instead of resuming.
-                try:
+                with contextlib.suppress(Exception):
                     _spill_dir.mkdir(parents=True, exist_ok=True)
                     for _stale in _spill_dir.glob("spill_layer_*.safetensors"):
-                        try:
+                        with contextlib.suppress(Exception):
                             _stale.unlink()
-                        except Exception:
-                            pass
-                    _manifest = _spill_dir / "manifest.json"
-                    try:
-                        if _manifest.exists():
-                            _manifest.unlink()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                    with contextlib.suppress(Exception):
+                        (_spill_dir / "manifest.json").unlink(missing_ok=True)
 
                 logger.info(
                     "dsv4 spill miss: stacking %d layers to %s",
@@ -919,19 +912,15 @@ def _patch_model(dsv4: Any) -> None:
                             layer_idx + 1,
                             n_layers,
                         )
-                import re as _re
-
                 _key_to_file: dict[str, str] = {}
                 for k in weights:
-                    if ".ffn.switch_mlp." not in k or not k.startswith(
-                        "model.layers."
-                    ):
+                    if ".ffn.switch_mlp." not in k or not k.startswith("model.layers."):
                         continue
-                    _m = _re.search(r"model\.layers\.(\d+)\.", k)
-                    if _m:
-                        _key_to_file[k] = "spill_layer_%02d.safetensors" % int(
-                            _m.group(1)
-                        )
+                    # Filtered keys are model.layers.{N}.ffn.switch_mlp.* —
+                    # the layer index is the third dotted component.
+                    _layer = k.split(".")[2]
+                    if _layer.isdigit():
+                        _key_to_file[k] = "spill_layer_%02d.safetensors" % int(_layer)
                 _files = sorted(
                     p.name
                     for p in _spill_dir.glob("spill_layer_*.safetensors")

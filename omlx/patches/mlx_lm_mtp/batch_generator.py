@@ -871,6 +871,16 @@ def _mtp_head_source(module: Any, runtime: Any) -> Optional[dict]:
     return src
 
 
+def _mtp_head_source_cached(module: Any, runtime: Any) -> dict | None:
+    """The head's reloadable weight source, resolved once and stashed on it."""
+    src = getattr(module, "_omlx_mtp_source", None)
+    if src is None:
+        src = _mtp_head_source(module, runtime)
+        if src is not None:
+            module._omlx_mtp_source = src
+    return src
+
+
 def _evict_mtp_head(model: Any, reason: str) -> int:
     """Drop the head's materialized arrays; reload path is stashed on it."""
     if not _mtp_head_evict_enabled():
@@ -885,13 +895,10 @@ def _evict_mtp_head(model: Any, reason: str) -> int:
         params = dict(tree_flatten(module.parameters()))
         if not params:
             return 0
-        src = getattr(module, "_omlx_mtp_source", None)
+        src = _mtp_head_source_cached(module, runtime)
         if src is None:
-            src = _mtp_head_source(module, runtime)
-            if src is None:
-                logger.debug("MTP head evict skipped: no reloadable source")
-                return 0
-            module._omlx_mtp_source = src
+            logger.debug("MTP head evict skipped: no reloadable source")
+            return 0
         freed = sum(int(a.nbytes) for a in params.values())
         module.load_weights(
             [(p, mx.zeros(0, dtype=a.dtype)) for p, a in params.items()],
@@ -925,11 +932,9 @@ def _reload_mtp_head(model: Any) -> bool:
         module, runtime = _mtp_head_module(model)
         if module is None or not getattr(module, "_omlx_mtp_evicted", False):
             return True
-        src = getattr(module, "_omlx_mtp_source", None)
+        src = _mtp_head_source_cached(module, runtime)
         if src is None:
-            src = _mtp_head_source(module, runtime)
-            if src is None:
-                return False
+            return False
         by_file: Dict[Any, list] = {}
         for path, (shard, key) in src.items():
             by_file.setdefault(shard, []).append((path, key))
@@ -963,9 +968,7 @@ def _mtp_streaming_gate() -> Tuple[str, Optional[dict]]:
         sig = None
     if sig is None:
         return "on", None
-    if _MTP_STREAM_GATE == "off":
-        return "off", sig
-    return _MTP_STREAM_GATE, sig
+    return ("off" if _MTP_STREAM_GATE == "off" else _MTP_STREAM_GATE), sig
 
 
 @dataclass
@@ -3179,16 +3182,12 @@ def _mtp_stats_accumulate(stats: "_MtpStats") -> None:
         g[k] = g.get(k, 0) + int(getattr(stats, k, 0))
     for k in ("backbone_ms", "mtp_head_ms", "sample_ms", "cache_ops_ms"):
         g[k] = g.get(k, 0.0) + float(getattr(stats, k, 0.0))
-    for j, n in enumerate(stats.depth_drafted):
-        dd = g.setdefault("depth_drafted", [])
-        while len(dd) <= j:
-            dd.append(0)
-        dd[j] += int(n)
-    for j, n in enumerate(stats.depth_accepted):
-        da = g.setdefault("depth_accepted", [])
-        while len(da) <= j:
-            da.append(0)
-        da[j] += int(n)
+    for name in ("depth_drafted", "depth_accepted"):
+        for j, n in enumerate(getattr(stats, name)):
+            acc = g.setdefault(name, [])
+            while len(acc) <= j:
+                acc.append(0)
+            acc[j] += int(n)
     g["sequences"] = g.get("sequences", 0) + 1
     if stats.mtp_gate is not None:
         g["mtp_gate"] = dict(stats.mtp_gate)

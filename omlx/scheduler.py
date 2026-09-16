@@ -2529,9 +2529,7 @@ class Scheduler:
         clear, ``_mx_buffer_access_lock``), so the #978/#1040 panic-class
         gating semantics are preserved.
         """
-        info = self._streaming_guard_info
-        if info is None:
-            info = self._resolve_streaming_guard_info()
+        info = Scheduler._resolved_guard_info(self)
         pool = mx.get_cache_memory()
         if not info:
             # Diagnostic: the streaming hooks are inert without the backing's
@@ -4221,6 +4219,61 @@ class Scheduler:
     _streaming_lru_cache: Any = None
     _streaming_lru_bytes_last: int | None = None
 
+    def _resolved_guard_info(self) -> dict:
+        """Streaming guard metadata, lazy-resolving on first use ({} when absent).
+
+        The lazy resolve lets even the first guard/throttle call (before any
+        ``_streaming_bank_bytes`` invocation) see the streaming model.
+        """
+        info = self._streaming_guard_info
+        if info is None:
+            info = self._resolve_streaming_guard_info()
+        return info or {}
+
+    def _streaming_active(self) -> bool:
+        """Whether an expert-streaming backing resolved on the model tree.
+
+        Backing presence counts (not just guard metadata): the V4.1 and
+        legacy adapters stream through mmap'd shards too — their clean file
+        pages poison the phys probe identically.
+        """
+        if self._streaming_guard_info is None:
+            self._resolve_streaming_guard_info()
+        return (
+            bool(self._streaming_guard_info)
+            or getattr(self, "_streaming_backing", None) is not None
+        )
+
+    def _streaming_lru_resident_bytes(self) -> int | None:
+        """Live resident-bytes sample of the app-level expert LRU heap.
+
+        Returns None when no streaming cache is stashed or it cannot be
+        read — callers fall back to their raw-delta behavior.
+        """
+        probe = getattr(
+            getattr(self, "_streaming_lru_cache", None), "resident_bytes", None
+        )
+        if not callable(probe):
+            return None
+        try:
+            return int(probe())
+        except Exception:
+            return None
+
+    def streaming_state(self) -> tuple[dict | None, Any, Any]:
+        """(guard_info, backing, lru_cache) snapshot for pool telemetry.
+
+        Lazy-resolves the guard info first so a status query before the
+        first chunk still reports an attached streaming model.
+        """
+        if self._streaming_guard_info is None:
+            Scheduler._resolve_streaming_guard_info(self)
+        return (
+            self._streaming_guard_info,
+            getattr(self, "_streaming_backing", None),
+            getattr(self, "_streaming_lru_cache", None),
+        )
+
     def _streaming_bank_bytes(self, n_tokens: int) -> int:
         """Predicted live expert mini-bank bytes for one streaming chunk.
 
@@ -4231,9 +4284,7 @@ class Scheduler:
         token chunks whose real peak reaches ~26 GB on qwen4_exp (48 layers x
         ~215 uniq experts x ~2.5 MB) and starves the machine (F1 finding).
         """
-        info = self._streaming_guard_info
-        if info is None:
-            info = self._resolve_streaming_guard_info()
+        info = Scheduler._resolved_guard_info(self)
         if not info:
             return 0
         uniq = min(
@@ -4282,18 +4333,10 @@ class Scheduler:
             # BEFORE the first chunk runs, so the warmup fill is
             # corrected too. Missing/unreadable cache disables the
             # tracker correction (raw deltas flow through).
-            self._streaming_lru_cache = getattr(
-                backing, "_streaming_cache", None
+            self._streaming_lru_cache = getattr(backing, "_streaming_cache", None)
+            self._streaming_lru_bytes_last = Scheduler._streaming_lru_resident_bytes(
+                self
             )
-            try:
-                probe = getattr(
-                    self._streaming_lru_cache, "resident_bytes", None
-                )
-                self._streaming_lru_bytes_last = (
-                    int(probe()) if callable(probe) else None
-                )
-            except Exception:
-                self._streaming_lru_bytes_last = None
         return self._streaming_guard_info
 
     def _predicted_chunk_transient(
@@ -5010,14 +5053,7 @@ class Scheduler:
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
             self._last_mlx_active_memory_bytes = active
-        if self._streaming_guard_info is None:
-            # Lazy-resolve so even the first guard/throttle call (before any
-            # _streaming_bank_bytes invocation) sees the streaming model.
-            self._resolve_streaming_guard_info()
-        if (
-            self._streaming_guard_info
-            or getattr(self, "_streaming_backing", None) is not None
-        ):
+        if Scheduler._streaming_active(self):
             # Streaming backing resolved: active Metal is the real
             # commitment — with two corrections. The mlock'd pin pages on
             # the backing are wired RAM outside the Metal allocator (never
@@ -5026,13 +5062,9 @@ class Scheduler:
             # a materialized heap already inside `active` stays single-
             # counted via the max().
             floor = 0
-            cache = getattr(self, "_streaming_lru_cache", None)
-            probe = getattr(cache, "resident_bytes", None)
-            if callable(probe):
-                try:
-                    floor += max(0, int(probe()))
-                except Exception:
-                    pass
+            resident = Scheduler._streaming_lru_resident_bytes(self)
+            if resident is not None:
+                floor += max(0, resident)
             floor += max(
                 0,
                 int(
@@ -5257,15 +5289,8 @@ class Scheduler:
         chunk runs — so the warmup fill is corrected too. LRU shrink
         (eviction/governor pressure) reports 0, never a negative credit.
         """
-        cache = getattr(self, "_streaming_lru_cache", None)
-        probe = getattr(cache, "resident_bytes", None)
-        if not callable(probe):
-            return 0
-        try:
-            now = int(probe())
-        except Exception:
-            return 0
-        if now < 0:
+        now = Scheduler._streaming_lru_resident_bytes(self)
+        if now is None or now < 0:
             return 0
         last = getattr(self, "_streaming_lru_bytes_last", None)
         self._streaming_lru_bytes_last = now
@@ -5285,12 +5310,7 @@ class Scheduler:
         Metal active high-water instead: exactly the banks + activations the
         chunk really commits.
         """
-        if self._streaming_guard_info is None:
-            self._resolve_streaming_guard_info()
-        if (
-            self._streaming_guard_info
-            or getattr(self, "_streaming_backing", None) is not None
-        ):
+        if Scheduler._streaming_active(self):
             # Backing presence (not just guard metadata): the V4.1 and
             # legacy adapters stream through mmap'd shards too — their
             # clean file pages poison the phys probe identically.

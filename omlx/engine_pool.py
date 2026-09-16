@@ -55,6 +55,7 @@ from .model_settings import (
     EXPERT_STREAMING_TUNABLE_KEYS,
     ane_prefill_backend,
     ane_prefill_fraction,
+    moe_offload_requested,
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
@@ -415,8 +416,6 @@ class EnginePool:
                 shared_fraction=runtime_settings.qwen35_ane_prefill_shared_fraction,
                 width=runtime_settings.qwen35_ane_prefill_sequence_length,
             )
-        from .model_settings import moe_offload_requested
-
         if moe_offload_requested(runtime_settings):
             from .patches.moe_expert_offload import estimate_offload_admission_bytes
 
@@ -511,8 +510,6 @@ class EnginePool:
                 qwen4_exp_residency_estimate,
             )
 
-            from .model_settings import moe_offload_requested
-
             estimate = qwen4_exp_residency_estimate(entry.model_path)
             if moe_offload_requested(settings):
                 from .patches.moe_expert_offload import estimate_offload_admission_bytes
@@ -577,7 +574,6 @@ class EnginePool:
         if model_type != "deepseek_v41":
             return False, False, None
         try:
-            from .model_settings import moe_offload_requested
             from .patches.deepseek_v41.residency import (
                 deepseek_v41_residency_estimate,
             )
@@ -951,10 +947,14 @@ class EnginePool:
                 # budget_gib is canonicalized: the WebUI writes an explicit 0
                 # for page-cache mode, and 0 must hash the same as unset so
                 # flipping auto/page-cache never forces a reload.
-                if key == "expert_streaming_budget_gib":
-                    add(key, data.get(key) or 0)
-                else:
-                    add(key, data.get(key))
+                add(
+                    key,
+                    (
+                        (data.get(key) or 0)
+                        if key == "expert_streaming_budget_gib"
+                        else data.get(key)
+                    ),
+                )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"
@@ -3542,15 +3542,16 @@ class EnginePool:
             sched = self._resolve_scheduler_from_engine(engine)
             guard_info = None
             if sched is not None:
-                if getattr(sched, "_streaming_guard_info", None) is None:
-                    resolve = getattr(sched, "_resolve_streaming_guard_info", None)
-                    if callable(resolve):
-                        resolve()
-                guard_info = getattr(sched, "_streaming_guard_info", None)
-                if backing is None:
-                    backing = getattr(sched, "_streaming_backing", None)
-                if cache is None:
-                    cache = getattr(sched, "_streaming_lru_cache", None)
+                # The scheduler's accessor lazy-resolves and returns the
+                # (guard_info, backing, lru_cache) snapshot — no private
+                # getattr mining here.
+                state = getattr(sched, "streaming_state", None)
+                if callable(state):
+                    guard_info, sched_backing, sched_cache = state()
+                    if backing is None:
+                        backing = sched_backing
+                    if cache is None:
+                        cache = sched_cache
             if backing is None and cache is None:
                 return None
 

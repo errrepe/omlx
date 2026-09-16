@@ -784,23 +784,11 @@ class BatchedEngine(BaseEngine):
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
-        # Persist the learned expert-pin profile while the backing is still
-        # reachable (teardown below drops it with the model).
-        from omlx.patches.expert_streaming import (
-            resolve_streaming_backing,
-            save_expert_pin_profile,
-            shutdown_expert_streaming,
-        )
+        # Persist the learned expert-pin profile and shut the streaming
+        # backing down while it is still reachable (it drops with the model).
+        from omlx.patches.expert_streaming import teardown_expert_streaming
 
-        save_expert_pin_profile(self)
-        try:
-            shutdown_expert_streaming(resolve_streaming_backing(self))
-        except Exception:
-            pass
-        try:
-            self._expert_streaming_backing = None
-        except Exception:
-            pass
+        teardown_expert_streaming(self)
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
@@ -1065,10 +1053,7 @@ class BatchedEngine(BaseEngine):
         )
 
         text = clean_special_tokens(output.output_text)
-        self._log_streaming_summary(
-            prompt_tokens=output.prompt_tokens,
-            completion_tokens=output.completion_tokens,
-        )
+        self._log_streaming_summary(output)
 
         return GenerationOutput(
             text=text,
@@ -1078,21 +1063,6 @@ class BatchedEngine(BaseEngine):
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
-        )
-
-    def _log_streaming_summary(
-        self, *, prompt_tokens: int = 0, completion_tokens: int = 0
-    ) -> None:
-        """One-line MoE streaming health log per completed request.
-
-        No-op unless expert streaming is active.
-        """
-        from ..patches.expert_streaming import log_expert_streaming_summary
-
-        log_expert_streaming_summary(
-            self,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
         )
 
     async def stream_generate(
@@ -1227,14 +1197,7 @@ class BatchedEngine(BaseEngine):
                 logger.debug(
                     f"[stream_generate] Request {request_id} finished normally"
                 )
-                self._log_streaming_summary(
-                    prompt_tokens=int(
-                        getattr(last_output, "prompt_tokens", 0) or 0
-                    ),
-                    completion_tokens=int(
-                        getattr(last_output, "completion_tokens", 0) or 0
-                    ),
-                )
+                self._log_streaming_summary(last_output)
 
     async def chat(
         self,

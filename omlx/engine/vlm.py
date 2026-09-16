@@ -1902,11 +1902,7 @@ class VLMBatchedEngine(BaseEngine):
                         # is_mtp_active() — forward the request or the
                         # resident DSpark head is dropped on load.
                         preserve_mtp=(
-                            True
-                            if getattr(
-                                self._model_settings, "mtp_enabled", False
-                            )
-                            else None
+                            getattr(self._model_settings, "mtp_enabled", False) or None
                         ),
                     )
                     self._attach_v41_dynamic_residency(loaded)
@@ -1944,21 +1940,21 @@ class VLMBatchedEngine(BaseEngine):
                         expert_streaming_estimate,
                     )
 
-                    if is_supported_model_type(model_type) and expert_streaming_estimate(
-                        self._model_name
-                    ).supported:
-                        # Lazy-load so giant MoE checkpoints (Qwen3.8-Flash-Next
-                        # 99G, GLM-5.3-Flash-oQ4e 190G) stream from SSD instead of
-                        # materializing fully in RAM; expert streaming replaces
-                        # the MoE projections afterwards.
-                        load_kwargs["lazy"] = True
                     # Expert offload wraps BEFORE materialization so non-resident
                     # experts never load; keep the load lazy only when the feature
                     # is on. Threads into main's load_kwargs path (lazy is idempotent
                     # with the QWEN4_EXP case above). Unified backend: either key.
+                    # The estimate side (checked second — it costs a header scan)
+                    # lazy-loads giant MoE checkpoints (Qwen3.8-Flash-Next 99G,
+                    # GLM-5.3-Flash-oQ4e 190G) so they stream from SSD instead of
+                    # materializing fully in RAM; expert streaming replaces the
+                    # MoE projections afterwards.
                     from ..model_settings import moe_offload_requested
 
-                    if moe_offload_requested(self._model_settings):
+                    if moe_offload_requested(self._model_settings) or (
+                        is_supported_model_type(model_type)
+                        and expert_streaming_estimate(self._model_name).supported
+                    ):
                         load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
@@ -2575,7 +2571,7 @@ class VLMBatchedEngine(BaseEngine):
             from ..patches.deepseek_v41.streaming_backing import (
                 V41StreamingBacking,
             )
-            from ..patches.expert_streaming import _dynamic_armed
+            from ..patches.expert_streaming import _dynamic_armed, _io_overrides
 
             layers = []
             for idx, layer in enumerate(model.language_model.layers):
@@ -2585,31 +2581,26 @@ class VLMBatchedEngine(BaseEngine):
             if not layers:
                 return
             settings = self._model_settings
+            # Same validated IO-override view the converter consumes:
+            # out-of-range/unparseable tunables resolve to None (governor
+            # defaults) instead of raising mid-attach into a debug-logged
+            # static fallback.
+            io_ov = _io_overrides(settings)
             # settings=None: skip the generic pinned-budget rule (see
             # docstring). Env opt-out still applies inside _dynamic_armed.
-            dyn = _dynamic_armed(
-                getattr(settings, "expert_streaming_dynamic", None), None
-            )
-            max_gib = getattr(
-                settings, "expert_streaming_dynamic_max_gib", None
-            )
-            min_gib = getattr(
-                settings, "expert_streaming_dynamic_min_gib", None
-            )
-            stall = getattr(
-                settings, "expert_streaming_dynamic_stall_target", None
-            )
+            dyn = _dynamic_armed(io_ov["expert_streaming_dynamic"], None)
+
+            def _gib(key: str) -> int | None:
+                v = io_ov.get(key)
+                return int(v * 1024**3) if v is not None else None
+
             backing = V41StreamingBacking(
                 plan,
                 layers,
                 dynamic=bool(dyn),
-                max_budget_bytes=(
-                    int(max_gib * 1024**3) if max_gib is not None else None
-                ),
-                min_budget_bytes=(
-                    int(min_gib * 1024**3) if min_gib is not None else None
-                ),
-                stall_target=stall,
+                max_budget_bytes=_gib("expert_streaming_dynamic_max_gib"),
+                min_budget_bytes=_gib("expert_streaming_dynamic_min_gib"),
+                stall_target=io_ov.get("expert_streaming_dynamic_stall_target"),
             )
             self._expert_streaming_backing = backing
             try:
@@ -2661,23 +2652,11 @@ class VLMBatchedEngine(BaseEngine):
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
-        # Persist the learned expert-pin profile while the backing is still
-        # reachable (teardown below drops it with the model).
-        from omlx.patches.expert_streaming import (
-            resolve_streaming_backing,
-            save_expert_pin_profile,
-            shutdown_expert_streaming,
-        )
+        # Persist the learned expert-pin profile and shut the streaming
+        # backing down while it is still reachable (it drops with the model).
+        from omlx.patches.expert_streaming import teardown_expert_streaming
 
-        save_expert_pin_profile(self)
-        try:
-            shutdown_expert_streaming(resolve_streaming_backing(self))
-        except Exception:
-            pass
-        try:
-            self._expert_streaming_backing = None
-        except Exception:
-            pass
+        teardown_expert_streaming(self)
         engine = self._engine
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
@@ -4146,7 +4125,6 @@ class VLMBatchedEngine(BaseEngine):
 
                 yield GenerationOutput(
                     text=text,
-    
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -4181,26 +4159,7 @@ class VLMBatchedEngine(BaseEngine):
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
                 await engine.abort_request(request_id)
             else:
-                self._log_streaming_summary(
-                    prompt_tokens=int(
-                        getattr(last_output, "prompt_tokens", 0) or 0
-                    ),
-                    completion_tokens=int(
-                        getattr(last_output, "completion_tokens", 0) or 0
-                    ),
-                )
-
-    def _log_streaming_summary(
-        self, *, prompt_tokens: int = 0, completion_tokens: int = 0
-    ) -> None:
-        """Parity with BatchedEngine: one-line MoE streaming health log."""
-        from ..patches.expert_streaming import log_expert_streaming_summary
-
-        log_expert_streaming_summary(
-            self,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        )
+                self._log_streaming_summary(last_output)
 
     async def chat(
         self,
@@ -4286,13 +4245,7 @@ class VLMBatchedEngine(BaseEngine):
         # + dynamic-governor observe. VLM chat is the path the bench and the
         # largest streaming checkpoints use; without this the governor never
         # fires here (found 2026-09-11: actions stayed 0 across requests).
-        try:
-            self._log_streaming_summary(
-                prompt_tokens=getattr(output, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(output, "completion_tokens", 0) or 0,
-            )
-        except Exception:
-            pass
+        self._log_streaming_summary(output)
         return output
 
     async def preflight_chat(
