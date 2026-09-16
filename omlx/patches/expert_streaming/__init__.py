@@ -522,8 +522,8 @@ async def streaming_offload_load(
     """
     import asyncio
 
-    from ..engine_core import get_mlx_executor
-    from ..model_settings import moe_offload_requested
+    from ...engine_core import get_mlx_executor
+    from ...model_settings import moe_offload_requested
 
     loop = asyncio.get_running_loop()
     offload_requested = moe_offload_requested(settings)
@@ -564,7 +564,7 @@ async def streaming_offload_load(
     # post-apply materialize fixes that on the same executor.
     wrapped = 0
     if offload_requested:
-        from ..patches.moe_expert_offload import (
+        from ..moe_expert_offload import (
             apply_moe_expert_offload,
             materialize_offload_state,
         )
