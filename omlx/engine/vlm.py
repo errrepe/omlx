@@ -1918,6 +1918,12 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
+                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                        # PLE checkpoints must stay lazy until
+                        # materialize_lazy_state wires the gather-ahead
+                        # machinery — evaluating eagerly materializes the
+                        # whole SSD-backed weight tree.
+                        load_kwargs["lazy"] = True
                     # Single predicate shared with EnginePool and the
                     # converter (engine/batched.py carries the same call).
                     #

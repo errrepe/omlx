@@ -1898,12 +1898,11 @@ class ModelSettingsManager:
             if description is not None:
                 template["description"] = description
             if settings is not None:
-                # Same partial-update semantics as update_profile: incoming
-                # settings are a patch over the stored universal fields, not
-                # a wholesale replacement.
-                merged = dict(template.get("settings") or {})
-                merged.update(filter_universal_fields(settings))
-                template["settings"] = merged
+                # Replace, don't merge: unlike update_profile, templates only
+                # hold universal fields and the editor serializes every one
+                # of them (formValuesForTemplate). A key the user cleared is
+                # absent by design — merging would resurrect it.
+                template["settings"] = filter_universal_fields(settings)
             template["updated_at"] = utcnow().isoformat()
             templates_snapshot = copy.deepcopy(self._templates)
             profiles_snapshot = copy.deepcopy(self._profiles)
