@@ -2,6 +2,10 @@
 """Dynamic budget (auto default) + phase-aware caps."""
 from types import SimpleNamespace
 
+import pytest
+
+import omlx.patches.expert_streaming as P
+import omlx.patches.expert_streaming.governor as G
 from omlx.patches.expert_streaming import (
     _auto_budget_bytes,
     _budget_is_pinned,
@@ -9,6 +13,15 @@ from omlx.patches.expert_streaming import (
     resolve_budget_bytes,
 )
 from omlx.patches.expert_streaming.governor import ExpertResidencyGovernor
+
+
+@pytest.fixture
+def free_bytes(monkeypatch):
+    """Patch ``G._free_bytes`` to a fixed value for the test."""
+    def _set(n):
+        monkeypatch.setattr(G, "_free_bytes", lambda: n)
+
+    return _set
 
 
 class _Stats:
@@ -67,11 +80,10 @@ def _feed(cache, layers, missed, by_layer=None):
 
 # -- hunger -------------------------------------------------------------
 
-def test_hunger_grows_additively_with_headroom(monkeypatch):
+def test_hunger_grows_additively_with_headroom(free_bytes):
     c = _FakeCache(capacity=400, per_layer=100)
     g = _gov(c, num_layers=12)
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: 3 * 1024**3)
+    free_bytes(3 * 1024**3)
     _feed(c, 64, 32, {0: 20, 1: 12})  # stall 0.50 > 0.05
     action = g.observe(force=True)
     assert action.startswith("grow")
@@ -80,9 +92,8 @@ def test_hunger_grows_additively_with_headroom(monkeypatch):
     assert all(v <= c.capacity for v in c.overrides.values())
 
 
-def test_no_grow_small_window(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: 3 * 1024**3)
+def test_no_grow_small_window(free_bytes):
+    free_bytes(3 * 1024**3)
     c = _FakeCache()
     g = _gov(c)
     _feed(c, 8, 8, {0: 8})  # stall 1.0 but window < 16
@@ -90,9 +101,8 @@ def test_no_grow_small_window(monkeypatch):
     assert c.capacity == 400
 
 
-def test_no_grow_without_headroom(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: int(2.5 * 1024**3))
+def test_no_grow_without_headroom(free_bytes):
+    free_bytes(int(2.5 * 1024**3))
     c = _FakeCache()
     g = _gov(c, target_free_bytes=3 * 1024**3)  # free < TGT -> shrink zone
     _feed(c, 64, 64, {0: 40})
@@ -100,18 +110,16 @@ def test_no_grow_without_headroom(monkeypatch):
     assert action.startswith("shrink")  # pressure wins over hunger
 
 
-def test_no_grow_below_target(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: 3 * 1024**3)
+def test_no_grow_below_target(free_bytes):
+    free_bytes(3 * 1024**3)
     c = _FakeCache()
     g = _gov(c, stall_target=0.05)
     _feed(c, 100, 2)  # stall 0.02 < target
     assert g.observe(force=True) == ""
 
 
-def test_pressure_shrink_respects_min_budget(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: int(1.5 * 1024**3))
+def test_pressure_shrink_respects_min_budget(free_bytes):
+    free_bytes(int(1.5 * 1024**3))
     c = _FakeCache(capacity=400, per_layer=100)
     g = _gov(c, min_budget_bytes=300 * 1024 * 1024)  # floor 300 slots
     action = g.observe(force=True)
@@ -119,18 +127,16 @@ def test_pressure_shrink_respects_min_budget(monkeypatch):
     assert c.capacity == 300  # max(floor, half)=300, not 200
 
 
-def test_desperate_clears(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: int(0.1 * 1024**3))
+def test_desperate_clears(free_bytes):
+    free_bytes(int(0.1 * 1024**3))
     c = _FakeCache()
     g = _gov(c)
     assert g.observe(force=True).startswith("clear")
     assert c.cleared == 1
 
 
-def test_abundance_doubles(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: 5 * 1024**3)
+def test_abundance_doubles(free_bytes):
+    free_bytes(5 * 1024**3)
     c = _FakeCache(capacity=400, per_layer=100)
     g = _gov(c)
     _feed(c, 100, 1)  # no hunger; abundance path
@@ -139,9 +145,8 @@ def test_abundance_doubles(monkeypatch):
     assert c.capacity == 800
 
 
-def test_cooldown_blocks_flap(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: 5 * 1024**3)
+def test_cooldown_blocks_flap(free_bytes):
+    free_bytes(5 * 1024**3)
     c = _FakeCache()
     g = _gov(c, cooldown_s=3600)
     _feed(c, 100, 1)
@@ -149,9 +154,8 @@ def test_cooldown_blocks_flap(monkeypatch):
     assert g.observe() == ""  # cooling down
 
 
-def test_reset_rebaselines(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: 3 * 1024**3)
+def test_reset_rebaselines(free_bytes):
+    free_bytes(3 * 1024**3)
     c = _FakeCache()
     g = _gov(c)
     _feed(c, 100, 50, {0: 30})
@@ -166,9 +170,8 @@ def test_reset_rebaselines(monkeypatch):
     assert c.capacity == 500
 
 
-def test_duck_cache_without_targeting(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: 3 * 1024**3)
+def test_duck_cache_without_targeting(free_bytes):
+    free_bytes(3 * 1024**3)
 
     class _Bare:
         """Minimal contract: capacity/stats/clear/resize — no targeting."""
@@ -283,11 +286,10 @@ def test_accessors_safe_without_cache():
     assert g.min_capacity() >= 1
 
 
-def test_tick_observe_serialized(monkeypatch):
+def test_tick_observe_serialized(free_bytes):
     """tick() holds the governor lock across its throttle bookkeeping and
     observe() — a mid-request tick cannot interleave a boundary observe."""
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_free_bytes", lambda: 3 * 1024**3)
+    free_bytes(3 * 1024**3)
     c = _FakeCache()
     g = _gov(c, cooldown_s=0)
     _feed(c, 100, 50, {0: 30})
@@ -328,19 +330,26 @@ def test_auto_budget_bounds():
     assert int(0.5 * 1024**3) <= b <= int(4.0 * 1024**3)
 
 
-def test_explicit_budget_wins():
-    s = SimpleNamespace(expert_streaming_budget_gib=1.5, expert_streaming_budget_auto=True)
-    assert resolve_budget_bytes(s) == int(1.5 * 1024**3)
-
-
-def test_auto_default_returns_scaled():
-    s = SimpleNamespace(expert_streaming_budget_gib=None, expert_streaming_budget_auto=None)
-    assert resolve_budget_bytes(s) == _auto_budget_bytes() > 0
-
-
-def test_auto_false_is_page_cache_only():
-    s = SimpleNamespace(expert_streaming_budget_gib=None, expert_streaming_budget_auto=False)
-    assert resolve_budget_bytes(s) == 0
+@pytest.mark.parametrize(
+    ("gib", "auto", "expected"),
+    [
+        # explicit setting always wins
+        (1.5, True, int(1.5 * 1024**3)),
+        # None sentinel: auto budget scaled to RAM
+        (None, None, -1),
+        # auto=False -> page-cache-only path (no budget)
+        (None, False, 0),
+    ],
+    ids=["explicit_wins", "auto_scales", "auto_off_page_cache"],
+)
+def test_resolve_budget_bytes(gib, auto, expected):
+    s = SimpleNamespace(
+        expert_streaming_budget_gib=gib, expert_streaming_budget_auto=auto
+    )
+    if expected < 0:
+        assert resolve_budget_bytes(s) == _auto_budget_bytes() > 0
+    else:
+        assert resolve_budget_bytes(s) == expected
 
 
 def test_dynamic_armed_matrix(monkeypatch):
@@ -350,7 +359,6 @@ def test_dynamic_armed_matrix(monkeypatch):
     assert _dynamic_armed(True, pinned) is True
     assert _dynamic_armed(False, auto) is False
     # env forces on
-    import omlx.patches.expert_streaming as P
     monkeypatch.setattr(P, "dynamic_residency_enabled", lambda: True)
     assert _dynamic_armed(None, pinned) is True
     monkeypatch.setattr(P, "dynamic_residency_enabled", lambda: False)
@@ -362,38 +370,48 @@ def test_dynamic_armed_matrix(monkeypatch):
 
 # -- watermark env fractions + generic staging headroom ----------------
 
-def test_watermark_envs_scale_with_ram(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    ram = 96 * 1024**3
-    monkeypatch.setattr(G, "_total_ram_bytes", lambda: ram)
-    monkeypatch.setenv("OMLX_GOV_LOW_FRAC", "0.05")
-    monkeypatch.setenv("OMLX_GOV_TARGET_FRAC", "0.15")
-    monkeypatch.setenv("OMLX_GOV_HIGH_FRAC", "0.30")
-    g = _gov(cache=None, low_free_bytes=None,
-             target_free_bytes=None, high_free_bytes=None)
-    assert g.low_free_bytes == int(ram * 0.05)
-    assert g.target_free_bytes == int(ram * 0.15)
-    assert g.high_free_bytes == int(ram * 0.30)
+@pytest.mark.parametrize(
+    ("ram", "env", "kwargs", "expected"),
+    [
+        # all three watermarks scale with RAM via the env fractions
+        (
+            96,
+            {"OMLX_GOV_LOW_FRAC": "0.05", "OMLX_GOV_TARGET_FRAC": "0.15",
+             "OMLX_GOV_HIGH_FRAC": "0.30"},
+            {"low_free_bytes": None, "target_free_bytes": None,
+             "high_free_bytes": None},
+            {"low_free_bytes": int(96 * 1024**3 * 0.05),
+             "target_free_bytes": int(96 * 1024**3 * 0.15),
+             "high_free_bytes": int(96 * 1024**3 * 0.30)},
+        ),
+        # explicit kwarg wins over the env fraction
+        (
+            96,
+            {"OMLX_GOV_LOW_FRAC": "0.05"},
+            {"low_free_bytes": 1024**3},
+            {"low_free_bytes": 1024**3},
+        ),
+        # unparsable env keeps the built-in default fraction (0.10)
+        (
+            64,
+            {"OMLX_GOV_LOW_FRAC": "banana"},
+            {"low_free_bytes": None},
+            {"low_free_bytes": int(64 * 1024**3 * 0.10)},
+        ),
+    ],
+    ids=["envs_scale_with_ram", "explicit_kwargs_beat_env",
+         "invalid_env_keeps_default"],
+)
+def test_watermark_resolution(monkeypatch, ram, env, kwargs, expected):
+    monkeypatch.setattr(G, "_total_ram_bytes", lambda: ram * 1024**3)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    g = _gov(cache=None, **kwargs)
+    for attr, want in expected.items():
+        assert getattr(g, attr) == want
 
 
-def test_watermark_explicit_kwargs_beat_env(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    monkeypatch.setattr(G, "_total_ram_bytes", lambda: 96 * 1024**3)
-    monkeypatch.setenv("OMLX_GOV_LOW_FRAC", "0.05")
-    g = _gov(low_free_bytes=1 * 1024**3)
-    assert g.low_free_bytes == 1 * 1024**3  # explicit wins
-
-
-def test_watermark_invalid_env_keeps_default(monkeypatch):
-    import omlx.patches.expert_streaming.governor as G
-    ram = 64 * 1024**3
-    monkeypatch.setattr(G, "_total_ram_bytes", lambda: ram)
-    monkeypatch.setenv("OMLX_GOV_LOW_FRAC", "banana")
-    g = _gov(cache=None, low_free_bytes=None)
-    assert g.low_free_bytes == int(ram * 0.10)
-
-
-def test_stage_headroom_generic(monkeypatch):
+def test_stage_headroom_generic():
     """Generic path staging mirrors the V4.1 headroom gate."""
     from omlx.patches.expert_streaming.streaming_switch import (
         StreamingQuantizedSwitchLinear,

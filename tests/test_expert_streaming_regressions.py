@@ -1,49 +1,13 @@
 """Regression coverage: SSD-backing failure, per-model top-k isolation,
-spill manifest invalidation, prefill stand-in LRU probe."""
+prefill stand-in LRU probe."""
 
-import json
-import struct
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-
-
-def _write_supported_checkpoint(tmp: Path) -> None:
-    config = {
-        "model_type": "qwen4_exp",
-        "num_hidden_layers": 2,
-        "num_experts": 4,
-        "hidden_size": 32,
-        "moe_intermediate_size": 16,
-    }
-    (tmp / "config.json").write_text(json.dumps(config))
-    import numpy as np
-
-    tensors = {}
-    for layer in range(2):
-        for proj, shape in [
-            ("gate_proj", (4, 16, 32)),
-            ("up_proj", (4, 16, 32)),
-            ("down_proj", (4, 32, 16)),
-        ]:
-            key = f"model.layers.{layer}.mlp.switch_mlp.{proj}.weight"
-            tensors[key] = (shape, "BF16", int(np.prod(shape)) * 2)
-    header = {}
-    offset = 0
-    for k, (shape, dtype, size) in tensors.items():
-        header[k] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + size]}
-        offset += size
-    hb = json.dumps(header).encode()
-    with (tmp / "model.safetensors").open("wb") as f:
-        f.write(struct.pack("<Q", len(hb)))
-        f.write(hb)
-        f.write(b"\x00" * offset)
-    (tmp / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
-    )
+from streaming_fixtures import write_moe_checkpoint
 
 
 def test_ssd_backing_failure_fails_clean_not_ram_fallback():
@@ -52,7 +16,7 @@ def test_ssd_backing_failure_fails_clean_not_ram_fallback():
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        _write_supported_checkpoint(tmp)
+        write_moe_checkpoint(tmp)
         model = SimpleNamespace()  # never reached: backing fails first
         with patch(
             "omlx.patches.expert_streaming.shard_bank.ExpertBackingStore",
@@ -132,25 +96,4 @@ def test_topk_patch_uses_per_instance():
     finally:
         at.configure(prev)
         at.configure_cache_prior(0.0)
-
-
-def test_spill_source_change_invalidates_and_empty_manifest_rejected(tmp_path):
-    """Checkpoint change must not serve previous weights."""
-    from omlx.patches.deepseek_v4 import spill as S
-
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"x" * 64)
-    conv = S.spill_dir_for(model_dir)
-    conv.mkdir(parents=True)
-    (conv / "spill_layer_00.safetensors").write_bytes(b"y" * 64)
-    S.write_manifest(conv, model_dir, ["spill_layer_00.safetensors"], {"k": "spill_layer_00.safetensors"})
-    assert S.spill_is_valid(model_dir) == conv
-    # Source change invalidates; stale shard must not validate.
-    (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"x" * 65)
-    assert S.spill_is_valid(model_dir) is None
-    # Empty file list never validates (would otherwise glob stale shards).
-    S.write_manifest(conv, model_dir, [], {})
-    assert S.spill_is_valid(model_dir) is None
-
 

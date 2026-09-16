@@ -9,7 +9,42 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+from streaming_fixtures import v41_backing
 from test_deepseek_v41 import write_checkpoint
+
+
+def _glu_store(tmp_path, n=4):
+    """Quantized n-expert SwitchGLU whose ``switch_glu`` tensors are
+    written to ``tmp_path/model.safetensors``, plus the
+    ``CheckpointExpertStore``/``_GLUStoreView`` pair reading them."""
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from omlx.patches.moe_expert_offload import (
+        CheckpointExpertStore,
+        _GLUStoreView,
+    )
+
+    glu = SwitchGLU(32, 32, n)
+    nn.quantize(glu, group_size=32, bits=4)
+    tensors = {}
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        lin = getattr(glu, proj)
+        for field in ("weight", "scales", "biases"):
+            if lin.get(field) is not None:
+                tensors[f"layers.0.mlp.switch_glu.{proj}.{field}"] = lin[field]
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    store = CheckpointExpertStore(tmp_path)
+    view = _GLUStoreView(store, "layers.0.mlp.switch_glu")
+    return glu, store, view
+
+
+def _legacy_cache(tmp_path, capacity=2, n=4):
+    """An ``ExpertCache`` over a freshly written ``_glu_store``."""
+    from omlx.patches.moe_expert_offload import ExpertCache
+
+    glu, _store, view = _glu_store(tmp_path, n)
+    return ExpertCache(glu, capacity, view)
 
 
 def _loaded_v41(tmp_path, *, n_routed=16, n_activated=4, fraction=0.25):
@@ -92,21 +127,9 @@ class TestV41GovernorFloor:
     """The dynamic floor is one decode working set, not min(8, cap)."""
 
     def test_floor_tracks_n_activated(self, tmp_path):
-        from omlx.patches.deepseek_v41.streaming_backing import (
-            V41StreamingBacking,
-        )
-        from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
-
         model = _loaded_v41(tmp_path, n_routed=16, n_activated=10)
         try:
-            layers = [
-                (i, l.ffn.experts.slots)
-                for i, l in enumerate(model.language_model.layers)
-                if isinstance(getattr(l.ffn, "experts", None), OffloadedExpert)
-            ]
-            backing = V41StreamingBacking(
-                model._moe_offload_plan, layers, dynamic=True
-            )
+            backing = v41_backing(model, dynamic=True)
             try:
                 assert backing.governor is not None
                 # Slot floor = one decode working set — a smaller floor
@@ -120,21 +143,9 @@ class TestV41GovernorFloor:
             model.close()
 
     def test_capacity_property_and_guard_info(self, tmp_path):
-        from omlx.patches.deepseek_v41.streaming_backing import (
-            V41StreamingBacking,
-        )
-        from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
-
         model = _loaded_v41(tmp_path)
         try:
-            layers = [
-                (i, l.ffn.experts.slots)
-                for i, l in enumerate(model.language_model.layers)
-                if isinstance(getattr(l.ffn, "experts", None), OffloadedExpert)
-            ]
-            backing = V41StreamingBacking(
-                model._moe_offload_plan, layers, dynamic=False
-            )
+            backing = v41_backing(model, dynamic=False)
             # capacity resolves to base_cap through a single property.
             assert backing.capacity == backing.base_cap
             # Absent on purpose — V4.1 slots are persistent buffers, not
@@ -179,31 +190,8 @@ class TestV41CompactAtomic:
 class TestLegacyCacheAtomicity:
     """Fetch-first install + a real lock on the legacy cache."""
 
-    def _cache(self, tmp_path, capacity=2, n=4):
-        from mlx_lm.models.switch_layers import SwitchGLU
-        import mlx.nn as nn
-
-        from omlx.patches.moe_expert_offload import (
-            CheckpointExpertStore,
-            ExpertCache,
-            _GLUStoreView,
-        )
-
-        glu = SwitchGLU(32, 32, n)
-        nn.quantize(glu, group_size=32, bits=4)
-        tensors = {}
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            lin = getattr(glu, proj)
-            for field in ("weight", "scales", "biases"):
-                if lin.get(field) is not None:
-                    tensors[f"layers.0.mlp.switch_glu.{proj}.{field}"] = lin[field]
-        mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
-        store = CheckpointExpertStore(tmp_path)
-        view = _GLUStoreView(store, "layers.0.mlp.switch_glu")
-        return ExpertCache(glu, capacity, view)
-
     def test_failed_install_mutates_nothing(self, tmp_path):
-        cache = self._cache(tmp_path)
+        cache = _legacy_cache(tmp_path)
         cache.ensure(mx.array([0]))  # one resident
         before_slots = dict(cache.slot_of)
         before_free = list(cache.free)
@@ -226,20 +214,11 @@ class TestLegacyCacheAtomicity:
 
     def test_legacy_apply_stamps_serialization_marker(self, tmp_path):
         import mlx.nn as nn
-        from mlx_lm.models.switch_layers import SwitchGLU
 
         from omlx.patches.moe_expert_offload import _apply_legacy_adapter
         from omlx.scheduler import _model_uses_expert_streaming
 
-        glu = SwitchGLU(32, 32, 4)
-        nn.quantize(glu, group_size=32, bits=4)
-        tensors = {}
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            lin = getattr(glu, proj)
-            for field in ("weight", "scales", "biases"):
-                if lin.get(field) is not None:
-                    tensors[f"layers.0.mlp.switch_glu.{proj}.{field}"] = lin[field]
-        mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+        glu, _store, _view = _glu_store(tmp_path)
 
         class _GLU(nn.Module):
             def __init__(self, g):
@@ -306,31 +285,8 @@ class TestTransitionProfileAtomic:
 class TestLegacyCacheResize:
     """Governor-facing resize/clear on the legacy per-layer cache."""
 
-    def _cache(self, tmp_path, capacity=4, n=8):
-        import mlx.nn as nn
-        from mlx_lm.models.switch_layers import SwitchGLU
-
-        from omlx.patches.moe_expert_offload import (
-            CheckpointExpertStore,
-            ExpertCache,
-            _GLUStoreView,
-        )
-
-        glu = SwitchGLU(32, 32, n)
-        nn.quantize(glu, group_size=32, bits=4)
-        tensors = {}
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            lin = getattr(glu, proj)
-            for field in ("weight", "scales", "biases"):
-                if lin.get(field) is not None:
-                    tensors[f"layers.0.mlp.switch_glu.{proj}.{field}"] = lin[field]
-        mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
-        store = CheckpointExpertStore(tmp_path)
-        view = _GLUStoreView(store, "layers.0.mlp.switch_glu")
-        return ExpertCache(glu, capacity, view)
-
     def test_shrink_evicts_lru_and_caps_installs(self, tmp_path):
-        cache = self._cache(tmp_path)
+        cache = _legacy_cache(tmp_path, capacity=4, n=8)
         try:
             cache.ensure(mx.array([0, 1, 2, 3]))  # fill all 4 rooms
             cache.resize(2)
@@ -347,7 +303,7 @@ class TestLegacyCacheResize:
             cache.disk._store.close()
 
     def test_grow_reallocs_and_installs_land(self, tmp_path):
-        cache = self._cache(tmp_path, capacity=4, n=8)
+        cache = _legacy_cache(tmp_path, capacity=4, n=8)
         try:
             cache.ensure(mx.array([0, 1]))
             cache.resize(6)
@@ -364,7 +320,7 @@ class TestLegacyCacheResize:
             cache.disk._store.close()
 
     def test_clear_drops_residency(self, tmp_path):
-        cache = self._cache(tmp_path)
+        cache = _legacy_cache(tmp_path, capacity=4, n=8)
         try:
             cache.ensure(mx.array([0, 1]))
             cache.clear()
@@ -379,26 +335,9 @@ class TestLegacyOffloadState:
     """The legacy aggregate presents the V4.1 governor duck-type."""
 
     def _module(self, tmp_path, capacity=4, n=8):
-        import mlx.nn as nn
-        from mlx_lm.models.switch_layers import SwitchGLU
+        from omlx.patches.moe_expert_offload import OffloadSwitchGLU
 
-        from omlx.patches.moe_expert_offload import (
-            CheckpointExpertStore,
-            OffloadSwitchGLU,
-            _GLUStoreView,
-        )
-
-        glu = SwitchGLU(32, 32, n)
-        nn.quantize(glu, group_size=32, bits=4)
-        tensors = {}
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            lin = getattr(glu, proj)
-            for field in ("weight", "scales", "biases"):
-                if lin.get(field) is not None:
-                    tensors[f"layers.0.mlp.switch_glu.{proj}.{field}"] = lin[field]
-        mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
-        store = CheckpointExpertStore(tmp_path)
-        view = _GLUStoreView(store, "layers.0.mlp.switch_glu")
+        glu, store, view = _glu_store(tmp_path, n)
         return OffloadSwitchGLU(glu, capacity, view), store
 
     def test_governor_duck_and_stats(self, tmp_path):

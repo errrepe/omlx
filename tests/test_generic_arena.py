@@ -113,6 +113,12 @@ def model(tmp_path):
         store.close()
 
 
+@pytest.fixture()
+def arena_on(monkeypatch):
+    """Enable the arena path (OMLX_EXPERT_STREAMING_ARENA) for a test."""
+    monkeypatch.setattr(ss, "_ARENA_ENV", True)
+
+
 def test_arena_disabled_by_default(model, monkeypatch):
     monkeypatch.setattr(ss, "_ARENA_ENV", False)
     glu = _make_glu(model)
@@ -123,8 +129,7 @@ def test_arena_disabled_by_default(model, monkeypatch):
     assert getattr(glu, "_arena", None) is None
 
 
-def test_arena_engage_maps_rhs_to_slots(model, monkeypatch):
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
+def test_arena_engage_maps_rhs_to_slots(model, arena_on):
     glu = _make_glu(model)
     plan = ss._RemapPlan()
     # Single-token shape (seq_len==1): the phase gate reads
@@ -148,8 +153,7 @@ def test_arena_engage_maps_rhs_to_slots(model, monkeypatch):
         assert lin._arena_bank.weight.shape[0] == arena.book.rooms
 
 
-def test_arena_row_contents_bitexact(model, monkeypatch):
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
+def test_arena_row_contents_bitexact(model, arena_on):
     glu = _make_glu(model)
     plan = ss._RemapPlan()
     idx = mx.array([[1, 4, 4, 2]], dtype=mx.int32)
@@ -222,8 +226,7 @@ def test_arena_sorted_path_matches_bundle_path(model, monkeypatch):
     np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
 
-def test_arena_hit_pays_zero_reads(model, monkeypatch):
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
+def test_arena_hit_pays_zero_reads(model, monkeypatch, arena_on):
     glu = _make_glu(model)
     reads = [0]
     orig = model.read_expert_into
@@ -243,8 +246,7 @@ def test_arena_hit_pays_zero_reads(model, monkeypatch):
     assert glu._arena.book.hits > 0
 
 
-def test_arena_eviction_keeps_correctness(model, monkeypatch):
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
+def test_arena_eviction_keeps_correctness(model, arena_on):
     glu = _make_glu(model, per_layer_cap=3)
     x = mx.random.normal((1, _IN), dtype=mx.float16)
     # cycle 5 experts through a 3-slot arena: forces evictions
@@ -258,43 +260,47 @@ def test_arena_eviction_keeps_correctness(model, monkeypatch):
     assert {7, 1}.issubset(set(arena.book.slot_of))
 
 
-def test_arena_demand_over_cap_falls_back(model, monkeypatch):
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
-    glu = _make_glu(model, per_layer_cap=3)
+def _sabotage_dict(glu):
+    """Swap every projection's backing store for a plain dict."""
+    for proj in _PROJS:
+        getattr(glu, proj).backing = {}
+
+
+def _sabotage_split(glu):
+    """Activate a hobbit split on one projection."""
+    glu.gate_proj.set_hobbit_split({0}, 8, 32)
+
+
+@pytest.mark.parametrize(
+    ("cap", "sabotage", "demand"),
+    [
+        # 6 unique experts > cap 3 -> engage declines before allocating
+        (3, None, [0, 1, 2, 3, 4, 5]),
+        # a non-store backing cannot host arena banks
+        (6, _sabotage_dict, [0, 1]),
+        # a hobbit-split projection cannot bind an arena bank
+        (6, _sabotage_split, [0, 1]),
+    ],
+    ids=["demand_over_cap", "dict_backing", "split_active"],
+)
+def test_arena_falls_back(model, arena_on, cap, sabotage, demand):
+    """Engage declines before allocating when the demand cannot be
+    served — demand over the working cap, a backing without a real
+    store, or a hobbit-split projection."""
+    glu = _make_glu(model, per_layer_cap=cap)
+    if sabotage is not None:
+        sabotage(glu)
     plan = ss._RemapPlan()
-    idx = mx.array([[0, 1, 2, 3, 4, 5]], dtype=mx.int32)
-    # 6 unique experts > cap 3 -> engage must decline before allocating
+    idx = mx.array([demand], dtype=mx.int32)
     assert not glu._arena_engage(plan, idx)
     assert plan.arena_rhs is None
     assert getattr(glu, "_arena", None) is None
 
 
-def test_arena_dict_backing_falls_back(model, monkeypatch):
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
-    glu = _make_glu(model)
-    for proj in _PROJS:
-        getattr(glu, proj).backing = {}
-    plan = ss._RemapPlan()
-    idx = mx.array([[0, 1]], dtype=mx.int32)
-    assert not glu._arena_engage(plan, idx)
-    assert getattr(glu, "_arena", None) is None
-
-
-def test_arena_split_active_falls_back(model, monkeypatch):
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
-    glu = _make_glu(model)
-    glu.gate_proj.set_hobbit_split({0}, 8, 32)
-    plan = ss._RemapPlan()
-    idx = mx.array([[0, 1]], dtype=mx.int32)
-    assert not glu._arena_engage(plan, idx)
-    assert getattr(glu, "_arena", None) is None
-
-
-def test_arena_rooms_byte_bounded(tmp_path, monkeypatch):
+def test_arena_rooms_byte_bounded(tmp_path, monkeypatch, arena_on):
     """The arena bound is a byte ceiling across projections — a governor
     -sized cache cap must never commit unbounded bank memory (measured
     Metal OOM on qwen3.8-flash when rooms tracked the cache cap)."""
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
     store = _make_store(tmp_path, e=64)
     try:
         glu = _make_glu(store, per_layer_cap=64, e=64)
@@ -316,10 +322,9 @@ def test_arena_rooms_byte_bounded(tmp_path, monkeypatch):
         store.close()
 
 
-def test_arena_static_bound_survives_governor_shrink(tmp_path, monkeypatch):
+def test_arena_static_bound_survives_governor_shrink(tmp_path, arena_on):
     """A governor shrink lowers the cache cap (fewer calls engage) but the
     arena's physical bound is static — bounded memory, no mid-run churn."""
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
     store = _make_store(tmp_path, e=64)
     try:
         glu = _make_glu(store, per_layer_cap=16, e=64)
@@ -343,8 +348,7 @@ def test_arena_static_bound_survives_governor_shrink(tmp_path, monkeypatch):
         store.close()
 
 
-def test_arena_feeds_governor_stats(model, monkeypatch):
-    monkeypatch.setattr(ss, "_ARENA_ENV", True)
+def test_arena_feeds_governor_stats(model, arena_on):
     glu = _make_glu(model)
     x = mx.random.normal((1, _IN), dtype=mx.float16)
     idx = mx.array([[0, 1, 2, 3]], dtype=mx.int32)

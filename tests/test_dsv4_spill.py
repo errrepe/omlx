@@ -41,10 +41,9 @@ def test_spill_validity_roundtrip(tmp_path):
     (conv / "spill_layer_00.safetensors").write_bytes(b"y" * 64)
     S.write_manifest(conv, model_dir, ["spill_layer_00.safetensors"], {"k": "spill_layer_00.safetensors"})
     assert S.spill_is_valid(model_dir) == conv
-    # source change invalidates
+    # source change invalidates; the stale shard must not validate
     (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"x" * 65)
     assert S.spill_is_valid(model_dir) is None
-
-
-
-
+    # empty file list never validates (would otherwise glob stale shards)
+    S.write_manifest(conv, model_dir, [], {})
+    assert S.spill_is_valid(model_dir) is None

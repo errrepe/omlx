@@ -10,6 +10,10 @@ import pytest
 from omlx.patches.expert_streaming import speculation as spec_mod
 from omlx.patches.expert_streaming.speculation import SpeculationState
 
+pytestmark = pytest.mark.skipif(
+    not spec_mod._STAGED_ENV, reason="staged prefetch disabled by env"
+)
+
 
 def _linear(layer=0, key_prefix="w"):
     return SimpleNamespace(
@@ -20,8 +24,6 @@ def _linear(layer=0, key_prefix="w"):
 
 def test_stage_pending_is_non_consuming():
     spec = SpeculationState()
-    if not spec_mod._STAGED_ENV:
-        pytest.skip("staged prefetch disabled by env")
     lin = _linear()
     fut: Future = Future()  # never completes
     n = spec.stage_register(fut, [1, 2], lin)
@@ -36,8 +38,6 @@ def test_stage_pending_is_non_consuming():
 
 def test_stage_resolve_completed_row_consumes():
     spec = SpeculationState()
-    if not spec_mod._STAGED_ENV:
-        pytest.skip("staged prefetch disabled by env")
     lin = _linear()
     key = lin.bundle_key(7)
     spec.staged[key] = ("w7", "s7", None)
@@ -49,8 +49,6 @@ def test_stage_resolve_completed_row_consumes():
 
 def test_close_cancels_staged_futures():
     spec = SpeculationState()
-    if not spec_mod._STAGED_ENV:
-        pytest.skip("staged prefetch disabled by env")
     lin = _linear()
     pending: Future = Future()
     spec.stage_register(pending, [1, 2, 3], lin)
@@ -82,8 +80,6 @@ def test_closed_state_guards_mutators():
 
 def test_closed_state_serves_nothing():
     spec = SpeculationState()
-    if not spec_mod._STAGED_ENV:
-        pytest.skip("staged prefetch disabled by env")
     lin = _linear()
     key = lin.bundle_key(5)
     spec.staged[key] = ("w", "s", None)
@@ -98,8 +94,6 @@ def test_closed_state_serves_nothing():
 
 def test_stage_drop_cancels_only_unreferenced_future():
     spec = SpeculationState()
-    if not spec_mod._STAGED_ENV:
-        pytest.skip("staged prefetch disabled by env")
     lin = _linear()
     shared: Future = Future()
     spec.stage_register(shared, [1, 2], lin)
@@ -115,8 +109,6 @@ def test_stage_drop_cancels_only_unreferenced_future():
 
 def test_close_mid_join_serves_only_requested_key():
     spec = SpeculationState()
-    if not spec_mod._STAGED_ENV:
-        pytest.skip("staged prefetch disabled by env")
     lin = _linear()
 
     class ClosingFuture:

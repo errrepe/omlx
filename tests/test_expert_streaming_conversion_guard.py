@@ -6,52 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-
-def _write_checkpoint(tmp: Path, *, fused: bool = False) -> None:
-    config = {
-        "model_type": "qwen4_exp",
-        "num_hidden_layers": 2,
-        "num_experts": 4,
-        "hidden_size": 32,
-        "moe_intermediate_size": 16,
-    }
-    (tmp / "config.json").write_text(json.dumps(config))
-    import numpy as np
-
-    tensors = {}
-    for layer in range(2):
-        if fused:
-            projs = [
-                ("gate_up_proj", (4, 32, 32)),
-                ("down_proj", (4, 32, 16)),
-            ]
-        else:
-            projs = [
-                ("gate_proj", (4, 16, 32)),
-                ("up_proj", (4, 16, 32)),
-                ("down_proj", (4, 32, 16)),
-            ]
-        for proj, shape in projs:
-            key = f"model.layers.{layer}.mlp.switch_mlp.{proj}.weight"
-            tensors[key] = (shape, "BF16", int(np.prod(shape)) * 2)
-    header = {}
-    offset = 0
-    for k, (shape, dtype, size) in tensors.items():
-        header[k] = {
-            "dtype": dtype,
-            "shape": list(shape),
-            "data_offsets": [offset, offset + size],
-        }
-        offset += size
-    hb = json.dumps(header).encode()
-    with (tmp / "model.safetensors").open("wb") as f:
-        f.write(struct.pack("<Q", len(hb)))
-        f.write(hb)
-        f.write(b"\x00" * offset)
-    (tmp / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
-    )
+from streaming_fixtures import write_moe_checkpoint
 
 
 def _write_cold_tier(tmp: Path, keys: list[str], *, bits: str) -> None:
@@ -75,7 +30,7 @@ class TestNoConversionReturnsNoBacking:
     def test_missing_layers(self, tmp_path):
         from omlx.patches.expert_streaming import convert_model_to_streaming
 
-        _write_checkpoint(tmp_path)
+        write_moe_checkpoint(tmp_path)
         model = SimpleNamespace()  # no layers anywhere
         out_model, backing = convert_model_to_streaming(
             model, str(tmp_path), None, use_file_backing=True
@@ -86,7 +41,7 @@ class TestNoConversionReturnsNoBacking:
     def test_layers_without_moe(self, tmp_path):
         from omlx.patches.expert_streaming import convert_model_to_streaming
 
-        _write_checkpoint(tmp_path)
+        write_moe_checkpoint(tmp_path)
         model = SimpleNamespace(
             model=SimpleNamespace(layers=[SimpleNamespace(), SimpleNamespace()])
         )
@@ -100,7 +55,7 @@ class TestEnsureStreamingBackingOrRaise:
     def test_raises_when_requested_supported_and_nothing_converted(self, tmp_path):
         from omlx.patches.expert_streaming import ensure_streaming_backing_or_raise
 
-        _write_checkpoint(tmp_path)
+        write_moe_checkpoint(tmp_path)
         with pytest.raises(RuntimeError, match="no MoE layer"):
             ensure_streaming_backing_or_raise(
                 SimpleNamespace(), None, requested=True, model_name=str(tmp_path)
@@ -109,7 +64,7 @@ class TestEnsureStreamingBackingOrRaise:
     def test_passes_with_real_conversion(self, tmp_path):
         from omlx.patches.expert_streaming import ensure_streaming_backing_or_raise
 
-        _write_checkpoint(tmp_path)
+        write_moe_checkpoint(tmp_path)
         backing = SimpleNamespace(streaming_converted=2)
         ensure_streaming_backing_or_raise(
             SimpleNamespace(), backing, requested=True, model_name=str(tmp_path)
@@ -118,7 +73,7 @@ class TestEnsureStreamingBackingOrRaise:
     def test_passes_when_legacy_wrapped(self, tmp_path):
         from omlx.patches.expert_streaming import ensure_streaming_backing_or_raise
 
-        _write_checkpoint(tmp_path)
+        write_moe_checkpoint(tmp_path)
         OffloadSwitchGLU = type("OffloadSwitchGLU", (), {})
         model = SimpleNamespace()
         model.named_modules = lambda: [("mlp", OffloadSwitchGLU())]
@@ -129,7 +84,7 @@ class TestEnsureStreamingBackingOrRaise:
     def test_noop_when_not_requested(self, tmp_path):
         from omlx.patches.expert_streaming import ensure_streaming_backing_or_raise
 
-        _write_checkpoint(tmp_path)
+        write_moe_checkpoint(tmp_path)
         ensure_streaming_backing_or_raise(
             SimpleNamespace(), None, requested=False, model_name=str(tmp_path)
         )
@@ -159,10 +114,15 @@ class TestColdTierLabelValidation:
         monkeypatch.setattr(shard_bank, "ExpertBackingStore", _spy)
         return captured
 
-    def test_mismatched_bits_label_rejected(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        ("tier", "accepted"),
+        [("2", False), ("3", True)],
+        ids=["mismatched_bits_rejected", "matching_bits_accepted"],
+    )
+    def test_bits_label_validated(self, tmp_path, monkeypatch, tier, accepted):
         from omlx.patches.expert_streaming import convert_model_to_streaming
 
-        _write_checkpoint(tmp_path)
+        write_moe_checkpoint(tmp_path)
         keys = [
             f"model.layers.{i}.mlp.switch_mlp.{p}.weight"
             for i in range(2)
@@ -173,35 +133,12 @@ class TestColdTierLabelValidation:
         _, backing = convert_model_to_streaming(
             SimpleNamespace(),
             str(tmp_path),
-            SimpleNamespace(expert_streaming_cold_tier="2"),
+            SimpleNamespace(expert_streaming_cold_tier=tier),
             use_file_backing=True,
         )
         try:
             # A 3-bit tier must not serve a "2" request — validation ran.
-            assert captured.get("cold_root") is None
-        finally:
-            if backing is not None:
-                backing.close()
-
-    def test_matching_bits_label_accepted(self, tmp_path, monkeypatch):
-        from omlx.patches.expert_streaming import convert_model_to_streaming
-
-        _write_checkpoint(tmp_path)
-        keys = [
-            f"model.layers.{i}.mlp.switch_mlp.{p}.weight"
-            for i in range(2)
-            for p in ("gate_proj", "up_proj", "down_proj")
-        ]
-        _write_cold_tier(tmp_path, keys, bits="3")
-        captured = self._spy_backing(monkeypatch)
-        _, backing = convert_model_to_streaming(
-            SimpleNamespace(),
-            str(tmp_path),
-            SimpleNamespace(expert_streaming_cold_tier="3"),
-            use_file_backing=True,
-        )
-        try:
-            assert captured.get("cold_root") is not None
+            assert (captured.get("cold_root") is not None) is accepted
         finally:
             if backing is not None:
                 backing.close()
@@ -215,7 +152,7 @@ class TestPrefillPinOrdering:
 
         from omlx.patches.expert_streaming import convert_model_to_streaming
 
-        _write_checkpoint(tmp_path, fused=True)
+        write_moe_checkpoint(tmp_path, fused=True)
         layers = []
         for _ in range(2):
             glu = SimpleNamespace(
@@ -256,7 +193,7 @@ class TestCanonicalKillSwitch:
     def test_converter_noops_under_env(self, tmp_path, monkeypatch):
         from omlx.patches.expert_streaming import convert_model_to_streaming
 
-        _write_checkpoint(tmp_path)
+        write_moe_checkpoint(tmp_path)
         monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
         model = SimpleNamespace()
         out_model, backing = convert_model_to_streaming(
@@ -274,51 +211,51 @@ class TestSpeculativeExclusivity:
     by backend — DFlash/VLM-MTP always reject, MTP is allowed where the
     streaming stack actually supports it."""
 
-    def test_canonical_key_dflash_rejected(self):
-        from omlx.model_settings import validate_moe_expert_offload
-
-        with pytest.raises(ValueError, match="DFlash"):
-            validate_moe_expert_offload(
+    @pytest.mark.parametrize(
+        ("settings", "model_type", "match"),
+        [
+            pytest.param(
                 {"expert_streaming_enabled": True, "dflash_enabled": True},
-                model_type="qwen4_exp",
-            )
-
-    def test_canonical_key_vlm_mtp_rejected(self):
-        from omlx.model_settings import validate_moe_expert_offload
-
-        with pytest.raises(ValueError, match="VLM"):
-            validate_moe_expert_offload(
+                "qwen4_exp",
+                "DFlash",
+                id="canonical_key_dflash_rejected",
+            ),
+            pytest.param(
                 {"expert_streaming_enabled": True, "vlm_mtp_enabled": True},
-                model_type="qwen4_exp",
-            )
-
-    def test_mtp_allowed_on_unified_types(self):
-        from omlx.model_settings import validate_moe_expert_offload
-
-        # Unified streaming converts MTP-stage banks too — the combo works.
-        validate_moe_expert_offload(
-            {"expert_streaming_enabled": True, "mtp_enabled": True},
-            model_type="qwen4_exp",
-        )
-
-    def test_mtp_allowed_on_deepseek_v41(self):
-        from omlx.model_settings import validate_moe_expert_offload
-
-        # Native DSpark verify runs under frozen residency (verify_scope).
-        validate_moe_expert_offload(
-            {"moe_expert_offload_enabled": True, "mtp_enabled": True},
-            model_type="deepseek_v41",
-        )
-
-    def test_mtp_rejected_on_legacy_only_types(self):
-        from omlx.model_settings import validate_moe_expert_offload
-
-        with pytest.raises(ValueError, match="Lightning MTP"):
-            validate_moe_expert_offload(
+                "qwen4_exp",
+                "VLM",
+                id="canonical_key_vlm_mtp_rejected",
+            ),
+            # Unified streaming converts MTP-stage banks too — allowed.
+            pytest.param(
+                {"expert_streaming_enabled": True, "mtp_enabled": True},
+                "qwen4_exp",
+                None,
+                id="mtp_allowed_on_unified_types",
+            ),
+            # Native DSpark verify runs under frozen residency (verify_scope).
+            pytest.param(
                 {"moe_expert_offload_enabled": True, "mtp_enabled": True},
-                model_type="gemma4",
-            )
+                "deepseek_v41",
+                None,
+                id="mtp_allowed_on_deepseek_v41",
+            ),
+            pytest.param(
+                {"moe_expert_offload_enabled": True, "mtp_enabled": True},
+                "gemma4",
+                "Lightning MTP",
+                id="mtp_rejected_on_legacy_only_types",
+            ),
+        ],
+    )
+    def test_speculative_exclusivity(self, settings, model_type, match):
+        from omlx.model_settings import validate_moe_expert_offload
 
+        if match is None:
+            validate_moe_expert_offload(settings, model_type=model_type)
+        else:
+            with pytest.raises(ValueError, match=match):
+                validate_moe_expert_offload(settings, model_type=model_type)
 
 
 class TestCompatAllowlistUnified:
@@ -328,7 +265,7 @@ class TestCompatAllowlistUnified:
     def test_streaming_type_approved_by_estimate(self, tmp_path):
         from omlx.patches.moe_offload_compat import moe_offload_compatibility
 
-        _write_checkpoint(tmp_path)  # qwen4_exp, BF16 switch_mlp banks
+        write_moe_checkpoint(tmp_path)  # qwen4_exp, BF16 switch_mlp banks
         supported, reason = moe_offload_compatibility(str(tmp_path))
         assert supported, reason
 
@@ -361,7 +298,6 @@ class TestStackedKeyValidation:
 
     def _backing(self, keys):
         return SimpleNamespace(_weight_map={k: "shard.safetensors" for k in keys})
-
 
     def test_optional_bias_falls_back(self):
         from omlx.patches.expert_streaming import _resolve_stacked_key

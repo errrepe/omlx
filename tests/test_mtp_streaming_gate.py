@@ -85,14 +85,22 @@ def test_mtp_gate_no_streaming_never_constrains(monkeypatch):
         assert got == "on" and sig is None
 
 
-def test_cheap_entry_parks_losing_speculation_fast():
-    # The auto-gate's controller mutation: depth-1 once + 3 baseline
-    # samples, then the short exit streak parks losing speculation — the
-    # behavior that replaces the full depth sweep under SSD streaming.
+def _controller():
+    """DepthController primed for the cheap-entry regime: one shallow
+    speculation pick plus a full warmup baseline, exit streak at the
+    module default."""
     c = bg._DepthController(3)
     c.cur = 1
     c._warmup = [0, 0, 0]
     c.EXIT_STREAK = bg._MTP_STREAM_EXIT_STREAK
+    return c
+
+
+def test_cheap_entry_parks_losing_speculation_fast():
+    # The auto-gate's controller mutation: depth-1 once + 3 baseline
+    # samples, then the short exit streak parks losing speculation — the
+    # behavior that replaces the full depth sweep under SSD streaming.
+    c = _controller()
 
     picks = []
     cycles = 0
@@ -112,10 +120,7 @@ def test_cheap_entry_parks_losing_speculation_fast():
 
 
 def test_cheap_entry_keeps_winning_speculation():
-    c = bg._DepthController(3)
-    c.cur = 1
-    c._warmup = [0, 0, 0]
-    c.EXIT_STREAK = bg._MTP_STREAM_EXIT_STREAK
+    c = _controller()
     # RAM-served verify: depth-1 cycles are barely costlier than plain steps
     # and acceptance is high — the gate must not park a winning MTP.
     for _ in range(40):

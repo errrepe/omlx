@@ -22,6 +22,8 @@ import pytest
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.models.llama import Model, ModelArgs
 
+from streaming_fixtures import bind_streaming_probe
+
 from omlx import scheduler as sched_mod
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import (
@@ -170,14 +172,7 @@ def _throttle_ctx(
     ns._snap_chunk_size = Scheduler._snap_chunk_size.__get__(ns, Scheduler)
     ns._current_usage_bytes = Scheduler._current_usage_bytes.__get__(ns, Scheduler)
     ns._streaming_guard_info = None
-    # PR #3468: _record_chunk_transient reads the app-level LRU heap growth;
-    # the stand-in must carry the same probe as a real Scheduler (returns 0
-    # with no stashed cache, matching production default).
-    ns._streaming_lru_cache = None
-    ns._streaming_lru_bytes_last = None
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
     ns._streaming_bank_bytes = Scheduler._streaming_bank_bytes.__get__(ns, Scheduler)
     ns._resolve_streaming_guard_info = Scheduler._resolve_streaming_guard_info.__get__(
         ns, Scheduler
@@ -814,14 +809,7 @@ def test_adaptive_throttle_charges_recently_reclaimed_footprint():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
 
     assert _call(ns, 2048, kv_len=147_680) == 2048
 
@@ -858,14 +846,7 @@ def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
     ns._record_chunk_transient(
         512,
         100 * _GB,
@@ -887,14 +868,7 @@ def test_sub_floor_tail_release_is_charged():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
 
     ns._record_chunk_transient(
         17,
@@ -915,14 +889,7 @@ def test_skipped_positive_sample_clears_reclaim_charge():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
     ns._record_chunk_transient(
         512,
         100 * _GB,
@@ -954,14 +921,7 @@ def test_speed_partial_positive_clears_reclaim_charge():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
     ns._record_chunk_transient(
         512,
         100 * _GB,
@@ -992,14 +952,7 @@ def test_record_chunk_transient_skips_tail_samples():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
 
     ns._record_chunk_transient(
         64,
@@ -1032,14 +985,7 @@ def test_record_chunk_transient_marks_floor_samples_only():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
 
     # First sample is always excluded from the max (seed noise).
     ns._record_chunk_transient(32, 0, 100, request_id="r", loop_label="unit")
@@ -1064,23 +1010,8 @@ def test_record_chunk_transient_skips_partial_speed_sample():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
     ns._streaming_guard_info = None
-    # PR #3468: _record_chunk_transient reads the app-level LRU heap growth;
-    # the stand-in must carry the same probe as a real Scheduler (returns 0
-    # with no stashed cache, matching production default).
-    ns._streaming_lru_cache = None
-    ns._streaming_lru_bytes_last = None
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
     ns._streaming_bank_bytes = Scheduler._streaming_bank_bytes.__get__(ns, Scheduler)
     ns._resolve_streaming_guard_info = Scheduler._resolve_streaming_guard_info.__get__(
         ns, Scheduler
@@ -1125,14 +1056,7 @@ def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
 
     ns._record_chunk_transient(
         2048,
@@ -1168,14 +1092,7 @@ def test_record_chunk_transient_keeps_partial_context_sample():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
-    # PR #3468: the record path calls _streaming_lru_heap_growth(); bind the
-    # real probe (returns 0 with no stashed cache) so the stand-in matches
-    # a real Scheduler.
-    ns._streaming_lru_cache = getattr(ns, "_streaming_lru_cache", None)
-    ns._streaming_lru_bytes_last = getattr(ns, "_streaming_lru_bytes_last", None)
-    ns._streaming_lru_heap_growth = Scheduler._streaming_lru_heap_growth.__get__(
-        ns, Scheduler
-    )
+    bind_streaming_probe(ns)
 
     partial_delta = 128 * 1024**2
     ns._record_chunk_transient(

@@ -2,35 +2,12 @@
 """V4.1 span reads — shared-backing-store demand path on synthetic checkpoints."""
 
 import json
-import struct
 from pathlib import Path
 
 import numpy as np
-import pytest
+from streaming_fixtures import write_safetensors
 
 from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
-
-
-def _write_safetensors(path: Path, tensors: dict) -> None:
-    """Minimal safetensors: {name: (np_array, st_dtype)}."""
-    header = {}
-    offset = 0
-    blobs = []
-    for name, (arr, dtype) in tensors.items():
-        raw = arr.tobytes()
-        header[name] = {
-            "dtype": dtype,
-            "shape": list(arr.shape),
-            "data_offsets": [offset, offset + len(raw)],
-        }
-        blobs.append(raw)
-        offset += len(raw)
-    blob = json.dumps(header).encode()
-    with path.open("wb") as f:
-        f.write(struct.pack("<Q", len(blob)))
-        f.write(blob)
-        for raw in blobs:
-            f.write(raw)
 
 
 def _make_checkpoint(root: Path, n_layers=2, n_experts=8, row_dim=4) -> dict:
@@ -52,7 +29,7 @@ def _make_checkpoint(root: Path, n_layers=2, n_experts=8, row_dim=4) -> dict:
         rng.integers(0, 255, size=(16, 16), dtype=np.uint8),
         "U8",
     )
-    _write_safetensors(root / "model-00001-of-00001.safetensors", tensors)
+    write_safetensors(root / "model-00001-of-00001.safetensors", tensors)
     index = {
         "weight_map": {
             k: "model-00001-of-00001.safetensors" for k in tensors

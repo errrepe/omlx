@@ -18,35 +18,21 @@ def _cfg(tmp_path: Path, model_type: str) -> str:
     return str(d)
 
 
-class TestRequested:
-    def test_none(self):
-        assert moe_offload_requested(None) is False
-
-    def test_empty(self):
-        assert moe_offload_requested({}) is False
-        assert moe_offload_requested(SimpleNamespace()) is False
-
-    def test_legacy(self):
-        assert moe_offload_requested({"moe_expert_offload_enabled": True}) is True
-        ns = SimpleNamespace(moe_expert_offload_enabled=True)
-        assert moe_offload_requested(ns) is True
-
-    def test_canonical(self):
-        assert moe_offload_requested({"expert_streaming_enabled": True}) is True
-        ns = SimpleNamespace(expert_streaming_enabled=True)
-        assert moe_offload_requested(ns) is True
+def test_moe_offload_requested():
+    assert moe_offload_requested(None) is False
+    assert moe_offload_requested({}) is False
+    assert moe_offload_requested(SimpleNamespace()) is False
+    assert moe_offload_requested({"moe_expert_offload_enabled": True}) is True
+    assert moe_offload_requested(SimpleNamespace(moe_expert_offload_enabled=True)) is True
+    assert moe_offload_requested({"expert_streaming_enabled": True}) is True
+    assert moe_offload_requested(SimpleNamespace(expert_streaming_enabled=True)) is True
 
 
-class TestOwnership:
-    def test_owned(self, tmp_path):
-        assert legado._streaming_owns_model(_cfg(tmp_path, "qwen4_exp")) is True
-
-    def test_legacy_types(self, tmp_path):
-        assert legado._streaming_owns_model(_cfg(tmp_path, "gemma4")) is False
-        assert legado._streaming_owns_model(_cfg(tmp_path, "deepseek_v41")) is False
-
-    def test_missing(self, tmp_path):
-        assert legado._streaming_owns_model(str(tmp_path / "nope")) is False
+def test_streaming_owns_model(tmp_path):
+    assert legado._streaming_owns_model(_cfg(tmp_path, "qwen4_exp")) is True
+    assert legado._streaming_owns_model(_cfg(tmp_path, "gemma4")) is False
+    assert legado._streaming_owns_model(_cfg(tmp_path, "deepseek_v41")) is False
+    assert legado._streaming_owns_model(str(tmp_path / "nope")) is False
 
 
 def _fake_est(**kw):
@@ -68,7 +54,6 @@ class TestViaStreaming:
         monkeypatch.setattr(self.CONV, _boom)
         model = SimpleNamespace(_expert_streaming_backing=object())
         assert legado._apply_via_streaming(model, _cfg(tmp_path, "qwen4_exp"), 0.25) == 4
-
 
     def test_unsupported_estimate_returns_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(self.EST, lambda *_a, **_k: _fake_est(supported=False))

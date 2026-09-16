@@ -11,26 +11,10 @@ Covers:
   * the legacy chunk scan's single host sync (route-boundary slices).
 """
 import json
-import struct
 
 import numpy as np
 import pytest
-
-
-def _write_safetensors(path, tensors):
-    _DTYPES = {"F32": np.dtype("<f4")}
-    header = {}
-    blob = bytearray()
-    for name, (arr, dtype) in tensors.items():
-        data = np.ascontiguousarray(arr).astype(_DTYPES[dtype]).tobytes()
-        header[name] = {
-            "dtype": "F32",
-            "shape": list(arr.shape),
-            "data_offsets": [len(blob), len(blob) + len(data)],
-        }
-        blob += data
-    hb = json.dumps(header).encode()
-    path.write_bytes(struct.pack("<Q", len(hb)) + hb + bytes(blob))
+from streaming_fixtures import write_safetensors
 
 
 def _moe_dir(tmp_path, *, n_experts=4, fused=False, model_type="qwen3_moe",
@@ -52,7 +36,7 @@ def _moe_dir(tmp_path, *, n_experts=4, fused=False, model_type="qwen3_moe",
             key = f"language_model.layers.{li}.mlp.switch_mlp.{proj}.weight"
             tensors[key] = (rng.standard_normal(shape).astype(np.float32), "F32")
     shard = tmp_path / "model.safetensors"
-    _write_safetensors(shard, tensors)
+    write_safetensors(shard, tensors)
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
