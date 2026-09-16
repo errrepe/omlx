@@ -24,10 +24,10 @@ ceilings enforced lazily; ``capacity`` reports the uniform base.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from dataclasses import dataclass, field
 
+from ..expert_streaming._env import env_bool, env_float
 from ..expert_streaming.slot_cache import DecodeVisitStats
 
 logger = logging.getLogger(__name__)
@@ -37,24 +37,18 @@ logger = logging.getLogger(__name__)
 # must have covered at least this share of observed demand recently
 # (EWMA, decay 0.9) or stage_predicted is skipped — a layer whose
 # routing diverged pays one bounded burst of staged reads and then
-# shuts itself off.
-try:
-    # `or "0.3"` — not `or 0`: an empty env must keep the default like
-    # the sibling knobs; "" -> 0.0 would silently hold the recall gate
-    # open and stage unconditionally.
-    _STAGED_MIN_RECALL = float(
-        os.environ.get("OMLX_V41_STAGE_MIN_RECALL", "0.3") or "0.3"
-    )
-except (TypeError, ValueError):
-    # Same contract as the moe_offload env knobs (_fetch_threads,
-    # _span_gap, _span_max_rows): a degenerate value keeps the default
-    # instead of killing the import.
-    logger.warning(
-        "Invalid OMLX_V41_STAGE_MIN_RECALL value; using 0.3",
-        exc_info=True,
-    )
-    _STAGED_MIN_RECALL = 0.3
+# shuts itself off. env_float's contract matches the old hand-rolled
+# parse: an empty or malformed value keeps the default instead of
+# holding the recall gate open ("" -> 0.0 would stage unconditionally).
+_STAGED_MIN_RECALL = env_float("OMLX_V41_STAGE_MIN_RECALL", 0.3)
 _STAGED_RECALL_DECAY = 0.9
+
+
+def _ewma(table: dict, key: int, obs: float) -> None:
+    """EWMA-update ``table[key]`` toward *obs* (decay _STAGED_RECALL_DECAY)."""
+    table[key] = (
+        _STAGED_RECALL_DECAY * table.get(key, 0.0) + (1.0 - _STAGED_RECALL_DECAY) * obs
+    )
 
 
 def _verify_ra_enabled() -> bool:
@@ -68,19 +62,10 @@ def _verify_ra_enabled() -> bool:
     materialize as staged payloads held across an iteration.
     OMLX_V41_VERIFY_RA=0 disables.
     """
-    return os.environ.get("OMLX_V41_VERIFY_RA", "1") != "0"
+    return env_bool("OMLX_V41_VERIFY_RA", True)
 
 
-try:
-    _VERIFY_MIN_RECALL = float(
-        os.environ.get("OMLX_V41_VERIFY_MIN_RECALL", "0.3") or "0.3"
-    )
-except (TypeError, ValueError):
-    logger.warning(
-        "Invalid OMLX_V41_VERIFY_MIN_RECALL value; using 0.3",
-        exc_info=True,
-    )
-    _VERIFY_MIN_RECALL = 0.3
+_VERIFY_MIN_RECALL = env_float("OMLX_V41_VERIFY_MIN_RECALL", 0.3)
 
 
 def _verify_hunger_frac() -> float:
@@ -97,16 +82,7 @@ def _verify_hunger_frac() -> float:
     truthful. 0 = verify stays telemetry-only (default).
     OMLX_V41_VERIFY_HUNGER, 0..1.
     """
-    try:
-        return min(
-            1.0,
-            max(
-                0.0,
-                float(os.environ.get("OMLX_V41_VERIFY_HUNGER", "0") or "0"),
-            ),
-        )
-    except (TypeError, ValueError):
-        return 0.0
+    return min(1.0, max(0.0, env_float("OMLX_V41_VERIFY_HUNGER", 0.0)))
 
 
 @dataclass
@@ -211,61 +187,37 @@ class V41StreamingBacking:
         self.base_cap = int(plan.capacity)
         self.overrides: dict = {}
         self.stats = _V41CacheStats()
-        self.governor = None
         if not dynamic or self.num_layers == 0:
-            return
-        try:
-            from ..expert_streaming.governor import (
-                ExpertResidencyGovernor,
-                _max_dynamic_budget_bytes,
-            )
-
-            initial_total = self.base_cap * self.per_slot
-            gov_max = (
-                int(max_budget_bytes)
-                if max_budget_bytes is not None
-                else _max_dynamic_budget_bytes()
-            )
-            gov_min = (
-                int(min_budget_bytes)
-                if min_budget_bytes is not None
-                else max(int(0.25 * 1024**3), initial_total // 4)
-            )
-            # Never shrink a layer below one token's decode working set:
-            # below n_activated_experts `ensure` raises "working set
-            # exceeds resident capacity" mid-generation — a fixed floor
-            # smaller than top_k breaks on top-k>8 models.
-            # The plan already guarantees capacity >= n_activated.
-            floor = (
-                int(min_cap)
-                if min_cap is not None
-                else max(
-                    1,
-                    min(int(getattr(plan, "n_activated", 8) or 8), self.base_cap),
-                )
-            )
-            kwargs = {}
-            if stall_target is not None:
-                kwargs["stall_target"] = stall_target
-            self.governor = ExpertResidencyGovernor(
-                self,
-                self.per_slot,
-                1,
-                max(gov_max, initial_total),
-                min_budget_bytes=gov_min,
-                min_cap=max(1, floor),
-                **kwargs,
-            )
-            logger.info(
-                "V4.1 dynamic residency: governor armed "
-                "(per-layer %d slots, min %d, max %.2f GiB)",
-                self.base_cap,
-                self.governor._min_cap_slots(),
-                self.governor.max_budget_bytes / 1024**3,
-            )
-        except Exception:
-            logger.debug("V4.1 governor arming failed", exc_info=True)
             self.governor = None
+            return
+        from ..expert_streaming.governor import arm_dynamic
+
+        # Never shrink a layer below one token's decode working set:
+        # below n_activated_experts `ensure` raises "working set
+        # exceeds resident capacity" mid-generation — a fixed floor
+        # smaller than top_k breaks on top-k>8 models.
+        # The plan already guarantees capacity >= n_activated.
+        # arm_dynamic resolves the byte budgets and applies an explicit
+        # min_cap over this floor_default; on failure residency stays
+        # static (returns None).
+        self.governor = arm_dynamic(
+            self,
+            self.per_slot,
+            self.base_cap,
+            floor_default=max(
+                1,
+                min(
+                    int(getattr(plan, "n_activated", 8) or 8),
+                    self.base_cap,
+                ),
+            ),
+            max_budget_bytes=max_budget_bytes,
+            min_budget_bytes=min_budget_bytes,
+            stall_target=stall_target,
+            min_cap=min_cap,
+            num_layers=1,
+            label="V4.1",
+        )
 
     # -- governor duck-type ------------------------------------------------
     def resize(self, cap: int, per_layer: int | None) -> None:
@@ -421,14 +373,29 @@ class V41StreamingBacking:
             prev = self.verify_uniq.get(li)
             if prev:
                 obs = len(prev & now) / len(now)
-                self.verify_recall[li] = (
-                    _STAGED_RECALL_DECAY * self.verify_recall.get(li, 0.0)
-                    + (1.0 - _STAGED_RECALL_DECAY) * obs
-                )
+                _ewma(self.verify_recall, li, obs)
             acc = self.verify_acc.get(li)
             if acc is None:
                 acc = self.verify_acc[li] = set()
             acc.update(now)
+
+    def _next_in_order(self, layer_idx, wrap=True):
+        """The MoE layer index after *layer_idx* in ``_order``.
+
+        ``wrap`` makes the last layer's "next" the first layer again —
+        the cross-token/cross-round lead. Without it the last layer has
+        no next. An unconvertible or unknown layer returns None —
+        "don't advise".
+        """
+        if not self._order:
+            return None
+        try:
+            pos = self._order.index(int(layer_idx))
+        except (TypeError, ValueError):
+            return None
+        if pos + 1 >= len(self._order):
+            return self._order[0] if wrap else None
+        return self._order[pos + 1]
 
     def advise_verify_next(self, layer_idx: int) -> None:
         """Advise the next layer's predicted verify demand (F3).
@@ -439,13 +406,11 @@ class V41StreamingBacking:
         and staged rows are skipped), so a wrong prediction only costs
         page-cache bytes, never correctness or held memory.
         """
-        if not _verify_ra_enabled() or not self._order:
+        if not _verify_ra_enabled():
             return
-        try:
-            pos = self._order.index(int(layer_idx))
-        except (TypeError, ValueError):
+        nxt = self._next_in_order(layer_idx)
+        if nxt is None:
             return
-        nxt = self._order[(pos + 1) % len(self._order)]
         with self._lock:
             pred = self.verify_uniq.get(nxt)
             recall = self.verify_recall.get(nxt, 0.0)
@@ -485,10 +450,7 @@ class V41StreamingBacking:
         prev = self.prev_uniq.get(li)
         if prev and now:
             obs = len(set(prev) & now) / len(now)
-            self.recall_ewma[li] = (
-                _STAGED_RECALL_DECAY * self.recall_ewma.get(li, 0.0)
-                + (1.0 - _STAGED_RECALL_DECAY) * obs
-            )
+            _ewma(self.recall_ewma, li, obs)
         self.prev_uniq[li] = now
 
     def stage_next(self, layer_idx: int) -> None:
@@ -500,15 +462,11 @@ class V41StreamingBacking:
         stages the next token's entry point. Failure is silent: staging
         is a hint, never on the demand path.
         """
-        if not self._order:
-            return
-        try:
-            pos = self._order.index(int(layer_idx))
-        except (TypeError, ValueError):
+        nxt = self._next_in_order(layer_idx)
+        if nxt is None:
             # int(None)/int(non-numeric) escapes ValueError alone; an
             # unconvertible or unknown layer just means "don't stage".
             return
-        nxt = self._order[(pos + 1) % len(self._order)]
         pred = self.prev_uniq.get(nxt)
         if not pred:
             self.staged_skips_no_pred += 1
@@ -539,16 +497,11 @@ class V41StreamingBacking:
         whose demand is a different token's tiny set. Failure is silent:
         readahead is a hint, never the demand path.
         """
-        if not self._order:
+        nxt = self._next_in_order(layer_idx, wrap=False)
+        if nxt is None:
             return
         try:
-            pos = self._order.index(int(layer_idx))
-        except (TypeError, ValueError):
-            return
-        if pos + 1 >= len(self._order):
-            return
-        try:
-            self.slots_of[self._order[pos + 1]].advise_bank()
+            self.slots_of[nxt].advise_bank()
         except Exception:
             pass
 
@@ -601,30 +554,31 @@ class V41StreamingBacking:
             misses = sum(s.misses for s in self.slots_of.values())
             resident = sum(len(s.slot_of) for s in self.slots_of.values())
         total = hits + misses
-        staged_hits = sum(getattr(s, "staged_hits", 0) for s in self.slots_of.values())
-        staged_drops = sum(getattr(s, "staged_drops", 0) for s in self.slots_of.values())
-        staged_failures = sum(
-            getattr(s, "staged_failures", 0) for s in self.slots_of.values()
+        slots = list(self.slots_of.values())
+        # Per-layer counters are a reporting contract — the key names
+        # below are read by admin summary payloads and the bench JSON.
+        counters = {
+            name: sum(getattr(s, name, 0) for s in slots)
+            for name in (
+                "staged_hits",
+                "staged_drops",
+                "staged_failures",
+                "staged_submits",
+                "ra_calls",
+                "ra_rows",
+                "ra_bytes",
+                "span_reads",
+                "span_demand_rows",
+                "span_phys_rows",
+                "span_fallbacks",
+            )
+        }
+        counters.update(
+            {
+                name: sum(getattr(s.book, name, 0) for s in slots)
+                for name in ("verify_misses", "verify_evict_resident")
+            }
         )
-        span_reads = sum(getattr(s, "span_reads", 0) for s in self.slots_of.values())
-        span_demand = sum(getattr(s, "span_demand_rows", 0) for s in self.slots_of.values())
-        span_phys = sum(getattr(s, "span_phys_rows", 0) for s in self.slots_of.values())
-        span_fallbacks = sum(
-            getattr(s, "span_fallbacks", 0) for s in self.slots_of.values()
-        )
-        staged_submits = sum(
-            getattr(s, "staged_submits", 0) for s in self.slots_of.values()
-        )
-        verify_misses = sum(
-            getattr(s.book, "verify_misses", 0) for s in self.slots_of.values()
-        )
-        verify_evict_resident = sum(
-            getattr(s.book, "verify_evict_resident", 0)
-            for s in self.slots_of.values()
-        )
-        ra_calls = sum(getattr(s, "ra_calls", 0) for s in self.slots_of.values())
-        ra_rows = sum(getattr(s, "ra_rows", 0) for s in self.slots_of.values())
-        ra_bytes = sum(getattr(s, "ra_bytes", 0) for s in self.slots_of.values())
         stats = self.stats
         return {
             "hits": hits,
@@ -634,18 +588,13 @@ class V41StreamingBacking:
             "resident": resident,
             "capacity_per_layer": self.base_cap,
             "layers": self.num_layers,
-            "staged_hits": staged_hits,
-            "staged_drops": staged_drops,
-            "staged_failures": staged_failures,
-            "staged_submits": staged_submits,
+            **counters,
             "staged_skips": self.staged_skips,
             "staged_skips_no_pred": self.staged_skips_no_pred,
             "staged_skips_recall": self.staged_skips_recall,
             "staged_skips_headroom": self.staged_skips_headroom,
             "verify_visits": stats.verify_visits,
             "verify_visits_missed": stats.verify_visits_missed,
-            "verify_misses": verify_misses,
-            "verify_evict_resident": verify_evict_resident,
             "verify_ra_submits": self.verify_ra_submits,
             "verify_ra_no_pred": self.verify_ra_no_pred,
             "verify_ra_recall": self.verify_ra_recall,
@@ -655,12 +604,5 @@ class V41StreamingBacking:
                 if self.verify_recall
                 else 0.0
             ),
-            "ra_calls": ra_calls,
-            "ra_rows": ra_rows,
-            "ra_bytes": ra_bytes,
-            "span_reads": span_reads,
-            "span_demand_rows": span_demand,
-            "span_phys_rows": span_phys,
-            "span_fallbacks": span_fallbacks,
             "governor": gov,
         }

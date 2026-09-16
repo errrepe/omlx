@@ -4,8 +4,6 @@
 import contextvars
 import json
 import math
-import os
-import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -16,13 +14,15 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .convert import repack_weight
-from .quantization import QuantizedProjection
-from .storage import TensorFile, decode_array
+from ..expert_streaming._env import env_bool, env_float, env_int
 from ..expert_streaming.slot_cache import (
     SlotArena,
     working_set_step,
 )
+from .convert import repack_weight
+from .quantization import QuantizedProjection
+from .residency import _files_signature, _header
+from .storage import TensorFile, decode_array
 
 
 def _fetch_threads() -> int:
@@ -35,10 +35,7 @@ def _fetch_threads() -> int:
     and overlap decode with waiting IO. LRU/frozen order and numerics are
     identical to the serial path by construction (ordered join).
     """
-    try:
-        return max(0, int(os.environ.get("OMLX_V41_FETCH_THREADS", "0")))
-    except (TypeError, ValueError):
-        return 0
+    return env_int("OMLX_V41_FETCH_THREADS", 0, lo=0)
 
 
 def _stage_enabled() -> bool:
@@ -50,14 +47,11 @@ def _stage_enabled() -> bool:
     path as demand fetches, so ordering and numerics are identical.
     OMLX_V41_STAGE=0 disables.
     """
-    return os.environ.get("OMLX_V41_STAGE", "1") != "0"
+    return env_bool("OMLX_V41_STAGE", True)
 
 
 def _stage_max(plan) -> int:
-    try:
-        cap = int(os.environ.get("OMLX_V41_STAGE_MAX", "0"))
-    except (TypeError, ValueError):
-        cap = 0
+    cap = env_int("OMLX_V41_STAGE_MAX", 0)
     if cap <= 0:
         cap = max(16, 2 * int(getattr(plan, "n_activated", 8) or 8))
     return cap
@@ -109,9 +103,6 @@ class _StagedSpan:
     def cancel(self):
         return self._fut.cancel()
 
-    def done(self):
-        return self._fut.done()
-
 
 class _WorkingSetOverCap(ValueError):
     """The chunk's routed set exceeds the LIVE cap after a shrink.
@@ -133,7 +124,7 @@ def _span_reads() -> bool:
     OMLX_V41_SPAN_READS=0 keeps the per-expert gather as an
     escape hatch.
     """
-    return os.environ.get("OMLX_V41_SPAN_READS", "1") != "0"
+    return env_bool("OMLX_V41_SPAN_READS", True)
 
 
 def _span_gap() -> int:
@@ -144,18 +135,12 @@ def _span_gap() -> int:
     lock). gap >= 2 bridges holes and reads unrouted experts (dead
     bytes), a net loss on NVMe. Env override stays for
     per-machine tuning on slower-seek disks."""
-    try:
-        return max(0, int(os.environ.get("OMLX_V41_SPAN_GAP", "1")))
-    except (TypeError, ValueError):
-        return 1
+    return env_int("OMLX_V41_SPAN_GAP", 1, lo=0)
 
 
 def _span_max_rows() -> int:
     """Cap on merged span length in rows (bounds one read's overfetch)."""
-    try:
-        return max(1, int(os.environ.get("OMLX_V41_SPAN_MAX", "64")))
-    except (TypeError, ValueError):
-        return 64
+    return env_int("OMLX_V41_SPAN_MAX", 64, lo=1)
 
 
 def _ra_enabled() -> bool:
@@ -168,31 +153,22 @@ def _ra_enabled() -> bool:
     userspace bytes materialize, ordering and numerics are untouched.
     OMLX_V41_RA=0 disables.
     """
-    return os.environ.get("OMLX_V41_RA", "1") != "0"
+    return env_bool("OMLX_V41_RA", True)
 
 
 def _ra_tokens() -> int:
     """Lookahead window in route rows (tokens) advised per chunk."""
-    try:
-        return max(1, int(os.environ.get("OMLX_V41_RA_TOKENS", "64")))
-    except (TypeError, ValueError):
-        return 64
+    return env_int("OMLX_V41_RA_TOKENS", 64, lo=1)
 
 
 def _ra_gap() -> int:
     """Id gap bridged by one advisory run (dead bytes cost no decode)."""
-    try:
-        return max(0, int(os.environ.get("OMLX_V41_RA_GAP", "8")))
-    except (TypeError, ValueError):
-        return 8
+    return env_int("OMLX_V41_RA_GAP", 8, lo=0)
 
 
 def _ra_max_rows() -> int:
     """Cap on one advisory run's span in rows."""
-    try:
-        return max(1, int(os.environ.get("OMLX_V41_RA_MAX", "256")))
-    except (TypeError, ValueError):
-        return 256
+    return env_int("OMLX_V41_RA_MAX", 256, lo=1)
 
 
 def _ra_next() -> bool:
@@ -204,17 +180,12 @@ def _ra_next() -> bool:
     ``_ra_next_cov`` so short prompts only advise the exact demand.
     OMLX_V41_RA_NEXT=0 disables.
     """
-    return os.environ.get("OMLX_V41_RA_NEXT", "1") != "0"
+    return env_bool("OMLX_V41_RA_NEXT", True)
 
 
 def _ra_next_cov() -> float:
     """Coverage threshold (unique demanded / bank size) for next-layer."""
-    try:
-        return min(1.0, max(0.0, float(os.environ.get(
-            "OMLX_V41_RA_NEXT_COV", "0.5"
-        ))))
-    except (TypeError, ValueError):
-        return 0.5
+    return min(1.0, max(0.0, env_float("OMLX_V41_RA_NEXT_COV", 0.5)))
 
 
 def _prefill_cap() -> int:
@@ -230,10 +201,7 @@ def _prefill_cap() -> int:
     transient footprint decays into a warm resident set for decode);
     0 disables. OMLX_V41_PREFILL_CAP, rows per layer.
     """
-    try:
-        return max(0, int(os.environ.get("OMLX_V41_PREFILL_CAP", "64")))
-    except (TypeError, ValueError):
-        return 0
+    return env_int("OMLX_V41_PREFILL_CAP", 64, lo=0)
 
 
 def _chunk_lookahead() -> bool:
@@ -245,7 +213,7 @@ def _chunk_lookahead() -> bool:
     demand — every staged row is consumed by the next ensure; nothing
     mispredicts. OMLX_V41_CHUNK_STAGE=0 disables.
     """
-    return os.environ.get("OMLX_V41_CHUNK_STAGE", "1") != "0"
+    return env_bool("OMLX_V41_CHUNK_STAGE", True)
 
 
 def _verify_scratch() -> int:
@@ -266,10 +234,7 @@ def _verify_scratch() -> int:
     headroom). 0 keeps the legacy chunked-verify behavior.
     OMLX_V41_VERIFY_SCRATCH, rows/layer.
     """
-    try:
-        return max(0, int(os.environ.get("OMLX_V41_VERIFY_SCRATCH", "8")))
-    except (TypeError, ValueError):
-        return 0
+    return env_int("OMLX_V41_VERIFY_SCRATCH", 8, lo=0)
 
 
 def _draft_offload() -> int:
@@ -287,31 +252,44 @@ def _draft_offload() -> int:
     the 48 GiB bench box). 0 keeps draft stages fully resident.
     OMLX_V41_DRAFT_OFFLOAD.
     """
-    try:
-        return max(0, int(os.environ.get("OMLX_V41_DRAFT_OFFLOAD", "8")))
-    except (TypeError, ValueError):
-        return 0
+    return env_int("OMLX_V41_DRAFT_OFFLOAD", 8, lo=0)
 
 
 def _span_groups(rows, gap, cap_rows):
-    """Ascending expert rows -> merged span lists.
+    """Ascending expert rows -> merged span lists (demanded ids only).
 
     Neighbors merge while ``row - prev <= gap`` and the run stays within
-    ``cap_rows`` rows. ``gap`` bounds the DIFFERENCE between adjacent ids:
-    0 disables merging entirely (adjacent ids differ by 1 > 0); only
-    gap >= 1 joins strictly contiguous rows. This is NOT the generic
-    path's ``merge_gap`` (missing rows bridged) — V4.1 gap=1 corresponds
-    to generic merge_gap=0.
+    ``cap_rows`` rows. ``gap`` bounds the DIFFERENCE between adjacent
+    demanded ids: 0 disables merging entirely (adjacent ids differ by
+    1 > 0); only gap >= 1 joins strictly contiguous rows. This is NOT
+    the generic path's ``merge_gap`` — that counts MISSING rows a run
+    may bridge, so V4.1 ``gap`` maps to ``merge_gap=gap - 1`` (V4.1
+    gap=1 == generic merge_gap=0), and ``cap_rows`` maps to its
+    ``max_run`` span bound.
+
+    Each ``(first, count)`` run from the shared segmenter is translated
+    back to the demanded-id group it covers; a run's tail may end in a
+    clamped partial hole, so groups are sliced by row range rather than
+    paired by length. Callers still read ``[group[0], group[-1] + 1)``.
     """
-    groups, cur = [], []
-    for row in rows:
-        if cur and (row - cur[-1] > gap or row - cur[0] + 1 > cap_rows):
-            groups.append(cur)
-            cur = []
-        cur.append(row)
-    if cur:
-        groups.append(cur)
+    if not rows or gap <= 0:
+        # gap=0 disables merging entirely — even strictly contiguous
+        # rows read alone, so it cannot ride the generic segmenter
+        # (merge_gap=0 still joins contiguous ids).
+        return [[row] for row in rows]
+    from ..expert_streaming.shard_bank import segment_runs
+
+    groups, i = [], 0
+    for first, count in segment_runs(
+        rows, merge_gap=gap - 1, max_run=max(1, int(cap_rows))
+    ):
+        j = i
+        while j < len(rows) and rows[j] < first + count:
+            j += 1
+        groups.append(rows[i:j])
+        i = j
     return groups
+
 
 # Layer 3 seam: the DSpark verify driver enters
 # verify_scope() around the draft-block forward. While set, _ExpertSlots
@@ -337,6 +315,16 @@ _PROJECTIONS = ("w1", "w3", "w2")
 _FLOAT_BYTES = {"BF16": 2, "F16": 2, "F32": 4}
 
 
+def _fields(spec):
+    """Field names one stacked projection needs — weight plus the
+    quantization parameters its ``spec`` carries (affine mode adds
+    biases; mxfp modes keep only scales)."""
+    fields = ["weight"]
+    if spec:
+        fields += ["scales"] + (["biases"] if spec["mode"] == "affine" else [])
+    return fields
+
+
 class ExpertOffloadPlan:
     """Validate every routed tensor before promising any memory savings."""
 
@@ -360,7 +348,9 @@ class ExpertOffloadPlan:
         self.excluded_keys = set()
         self.resident_bytes = 0
         self.full_bytes = 0
-        self._headers = {}
+        # filename -> (size, mtime_ns) signature for the shared
+        # lru-cached safetensors header reader (residency._header).
+        self._file_stats = {}
         self._readers = {}
         self._readers_lock = threading.Lock()
         self._store = None
@@ -465,13 +455,17 @@ class ExpertOffloadPlan:
 
     def _entry(self, key):
         filename = self.mapping[key]
-        if filename not in self._headers:
-            path = self.path / filename
-            with path.open("rb") as file:
-                length = struct.unpack("<Q", file.read(8))[0]
-                header = json.loads(file.read(length))
-            self._headers[filename] = header
-        entry = self._headers[filename][key]
+        stat = self._file_stats.get(filename)
+        if stat is None:
+            info = (self.path / filename).stat()
+            stat = self._file_stats[filename] = (
+                info.st_size,
+                info.st_mtime_ns,
+            )
+        # Shared cached header parse (residency._header): per file it is
+        # read+parsed once process-wide, so plan construction no longer
+        # re-reads every shard header per ExpertOffloadPlan.
+        entry = _header(str(self.path / filename), *stat)[key]
         self.excluded_keys.add(key)
         return entry
 
@@ -480,10 +474,7 @@ class ExpertOffloadPlan:
         if self.converted is not None:
             name = f"{prefix}.{proj}"
             spec = self.converted.get("quantized_modules", {}).get(name)
-            fields = ["weight"]
-            if spec:
-                fields += ["scales"] + (["biases"] if spec["mode"] == "affine" else [])
-            entries = {f: self._entry(f"{name}.{f}") for f in fields}
+            entries = {f: self._entry(f"{name}.{f}") for f in _fields(spec)}
             for field, entry in entries.items():
                 shape = (count, *logical)
                 dtype = entry["dtype"]
@@ -606,7 +597,7 @@ class ExpertOffloadPlan:
                     reader = self._readers[filename] = TensorFile(
                         self.path / filename
                     )
-        return reader.read(key, rows=expert)
+        return reader.read(key)
 
     def _read_span(self, key, lo, hi):
         if self._closed:
@@ -627,13 +618,10 @@ class ExpertOffloadPlan:
     def fetch(self, prefix, proj, expert):
         if self.converted is not None:
             spec = self.layers[prefix][proj]
-            fields = ["weight"]
-            if spec:
-                fields += ["scales"] + (["biases"] if spec["mode"] == "affine" else [])
             row = int(expert)
             return {
                 field: decode_array(*self._read(f"{prefix}.{proj}.{field}", row))
-                for field in fields
+                for field in _fields(spec)
             }
         name = f"{prefix.removeprefix('language_model.')}.{expert}.{proj}"
         raw, dtype = self._read(name + ".weight")
@@ -646,13 +634,7 @@ class ExpertOffloadPlan:
 
     def _field_keys(self, prefix, proj):
         """Stacked store keys for one projection (weight + quant fields)."""
-        spec = self.layers[prefix][proj]
-        fields = ["weight"]
-        if spec:
-            fields += ["scales"] + (
-                ["biases"] if spec["mode"] == "affine" else []
-            )
-        return [f"{prefix}.{proj}.{f}" for f in fields]
+        return [f"{prefix}.{proj}.{f}" for f in _fields(self.layers[prefix][proj])]
 
     def fetch_span(self, prefix, proj, lo, hi):
         """Read physical rows ``[lo, hi)`` of one projection contiguously.
@@ -886,6 +868,12 @@ class _ExpertSlots:
             rows, missed = self._ensure_locked(
                 indices, frozen=verify or phase == "prefill", verify=verify
             )
+        # One device->host routing sync serves both predictors.
+        routed = (
+            {int(e) for e in indices.reshape(-1).tolist()}
+            if self.backing is not None and phase in ("decode", "verify")
+            else None
+        )
         if phase == "decode" and self.backing is not None:
             self.backing.note_visit(self.layer, missed)
             # Record this token's routing as the predictor for the
@@ -893,9 +881,7 @@ class _ExpertSlots:
             # predicted set while this layer's compute runs. Frozen
             # (verify) ensures skip both — verify traffic would pollute
             # the decode predictor and draft cycles race the schedule.
-            self.backing.note_routing(
-                self.layer, {int(e) for e in indices.reshape(-1).tolist()}
-            )
+            self.backing.note_routing(self.layer, routed)
             self.backing.stage_next(self.layer)
         elif phase == "verify" and self.backing is not None:
             # Telemetry only (megaplan F0): verify stalls are real wall
@@ -907,9 +893,7 @@ class _ExpertSlots:
             # advise the next layer's predicted demand — under DSpark
             # virtually all trunk traffic is verify, so this predictor
             # is the only one that sees real routing.
-            self.backing.note_verify_routing(
-                self.layer, {int(e) for e in indices.reshape(-1).tolist()}
-            )
+            self.backing.note_verify_routing(self.layer, routed)
             self.backing.advise_verify_next(self.layer)
         return rows
 
@@ -969,6 +953,27 @@ class _ExpertSlots:
                         break
             self.arena.staged_submits += len(self._staged) - staged_before
 
+    def _advise_runs(self, runs, store):
+        """F_RDADVISE each ``(first, count)`` run across every field.
+
+        A sorted demanded-id run collapses to one contiguous byte range
+        per field — ``advise_expert_run`` issues a single radvisory per
+        run (and splits at tier boundaries internally). Returns bytes
+        actually advised; a failed run does not stop the rest —
+        readahead is a hint, never the demand path.
+        """
+        total = 0
+        for proj in _PROJECTIONS:
+            for key in self.plan._field_keys(self.prefix, proj):
+                for first, count in runs:
+                    try:
+                        ok, nbytes, _seg = store.advise_expert_run(key, first, count)
+                    except Exception:
+                        ok, nbytes = False, 0
+                    if ok:
+                        total += nbytes
+        return total
+
     def _advise_keys(self, experts):
         """F_RDADVISE the given expert rows across every projection field.
 
@@ -984,19 +989,11 @@ class _ExpertSlots:
             store = self.plan._backing()
         except Exception:
             return 0, 0
-        total = 0
-        for proj in _PROJECTIONS:
-            for key in self.plan._field_keys(self.prefix, proj):
-                for run in _span_groups(experts, _ra_gap(), _ra_max_rows()):
-                    try:
-                        ok, nbytes, _seg = store.advise_expert_run(
-                            key, run[0], run[-1] - run[0] + 1
-                        )
-                    except Exception:
-                        ok, nbytes = False, 0
-                    if ok:
-                        total += nbytes
-        return len(experts), total
+        runs = [
+            (run[0], run[-1] - run[0] + 1)
+            for run in _span_groups(experts, _ra_gap(), _ra_max_rows())
+        ]
+        return len(experts), self._advise_runs(runs, store)
 
     def advise_demand(self, experts):
         """Readahead the demanded-but-missing experts of an upcoming chunk.
@@ -1033,30 +1030,17 @@ class _ExpertSlots:
         does too — advising all rows at once buys a full layer of lead
         time while this layer's compute+IO runs.
         """
-        if (
-            not _ra_enabled()
-            or not _ra_next()
-            or self.plan.converted is None
-        ):
+        if not _ra_enabled() or not _ra_next() or self.plan.converted is None:
             return 0
         try:
             store = self.plan._backing()
         except Exception:
             return 0
-        total = 0
-        for proj in _PROJECTIONS:
-            for key in self.plan._field_keys(self.prefix, proj):
-                try:
-                    ok, nbytes, _seg = store.advise_expert_run(
-                        key, 0, self.plan.count_of(self.prefix)
-                    )
-                except Exception:
-                    ok, nbytes = False, 0
-                if ok:
-                    total += nbytes
+        count = self.plan.count_of(self.prefix)
+        total = self._advise_runs([(0, count)], store)
         if total:
             self.ra_calls += 1
-            self.ra_rows += self.plan.count_of(self.prefix)
+            self.ra_rows += count
             self.ra_bytes += total
         return total
 
@@ -1091,6 +1075,28 @@ class _ExpertSlots:
             missed,
         )
 
+    def _join_staged(self, expert):
+        """Pop and join the staged future for *expert*, if any.
+
+        Returns its per-expert payload on success (counting
+        ``arena.staged_hits``); a missing, failed or empty payload
+        returns None — ``staged_failures`` counts only futures that
+        actually existed but yielded nothing.
+        """
+        fut = self._staged.pop(expert, None)
+        if fut is None:
+            return None
+        payload = None
+        try:
+            payload = fut.result()
+        except Exception:
+            pass
+        if payload:
+            self.arena.staged_hits += 1
+            return payload
+        self.staged_failures += 1
+        return None
+
     def _produce(self, fetch_list):
         """Pass 2: fetch (IO + CPU decode, no mx assignment/eval). Serial by
         default; worker threads when OMLX_V41_FETCH_THREADS>0. Workers
@@ -1100,17 +1106,9 @@ class _ExpertSlots:
 
         def _one(item):
             expert, _slot, _victim = item
-            fut = self._staged.pop(expert, None)
-            if fut is not None:
-                payload = None
-                try:
-                    payload = fut.result()
-                except Exception:
-                    pass
-                if payload:
-                    self.arena.staged_hits += 1
-                    return payload
-                self.staged_failures += 1
+            payload = self._join_staged(expert)
+            if payload is not None:
+                return payload
             return {
                 proj: self.plan.fetch(self.prefix, proj, expert)
                 for proj in _PROJECTIONS
@@ -1151,21 +1149,11 @@ class _ExpertSlots:
         resolved = {}
         for item in fetch_list:
             expert = item[0]
-            fut = self._staged.pop(expert, None)
-            if fut is None:
+            payload = self._join_staged(expert)
+            if payload is None:
                 demand.append(item)
-                continue
-            payload = None
-            try:
-                payload = fut.result()
-            except Exception:
-                pass
-            if payload:
-                self.arena.staged_hits += 1
-                resolved[expert] = payload
             else:
-                self.staged_failures += 1
-                demand.append(item)
+                resolved[expert] = payload
         demand.sort(key=lambda item: int(item[0]))
         spans = _span_groups([int(item[0]) for item in demand], gap, cap_rows)
 
@@ -1255,10 +1243,24 @@ class OffloadedExpert(nn.Module):
         # (unless the governor retargeted mid-call) and compacts the
         # extra rooms back out, keeping the MRU-end decode residents.
         entry_cap = entry_rooms = raised_cap = None
+
+        def _step():
+            # Chunk bound from the LIVE cap: read under the slots lock so
+            # a governor resize mid-call cannot tear the value, and
+            # re-read per chunk so a governor shrink re-splits the
+            # remaining rows instead of leaving a chunk's routed set
+            # wider than the live cap (needed > book.cap aborts ensure
+            # mid-prefill). Under verify the scratch rows (F4) widen the
+            # working set: one ensure covers the whole block's union
+            # instead of cap//top_k tokens.
+            with self.slots._slots_lock:
+                return working_set_step(
+                    self.slots.cap + (_verify_scratch() if is_verify else 0),
+                    flat_i.shape[-1],
+                )
+
         if multi and not is_verify:
-            target = min(
-                _prefill_cap(), self.slots.plan.count_of(self.slots.prefix)
-            )
+            target = min(_prefill_cap(), self.slots.plan.count_of(self.slots.prefix))
             with self.slots._slots_lock:
                 entry_cap = self.slots.book.cap
                 entry_rooms = self.slots.book.rooms
@@ -1282,22 +1284,7 @@ class OffloadedExpert(nn.Module):
                 self.slots.backing.advise_next_layer(self.slots.layer)
         try:
             while start < flat_i.shape[0]:
-                # Bound each chunk by route count without an O(prompt^2)
-                # search. Governor-driven ceiling, not the plan's initial
-                # capacity — read under the slots lock so it cannot tear
-                # against a mid-call resize, and re-read per chunk so a
-                # governor shrink re-splits the remaining rows instead of
-                # leaving a chunk's routed set wider than the live cap
-                # (needed > book.cap aborts ensure mid-prefill).
-                with self.slots._slots_lock:
-                    # Under verify the scratch rows (F4) widen the
-                    # working set: one ensure covers the whole block's
-                    # union instead of cap//top_k tokens.
-                    step = working_set_step(
-                        self.slots.cap
-                        + (_verify_scratch() if is_verify else 0),
-                        flat_i.shape[-1],
-                    )
+                step = _step()
                 if multi:
                     if _ra_enabled():
                         horizon = min(
@@ -1337,12 +1324,7 @@ class OffloadedExpert(nn.Module):
                     # always makes progress (needed <= step*top_k <= old
                     # cap); when it cannot shrink further the working
                     # set is unservable.
-                    with self.slots._slots_lock:
-                        shrunk = working_set_step(
-                            self.slots.cap
-                            + (_verify_scratch() if is_verify else 0),
-                            flat_i.shape[-1],
-                        )
+                    shrunk = _step()
                     if shrunk >= step:
                         raise
                     continue
@@ -1393,10 +1375,7 @@ def estimate_expert_savings(path, fraction):
     path = Path(path)
     files = [path / "config.json", path / "model.safetensors.index.json"]
     files.extend(path.glob("*.safetensors"))
-    signature = tuple(
-        (str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(files)
-    )
-    return _estimate_expert_savings(str(path), fraction, signature)
+    return _estimate_expert_savings(str(path), fraction, _files_signature(files))
 
 
 @lru_cache(maxsize=32)

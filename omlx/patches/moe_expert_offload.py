@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import struct
 import threading
@@ -47,6 +46,7 @@ from mlx_lm.models.switch_layers import (
 )
 
 from ..scheduler import _sync_and_clear_cache
+from .expert_streaming._env import env_bool
 from .expert_streaming.slot_cache import DecodeVisitStats, SlotBookkeeping
 
 logger = logging.getLogger(__name__)
@@ -573,17 +573,6 @@ class OffloadSwitchGLU(nn.Module):
         return out.reshape(indices.shape + (x.shape[-1],))
 
 
-class _LegacyCacheStats(DecodeVisitStats):
-    """Cumulative decode-visit counters for governor windows.
-
-    The shared contract class (``expert_streaming.slot_cache``) is the
-    shape ``ExpertResidencyGovernor._window`` duck-reads — same fields the
-    V4.1 backing and the unified CacheStats expose.
-    """
-
-    pass
-
-
 class LegacyOffloadState:
     """Governor-facing cache over the legacy per-layer ``ExpertCache``s.
 
@@ -623,58 +612,32 @@ class LegacyOffloadState:
             min(int(c.capacity) for c in self.caches) if self.caches else 0
         )
         self.overrides: dict = {}
-        self.stats = _LegacyCacheStats()
+        # The shared contract class (expert_streaming.slot_cache) is the
+        # shape ExpertResidencyGovernor._window duck-reads — same fields
+        # the V4.1 backing and the unified CacheStats expose.
+        self.stats = DecodeVisitStats()
         self.governor = None
         if not dynamic or not self.caches:
             return
-        try:
-            from .expert_streaming.governor import (
-                ExpertResidencyGovernor,
-                _max_dynamic_budget_bytes,
-            )
+        from .expert_streaming.governor import arm_dynamic
 
-            initial_total = self.base_cap * self.per_slot
-            gov_max = (
-                int(max_budget_bytes)
-                if max_budget_bytes is not None
-                else _max_dynamic_budget_bytes()
-            )
-            gov_min = (
-                int(min_budget_bytes)
-                if min_budget_bytes is not None
-                else max(int(0.25 * 1024**3), initial_total // 4)
-            )
-            # Never shrink a layer below one token's decode working set:
-            # the wrap-time capacity already floors at the model's routing
-            # top-k, and going below it turns every step into a fetch
-            # storm.
-            floor = (
-                int(min_cap)
-                if min_cap is not None
-                else min(8, self.base_cap)
-            )
-            kwargs = {}
-            if stall_target is not None:
-                kwargs["stall_target"] = stall_target
-            self.governor = ExpertResidencyGovernor(
-                self,
-                self.per_slot,
-                1,
-                max(gov_max, initial_total),
-                min_budget_bytes=gov_min,
-                min_cap=max(1, floor),
-                **kwargs,
-            )
-            logger.info(
-                "moe expert offload: dynamic residency governor armed "
-                "(per-layer %d slots, min %d, max %.2f GiB)",
-                self.base_cap,
-                self.governor._min_cap_slots(),
-                self.governor.max_budget_bytes / 1024**3,
-            )
-        except Exception:
-            logger.debug("legacy governor arming failed", exc_info=True)
-            self.governor = None
+        # Never shrink a layer below one token's decode working set:
+        # the wrap-time capacity already floors at the model's routing
+        # top-k, and going below it turns every step into a fetch storm.
+        # floor_default covers the no-explicit-min_cap case (8 like the
+        # legacy wrap default); an explicit min_cap wins in arm_dynamic.
+        self.governor = arm_dynamic(
+            self,
+            self.per_slot,
+            self.base_cap,
+            floor_default=min(8, self.base_cap),
+            max_budget_bytes=max_budget_bytes,
+            min_budget_bytes=min_budget_bytes,
+            stall_target=stall_target,
+            min_cap=min_cap,
+            num_layers=1,
+            label="moe expert offload",
+        )
 
     # -- governor duck-type ------------------------------------------------
     def resize(self, cap: int, per_layer: int | None) -> None:
@@ -719,6 +682,19 @@ class LegacyOffloadState:
         # cache._lock then state._lock impossible to invert.
         with self._lock:
             self.stats.note_visit(layer_idx, missed)
+        # Mid-request governor tick — parity with the V4.1 backing's
+        # note_visit and the unified cache: one visit per layer-call is
+        # the same cadence, and tick() self-throttles on _GOV_TICK_S so
+        # the cost is a monotonic compare until the interval elapses.
+        # Runs outside the state lock: observe() may resize() which
+        # retakes it (RLock is reentrant; unscoped matches the V4.1
+        # lock-ordering contract).
+        gov = self.governor
+        if gov is not None:
+            try:
+                gov.tick()
+            except Exception:
+                logger.debug("legacy governor tick failed", exc_info=True)
 
     def summary(self) -> dict:
         # The governor snapshot runs OUTSIDE the state lock on purpose:
@@ -912,7 +888,7 @@ def apply_moe_expert_offload(
     they are served by that stack (fraction = initial budget, dynamic
     governor on); elsewhere the legacy adapter runs unchanged.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
+    if not env_bool("OMLX_MOE_EXPERT_OFFLOAD", True):
         return 0
     # Unified backend: model types covered by expert_streaming route
     # to our stack — the resident fraction becomes the INITIAL budget and
@@ -1080,9 +1056,9 @@ def _apply_via_streaming(
     """Convert via the expert_streaming stack; 0 when it converts nothing."""
     import dataclasses
 
-    from .expert_streaming import convert_model_to_streaming
-    from .expert_streaming.residency import expert_streaming_estimate
     from ..model_settings import ModelSettings
+    from .expert_streaming import _budget_is_pinned, convert_model_to_streaming
+    from .expert_streaming.residency import expert_streaming_estimate
 
     est = expert_streaming_estimate(str(model_path))
     if not est.supported:
@@ -1111,18 +1087,7 @@ def _apply_via_streaming(
         overrides: dict = {"expert_streaming_enabled": True}
         if getattr(model_settings, "expert_streaming_dynamic", None) is None:
             overrides["expert_streaming_dynamic"] = True
-        if (
-            budget_gib is not None
-            and not any(
-                getattr(model_settings, a, None) is not None
-                for a in (
-                    "expert_streaming_budget_gib",
-                    "expert_cache_budget_gib",
-                    "expert_streaming_budget_mib",
-                    "expert_cache_budget_mib",
-                )
-            )
-        ):
+        if budget_gib is not None and not _budget_is_pinned(model_settings):
             overrides["expert_streaming_budget_gib"] = budget_gib
         settings = dataclasses.replace(model_settings, **overrides)
     else:
@@ -1179,7 +1144,7 @@ def estimate_offload_admission_bytes(
     do not under-report the resident share. Falls back to ``full_size`` on
     any failure — admission must never get more permissive by accident.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
+    if not env_bool("OMLX_MOE_EXPERT_OFFLOAD", True):
         return full_size
     try:
         model_dir = _resolve_model_dir(model_path)
@@ -1196,6 +1161,8 @@ def estimate_offload_admission_bytes(
             try:
                 from .expert_streaming.residency import (
                     SUPPORTED_TYPES as _STREAMING_TYPES,
+                )
+                from .expert_streaming.residency import (
                     expert_streaming_estimate,
                     normalize_model_type,
                 )

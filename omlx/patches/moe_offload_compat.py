@@ -7,6 +7,8 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
+from .deepseek_v41.residency import _files_signature
+
 _SUPPORTED_TYPES = frozenset({"deepseek_v41", "qwen4_exp", "gemma4", "olmoe"})
 
 
@@ -22,10 +24,17 @@ def moe_offload_compatibility(model_path):
         try:
             from .expert_streaming.residency import (
                 SUPPORTED_TYPES as _STREAMING_TYPES,
+            )
+            from .expert_streaming.residency import (
+                _config_model_type,
                 expert_streaming_estimate,
                 normalize_model_type,
             )
 
+            # Effective model_type: top level wins, VLM wrappers fall
+            # back to text_config — the same reading the streaming stack
+            # and the legacy adapter apply (normalized).
+            mtype = _config_model_type(raw)
             if mtype and normalize_model_type(mtype) in _STREAMING_TYPES:
                 est = expert_streaming_estimate(str(path))
                 if est.supported:
@@ -46,10 +55,7 @@ def moe_offload_compatibility(model_path):
         index = path / "model.safetensors.index.json"
         if index.exists():
             files.append(index)
-        signature = tuple(
-            (str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(files)
-        )
-        return _inspect(str(path), signature)
+        return _inspect(str(path), _files_signature(files))
     except (OSError, TypeError, ValueError, KeyError):
         return False, "Could not verify the expert checkpoint layout."
 
@@ -57,7 +63,12 @@ def moe_offload_compatibility(model_path):
 @lru_cache(maxsize=128)
 def _inspect(path, signature):
     raw = json.loads((Path(path) / "config.json").read_text())
-    kind = raw["model_type"]
+    try:
+        from .expert_streaming.residency import _config_model_type
+
+        kind = _config_model_type(raw)
+    except Exception:
+        kind = raw.get("model_type")
     if kind == "deepseek_v41":
         from .deepseek_v41.moe_offload import estimate_expert_savings
 

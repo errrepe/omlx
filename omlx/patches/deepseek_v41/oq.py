@@ -203,8 +203,14 @@ def quantize_engram(
         }
         offset += length
     names = {key: f"{module_name}.{key}" if module_name else key for key in shapes}
+    # This header is built by hand (mx.save_safetensors cannot stream into
+    # a preallocated file), so it must carry the same __metadata__ the
+    # library writer emits — format:mlx, the oMLX convention the generic
+    # MLX-detection heuristic and external tooling read.
     encoded = json.dumps(
-        {names[key]: value for key, value in header.items()}, separators=(",", ":")
+        {names[key]: value for key, value in header.items()}
+        | {"__metadata__": {"format": "mlx"}},
+        separators=(",", ":"),
     ).encode()
     encoded += b" " * (-len(encoded) % 8)
     data_start = 8 + len(encoded)

@@ -380,9 +380,10 @@ class TestDecodeVisitStats:
     def test_shared_contract(self):
         from omlx.patches.deepseek_v41.streaming_backing import _V41CacheStats
         from omlx.patches.expert_streaming.slot_cache import DecodeVisitStats
-        from omlx.patches.moe_expert_offload import _LegacyCacheStats
 
-        for cls in (_V41CacheStats, _LegacyCacheStats):
+        # The legacy offload state rides the base class directly — the
+        # pass-subclass was dropped; both shapes must expose the contract.
+        for cls in (_V41CacheStats, DecodeVisitStats):
             st = cls()
             assert isinstance(st, DecodeVisitStats)
             st.note_visit(3, missed=True)

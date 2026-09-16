@@ -35,17 +35,27 @@ def _header(filename, size, mtime_ns):
         return json.loads(file.read(length))
 
 
+def _files_signature(files):
+    """``(path, size, mtime_ns)`` tuples — the cache key for header scans.
+
+    Shared by every lru-cached per-checkpoint reader (the residency
+    estimate here, ``moe_offload.estimate_expert_savings`` and the
+    ``moe_offload_compat`` layout check): a replaced file changes size
+    or mtime and re-runs the scan, an untouched one stays cached.
+    """
+    return tuple(
+        (str(f), st.st_size, st.st_mtime_ns)
+        for f in sorted(files)
+        for st in (f.stat(),)
+    )
+
+
 def deepseek_v41_residency_estimate(model_path):
     path = Path(model_path).expanduser().resolve()
     files = [path / "config.json", path / "model.safetensors.index.json"]
     files.extend(path.glob("*.safetensors"))
     files.extend((path / "engram").glob("*.safetensors"))
-    signature = tuple(
-        (str(f), st.st_size, st.st_mtime_ns)
-        for f in sorted(files)
-        for st in (f.stat(),)
-    )
-    return _estimate(str(path), signature)
+    return _estimate(str(path), _files_signature(files))
 
 
 @lru_cache(maxsize=128)
