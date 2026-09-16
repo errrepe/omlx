@@ -444,13 +444,6 @@ class SpeculationState:
             self._advise_seen.clear()
             self._trans_pending.clear()
             self.recall_ewma.clear()
-            # Per-token routing scratch is per-conversion state — clear it
-            # so a drained engine serves nothing stale. ``trans`` itself
-            # survives: it is the learned profile that save-on-unload
-            # persists after close.
-            self._cur_token_sets.clear()
-            self._prev_token_sets.clear()
-            self._xlayer_ewma.clear()
         for fut in futs:
             try:
                 fut.cancel()

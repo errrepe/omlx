@@ -228,6 +228,10 @@ class ModelSettingsRequest(BaseModel):
 
     model_alias: str | None = None
     model_type_override: str | None = None
+    # Checkpoint-derived model_type scope (auto-managed — stamped into the
+    # settings record by _validate_model_settings; accepted here so stored
+    # profiles round-trip through extra="forbid").
+    model_type: str | None = None
     max_context_window: int | None = None
     max_tokens: int | None = None
     temperature: float | None = None
@@ -261,6 +265,27 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_dynamic_min_gib: float | None = None
     expert_streaming_dynamic_stall_target: float | None = None
     expert_streaming_prefill_budget_gib: float | None = None
+    # Per-model routing/IO tunables (see ModelSettings and
+    # patches/expert_streaming/_IO_OVERRIDE_KEYS). None keeps the env /
+    # built-in default. The settings form never sends these — they are
+    # profile-preserved keys that must round-trip through extra="forbid".
+    # Bounds are enforced by _validate_expert_streaming_bounds.
+    expert_streaming_topk_threshold: float | None = None
+    expert_streaming_cache_prior: float | None = None
+    expert_streaming_io_depth: int | None = None
+    expert_streaming_coalesce: bool | None = None
+    expert_streaming_readahead: bool | None = None
+    expert_streaming_seed: bool | None = None
+    expert_streaming_per_layer_eval: bool | None = None
+    expert_streaming_pins: bool | None = None
+    expert_streaming_pin_gib: float | None = None
+    expert_streaming_pin_sync: bool | None = None
+    expert_streaming_pin_regime: str | None = None
+    # "2"/"3" select a cold precision tier (""/None = off); int values are
+    # accepted and coerce the same way the bounds check does (str()).
+    expert_streaming_cold_tier: str | int | None = None
+    expert_streaming_hot_fraction: float | None = None
+    expert_streaming_cache_policy: str | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
