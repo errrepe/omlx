@@ -62,6 +62,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from .patches.expert_streaming import find_streaming_backing
 from .patches.expert_streaming._env import env_float
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
@@ -1583,26 +1584,11 @@ def _streaming_backing_of(model: Any) -> Any | None:
     vision adapters (``language_model``/``model``/``_vlm_model``/
     ``_language_model`` hops). A bare getattr misses the nested cases:
     requests would stream without serialization and the prefill guard
-    would never charge the mini-bank transient. The depth cap bounds
-    adapter property loops.
+    would never charge the mini-bank transient. Delegates to the shared
+    breadth-first walk — its visited set and depth cap bound adapter
+    property loops the same way the old linear chain's did.
     """
-    cur: Any = model
-    for _ in range(5):
-        if cur is None:
-            return None
-        backing = getattr(cur, "_expert_streaming_backing", None)
-        if backing is not None:
-            return backing
-        nxt = (
-            getattr(cur, "language_model", None)
-            or getattr(cur, "model", None)
-            or getattr(cur, "_vlm_model", None)
-            or getattr(cur, "_language_model", None)
-        )
-        if nxt is cur:
-            return None
-        cur = nxt
-    return None
+    return find_streaming_backing(model)
 
 
 def _model_uses_expert_streaming(model: Any) -> bool:
