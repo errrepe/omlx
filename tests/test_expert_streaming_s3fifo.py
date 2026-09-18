@@ -123,3 +123,30 @@ def test_ghost_second_chance_goes_main():
     c.put((0, 1, "w"), "a2")  # ghost hit -> main queue
     assert c._store.get((0, 1, "w")) == "a2"
     assert (0, 1, "w") in c._main_layers.get(0, {})
+
+
+def test_admission_note_counts_small_queue_toward_global_full():
+    """B3: global fullness must see _small + _store, not _store alone.
+
+    Probationary small-queue rows are residents. A fullness check over
+    ``_store`` alone admitted on the first sighting into a cache that was
+    already at capacity once the small FIFO was counted.
+    """
+    c = _cache(8, 4)  # capacity 8, per-layer cap 2
+    # Raise layer 0's cap so the probe key's LAYER is not the binding
+    # constraint — only the global occupancy matters.
+    c.set_layer_caps({0: 16})
+    for i in range(8):
+        c.put((i % 4, i, "w"), object())
+    # Promote one probationary row into the main queue, then refill —
+    # the small FIFO re-bounds to its cap and total occupancy reaches
+    # the global capacity.
+    assert c.get((1, 1, "w")) is not None
+    c.put((0, 9, "w"), object())
+    assert c.size == c.capacity == 8
+    assert len(c._small) == 7 and len(c._store) == 1
+    # Under the old _store-only check, fullness read 1 < 8 and the first
+    # sighting admitted; counting both queues the cache is full, so the
+    # 2nd-touch filter applies.
+    assert c.admission_note((0, 50, "w")) is False
+    assert c.admission_note((0, 50, "w")) is True

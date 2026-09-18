@@ -25,6 +25,7 @@ from collections import Counter
 from typing import Any, Dict, Tuple
 
 from ._env import env_bool, env_int
+from .staging import PrevTokenPredictor, StagedReads
 
 
 _TRANSITION_ENV = env_bool("OMLX_EXPERT_STREAMING_TRANSITION", True)
@@ -71,7 +72,20 @@ class SpeculationState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.closed = False
-        self.prev_uniq_by_layer: Dict[int, list[int]] = {}
+        # Per-conversion contract field stamped by conversion from the
+        # expert_streaming_readahead setting: None means "no opinion" —
+        # the OMLX_EXPERT_STREAMING_RA env default applies.
+        self.readahead_enabled: bool | None = None
+        # Prev-token prediction + recall gate ride the shared primitive;
+        # the public dict attrs stay as aliases into it (external readers
+        # — the advisor, the summary — see live state either way).
+        self._predictor = PrevTokenPredictor(
+            decay=_STAGED_RECALL_DECAY, min_recall=_STAGED_MIN_RECALL
+        )
+        self.prev_uniq_by_layer: Dict[int, list[int]] = (
+            self._predictor.prev_uniq_by_layer
+        )
+        self.recall_ewma: Dict[int, float] = self._predictor.recall_ewma
         self.linears_by_layer: Dict[int, list[Any]] = {}
         # Counter: bump() and the stage_resolve hit/miss tallies just
         # auto-vivify; the two keys the streaming summary reads
@@ -85,12 +99,15 @@ class SpeculationState:
         self.trans_updates = 0
         # Staged prefetch state. `staged` holds completed NumPy rows
         # keyed by the TARGET linear's bundle_key; `staged_futs` maps the
-        # same keys to (future, ids, linear) while the set read is in
-        # flight — demand joins the in-flight read instead of re-issuing it.
-        # recall_ewma[layer] is the prev-token prediction's observed recall.
-        self.staged: Dict[Any, Any] = {}
-        self.staged_futs: Dict[Any, Tuple[Any, list, Any]] = {}
-        self.recall_ewma: Dict[int, float] = {}
+        # same keys to (future, ids, key_of) while the set read is in
+        # flight — demand joins the in-flight read instead of re-issuing
+        # it. Both are aliases into the shared StagedReads registry; the
+        # registry's own (leaf) lock serializes its mutations.
+        self._staged_reads = StagedReads(_STAGED_MAX)
+        self.staged: Dict[Any, Any] = self._staged_reads.rows
+        self.staged_futs: Dict[Any, Tuple[Any, list, Any]] = (
+            self._staged_reads.futs
+        )
         # Advise TTL dedup + transition-overfetch precision. The clock
         # advances one step per record_prev call (one MoE layer-call), so
         # TTL units are layer-calls (≈ num_layers per decode token).
@@ -130,17 +147,9 @@ class SpeculationState:
             if pend:
                 self._trans_total += len(pend)
                 self._trans_hits += len(set(now) & pend)
-            prev = self.prev_uniq_by_layer.get(int(layer_idx))
-            if prev and now:
-                # Recall of the prev-token prediction for THIS call — the
-                # gate that decides whether staging this layer pays.
-                inter = len(set(prev) & set(now))
-                obs = inter / max(1, len(now))
-                old = self.recall_ewma.get(int(layer_idx), 0.0)
-                self.recall_ewma[int(layer_idx)] = (
-                    _STAGED_RECALL_DECAY * old
-                    + (1.0 - _STAGED_RECALL_DECAY) * obs
-                )
+            # Prev-set store + recall EWMA fold-in (the predictor scores
+            # the PREVIOUS prediction against this call before storing).
+            prev = self._predictor.record(int(layer_idx), now)
             if _TRANSITION_ENV and prev and now:
                 # Credit temporal transitions prev -> now (EWMA without a
                 # global decay pass: w = 1 + 0.9*w, normalized on read).
@@ -152,7 +161,6 @@ class SpeculationState:
                         for k in sorted(row, key=row.get)[: len(row) - _TRANSITION_TOP]:  # type: ignore[arg-type]
                             del row[k]
                 self.trans_updates += 1
-            self.prev_uniq_by_layer[int(layer_idx)] = now
 
     def to_payload(self) -> dict:
         """Serialize the transition table (fingerprint filled by caller)."""
@@ -235,14 +243,10 @@ class SpeculationState:
             return False
         li = int(layer_idx)
         with self.lock:
-            return self.recall_ewma.get(li, 0.0) >= _STAGED_MIN_RECALL
+            return self._predictor.gate(li)
 
     def stage_room(self) -> bool:
-        with self.lock:
-            return (
-                not self.closed
-                and len(self.staged) + len(self.staged_futs) < _STAGED_MAX
-            )
+        return not self.is_closed() and self._staged_reads.room()
 
     def stage_pending(self, key: Any) -> bool:
         """True while a staged read covers *key* (done or in flight).
@@ -254,8 +258,7 @@ class SpeculationState:
         """
         if not _STAGED_ENV:
             return False
-        with self.lock:
-            return key in self.staged or key in self.staged_futs
+        return self._staged_reads.pending(key)
 
     def stage_register(self, fut: Any, ids: list, linear: Any) -> int:
         """Map a submitted set-read future under each expert's bundle_key.
@@ -264,19 +267,9 @@ class SpeculationState:
         flight are skipped). On demand, ``stage_resolve`` awaits the future
         once and fans its rows out into ``staged`` for the siblings.
         """
-        registered = 0
-        with self.lock:
-            if self.closed:
-                return 0
-            for eid in ids:
-                key = linear.bundle_key(int(eid))
-                if key in self.staged or key in self.staged_futs:
-                    continue
-                if len(self.staged) + len(self.staged_futs) >= _STAGED_MAX:
-                    break
-                self.staged_futs[key] = (fut, ids, linear)
-                registered += 1
-        return registered
+        if self.is_closed():
+            return 0
+        return self._staged_reads.register(fut, ids, linear.bundle_key)
 
     def stage_resolve(self, key: Any, wait: bool = True) -> Any:
         """Return a staged NumPy row for *key*, or None.
@@ -291,52 +284,15 @@ class SpeculationState:
         """
         if not _STAGED_ENV:
             return None
-        with self.lock:
-            if self.closed:
-                return None
-            row = self.staged.pop(key, None)
-            if row is not None:
-                self.stats["staged_hits"] += 1
-                return row
-            entry = self.staged_futs.get(key)
-            if entry is not None and not wait and not entry[0].done():
-                return None
-        if entry is None:
+        if self.is_closed():
             return None
-        fut, ids, linear = entry
-        try:
-            got = fut.result()
-        except Exception:
-            got = None
-        rows = got[1] if isinstance(got, tuple) else got
+        row = self._staged_reads.resolve(key, wait=wait)
+        # Mirror the registry's resolve counters into the stats Counter —
+        # assignment, not +=, so the mirror is always the true total.
         with self.lock:
-            if self.closed:
-                # close() cleared staged/staged_futs mid-join: serve the
-                # joined row for THIS key only — re-fanning it into the
-                # cleared dicts would resurrect state on a closed store.
-                if rows:
-                    for eid, r in zip(ids, rows):
-                        if (
-                            r is not None
-                            and linear.bundle_key(int(eid)) == key
-                        ):
-                            return r
-                return None
-            if rows:
-                for eid, r in zip(ids, rows):
-                    if r is None:
-                        continue
-                    k = linear.bundle_key(int(eid))
-                    self.staged_futs.pop(k, None)
-                    self.staged.setdefault(k, r)
-            for eid in ids:
-                self.staged_futs.pop(linear.bundle_key(int(eid)), None)
-            row = self.staged.pop(key, None)
-            if row is not None:
-                self.stats["staged_hits"] += 1
-            else:
-                self.stats["staged_misses"] += 1
-            return row
+            self.stats["staged_hits"] = self._staged_reads.hits
+            self.stats["staged_misses"] = self._staged_reads.misses
+        return row
 
     def stage_drop(self, key: Any) -> None:
         """Remove *key* from staging; cancel its in-flight read when held.
@@ -345,19 +301,11 @@ class SpeculationState:
         is cancelled only when no other staged_futs entry still references
         it, so dropping one key cannot kill a sibling's join.
         """
-        with self.lock:
-            self.staged.pop(key, None)
-            entry = self.staged_futs.pop(key, None)
-            fut = entry[0] if entry is not None else None
-            if fut is not None and any(
-                e[0] is fut for e in self.staged_futs.values()
-            ):
-                fut = None
-        if fut is not None:
-            try:
-                fut.cancel()
-            except Exception:
-                pass
+        self._staged_reads.drop(key)
+
+    def staged_keys(self) -> list:
+        """Locked snapshot of every staged key (done rows + in-flight)."""
+        return self._staged_reads.keys()
 
     # -- advise hygiene ----------------------------------------------------
 
@@ -414,23 +362,25 @@ class SpeculationState:
     def close(self) -> None:
         """Stop speculation: mark closed, cancel staged reads, clear state.
 
-        Idempotent. In-flight staged futures are cancelled (a pending set
-        read never starts; a running one finishes into the void) BEFORE the
-        dicts drop, so a worker cannot fan rows out into a cleared
-        ``staged`` after close — ``stage_resolve``'s join re-checks
-        ``closed`` under the lock for the same reason. The routing history
-        and registry are cleared so a closed state can never serve another
+        Idempotent. In-flight staged futures are collected (closed +
+        cleared) under the lock and cancelled outside it — a pending set
+        read never starts; a running one finishes into the void, and a
+        worker cannot fan rows out into a cleared ``staged`` after close:
+        ``StagedReads.resolve``'s join re-checks its own ``closed`` under
+        its lock for the same reason. The routing history and registry
+        are cleared so a closed state can never serve another
         conversion's speculation.
         """
         with self.lock:
             if self.closed:
                 return
             self.closed = True
-            futs = [entry[0] for entry in self.staged_futs.values()]
+            # Latch + drop under the registry's leaf lock (nested inside
+            # ours — the only spec->staged nesting); cancels run after
+            # release so a done callback can never fire under the lock.
+            futs = self._staged_reads.clear()
             self.prev_uniq_by_layer.clear()
             self.linears_by_layer.clear()
-            self.staged.clear()
-            self.staged_futs.clear()
             self._advise_seen.clear()
             self._trans_pending.clear()
             self.recall_ewma.clear()

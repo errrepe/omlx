@@ -359,3 +359,30 @@ def test_arena_feeds_governor_stats(model, arena_on):
     # per-layer miss map feeds the governor's targeted growth
     if st.decode_layers_missed:
         assert st.decode_misses_by_layer.get(0, 0) >= 1
+
+
+def test_arena_bytes_counted_in_cache_resident_bytes(model, arena_on):
+    """B6: arena-bound rows never enter _store, so the cache's
+    resident_bytes must add every registered arena's bound banks — else
+    the scheduler's heap accounting loses the whole arena residency."""
+    glu = _make_glu(model)
+    cache = glu._cache
+    plan = ss._RemapPlan()
+    idx = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+    assert glu._arena_engage(plan, idx)
+    arena = glu._arena
+    expected = sum(
+        int(a.nbytes)
+        for proj in _PROJS
+        for a in (
+            getattr(glu, proj)._arena_bank.weight,
+            getattr(glu, proj)._arena_bank.scales,
+            getattr(glu, proj)._arena_bank.biases,
+        )
+        if a is not None
+    )
+    assert expected > 0
+    assert arena.resident_bytes() == expected
+    # The cache total is store slots + every registered arena's bytes.
+    store_bytes = int(cache.size) * int(cache.per_slot_bytes)
+    assert cache.resident_bytes() == store_bytes + expected

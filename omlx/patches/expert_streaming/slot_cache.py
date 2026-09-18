@@ -475,6 +475,27 @@ class SlotArena:
             for fname, array in fields.items():
                 arrays[fname][slot] = array
 
+    def resident_bytes(self) -> int:
+        """Bytes committed by this arena's bound banks.
+
+        Sum of every bound array's ``nbytes`` across projections —
+        physical rows are committed memory whether or not they host a
+        resident (a grown-but-free row still occupies the bank), so the
+        accounting is rooms x row-bytes, not len(slot_of). Deliberately
+        unlocked: ``nbytes`` is a metadata read and a mid-rebind caller
+        may see either generation — for byte accounting either is
+        correct, and taking the arena lock from a cache-locked caller
+        would add a lock order for no precision gain.
+        """
+        total = 0
+        try:
+            for proj in self.projections:
+                for array in self._arrays_of(proj).values():
+                    total += int(getattr(array, "nbytes", 0) or 0)
+        except Exception:
+            pass
+        return total
+
     def set_cap(self, cap: int) -> int:
         """Retarget the residency ceiling; returns the applied cap.
 

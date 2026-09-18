@@ -133,3 +133,63 @@ def test_close_mid_join_serves_only_requested_key():
     assert spec.staged_futs == {}
     # A fully-post-close resolve serves nothing (entries are gone).
     assert spec.stage_resolve(lin.bundle_key(2)) is None
+
+
+class TestReadaheadGate:
+    """B5: spec_state.readahead_enabled gates the F_RDADVISE advisor —
+    False vetoes advise_expert_run; None falls back to the env default."""
+
+    def _advisor_fixture(self, readahead):
+        import omlx.patches.expert_streaming.streaming_switch as ss
+
+        spec = SpeculationState()
+        spec.readahead_enabled = readahead
+        spec.prev_uniq_by_layer[1] = [0, 1]  # next layer's last routing
+        advised = []
+        target = SimpleNamespace(
+            stacked_weight_key="k.weight",
+            stacked_scales_key="k.scales",
+            stacked_biases_key=None,
+            backing=SimpleNamespace(
+                advise_expert_run=lambda key, first, count: (
+                    advised.append((key, first, count)) or (True, 0, 1)
+                )
+            ),
+        )
+        spec.linears_by_layer[1] = [target]
+        lin = SimpleNamespace(
+            layer_idx=0,
+            _spec_state=lambda: spec,
+            _is_split_active=lambda: False,
+        )
+        plan = SimpleNamespace(advised_runs=set())
+        call = ss.StreamingQuantizedSwitchLinear._advise_next_layer_prev_token
+        return spec, advised, lin, plan, call
+
+    def test_disabled_vetoes_advisor(self):
+        spec, advised, lin, plan, call = self._advisor_fixture(False)
+        call(lin, plan)
+        assert advised == []
+        assert spec.stats.get("advised", 0) == 0
+
+    def test_enabled_advises_weight_scales_biases(self):
+        spec, advised, lin, plan, call = self._advisor_fixture(True)
+        call(lin, plan)
+        keys = {k for k, _f, _c in advised}
+        # Weight + scales (no biases on this target) — full demand-path
+        # coverage, each advised once per run.
+        assert keys == {"k.weight", "k.scales"}
+        assert spec.stats.get("advised", 0) > 0
+
+    def test_none_falls_back_to_env(self, monkeypatch):
+        import omlx.patches.expert_streaming.streaming_switch as ss
+
+        # Env default on: an unstamped state still advises.
+        spec, advised, lin, plan, call = self._advisor_fixture(None)
+        call(lin, plan)
+        assert advised
+        # Env off vetoes an unstamped state.
+        monkeypatch.setattr(ss, "_RA_ENV", False)
+        spec2, advised2, lin2, plan2, call = self._advisor_fixture(None)
+        call(lin2, plan2)
+        assert advised2 == []

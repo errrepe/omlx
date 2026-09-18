@@ -36,3 +36,14 @@ def env_bool(name: str, default: bool) -> bool:
     """
     v = os.environ.get(name, "").strip()
     return default if v not in ("0", "1") else v == "1"
+
+
+def env_str(name: str, default: str | None) -> str | None:
+    """Tolerant string knob: stripped; *default* on empty/missing.
+
+    Whitespace-only values degrade to the default instead of propagating
+    a string that would fail a downstream equality check. A ``None``
+    default makes unset/empty mean "no opinion" (the caller's contract).
+    """
+    v = os.environ.get(name, "").strip()
+    return v if v else default

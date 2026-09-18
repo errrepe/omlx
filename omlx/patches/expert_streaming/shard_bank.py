@@ -29,7 +29,12 @@ from typing import Any, Dict, NamedTuple, Tuple
 import mlx.core as mx
 import numpy as np
 
-from ._env import env_float, env_int
+from omlx.utils.safetensors import (
+    SAFETENSORS_NUMPY_DTYPES,
+    read_safetensors_header,
+)
+
+from ._env import env_float, env_int, env_str
 
 _PAGE_SIZE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
 
@@ -144,19 +149,16 @@ def _munlock_range(mm: mmap.mmap, offset: int, length: int) -> int:
         return 0
 
 
+# Shared safetensors dtype map (omlx.utils.safetensors), projected into the
+# (np dtype, itemsize) shape _rp_for consumes. The shared table is a
+# superset of the tags this file used to list, so previously-unsupported
+# tags now resolve instead of raising TypeError.
 _DTYPE_MAP: dict[str, tuple[np.dtype, int]] = {
-    "BF16": (np.dtype("<u2"), 2),
-    "F16": (np.dtype("<f2"), 2),
-    "F32": (np.dtype("<f4"), 4),
-    "U32": (np.dtype("<u4"), 4),
-    "U8": (np.dtype("u1"), 1),
-    "I32": (np.dtype("<i4"), 4),
-    "I64": (np.dtype("<i8"), 8),
-    "F8_E4M3": (np.dtype("u1"), 1),
+    tag: (dt, dt.itemsize) for tag, dt in SAFETENSORS_NUMPY_DTYPES.items()
 }
 
 
-def _np_to_mx(key: str, np_view: np.ndarray, dtype_str: str) -> mx.array:
+def np_to_mx(np_view: np.ndarray, dtype_str: str | None) -> mx.array:
     """Promote an expert's np.ndarray slice to the MLX representation."""
     if dtype_str == "BF16":
         # bf16 is stored as raw uint16 bits — reinterpret directly. This
@@ -335,13 +337,29 @@ class _ReadParams(NamedTuple):
         return self.shape[1:] if len(self.shape) > 1 else self.shape
 
 
+class TensorEntry(NamedTuple):
+    """Public descriptor for one safetensors tensor in a shard.
+
+    Exposes what ``_ShardReader.header[key]`` + ``_rp_for`` know, without
+    making callers reach into either: the dtype tag, the stored shape
+    (expert dim first for stacked banks), one row's byte size, and the
+    per-row shape.
+    """
+
+    dtype_str: str
+    shape: tuple[int, ...]
+    expert_bytes: int
+    per_shape: tuple[int, ...]
+
+
 def _read_header(f) -> dict:
     """Parse the safetensors JSON header from an open file at offset 0.
 
     Leaves the file positioned at the data start (8-byte size + JSON).
+    Shared parser lives in omlx.utils.safetensors; this alias keeps the
+    legacy in-file call sites (and any private importer) working.
     """
-    hsize = struct.unpack("<Q", f.read(8))[0]
-    return json.loads(f.read(hsize))
+    return read_safetensors_header(f)
 
 
 def _pread_full(fd: int, n: int, off: int) -> bytes:
@@ -444,6 +462,46 @@ class _ShardReader:
         )
         self._rp[key] = rp
         return rp
+
+    def tensor_entry(self, key: str) -> "TensorEntry":
+        """Public header descriptor for *key* (dtype/shape/row geometry).
+
+        Same data the read paths derive — the ``_rp_for`` cache means the
+        geometry math runs once per key.
+        """
+        rp = self._rp_for(key)
+        return TensorEntry(
+            dtype_str=str(self.header[key]["dtype"]),
+            shape=rp.shape,
+            expert_bytes=rp.expert_bytes,
+            per_shape=rp.per_shape,
+        )
+
+    def read_span(self, key: str, lo: int, hi: int) -> np.ndarray:
+        """Contiguous expert rows [lo, hi) as ONE (hi-lo, *per_shape) array.
+
+        The unsliced counterpart of ``expert_run`` — same single preadv,
+        but the caller gets the row block whole (span consumers reshape or
+        index into it themselves) instead of a per-row list.
+        """
+        lo, hi = int(lo), int(hi)
+        rp = self._rp_for(key)
+        _check_bounds(rp, key, lo, hi - lo)
+        off = rp.tensor_abs_off + lo * rp.expert_bytes
+        buf = np.empty(rp.expert_bytes * (hi - lo), dtype=np.uint8)
+        self._read_into(off, buf)
+        return np.frombuffer(buf, dtype=rp.np_dtype).reshape(
+            (hi - lo, *rp.per_shape)
+        )
+
+    def load_tensor(self, key: str) -> np.ndarray:
+        """Whole-tensor read for *key* (all expert rows) as one array.
+
+        For the per-expert checkpoint layout this is the (E, *per) bank
+        itself — the span read of the full row range.
+        """
+        rp = self._rp_for(key)
+        return self.read_span(key, 0, rp.num_experts)
 
     def _read_into(self, abs_off: int, out: np.ndarray) -> None:
         """Zero-copy read of out.nbytes bytes at abs_off into the writable
@@ -580,7 +638,7 @@ _COLD_BANK_MARKERS = (
 # The env override is the bench/developer opt-in — an EMPTY env
 # means "no opinion" (None) so the runtime contract stays "unset = uniform
 # tier"; the settings key (expert_streaming_hot_fraction) is the per-model UI.
-HOT_FRACTION_ENV: str | None = os.environ.get("OMLX_EXPERT_STREAMING_HOT_FRACTION", "") or None
+HOT_FRACTION_ENV: str | None = env_str("OMLX_EXPERT_STREAMING_HOT_FRACTION", None)
 
 
 def load_hot_set_from_profile(
@@ -988,7 +1046,7 @@ each key to its shard filename, so stacked banks spilled outside the
     def load_expert(self, key: str, expert_id: int) -> mx.array:
         reader = self._reader_for_key(key, expert_id)
         np_view = reader.expert_slice(key, expert_id)
-        return _np_to_mx(key, np_view, reader.header[key]["dtype"])
+        return np_to_mx(np_view, reader.header[key]["dtype"])
 
     def load_expert_slice(self, key: str, expert_id: int) -> np.ndarray:
         """Return a fresh np.ndarray copy of one expert's slice (mmap-backed).
@@ -1011,6 +1069,24 @@ each key to its shard filename, so stacked banks spilled outside the
         """
         reader = self._reader_for_key(key, first_id)
         return reader.expert_run(key, first_id, count)
+
+    def read_span(self, key: str, lo: int, hi: int) -> np.ndarray:
+        """Contiguous expert rows [lo, hi) of *key* as one array.
+
+        Tier-aware through ``_reader_for_key``: the span must sit inside
+        ONE reader's tier (a run straddling the hot/cold boundary reads
+        whichever tier *lo* resolved — split callers segment first, like
+        ``advise_expert_run`` does).
+        """
+        return self._reader_for_key(key, lo).read_span(key, lo, hi)
+
+    def tensor_entry(self, key: str) -> TensorEntry:
+        """Header descriptor for *key* on its resolved reader."""
+        return self._reader_for_key(key).tensor_entry(key)
+
+    def load_tensor(self, key: str) -> np.ndarray:
+        """Whole-tensor read for *key* (the per-expert checkpoint layout)."""
+        return self._reader_for_key(key).load_tensor(key)
 
     def read_expert_into(
         self,

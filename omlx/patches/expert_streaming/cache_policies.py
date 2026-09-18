@@ -147,7 +147,7 @@ class S3FIFOExpertCache(ExpertLRUCache):
             self._evict_one_global_unlocked()
         # Ghost hit -> main queue (2nd chance); else small queue.
         target_main = self._ghost.pop(key, _MISSING) is not _MISSING
-        while len(self._small) + len(self._store) >= self._global_cap_active():
+        while self._resident_count_unlocked() >= self._global_cap_active():
             self._evict_one_global_unlocked()
         if target_main:
             self._store[key] = value
@@ -214,12 +214,8 @@ class S3FIFOExpertCache(ExpertLRUCache):
             self._dec_layer_count(self._layer_of(old_k))
 
     def _drain_to_unlocked(self, cap: int) -> None:
-        """S3-FIFO: drain both queues, demoting small victims to ghost.
-
-        Sizes are summed inline — ``size`` would re-acquire the (held,
-        re-entrant) lock once per iteration.
-        """
-        while len(self._small) + len(self._store) > cap:
+        """S3-FIFO: drain both queues, demoting small victims to ghost."""
+        while self._resident_count_unlocked() > cap:
             self._evict_one_global_unlocked()
 
     def _retain_hot_unlocked(self, hot_pairs: set) -> int:
@@ -238,8 +234,9 @@ class S3FIFOExpertCache(ExpertLRUCache):
             self.stats.evictions += evicted
         return evicted
 
-    @property
-    def size(self) -> int:
-        with self._lock:
-            return len(self._small) + len(self._store)
+    def _resident_count_unlocked(self) -> int:
+        # Both queues hold resident rows — probationary small-queue rows
+        # serve demand reads exactly like main-queue rows, so occupancy
+        # (admission fullness, size) counts them.
+        return len(self._small) + len(self._store)
 

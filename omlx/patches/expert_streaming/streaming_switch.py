@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import queue as _queue
 import threading
 import weakref
@@ -25,10 +24,15 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ._env import env_bool, env_int
-from .shard_bank import segment_runs
+from ._env import env_bool, env_int, env_str
+from .shard_bank import np_to_mx, segment_runs
 from .slot_cache import DecodeVisitStats, SlotArena
 from .speculation import SpeculationState, _STAGED_MAX_IDS
+from .staging import stage_headroom
+from .._switch_sort import (
+    gather_sort as _gather_sort,
+    scatter_unsort as _scatter_unsort,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -862,7 +866,9 @@ class ExpertLRUCache:
                 and cap
                 and self._layer_counts.get(layer, 0) >= cap
             )
-            global_full = len(self._store) >= self._global_cap_active()
+            global_full = (
+                self._resident_count_unlocked() >= self._global_cap_active()
+            )
             if not layer_full and not global_full:
                 return True
             c = self._admit_counts.get(lk, 0) + 1
@@ -1008,28 +1014,48 @@ class ExpertLRUCache:
             self._layer_counts[old_layer] = max(0, self._layer_counts.get(old_layer, 1) - 1)
             self.stats.evictions += 1
 
+    def _resident_count_unlocked(self) -> int:
+        """Resident count under the already-held cache lock.
+
+        The base policy's residents all live in ``_store``; policies with
+        extra resident queues (S3FIFO's probationary ``_small``) override
+        so occupancy-sensitive paths — admission_note's global fullness —
+        see every resident, not just the main store's.
+        """
+        return len(self._store)
+
     @property
     def size(self) -> int:
         with self._lock:
-            return len(self._store)
+            return self._resident_count_unlocked()
 
     def resident_bytes(self) -> int:
         """App-level bytes currently held resident by this cache.
 
         ``size`` slots (polymorphic: S3FIFO counts both queues) times the
-        per-slot bytes the budget was sized with. The scheduler's prefill
-        tracker subtracts this heap's growth from the measured chunk delta
-        so a budget-bounded LRU fill is not linearized as a per-token
-        transient rate. Best-effort: never raises.
+        per-slot bytes the budget was sized with, PLUS every registered
+        SlotArena's bound-bank bytes — arena residents live in fixed
+        mx.array rows, never in ``_store``, so the slot count alone
+        under-reports while the arena path is engaged. The scheduler's
+        prefill tracker subtracts this heap's growth from the measured
+        chunk delta so a budget-bounded LRU fill is not linearized as a
+        per-token transient rate. Best-effort: never raises.
         """
         try:
             per_slot = int(getattr(self, "per_slot_bytes", 0) or 0)
-            return max(0, int(self.size)) * max(0, per_slot)
+            total = max(0, int(self.size)) * max(0, per_slot)
+            with self._lock:
+                arenas = list(self._arenas)
+            for ref, _layer in arenas:
+                arena = ref()
+                if arena is not None:
+                    total += int(arena.resident_bytes())
+            return total
         except Exception:
             return 0
 
 
-_CACHE_POLICY_ENV = os.environ.get("OMLX_EXPERT_STREAMING_CACHE", "lru").strip().lower()
+_CACHE_POLICY_ENV = (env_str("OMLX_EXPERT_STREAMING_CACHE", "lru") or "lru").lower()
 
 
 def make_expert_cache(
@@ -1070,46 +1096,21 @@ def __getattr__(name: str):
 def promote_np_array(v: Any, dtype_str: str | None = None):
     """Single promotion rule for numpy -> MLX (QuantHandler registry).
 
-    Centralizes the call sites that need the BF16-as-uint16 reinterpret:
-    a new quantization adds one branch here. Handlers keyed by (stored
-    numpy dtype, safetensors dtype string):
-      (uint16, BF16) -> bit-exact reinterpret (matches mx.load; a
-        shift->f32->astype path would flush subnormals via Metal FTZ and
-        cost ~9x more on 4 MB slices).
-      default -> mx.array copy on this thread.
+    Passthrough (None / already-mx.array) lives here; the ndarray ->
+    mx.array conversion delegates to ``shard_bank.np_to_mx`` — the shared
+    BF16-as-uint16 reinterpret + F8 decode (a shift->f32->astype path
+    would flush subnormals via Metal FTZ and cost ~9x more on 4 MB
+    slices).
     """
     if v is None:
         return None
     if isinstance(v, mx.array):
         return v
-    if dtype_str == "BF16" and getattr(v, "dtype", None) == np.uint16:
-        return mx.array(v).view(mx.bfloat16)
-    return mx.array(v)  # np.ndarray -> mx.array copy on this thread
-
-
-def _inverse_permutation(order, inverse_scatter=False):
-    if inverse_scatter:
-        return mx.put_along_axis(
-            mx.zeros_like(order), order, mx.arange(order.size, dtype=order.dtype), axis=0
-        )
-    return mx.argsort(order)
-
-
-def _gather_sort(x, indices, inverse_scatter=False):
-    *_, M = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = _inverse_permutation(order, inverse_scatter)
-    lhs_indices = order // M
-    x = x.flatten(0, -3)
-    return x[lhs_indices], indices[order], inv_order
-
-
-def _scatter_unsort(x, inv_order, shape=None):
-    x = x[inv_order]
-    if shape is not None:
-        x = mx.unflatten(x, 0, shape)
-    return x
+    if dtype_str == "BF16" and getattr(v, "dtype", None) != np.uint16:
+        # A BF16 label on non-uint16 data is not raw bits — .view would
+        # reinterpret at the wrong width, so degrade to a plain promote.
+        dtype_str = None
+    return np_to_mx(v, dtype_str)
 
 
 def _spec_state_of(*holders: Any) -> SpeculationState | None:
@@ -2261,9 +2262,15 @@ class StreamingQuantizedSwitchLinear(_StreamingLinearBase):
         speculative traffic), and each (target, run) fires at most once per
         layer call through plan.advised_runs.
         """
-        # The caller already checked _RA_ENV and resolved a live state.
         state = self._spec_state()
         if state is None or state.is_closed():
+            return
+        # Per-conversion readahead contract wins when conversion stamped
+        # it (expert_streaming_readahead); None keeps the env default.
+        _ra = getattr(state, "readahead_enabled", None)
+        if _ra is None:
+            _ra = _RA_ENV
+        if not _ra:
             return
         next_layer = self.layer_idx + 1
         targets = state.linears_by_layer.get(next_layer)
@@ -2338,26 +2345,40 @@ class StreamingQuantizedSwitchLinear(_StreamingLinearBase):
                 runs = segment_runs(sorted_prev)
             n_adv = 0
             for target in targets:
-                for first, count in runs:
-                    dedupe_key = (id(target), first, count)
-                    if dedupe_key in advised_runs:
-                        continue
-                    advised_runs.add(dedupe_key)
-                    try:
-                        ok, _adv_bytes, _adv_segs = (
-                            target.backing.advise_expert_run(
-                                target.stacked_weight_key, first, count
+                # Every bank the demand path reads needs the hint, not
+                # just the weight — a hit on weight but a miss on scales
+                # still stalls the projection. advise_expert_run
+                # re-segments each key's run at its own tier boundaries.
+                tkeys = [target.stacked_weight_key]
+                skey = getattr(target, "stacked_scales_key", None)
+                if skey:
+                    tkeys.append(skey)
+                bkey = getattr(target, "stacked_biases_key", None)
+                if bkey:
+                    tkeys.append(bkey)
+                for tkey in tkeys:
+                    for first, count in runs:
+                        dedupe_key = (id(target), tkey, first, count)
+                        if dedupe_key in advised_runs:
+                            continue
+                        advised_runs.add(dedupe_key)
+                        try:
+                            ok, _adv_bytes, _adv_segs = (
+                                target.backing.advise_expert_run(
+                                    tkey, first, count
+                                )
                             )
-                        )
-                        if ok:
-                            n_adv += count
-                    except Exception:
-                        logger.debug(
-                            "expert_streaming: advisory run failed for "
-                            "layer %d",
-                            next_layer,
-                            exc_info=True,
-                        )
+                            # "advised" counts expert rows hinted, once —
+                            # scales/biases rides don't re-count the row.
+                            if ok and tkey == target.stacked_weight_key:
+                                n_adv += count
+                        except Exception:
+                            logger.debug(
+                                "expert_streaming: advisory run failed for "
+                                "layer %d",
+                                next_layer,
+                                exc_info=True,
+                            )
             if n_adv:
                 state.bump("advised", n_adv)
         except Exception:
@@ -2459,11 +2480,11 @@ class StreamingQuantizedSwitchLinear(_StreamingLinearBase):
             # entries would both keep a wrong prediction alive and split
             # the new read around it. Keys are exact bundle keys
             # (layer, expert, kind); shared futures cancel only when no
-            # sibling staged key still references them.
-            for staged_keys in (state.staged, state.staged_futs):
-                for stale in (
-                    k for k in list(staged_keys) if k[0] == next_layer
-                ):
+            # sibling staged key still references them. The key snapshot
+            # is registry-locked — iterating the dicts directly would
+            # race a concurrent resolve's fan-out writes.
+            for stale in state.staged_keys():
+                if stale[0] == next_layer:
                     state.stage_drop(stale)
             fut = pool.submit(reader, want)
             state.stage_register(fut, want, target)
@@ -2481,21 +2502,9 @@ class StreamingQuantizedSwitchLinear(_StreamingLinearBase):
         governor floor or the last observed free memory was inside the
         desperate-clear band — under memory pressure staged rows get
         dropped before they are ever hit. Static caches (no governor)
-        always have slack.
+        always have slack. Shared predicate: staging.stage_headroom.
         """
-        gov = getattr(self.cache, "governor", None)
-        if gov is None:
-            return True
-        try:
-            at_floor = getattr(gov, "at_floor", None)
-            if callable(at_floor) and at_floor():
-                return False
-            desperate = getattr(gov, "in_desperate_band", None)
-            if callable(desperate) and desperate():
-                return False
-        except Exception:
-            return True
-        return True
+        return stage_headroom(getattr(self.cache, "governor", None))
 
     def _load_expert_bundle(self, expert_id: int) -> tuple[mx.array, mx.array, mx.array | None]:
         key = self.bundle_key(expert_id)
@@ -2540,7 +2549,11 @@ class StreamingQuantizedSwitchLinear(_StreamingLinearBase):
         # Speculation for layer+1, deduped per layer call
         # through plan.advised_runs (the GLU shares one plan).
         _spec_state = self._spec_state()
-        if _RA_ENV and _spec_state is not None and _spec_state.prev_uniq_by_layer:
+        # The advisor itself applies the readahead gate: spec_state's
+        # per-conversion readahead_enabled wins over the _RA_ENV default
+        # when conversion stamped it, so the env cannot veto a per-model
+        # enable (nor enable a per-model disable).
+        if _spec_state is not None and _spec_state.prev_uniq_by_layer:
             try:
                 self._advise_next_layer_prev_token(plan)
             except Exception:
@@ -2890,20 +2903,14 @@ class StreamingQuantizedSwitchLinear(_StreamingLinearBase):
             keep = mx.array(keep_np).reshape(keep_shape)
             tier_out = tier_out * keep
             out = tier_out if out is None else out + tier_out
-        if out is None:
-            # Degenerate: every unique expert hot (hot bank == full uniq
-            # order) — identical to the uniform path.
-            if 0 in tier_single:
-                w_b, s_b, b_b = tier_single[0]
-            else:
-                w_b, s_b, b_b = self._stack_bundles(
-                    tier_rows[0], dt, f"{self.proj_name} tier 0"
-                )
-            out = mx.gather_qmm(
-                x, w_b, s_b, b_b, rhs_indices=plan.remapped,
-                transpose=True, group_size=self.group_size, bits=self.bits,
-                mode=self.mode, sorted_indices=sorted_indices,
-            )
+        # out is None only when uniq_list was empty — unreachable: a call
+        # that routed >= 1 position (top_k >= 1) always has a uniq set, and
+        # the old "all-hot fallback" here would have stacked an empty bank
+        # anyway (mx.stack([])). Fail loud instead of assembling garbage.
+        assert out is not None, (
+            f"_qmm_dual_tier: empty uniq_list for layer {self.layer_idx} "
+            f"{self.proj_name}"
+        )
         return out
 
 
