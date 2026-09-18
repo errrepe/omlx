@@ -9,7 +9,12 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
-from streaming_fixtures import v41_backing
+from streaming_fixtures import (
+    closer,
+    quantized_glu_store,
+    v41_backing,
+    write_safetensors,
+)
 from test_deepseek_v41 import write_checkpoint
 
 
@@ -17,33 +22,15 @@ def _glu_store(tmp_path, n=4):
     """Quantized n-expert SwitchGLU whose ``switch_glu`` tensors are
     written to ``tmp_path/model.safetensors``, plus the
     ``CheckpointExpertStore``/``_GLUStoreView`` pair reading them."""
-    import mlx.nn as nn
-    from mlx_lm.models.switch_layers import SwitchGLU
-
-    from omlx.patches.moe_expert_offload import (
-        CheckpointExpertStore,
-        _GLUStoreView,
-    )
-
-    glu = SwitchGLU(32, 32, n)
-    nn.quantize(glu, group_size=32, bits=4)
-    tensors = {}
-    for proj in ("gate_proj", "up_proj", "down_proj"):
-        lin = getattr(glu, proj)
-        for field in ("weight", "scales", "biases"):
-            if lin.get(field) is not None:
-                tensors[f"layers.0.mlp.switch_glu.{proj}.{field}"] = lin[field]
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
-    store = CheckpointExpertStore(tmp_path)
-    view = _GLUStoreView(store, "layers.0.mlp.switch_glu")
-    return glu, store, view
+    return quantized_glu_store(tmp_path, "layers.0.mlp.switch_glu", experts=n)
 
 
-def _legacy_cache(tmp_path, capacity=2, n=4):
+def _legacy_cache(tmp_path, closer, capacity=2, n=4):
     """An ``ExpertCache`` over a freshly written ``_glu_store``."""
     from omlx.patches.moe_expert_offload import ExpertCache
 
-    glu, _store, view = _glu_store(tmp_path, n)
+    glu, store, view = _glu_store(tmp_path, n)
+    closer(store)
     return ExpertCache(glu, capacity, view)
 
 
@@ -74,124 +61,106 @@ def _slots(model, layer=0):
 class TestV41FetchRollback:
     """A fetch failure must not orphan rows or drop the victim."""
 
-    def test_failed_fetch_restores_victim(self, tmp_path):
-        model = _loaded_v41(tmp_path)
-        try:
-            slots = _slots(model)
-            # Fill the cache, then miss: the miss evicts the LRU victim
-            # before fetching — the failing fetch must restore it.
-            slots.ensure(mx.array([[0, 1]]))
-            slots.ensure(mx.array([[2, 3]]))
-            victim = next(iter(slots.slot_of))
-            before = dict(slots.slot_of)
+    def test_failed_fetch_restores_victim(self, tmp_path, closer):
+        model = closer(_loaded_v41(tmp_path))
+        slots = _slots(model)
+        # Fill the cache, then miss: the miss evicts the LRU victim
+        # before fetching — the failing fetch must restore it.
+        slots.ensure(mx.array([[0, 1]]))
+        slots.ensure(mx.array([[2, 3]]))
+        victim = next(iter(slots.slot_of))
+        before = dict(slots.slot_of)
 
-            orig = slots.plan.fetch
+        orig = slots.plan.fetch
 
-            def _boom(prefix, proj, expert):
-                if expert == 9:
-                    raise OSError("injected shard failure")
-                return orig(prefix, proj, expert)
-
-            slots.plan.fetch = _boom
-            with pytest.raises(OSError, match="injected"):
-                slots.ensure(mx.array([[9, 0]]))
-            # Every row accounted for; the evicted victim kept residency
-            # (its bytes were never overwritten).
-            assert len(slots.slot_of) + len(slots.free) == slots.rooms
-            assert victim in slots.slot_of
-            assert set(slots.slot_of) == set(before)
-        finally:
-            model.close()
-
-    def test_failed_fetch_keeps_free_rows_consistent(self, tmp_path):
-        model = _loaded_v41(tmp_path)
-        try:
-            slots = _slots(model)
-            slots.ensure(mx.array([[0, 1]]))  # fill 2 of cap rooms
-            free_before = sorted(slots.free)
-
-            def _boom(prefix, proj, expert):
+        def _boom(prefix, proj, expert):
+            if expert == 9:
                 raise OSError("injected shard failure")
+            return orig(prefix, proj, expert)
 
-            slots.plan.fetch = _boom
-            with pytest.raises(OSError):
-                slots.ensure(mx.array([[7]]))
-            assert len(slots.slot_of) + len(slots.free) == slots.rooms
-            assert sorted(slots.free) == free_before  # fresh row returned
-            assert 7 not in slots.slot_of
-        finally:
-            model.close()
+        slots.plan.fetch = _boom
+        with pytest.raises(OSError, match="injected"):
+            slots.ensure(mx.array([[9, 0]]))
+        # Every row accounted for; the evicted victim kept residency
+        # (its bytes were never overwritten).
+        assert len(slots.slot_of) + len(slots.free) == slots.rooms
+        assert victim in slots.slot_of
+        assert set(slots.slot_of) == set(before)
+
+    def test_failed_fetch_keeps_free_rows_consistent(self, tmp_path, closer):
+        model = closer(_loaded_v41(tmp_path))
+        slots = _slots(model)
+        slots.ensure(mx.array([[0, 1]]))  # fill 2 of cap rooms
+        free_before = sorted(slots.free)
+
+        def _boom(prefix, proj, expert):
+            raise OSError("injected shard failure")
+
+        slots.plan.fetch = _boom
+        with pytest.raises(OSError):
+            slots.ensure(mx.array([[7]]))
+        assert len(slots.slot_of) + len(slots.free) == slots.rooms
+        assert sorted(slots.free) == free_before  # fresh row returned
+        assert 7 not in slots.slot_of
 
 
 class TestV41GovernorFloor:
     """The dynamic floor is one decode working set, not min(8, cap)."""
 
-    def test_floor_tracks_n_activated(self, tmp_path):
-        model = _loaded_v41(tmp_path, n_routed=16, n_activated=10)
-        try:
-            backing = v41_backing(model, dynamic=True)
-            try:
-                assert backing.governor is not None
-                # Slot floor = one decode working set — a smaller floor
-                # would shrink top-k 10 models below the working set and
-                # _ensure_locked would raise mid-generation.
-                assert backing.governor.min_cap == 10
-                assert backing.governor._min_cap_slots() >= 10
-            finally:
-                backing.close()
-        finally:
-            model.close()
+    def test_floor_tracks_n_activated(self, tmp_path, closer):
+        model = closer(_loaded_v41(tmp_path, n_routed=16, n_activated=10))
+        backing = closer(v41_backing(model, dynamic=True))
+        assert backing.governor is not None
+        # Slot floor = one decode working set — a smaller floor
+        # would shrink top-k 10 models below the working set and
+        # _ensure_locked would raise mid-generation.
+        assert backing.governor.min_cap == 10
+        assert backing.governor._min_cap_slots() >= 10
 
-    def test_capacity_property_and_guard_info(self, tmp_path):
-        model = _loaded_v41(tmp_path)
-        try:
-            backing = v41_backing(model, dynamic=False)
-            # capacity resolves to base_cap through a single property.
-            assert backing.capacity == backing.base_cap
-            # Absent on purpose — V4.1 slots are persistent buffers, not
-            # the generic path's lazy mini-banks; the scheduler reads the
-            # missing attr as None.
-            assert getattr(backing, "streaming_guard_info", None) is None
-            backing.close()
-            assert model._moe_offload_plan._closed
-            backing.close()  # idempotent
-        finally:
-            model.close()
+    def test_capacity_property_and_guard_info(self, tmp_path, closer):
+        model = closer(_loaded_v41(tmp_path))
+        backing = closer(v41_backing(model, dynamic=False))
+        # capacity resolves to base_cap through a single property.
+        assert backing.capacity == backing.base_cap
+        # Absent on purpose — V4.1 slots are persistent buffers, not
+        # the generic path's lazy mini-banks; the scheduler reads the
+        # missing attr as None.
+        assert getattr(backing, "streaming_guard_info", None) is None
+        backing.close()
+        assert model._moe_offload_plan._closed
+        backing.close()  # idempotent
 
 
 class TestV41CompactAtomic:
     """compact/_grow evaluate all projections before rebinding."""
 
-    def test_compact_failure_leaves_consistent_state(self, tmp_path, monkeypatch):
-        model = _loaded_v41(tmp_path)
-        try:
-            slots = _slots(model)
-            slots.ensure(mx.array([[0, 1]]))
-            slots.ensure(mx.array([[2, 3]]))
-            before = dict(slots.slot_of)
+    def test_compact_failure_leaves_consistent_state(self, tmp_path, monkeypatch, closer):
+        model = closer(_loaded_v41(tmp_path))
+        slots = _slots(model)
+        slots.ensure(mx.array([[0, 1]]))
+        slots.ensure(mx.array([[2, 3]]))
+        before = dict(slots.slot_of)
 
-            orig_stack = mx.stack
+        orig_stack = mx.stack
 
-            def _boom(*a, **k):
-                raise RuntimeError("injected compact failure")
+        def _boom(*a, **k):
+            raise RuntimeError("injected compact failure")
 
-            monkeypatch.setattr(mx, "stack", _boom)
-            with pytest.raises(RuntimeError, match="injected compact"):
-                slots.compact(1)
-            monkeypatch.undo()
-            # Nothing rebound: slot map untouched, module still serves.
-            assert slots.slot_of == before
-            rows = slots.ensure(mx.array([[0, 1]]))
-            mx.eval(rows)
-        finally:
-            model.close()
+        monkeypatch.setattr(mx, "stack", _boom)
+        with pytest.raises(RuntimeError, match="injected compact"):
+            slots.compact(1)
+        monkeypatch.undo()
+        # Nothing rebound: slot map untouched, module still serves.
+        assert slots.slot_of == before
+        rows = slots.ensure(mx.array([[0, 1]]))
+        mx.eval(rows)
 
 
 class TestLegacyCacheAtomicity:
     """Fetch-first install + a real lock on the legacy cache."""
 
-    def test_failed_install_mutates_nothing(self, tmp_path, monkeypatch):
-        cache = _legacy_cache(tmp_path)
+    def test_failed_install_mutates_nothing(self, tmp_path, monkeypatch, closer):
+        cache = _legacy_cache(tmp_path, closer)
         cache.ensure(mx.array([0]))  # one resident
         before_slots = dict(cache.slot_of)
         before_free = list(cache.free)
@@ -216,13 +185,14 @@ class TestLegacyCacheAtomicity:
         assert cache.free == before_free
         assert 1 not in cache.slot_of
 
-    def test_legacy_apply_stamps_serialization_marker(self, tmp_path):
+    def test_legacy_apply_stamps_serialization_marker(self, tmp_path, closer):
         import mlx.nn as nn
 
         from omlx.patches.moe_expert_offload import _apply_legacy_adapter
         from omlx.scheduler import _model_uses_expert_streaming
 
-        glu, _store, _view = _glu_store(tmp_path)
+        glu, store, _view = _glu_store(tmp_path)
+        closer(store)
 
         class _GLU(nn.Module):
             def __init__(self, g):
@@ -254,9 +224,7 @@ class TestShardBankClose:
 
         # Minimal checkpoint: the store only needs a readable header.
         (tmp_path / "config.json").write_text(json.dumps({"model_type": "x"}))
-        mx.save_safetensors(
-            str(tmp_path / "model.safetensors"), {"w": mx.zeros((2, 2))}
-        )
+        write_safetensors(tmp_path / "model.safetensors", {"w": mx.zeros((2, 2))})
         store = ExpertBackingStore(tmp_path)
         store._cold_key_to_reader["some.key"] = SimpleNamespace()
         store.close()
@@ -289,106 +257,92 @@ class TestTransitionProfileAtomic:
 class TestLegacyCacheResize:
     """Governor-facing resize/clear on the legacy per-layer cache."""
 
-    def test_shrink_evicts_lru_and_caps_installs(self, tmp_path):
-        cache = _legacy_cache(tmp_path, capacity=4, n=8)
-        try:
-            cache.ensure(mx.array([0, 1, 2, 3]))  # fill all 4 rooms
-            cache.resize(2)
-            assert cache.capacity == 2
-            assert len(cache.slot_of) == 2
-            assert 0 not in cache.slot_of and 1 not in cache.slot_of
-            # Ceiling is a count, not a row range: a free row exists but
-            # the install must still evict the LRU victim.
-            cache.ensure(mx.array([4]))
-            assert 4 in cache.slot_of
-            assert len(cache.slot_of) == 2
-            assert len(cache.slot_of) + len(cache.free) == cache.rooms
-        finally:
-            cache.disk._store.close()
+    def test_shrink_evicts_lru_and_caps_installs(self, tmp_path, closer):
+        cache = _legacy_cache(tmp_path, closer, capacity=4, n=8)
+        cache.ensure(mx.array([0, 1, 2, 3]))  # fill all 4 rooms
+        cache.resize(2)
+        assert cache.capacity == 2
+        assert len(cache.slot_of) == 2
+        assert 0 not in cache.slot_of and 1 not in cache.slot_of
+        # Ceiling is a count, not a row range: a free row exists but
+        # the install must still evict the LRU victim.
+        cache.ensure(mx.array([4]))
+        assert 4 in cache.slot_of
+        assert len(cache.slot_of) == 2
+        assert len(cache.slot_of) + len(cache.free) == cache.rooms
 
-    def test_grow_reallocs_and_installs_land(self, tmp_path):
-        cache = _legacy_cache(tmp_path, capacity=4, n=8)
-        try:
-            cache.ensure(mx.array([0, 1]))
-            cache.resize(6)
-            assert cache.rooms == 6
-            assert cache.capacity == 6
-            cache.ensure(mx.array([5, 6]))
-            assert 5 in cache.slot_of and 6 in cache.slot_of
-            assert len(cache.slot_of) + len(cache.free) == cache.rooms
-            # Beyond n_experts clamps.
-            cache.resize(64)
-            assert cache.capacity == 8
-            assert cache.rooms == 8
-        finally:
-            cache.disk._store.close()
+    def test_grow_reallocs_and_installs_land(self, tmp_path, closer):
+        cache = _legacy_cache(tmp_path, closer, capacity=4, n=8)
+        cache.ensure(mx.array([0, 1]))
+        cache.resize(6)
+        assert cache.rooms == 6
+        assert cache.capacity == 6
+        cache.ensure(mx.array([5, 6]))
+        assert 5 in cache.slot_of and 6 in cache.slot_of
+        assert len(cache.slot_of) + len(cache.free) == cache.rooms
+        # Beyond n_experts clamps.
+        cache.resize(64)
+        assert cache.capacity == 8
+        assert cache.rooms == 8
 
-    def test_clear_drops_residency(self, tmp_path):
-        cache = _legacy_cache(tmp_path, capacity=4, n=8)
-        try:
-            cache.ensure(mx.array([0, 1]))
-            cache.clear()
-            assert cache.slot_of == {}
-            assert len(cache.free) == cache.rooms
-            assert cache.warm is False
-        finally:
-            cache.disk._store.close()
+    def test_clear_drops_residency(self, tmp_path, closer):
+        cache = _legacy_cache(tmp_path, closer, capacity=4, n=8)
+        cache.ensure(mx.array([0, 1]))
+        cache.clear()
+        assert cache.slot_of == {}
+        assert len(cache.free) == cache.rooms
+        assert cache.warm is False
 
 
 class TestLegacyOffloadState:
     """The legacy aggregate presents the V4.1 governor duck-type."""
 
-    def _module(self, tmp_path, capacity=4, n=8):
+    def _module(self, tmp_path, closer, capacity=4, n=8):
         from omlx.patches.moe_expert_offload import OffloadSwitchGLU
 
         glu, store, view = _glu_store(tmp_path, n)
-        return OffloadSwitchGLU(glu, capacity, view), store
+        closer(store)
+        return OffloadSwitchGLU(glu, capacity, view)
 
-    def test_governor_duck_and_stats(self, tmp_path):
+    def test_governor_duck_and_stats(self, tmp_path, closer):
         from omlx.patches.moe_expert_offload import LegacyOffloadState
 
-        mod, store = self._module(tmp_path)
-        try:
-            state = LegacyOffloadState([mod.cache], dynamic=True, min_cap=2)
-            assert state.governor is not None
-            assert state.governor.min_cap == 2
-            state.note_visit(0, True)
-            state.note_visit(0, False)
-            assert state.stats.decode_layers == 2
-            assert state.stats.decode_layers_missed == 1
-            assert state.stats.decode_misses_by_layer == {0: 1}
-            state.resize(2, None)
-            assert mod.cache.capacity == 2
-            state.set_layer_caps({0: 3})
-            assert mod.cache.capacity == 3
-            assert state.layer_cap_overrides() == {0: 3}
-            state.clear()
-            assert mod.cache.slot_of == {}
-            summary = state.summary()
-            assert summary["layers"] == 1
-            # Persistent slot buffers: no mini-bank transient term.
-            assert getattr(state, "streaming_guard_info", None) is None
-        finally:
-            store.close()
+        mod = self._module(tmp_path, closer)
+        state = LegacyOffloadState([mod.cache], dynamic=True, min_cap=2)
+        assert state.governor is not None
+        assert state.governor.min_cap == 2
+        state.note_visit(0, True)
+        state.note_visit(0, False)
+        assert state.stats.decode_layers == 2
+        assert state.stats.decode_layers_missed == 1
+        assert state.stats.decode_misses_by_layer == {0: 1}
+        state.resize(2, None)
+        assert mod.cache.capacity == 2
+        state.set_layer_caps({0: 3})
+        assert mod.cache.capacity == 3
+        assert state.layer_cap_overrides() == {0: 3}
+        state.clear()
+        assert mod.cache.slot_of == {}
+        summary = state.summary()
+        assert summary["layers"] == 1
+        # Persistent slot buffers: no mini-bank transient term.
+        assert getattr(state, "streaming_guard_info", None) is None
 
-    def test_decode_visit_feeds_stats(self, tmp_path):
+    def test_decode_visit_feeds_stats(self, tmp_path, closer):
         from omlx.patches.moe_expert_offload import LegacyOffloadState
 
-        mod, store = self._module(tmp_path)
-        try:
-            state = LegacyOffloadState([mod.cache], dynamic=False)
-            mod._state = state
-            mod._layer = 0
-            out = mod(mx.zeros((1, 32)), mx.array([[0]]))
-            mx.eval(out)
-            assert state.stats.decode_layers == 1
-            assert state.stats.decode_layers_missed == 1  # cold miss
-            # Multi-token call is not a decode visit.
-            out = mod(mx.zeros((3, 32)), mx.array([[0], [1], [0]]))
-            mx.eval(out)
-            assert state.stats.decode_layers == 1
-        finally:
-            store.close()
+        mod = self._module(tmp_path, closer)
+        state = LegacyOffloadState([mod.cache], dynamic=False)
+        mod._state = state
+        mod._layer = 0
+        out = mod(mx.zeros((1, 32)), mx.array([[0]]))
+        mx.eval(out)
+        assert state.stats.decode_layers == 1
+        assert state.stats.decode_layers_missed == 1  # cold miss
+        # Multi-token call is not a decode visit.
+        out = mod(mx.zeros((3, 32)), mx.array([[0], [1], [0]]))
+        mx.eval(out)
+        assert state.stats.decode_layers == 1
 
 
 class TestResolveBudgetBytes:

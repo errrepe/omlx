@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 from fastapi import HTTPException
+from streaming_fixtures import write_safetensors
 
 from omlx.patches.moe_offload_compat import moe_offload_compatibility
 
@@ -48,7 +49,7 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
                     mx.quantize(mx.ones(shape), group_size=32),
                 ):
                     tensors[f"{key}.{field}"] = value
-    mx.save_safetensors(str(path / "model.safetensors"), tensors)
+    write_safetensors(path / "model.safetensors", tensors)
     return tensors
 
 
@@ -83,7 +84,7 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
         tensors[key] = tensors[key].astype(mx.int32)
     else:
         tensors[key.removesuffix("weight") + "bias"] = mx.zeros((64,))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
     assert moe_offload_compatibility(tmp_path)[0] is False
     with pytest.raises(HTTPException) as error:
         _validate_model_settings(
@@ -124,7 +125,7 @@ def test_checkpoint_replacement_invalidates_eligibility(tmp_path):
     tensors = _checkpoint(tmp_path, "olmoe")
     assert moe_offload_compatibility(tmp_path)[0] is True
     tensors.pop(next(iter(tensors)))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
     assert moe_offload_compatibility(tmp_path)[0] is False
 
 

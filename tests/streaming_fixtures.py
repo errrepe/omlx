@@ -5,9 +5,13 @@ The PR's streaming tests grew by copy-paste; this module single-sources
 the pieces several files need:
 
 * ``write_safetensors`` — minimal safetensors writer taking real array
-  bytes OR header-only ``(shape, dtype, nbytes)`` specs;
+  bytes OR header-only ``(shape, dtype, nbytes)`` specs, plus optional
+  ``__metadata__``;
 * ``write_moe_checkpoint`` — a header-only qwen-style MoE checkpoint
   (config + zero-pad shard + index) for converter/estimator tests;
+* ``quantized_glu_store`` — a real quantized SwitchGLU written under a
+  caller-chosen key prefix, plus the ``CheckpointExpertStore`` /
+  ``_GLUStoreView`` pair reading it;
 * ``v41_backing`` — ``V41StreamingBacking`` assembly incl. the
   ``_expert_streaming_backing`` wiring the engine performs in prod;
 * ``bind_streaming_probe`` — the Scheduler LRU heap-growth probe every
@@ -41,7 +45,7 @@ _NP_TO_ST = {
 _ST_TO_NP = {v: k for k, v in _NP_TO_ST.items()}
 
 
-def write_safetensors(path, tensors):
+def write_safetensors(path, tensors, metadata=None):
     """Write a minimal safetensors file at ``path``.
 
     Each value in ``tensors`` may be:
@@ -53,8 +57,13 @@ def write_safetensors(path, tensors):
     * ``(shape, dtype, nbytes)`` — a header entry backed by ``nbytes``
       of zeros, enough for header-only readers (``ExpertBackingStore``,
       the conversion estimator) that never touch the payload.
+
+    ``metadata`` lands in the ``__metadata__`` header block (string
+    values, the cold-tier label convention).
     """
     header = {}
+    if metadata:
+        header["__metadata__"] = dict(metadata)
     blob = bytearray()
     for name, spec in tensors.items():
         if isinstance(spec, tuple) and len(spec) == 3:
@@ -118,6 +127,37 @@ def write_moe_checkpoint(
     (path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
     )
+
+
+def quantized_glu_store(
+    path, prefix, *, experts=4, dims=32, inter=32, group_size=32, bits=4
+):
+    """Quantized ``experts``-expert SwitchGLU whose ``prefix``-rooted
+    tensors are written to ``path/model.safetensors``, plus the
+    ``CheckpointExpertStore``/``_GLUStoreView`` pair reading them.
+
+    Returns ``(glu, store, view)`` — the caller keeps ``store`` alive for
+    the cache/view lifetime (register it on ``closer``).
+    """
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from omlx.patches.moe_expert_offload import (
+        CheckpointExpertStore,
+        _GLUStoreView,
+    )
+
+    glu = SwitchGLU(dims, inter, experts)
+    nn.quantize(glu, group_size=group_size, bits=bits)
+    tensors = {}
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        lin = getattr(glu, proj)
+        for field in ("weight", "scales", "biases"):
+            if lin.get(field) is not None:
+                tensors[f"{prefix}.{proj}.{field}"] = lin[field]
+    write_safetensors(path / "model.safetensors", tensors)
+    store = CheckpointExpertStore(path)
+    return glu, store, _GLUStoreView(store, prefix)
 
 
 def v41_backing(disk, **kwargs):

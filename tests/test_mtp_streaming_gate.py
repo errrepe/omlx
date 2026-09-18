@@ -11,6 +11,7 @@ no MLX / GPU.
 import gc
 
 import pytest
+from streaming_fixtures import closer
 
 from omlx.patches.expert_streaming.streaming_switch import (
     ExpertLRUCache,
@@ -20,12 +21,10 @@ from omlx.patches.mlx_lm_mtp import batch_generator as bg
 
 
 @pytest.fixture
-def live_cache():
-    cache = ExpertLRUCache(budget_bytes=1 << 20, per_expert_bytes=1024, num_layers=2)
-    try:
-        yield cache
-    finally:
-        cache.close()
+def live_cache(closer):
+    return closer(
+        ExpertLRUCache(budget_bytes=1 << 20, per_expert_bytes=1024, num_layers=2)
+    )
 
 
 def test_gate_state_none_without_live_cache():
@@ -46,13 +45,12 @@ def test_gate_state_ignores_closed_cache(live_cache):
     assert streaming_gate_state() is None
 
 
-def test_gate_state_ignores_unbounded_cache():
-    cache = ExpertLRUCache(budget_bytes=0, per_expert_bytes=1024, num_layers=2)
+def test_gate_state_ignores_unbounded_cache(closer):
+    cache = closer(
+        ExpertLRUCache(budget_bytes=0, per_expert_bytes=1024, num_layers=2)
+    )
     assert cache.capacity == 0
-    try:
-        assert streaming_gate_state() is None
-    finally:
-        cache.close()
+    assert streaming_gate_state() is None
 
 
 def test_gate_state_dead_cache_does_not_linger():

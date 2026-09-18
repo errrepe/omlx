@@ -13,6 +13,7 @@ import json
 import mlx.core as mx
 import numpy as np
 import pytest
+from streaming_fixtures import closer, write_safetensors
 
 import omlx.patches.expert_streaming.streaming_switch as ss
 from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
@@ -50,7 +51,7 @@ def _make_store(tmp_path, e=_E):
         tensors[f"{_PREFIX}.{proj}.weight"] = qw
         tensors[f"{_PREFIX}.{proj}.scales"] = qs
         tensors[f"{_PREFIX}.{proj}.biases"] = qb
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {k: "model.safetensors" for k in tensors}})
     )
@@ -105,12 +106,8 @@ def _make_glu(store, per_layer_cap=6, e=_E):
 
 
 @pytest.fixture()
-def model(tmp_path):
-    store = _make_store(tmp_path)
-    try:
-        yield store
-    finally:
-        store.close()
+def model(tmp_path, closer):
+    return closer(_make_store(tmp_path))
 
 
 @pytest.fixture()
@@ -297,55 +294,49 @@ def test_arena_falls_back(model, arena_on, cap, sabotage, demand):
     assert getattr(glu, "_arena", None) is None
 
 
-def test_arena_rooms_byte_bounded(tmp_path, monkeypatch, arena_on):
+def test_arena_rooms_byte_bounded(tmp_path, monkeypatch, arena_on, closer):
     """The arena bound is a byte ceiling across projections — a governor
     -sized cache cap must never commit unbounded bank memory (measured
     Metal OOM on qwen3.8-flash when rooms tracked the cache cap)."""
-    store = _make_store(tmp_path, e=64)
-    try:
-        glu = _make_glu(store, per_layer_cap=64, e=64)
-        # ~1 byte of arena budget -> floor-1 room: the ceiling is a hard
-        # bound, so an arena that cannot hold the demand must not commit
-        # eight rows it cannot pay for.
-        monkeypatch.setattr(ss, "_ARENA_MAX_BYTES", 1)
-        plan = ss._RemapPlan()
-        idx = mx.array([[0]], dtype=mx.int32)
-        assert glu._arena_engage(plan, idx)
-        arena = glu._arena
-        assert arena.book.rooms == 1 == arena.book.cap
-        # demand above the arena bound falls back to the bundle path
-        plan2 = ss._RemapPlan()
-        idx2 = mx.array(np.arange(10, dtype=np.int32).reshape(1, 10))
-        assert not glu._arena_engage(plan2, idx2)
-        assert plan2.arena_rhs is None
-    finally:
-        store.close()
+    store = closer(_make_store(tmp_path, e=64))
+    glu = _make_glu(store, per_layer_cap=64, e=64)
+    # ~1 byte of arena budget -> floor-1 room: the ceiling is a hard
+    # bound, so an arena that cannot hold the demand must not commit
+    # eight rows it cannot pay for.
+    monkeypatch.setattr(ss, "_ARENA_MAX_BYTES", 1)
+    plan = ss._RemapPlan()
+    idx = mx.array([[0]], dtype=mx.int32)
+    assert glu._arena_engage(plan, idx)
+    arena = glu._arena
+    assert arena.book.rooms == 1 == arena.book.cap
+    # demand above the arena bound falls back to the bundle path
+    plan2 = ss._RemapPlan()
+    idx2 = mx.array(np.arange(10, dtype=np.int32).reshape(1, 10))
+    assert not glu._arena_engage(plan2, idx2)
+    assert plan2.arena_rhs is None
 
 
-def test_arena_static_bound_survives_governor_shrink(tmp_path, arena_on):
+def test_arena_static_bound_survives_governor_shrink(tmp_path, arena_on, closer):
     """A governor shrink lowers the cache cap (fewer calls engage) but the
     arena's physical bound is static — bounded memory, no mid-run churn."""
-    store = _make_store(tmp_path, e=64)
-    try:
-        glu = _make_glu(store, per_layer_cap=16, e=64)
-        plan = ss._RemapPlan()
-        idx = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
-        assert glu._arena_engage(plan, idx)
-        arena = glu._arena
-        assert arena.book.rooms == 16
-        glu._cache.set_layer_caps({0: 4})
-        # demand within the shrunken cache cap still engages the arena
-        plan2 = ss._RemapPlan()
-        idx2 = mx.array([[0, 5, 6, 7]], dtype=mx.int32)
-        assert glu._arena_engage(plan2, idx2)
-        assert plan2.arena_rhs is not None
-        # demand above the shrunken cache cap -> bundle path
-        plan3 = ss._RemapPlan()
-        idx3 = mx.array(np.arange(10, dtype=np.int32).reshape(1, 10))
-        assert not glu._arena_engage(plan3, idx3)
-        assert plan3.arena_rhs is None
-    finally:
-        store.close()
+    store = closer(_make_store(tmp_path, e=64))
+    glu = _make_glu(store, per_layer_cap=16, e=64)
+    plan = ss._RemapPlan()
+    idx = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+    assert glu._arena_engage(plan, idx)
+    arena = glu._arena
+    assert arena.book.rooms == 16
+    glu._cache.set_layer_caps({0: 4})
+    # demand within the shrunken cache cap still engages the arena
+    plan2 = ss._RemapPlan()
+    idx2 = mx.array([[0, 5, 6, 7]], dtype=mx.int32)
+    assert glu._arena_engage(plan2, idx2)
+    assert plan2.arena_rhs is not None
+    # demand above the shrunken cache cap -> bundle path
+    plan3 = ss._RemapPlan()
+    idx3 = mx.array(np.arange(10, dtype=np.int32).reshape(1, 10))
+    assert not glu._arena_engage(plan3, idx3)
+    assert plan3.arena_rhs is None
 
 
 def test_arena_feeds_governor_stats(model, arena_on):

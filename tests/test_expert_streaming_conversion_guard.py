@@ -1,27 +1,21 @@
 """Conversion guard, cold-tier label validation, prefill pin ordering."""
 
 import json
-import struct
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from streaming_fixtures import write_moe_checkpoint
+from streaming_fixtures import closer, write_moe_checkpoint, write_safetensors
 
 
 def _write_cold_tier(tmp: Path, keys: list[str], *, bits: str) -> None:
     cold = tmp / "expert_cold"
     cold.mkdir()
-    header = {"__metadata__": {"omlx_cold_bits": bits, "omlx_cold_group_size": "64"}}
-    offset = 0
-    for k in keys:
-        header[k] = {"dtype": "BF16", "shape": [4], "data_offsets": [offset, offset + 8]}
-        offset += 8
-    hb = json.dumps(header).encode()
-    with (cold / "cold.safetensors").open("wb") as f:
-        f.write(struct.pack("<Q", len(hb)))
-        f.write(hb)
-        f.write(b"\x00" * offset)
+    write_safetensors(
+        cold / "cold.safetensors",
+        {k: ([4], "BF16", 8) for k in keys},
+        metadata={"omlx_cold_bits": bits, "omlx_cold_group_size": "64"},
+    )
 
 
 class TestNoConversionReturnsNoBacking:
@@ -119,7 +113,7 @@ class TestColdTierLabelValidation:
         [("2", False), ("3", True)],
         ids=["mismatched_bits_rejected", "matching_bits_accepted"],
     )
-    def test_bits_label_validated(self, tmp_path, monkeypatch, tier, accepted):
+    def test_bits_label_validated(self, tmp_path, monkeypatch, tier, accepted, closer):
         from omlx.patches.expert_streaming import convert_model_to_streaming
 
         write_moe_checkpoint(tmp_path)
@@ -136,18 +130,16 @@ class TestColdTierLabelValidation:
             SimpleNamespace(expert_streaming_cold_tier=tier),
             use_file_backing=True,
         )
-        try:
-            # A 3-bit tier must not serve a "2" request — validation ran.
-            assert (captured.get("cold_root") is not None) is accepted
-        finally:
-            if backing is not None:
-                backing.close()
+        if backing is not None:
+            closer(backing)
+        # A 3-bit tier must not serve a "2" request — validation ran.
+        assert (captured.get("cold_root") is not None) is accepted
 
 
 class TestPrefillPinOrdering:
     """The GiB->slots pin must use the reconciled per_expert_bytes."""
 
-    def test_fused_model_pins_reconciled_slots(self, tmp_path):
+    def test_fused_model_pins_reconciled_slots(self, tmp_path, closer):
         import mlx.core as mx
 
         from omlx.patches.expert_streaming import convert_model_to_streaming
@@ -168,14 +160,12 @@ class TestPrefillPinOrdering:
             use_file_backing=True,
         )
         assert backing is not None
-        try:
-            cache = backing._streaming_cache
-            # Reconciliation must have run (fused: 2 projections, not 3).
-            assert cache.per_expert_bytes > 0
-            expected = int(0.01 * 1024**3) // cache.per_expert_bytes
-            assert cache._prefill_global_cap == expected
-        finally:
-            backing.close()
+        closer(backing)
+        cache = backing._streaming_cache
+        # Reconciliation must have run (fused: 2 projections, not 3).
+        assert cache.per_expert_bytes > 0
+        expected = int(0.01 * 1024**3) // cache.per_expert_bytes
+        assert cache._prefill_global_cap == expected
 
 
 class TestReadaheadStamp:
@@ -195,7 +185,7 @@ class TestReadaheadStamp:
             layers.append(SimpleNamespace(mlp=SimpleNamespace(switch_mlp=glu)))
         return SimpleNamespace(model=SimpleNamespace(layers=layers))
 
-    def test_readahead_setting_stamps_spec_state(self, tmp_path):
+    def test_readahead_setting_stamps_spec_state(self, tmp_path, closer):
         from omlx.patches.expert_streaming import convert_model_to_streaming
 
         write_moe_checkpoint(tmp_path, fused=True)
@@ -207,22 +197,20 @@ class TestReadaheadStamp:
             use_file_backing=True,
         )
         assert backing is not None
-        try:
-            # The advisor reads spec_state.readahead_enabled (None = env
-            # default) — the resolved per-model flag must be stamped.
-            assert backing.spec_state.readahead_enabled is False
-            # Seed defaults on, so the warm/pin hook still attaches —
-            # with pin + recorder legs only, never a warmer leg.
-            sm = model.model.layers[0].mlp.switch_mlp
-            hook = getattr(sm, "_warm_pins", None)
-            assert hook is not None
-            assert not hasattr(hook, "warmer")
-            assert hook.pinner is None
-            assert hook.recorder is not None
-        finally:
-            backing.close()
+        closer(backing)
+        # The advisor reads spec_state.readahead_enabled (None = env
+        # default) — the resolved per-model flag must be stamped.
+        assert backing.spec_state.readahead_enabled is False
+        # Seed defaults on, so the warm/pin hook still attaches —
+        # with pin + recorder legs only, never a warmer leg.
+        sm = model.model.layers[0].mlp.switch_mlp
+        hook = getattr(sm, "_warm_pins", None)
+        assert hook is not None
+        assert not hasattr(hook, "warmer")
+        assert hook.pinner is None
+        assert hook.recorder is not None
 
-    def test_readahead_unset_defaults_on(self, tmp_path):
+    def test_readahead_unset_defaults_on(self, tmp_path, closer):
         from omlx.patches.expert_streaming import convert_model_to_streaming
         from omlx.patches.expert_streaming import warmer as _warmer_mod
 
@@ -231,11 +219,9 @@ class TestReadaheadStamp:
             self._model(), str(tmp_path), None, use_file_backing=True
         )
         assert backing is not None
-        try:
-            # Setting unset -> the env default (RA_ENABLED) is stamped.
-            assert backing.spec_state.readahead_enabled is _warmer_mod.RA_ENABLED
-        finally:
-            backing.close()
+        closer(backing)
+        # Setting unset -> the env default (RA_ENABLED) is stamped.
+        assert backing.spec_state.readahead_enabled is _warmer_mod.RA_ENABLED
 
 
 class TestCanonicalKillSwitch:
