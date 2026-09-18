@@ -847,12 +847,30 @@ def _patch_model(dsv4: Any) -> None:
         # in-RAM mx.stack graphs below would materialize all at once at
         # load-time eval (SIGKILL on a 48 GiB box), so spill them per layer
         # to mmap-backed shards instead (see ..deepseek_v4.spill).
-        if "model.layers.0.ffn.experts.0.w1.weight" in weights and _spill_armed():
+        # MTP stage banks (n_mtp x n_routed_experts) share the same spill
+        # dir — one shard per stage, recorded in the same manifest.
+        n_mtp = (
+            (
+                deepseek_v4_dspark.stage_count(self.args)
+                if is_dspark
+                else self.args.num_nextn_predict_layers
+            )
+            if has_mtp
+            else 0
+        )
+        block_part = "" if is_dspark else ".block"
+        _raw_experts = "model.layers.0.ffn.experts.0.w1.weight" in weights or any(
+            f"mtp.{i}{block_part}.ffn.experts.0.w1.weight" in weights
+            for i in range(n_mtp)
+        )
+        if _raw_experts and _spill_armed():
             from ..deepseek_v4.spill import (
                 load_spill_into,
                 spill_dir_for,
                 spill_is_valid,
                 spill_model_path,
+                spill_mtp_name,
+                stack_bank_to_spill,
                 stack_layer_to_spill,
                 write_manifest,
             )
@@ -864,10 +882,12 @@ def _patch_model(dsv4: Any) -> None:
                 load_spill_into(weights, _valid)
                 # The raw per-expert keys are superseded by the spilled
                 # stacked banks; drop them so strict load sees no extras.
+                # Covers mtp.* stage experts as well as backbone layers.
                 for _k in [
                     k
                     for k in weights
-                    if ".ffn.experts." in k and k.startswith("model.layers.")
+                    if ".ffn.experts." in k
+                    and k.startswith(("model.layers.", "mtp."))
                 ]:
                     del weights[_k]
                 logger.info(
@@ -885,7 +905,7 @@ def _patch_model(dsv4: Any) -> None:
                 # ~1 layer transient) instead of resuming.
                 with contextlib.suppress(Exception):
                     _spill_dir.mkdir(parents=True, exist_ok=True)
-                    for _stale in _spill_dir.glob("spill_layer_*.safetensors"):
+                    for _stale in _spill_dir.glob("spill_*.safetensors"):
                         with contextlib.suppress(Exception):
                             _stale.unlink()
                     with contextlib.suppress(Exception):
@@ -912,18 +932,45 @@ def _patch_model(dsv4: Any) -> None:
                             layer_idx + 1,
                             n_layers,
                         )
+                # MTP stage banks ride the same spill dir — one
+                # spill_mtp_{i}.safetensors shard per stage so the draft
+                # experts never materialize in RAM either.
+                for _mtp_idx in range(n_mtp):
+                    weights.update(
+                        stack_bank_to_spill(
+                            weights,
+                            src_prefix=f"mtp.{_mtp_idx}{block_part}.ffn.experts",
+                            dst_prefix=(
+                                f"mtp.{_mtp_idx}{block_part}.ffn.switch_mlp"
+                            ),
+                            n_experts=_n_exp,
+                            spill_dir=_spill_dir,
+                            file_name=spill_mtp_name(_mtp_idx),
+                        )
+                    )
                 _key_to_file: dict[str, str] = {}
                 for k in weights:
-                    if ".ffn.switch_mlp." not in k or not k.startswith("model.layers."):
+                    if ".ffn.switch_mlp." not in k:
                         continue
-                    # Filtered keys are model.layers.{N}.ffn.switch_mlp.* —
-                    # the layer index is the third dotted component.
-                    _layer = k.split(".")[2]
-                    if _layer.isdigit():
-                        _key_to_file[k] = "spill_layer_%02d.safetensors" % int(_layer)
+                    if k.startswith("model.layers."):
+                        # model.layers.{N}.ffn.switch_mlp.* — the layer
+                        # index is the third dotted component.
+                        _layer = k.split(".")[2]
+                        if _layer.isdigit():
+                            _key_to_file[k] = (
+                                "spill_layer_%02d.safetensors" % int(_layer)
+                            )
+                    elif k.startswith("mtp."):
+                        # mtp.{i}[.block].ffn.switch_mlp.* — the stage
+                        # index is the second dotted component.
+                        _mtp = k.split(".")[1]
+                        if _mtp.isdigit():
+                            _key_to_file[k] = (
+                                "spill_mtp_%02d.safetensors" % int(_mtp)
+                            )
                 _files = sorted(
                     p.name
-                    for p in _spill_dir.glob("spill_layer_*.safetensors")
+                    for p in _spill_dir.glob("spill_*.safetensors")
                 )
                 write_manifest(_spill_dir, _spill_src, _files, _key_to_file)
                 logger.info(
@@ -963,12 +1010,6 @@ def _patch_model(dsv4: Any) -> None:
         # ndim==2 gate keeps this idempotent for checkpoints that already
         # store the 3D MultiLinear layout (e.g. oQ output).
         if has_mtp:
-            n_mtp = (
-                deepseek_v4_dspark.stage_count(self.args)
-                if is_dspark
-                else self.args.num_nextn_predict_layers
-            )
-            block_part = "" if is_dspark else ".block"
             for mtp_idx in range(n_mtp):
                 prefix = f"mtp.{mtp_idx}{block_part}.attn.wo_a"
                 for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
@@ -977,14 +1018,10 @@ def _patch_model(dsv4: Any) -> None:
                             self.args.o_groups, self.args.o_lora_rank, -1
                         )
 
-        # Stack routed expert weights for MTP layers (PR 15).
+        # Stack routed expert weights for MTP layers (PR 15) — the in-RAM
+        # fallback path; when spill-stacking ran above, the raw
+        # mtp.*.ffn.experts.* keys are already gone and this no-ops.
         if has_mtp:
-            n_mtp = (
-                deepseek_v4_dspark.stage_count(self.args)
-                if is_dspark
-                else self.args.num_nextn_predict_layers
-            )
-            block_part = "" if is_dspark else ".block"
             for mtp_idx in range(n_mtp):
                 prefix = f"mtp.{mtp_idx}{block_part}.ffn.experts"
                 for src, dst in (

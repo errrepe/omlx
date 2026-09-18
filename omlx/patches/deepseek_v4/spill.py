@@ -34,9 +34,13 @@ import os
 from pathlib import Path
 from typing import Any
 
-_SPILL_VERSION = 1
+# Version 2: manifests now also cover MTP stage banks (spill_mtp_*) —
+# a v1 manifest would validate while serving no mtp.* stacked keys,
+# and the sanitize hit path would drop the raw mtp experts anyway.
+_SPILL_VERSION = 2
 _MANIFEST_NAME = "manifest.json"
 _LAYER_FILE = "spill_layer_{idx:02d}.safetensors"
+_MTP_FILE = "spill_mtp_{idx:02d}.safetensors"
 
 # Load-time context: model_loading sets this from the load_config wrapper
 # (which receives the checkpoint path) before mlx_lm.load runs sanitize.
@@ -145,6 +149,64 @@ def spill_layer_name(layer_idx: int) -> str:
     return _LAYER_FILE.format(idx=layer_idx)
 
 
+def spill_mtp_name(mtp_idx: int) -> str:
+    """Spill shard filename for one MTP stage's stacked expert bank."""
+    return _MTP_FILE.format(idx=mtp_idx)
+
+
+def stack_bank_to_spill(
+    weights: dict[str, Any],
+    *,
+    src_prefix: str,
+    dst_prefix: str,
+    n_experts: int,
+    spill_dir: Path,
+    file_name: str,
+) -> dict[str, Any]:
+    """Stack one expert bank to a spill shard; return mmap arrays.
+
+    Generic form of the backbone layer spill: pops
+    ``{src_prefix}.{e}.{w1,w2,w3}.{weight,scales,biases}`` from
+    *weights*, stacks each (src, suffix) bank, evaluates just this bank
+    (~2 GiB transient), saves ``file_name`` under the
+    ``{dst_prefix}.{gate_proj,down_proj,up_proj}.{suffix}`` names, and
+    reloads the shard as memory-mapped lazy arrays. The caller merges
+    the return value back into *weights*.
+    """
+    import gc as _gc
+
+    import mlx.core as mx
+
+    stacked: dict[str, Any] = {}
+    for src, dst in _PROJ_MAP:
+        for suffix in _SUFFIXES:
+            key0 = f"{src_prefix}.0.{src}.{suffix}"
+            if key0 not in weights:
+                continue
+            parts = [
+                weights.pop(f"{src_prefix}.{e}.{src}.{suffix}")
+                for e in range(n_experts)
+            ]
+            stacked[f"{dst_prefix}.{dst}.{suffix}"] = mx.stack(parts)
+            del parts
+    if not stacked:
+        return {}
+    mx.eval(stacked)
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(str(spill_dir / file_name), stacked)
+    # Reload as memory-mapped lazy arrays: no RAM held past this point.
+    reloaded = mx.load(str(spill_dir / file_name))
+    # Drop the evaluated banks AND flush the Metal buffer pool: without
+    # this each layer's ~2 GiB stays wired and 43 layers OOM the box.
+    del stacked
+    _gc.collect()
+    try:
+        mx.metal.clear_cache()
+    except Exception:
+        pass
+    return dict(reloaded)
+
+
 def stack_layer_to_spill(
     weights: dict[str, Any],
     *,
@@ -160,40 +222,14 @@ def stack_layer_to_spill(
     reloads the shard as memory-mapped lazy arrays. The caller merges the
     return value back into *weights*.
     """
-    import gc as _gc
-
-    import mlx.core as mx
-
-    prefix = f"model.layers.{layer_idx}.ffn.experts"
-    stacked: dict[str, Any] = {}
-    for src, dst in _PROJ_MAP:
-        for suffix in _SUFFIXES:
-            key0 = f"{prefix}.0.{src}.{suffix}"
-            if key0 not in weights:
-                continue
-            parts = [
-                weights.pop(f"{prefix}.{e}.{src}.{suffix}")
-                for e in range(n_experts)
-            ]
-            stacked[f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"] = mx.stack(parts)
-            del parts
-    if not stacked:
-        return {}
-    mx.eval(stacked)
-    fname = spill_layer_name(layer_idx)
-    spill_dir.mkdir(parents=True, exist_ok=True)
-    mx.save_safetensors(str(spill_dir / fname), stacked)
-    # Reload as memory-mapped lazy arrays: no RAM held past this point.
-    reloaded = mx.load(str(spill_dir / fname))
-    # Drop the evaluated banks AND flush the Metal buffer pool: without
-    # this each layer's ~2 GiB stays wired and 43 layers OOM the box.
-    del stacked
-    _gc.collect()
-    try:
-        mx.metal.clear_cache()
-    except Exception:
-        pass
-    return dict(reloaded)
+    return stack_bank_to_spill(
+        weights,
+        src_prefix=f"model.layers.{layer_idx}.ffn.experts",
+        dst_prefix=f"model.layers.{layer_idx}.ffn.switch_mlp",
+        n_experts=n_experts,
+        spill_dir=spill_dir,
+        file_name=spill_layer_name(layer_idx),
+    )
 
 
 def load_spill_into(weights: dict[str, Any], spill_dir: Path) -> list[str]:
@@ -206,7 +242,7 @@ def load_spill_into(weights: dict[str, Any], spill_dir: Path) -> list[str]:
     manifest = read_manifest(spill_dir) or {}
     served: list[str] = []
     for fname in manifest.get("files") or sorted(
-        p.name for p in spill_dir.glob("spill_layer_*.safetensors")
+        p.name for p in spill_dir.glob("spill_*.safetensors")
     ):
         for k, v in mx.load(str(spill_dir / fname)).items():
             weights[k] = v
