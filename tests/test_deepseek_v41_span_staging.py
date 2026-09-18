@@ -4,8 +4,9 @@ Every other staging test (test_deepseek_v41_dspark_offload.py) runs on
 SOURCE checkpoints, where ``stage_predicted`` submits one ``_stage_one``
 future per expert. Converted checkpoints take the coalesced path:
 ``_span_groups`` merges the predicted set into runs, one ``_stage_span``
-future covers each run, and every expert's ``_StagedSpan`` handle slices
-its payload out of the shared block via ``block[expert - lo]``. These
+future covers each run, and every expert id's ``StagedReads`` entry
+points at that shared future — a join fans the decoded rows out to the
+sibling keys (``block[expert - lo]`` per row). These
 tests exercise that fan-out — including a gap-merged run where an
 off-by-one in the row offset would commit a different expert's bytes.
 """
@@ -44,18 +45,20 @@ def _backing(disk):
 def test_stage_span_payload_rows_match_per_expert_fetch(tmp_path, closer):
     """``_stage_span`` row math directly: each expert's payload sliced
     out of the merged block must equal the per-expert fetch — expert 3
-    reads block[0], expert 5 reads block[2] of the [3,6) span."""
+    reads block[0], expert 5 reads block[2] of the [3,6) span. The
+    return is a list aligned with the requested ids (the StagedReads
+    set-read contract)."""
     disk = closer(_converted_disk(tmp_path))
     plan = disk._moe_offload_plan
     prefix = "language_model.layers.1.ffn.experts"
     got = _stage_span(plan, prefix, [3, 5])
-    assert set(got) == {3, 5}
-    for expert in (3, 5):
+    assert len(got) == 2
+    for expert, payload in zip((3, 5), got):
         for proj in ("w1", "w3", "w2"):
             want = plan.fetch(prefix, proj, expert)["weight"]
             np.testing.assert_array_equal(
                 np.asarray(
-                    got[expert][proj]["weight"].astype(mx.float32)
+                    payload[proj]["weight"].astype(mx.float32)
                 ),
                 np.asarray(want.astype(mx.float32)),
             )
@@ -74,13 +77,14 @@ def test_backing_staged_span_preserves_arithmetic(tmp_path, monkeypatch, closer)
     slots1 = _slot(disk, 1)
     # Prime layer-1 residency away from the staged set, then let a
     # layer-0 ensure stage {3,5} into layer 1: one merged _stage_span
-    # over rows [3,6), two _StagedSpan handles on a single future.
+    # over rows [3,6), both expert keys sharing a single future in the
+    # StagedReads registry (entry = (fut, ids, key_of)).
     slots1.ensure(mx.array([[6, 7]]))
     backing.note_routing(1, {3, 5})
     backing.recall_ewma[1] = 1.0  # skip EWMA warm-up (recall gate)
     slots0.ensure(mx.array([[0, 1]]))
     assert set(slots1._staged) == {3, 5}
-    assert slots1._staged[3]._fut is slots1._staged[5]._fut
+    assert slots1._staged[3][0] is slots1._staged[5][0]
     slots1.ensure(mx.array([[3, 5]]))
     assert slots1.staged_hits == 2
     resident_experts = resident.language_model.layers[1].ffn.experts
@@ -108,10 +112,10 @@ def test_staged_span_multi_run_drops_undemanded(tmp_path, monkeypatch, closer):
     backing.recall_ewma[1] = 1.0
     slots0.ensure(mx.array([[2, 3]]))
     assert set(slots1._staged) == {0, 1, 4, 5}
-    # One future per merged run, shared by that run's handles.
-    assert slots1._staged[0]._fut is slots1._staged[1]._fut
-    assert slots1._staged[4]._fut is slots1._staged[5]._fut
-    assert slots1._staged[0]._fut is not slots1._staged[4]._fut
+    # One future per merged run, shared by that run's registry entries.
+    assert slots1._staged[0][0] is slots1._staged[1][0]
+    assert slots1._staged[4][0] is slots1._staged[5][0]
+    assert slots1._staged[0][0] is not slots1._staged[4][0]
     rows = slots1.ensure(mx.array([[0, 1]]))
     mx.eval(rows)
     assert slots1.staged_hits == 2

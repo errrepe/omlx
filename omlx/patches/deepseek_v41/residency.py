@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from omlx.utils.safetensors import file_signature, read_safetensors_header
+
 
 @dataclass(frozen=True)
 class EngramResidencyEstimate:
@@ -25,14 +27,16 @@ class EngramResidencyEstimate:
 
 @lru_cache(maxsize=128)
 def _header(filename, size, mtime_ns):
+    # Keep the corrupt-header sanity check the shared parser omits, then
+    # delegate the 8-byte length + JSON body to it.
     with open(filename, "rb") as file:
         raw = file.read(8)
         if len(raw) != 8:
             raise ValueError("Truncated safetensors header")
-        length = struct.unpack("<Q", raw)[0]
-        if length > size - 8:
+        if struct.unpack("<Q", raw)[0] > size - 8:
             raise ValueError("Invalid safetensors header length")
-        return json.loads(file.read(length))
+        file.seek(0)
+        return read_safetensors_header(file)
 
 
 def _files_signature(files):
@@ -44,9 +48,8 @@ def _files_signature(files):
     or mtime and re-runs the scan, an untouched one stays cached.
     """
     return tuple(
-        (str(f), st.st_size, st.st_mtime_ns)
+        (str(f), *file_signature(f))
         for f in sorted(files)
-        for st in (f.stat(),)
     )
 
 

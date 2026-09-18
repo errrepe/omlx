@@ -34,6 +34,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ..expert_streaming._env import env_bool, env_str
+
 # Version 2: manifests now also cover MTP stage banks (spill_mtp_*) —
 # a v1 manifest would validate while serving no mtp.* stacked keys,
 # and the sanitize hit path would drop the raw mtp experts anyway.
@@ -65,14 +67,14 @@ def spill_model_path() -> str | None:
 def spill_dir_for(model_path: str | os.PathLike) -> Path:
     """Spill directory for a checkpoint (volume-local, outside the dir)."""
     model_path = Path(model_path)
-    root = os.environ.get("OMLX_SPILL_DIR")
+    root = env_str("OMLX_SPILL_DIR", None)
     base = Path(root).expanduser() if root else model_path.parent / ".omlx_spill"
     return base / model_path.name
 
 
 def spill_disabled() -> bool:
     """Escape hatch: OMLX_DSV4_SPILL=0 restores in-RAM stacking."""
-    return os.environ.get("OMLX_DSV4_SPILL", "1") == "0"
+    return not env_bool("OMLX_DSV4_SPILL", True)
 
 
 def _source_files(model_path: Path) -> list[Path]:

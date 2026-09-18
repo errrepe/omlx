@@ -12,13 +12,13 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..expert_streaming._env import env_bool, env_float, env_int
 from ..expert_streaming.slot_cache import (
     SlotArena,
     working_set_step,
 )
+from ..expert_streaming.staging import StagedReads
 from .convert import repack_weight
 from .quantization import QuantizedProjection
 from .residency import _files_signature, _header
@@ -61,18 +61,25 @@ def _stage_one(plan, prefix, expert):
     return {proj: plan.fetch(prefix, proj, expert) for proj in _PROJECTIONS}
 
 
+def _stage_one_row(plan, prefix, expert):
+    """Single-expert stage read in the registry's aligned-rows contract."""
+    return [_stage_one(plan, prefix, expert)]
+
+
 def _stage_span(plan, prefix, experts):
     """Coalesced speculative read: one merged span, per-expert payloads.
 
     ``experts`` is an ascending run (see ``_span_groups``); the shared
     ``fetch_span`` covers [first, last] once per projection and each
     expert decodes only its own row — gap overfetch costs I/O, not
-    decode CPU (same contract as the demand path).
+    decode CPU (same contract as the demand path). Returns a list
+    aligned with *experts* — the ``StagedReads`` set-read contract, so a
+    join fans the decoded rows out to every sibling key.
     """
     lo, hi = experts[0], experts[-1] + 1
     raw = {proj: plan.fetch_span(prefix, proj, lo, hi) for proj in _PROJECTIONS}
-    return {
-        expert: {
+    return [
+        {
             proj: {
                 field: decode_array(block[expert - lo], dtype)
                 for field, (block, dtype) in raw[proj].items()
@@ -80,28 +87,7 @@ def _stage_span(plan, prefix, experts):
             for proj in _PROJECTIONS
         }
         for expert in experts
-    }
-
-
-class _StagedSpan:
-    """Per-expert handle on one coalesced staged span read.
-
-    The staging worker submits ONE task per merged run; every expert in
-    the run maps to a handle whose ``result()`` slices out its own
-    payload, so the demand join keeps its per-expert contract.
-    """
-
-    __slots__ = ("_fut", "_expert")
-
-    def __init__(self, fut, expert):
-        self._fut, self._expert = fut, int(expert)
-
-    def result(self, timeout=None):
-        got = self._fut.result(timeout)
-        return None if got is None else got.get(self._expert)
-
-    def cancel(self):
-        return self._fut.cancel()
+    ]
 
 
 class _WorkingSetOverCap(ValueError):
@@ -575,12 +561,13 @@ class ExpertOffloadPlan:
             raise RuntimeError("MoE expert store is closed")
         if expert is not None:
             # Stacked expert rows ride the shared backing store — preadv
-            # into caller buffers, run coalescing, read telemetry.
+            # into caller buffers, run coalescing, read telemetry. The
+            # public tensor_entry carries the dtype tag; no reader
+            # internals are touched here.
             store = self._backing()
-            reader = store._reader_for_key(key, int(expert))
             return (
                 store.load_expert_slice(key, int(expert)),
-                reader.header[key]["dtype"],
+                store.tensor_entry(key).dtype_str,
             )
         filename = self.mapping[key]
         reader = self._readers.get(filename)
@@ -603,16 +590,14 @@ class ExpertOffloadPlan:
         if self._closed:
             raise RuntimeError("MoE expert store is closed")
         store = self._backing()
-        reader = store._reader_for_key(key, lo)
-        rp = reader._rp_for(key)
-        block = np.empty((hi - lo, rp.expert_bytes), dtype=np.uint8)
-        if not store.read_expert_into(
-            [(key, list(range(lo, hi)))], [block]
-        ):
-            raise ValueError(f"Span read failed: {key}[{lo}:{hi}]")
+        # Public span API: one contiguous preadv over rows [lo, hi)
+        # returning the (hi-lo, *per_shape) block; tensor_entry supplies
+        # the dtype tag decode_array needs. Bounds/short reads raise
+        # inside the store (ValueError/OSError) — same fail-high as the
+        # read_expert_into path this replaces.
         return (
-            block.view(rp.np_dtype).reshape(hi - lo, *rp.per_shape),
-            reader.header[key]["dtype"],
+            store.read_span(key, lo, hi),
+            store.tensor_entry(key).dtype_str,
         )
 
     def fetch(self, prefix, proj, expert):
@@ -734,6 +719,12 @@ class _ExpertSlots:
         )
         self.book = self.arena.book
         self._slots_lock = self.arena.lock
+        # Speculative staged reads ride the shared keyed registry
+        # (expert-id keys): resolve() joins an in-flight set read once
+        # and fans its rows out to the sibling ids — the same
+        # one-read-per-merged-run contract _StagedSpan hand-rolled. The
+        # bound is the bank size: staged keys are expert ids.
+        self._staged_reads = StagedReads(plan.count_of(prefix))
         self.backing = None
         self.layer = None
         # Span-read telemetry: merged contiguous fetches per ensure.
@@ -790,10 +781,22 @@ class _ExpertSlots:
     def evictions(self):
         return self.book.evictions
 
-    # Staging aliases — the side dict and counters live on the arena.
+    # Staging aliases — staged rows/futures live in the shared
+    # StagedReads registry; the counters stay on the arena.
     @property
     def _staged(self):
-        return self.arena.staged
+        """Joined view: expert id -> resolved row or in-flight fut entry.
+
+        ``StagedReads`` splits in-flight set reads (``futs`` —
+        ``(future, ids, key_of)`` tuples) from completed payloads
+        (``rows``); membership probes and tests see the union.
+        Partially built slots (unit-test fakes) report empty.
+        """
+        reads = getattr(self, "_staged_reads", None)
+        if reads is None:
+            return {}
+        with reads.lock:
+            return {**reads.rows, **reads.futs}
 
     @property
     def staged_hits(self):
@@ -811,13 +814,15 @@ class _ExpertSlots:
         """Drop all residency and cancel pending staged fetches."""
         with self._slots_lock:
             self.book.reset()
-            staged = list(self._staged.values())
-            self._staged.clear()
-        for fut in staged:
-            try:
-                fut.cancel()
-            except Exception:
-                pass
+            reads = getattr(self, "_staged_reads", None)
+            staged = reads.keys() if reads is not None else []
+        if reads is None:
+            return
+        # drop() cancels a set read only once its last key is removed —
+        # outside _slots_lock so a Future cancel's callbacks never run
+        # under a lock the join path needs.
+        for key in staged:
+            reads.drop(key)
 
     def _bind(self, proj, values, spec):
         if spec:
@@ -914,6 +919,9 @@ class _ExpertSlots:
         """
         if not _stage_enabled():
             return
+        reads = getattr(self, "_staged_reads", None)
+        if reads is None:
+            return
         with self._slots_lock:
             room = (
                 _stage_max(self.plan) if limit is None else int(limit)
@@ -941,16 +949,19 @@ class _ExpertSlots:
                         )
                     except Exception:
                         break
-                    for expert in group:
-                        self._staged[expert] = _StagedSpan(fut, expert)
+                    # One registry entry per expert id, all pointing at
+                    # the shared span read — the first demand join fans
+                    # its decoded rows out to the sibling ids.
+                    reads.register(fut, group, int)
             else:
                 for expert in todo:
                     try:
-                        self._staged[expert] = pool.submit(
-                            _stage_one, self.plan, self.prefix, expert
+                        fut = pool.submit(
+                            _stage_one_row, self.plan, self.prefix, expert
                         )
                     except Exception:
                         break
+                    reads.register(fut, [expert], int)
             self.arena.staged_submits += len(self._staged) - staged_before
 
     def _advise_runs(self, runs, store):
@@ -1068,6 +1079,16 @@ class _ExpertSlots:
         missed = self.arena.ensure_set(
             needed, frozen, self._produce, verify=verify, scratch=scratch
         )
+        # Staged rows the ensure did not consume are mispredictions —
+        # drop them so they cannot linger past the demand window (the
+        # arena runs the same sweep on its own staged dict).
+        reads = getattr(self, "_staged_reads", None)
+        if reads is not None:
+            leftover = reads.keys()
+            if leftover:
+                self.arena.staged_drops += len(leftover)
+                for key in leftover:
+                    reads.drop(key)
         return (
             self.arena.rows_for(indices.reshape(-1).tolist()).reshape(
                 indices.shape
@@ -1076,25 +1097,25 @@ class _ExpertSlots:
         )
 
     def _join_staged(self, expert):
-        """Pop and join the staged future for *expert*, if any.
+        """Pop and join the staged payload for *expert*, if any.
 
-        Returns its per-expert payload on success (counting
-        ``arena.staged_hits``); a missing, failed or empty payload
-        returns None — ``staged_failures`` counts only futures that
-        actually existed but yielded nothing.
+        ``StagedReads.resolve`` awaits an in-flight set read once and
+        fans its rows out to the sibling keys, so a joined span serves
+        later resolves from ``rows``. Returns the per-expert payload on
+        success (counting ``arena.staged_hits``); a missing, failed or
+        empty payload returns None — ``staged_failures`` counts only
+        futures that actually existed but yielded nothing.
         """
-        fut = self._staged.pop(expert, None)
-        if fut is None:
+        reads = getattr(self, "_staged_reads", None)
+        if reads is None:
             return None
-        payload = None
-        try:
-            payload = fut.result()
-        except Exception:
-            pass
+        had = reads.pending(int(expert))
+        payload = reads.resolve(int(expert))
         if payload:
             self.arena.staged_hits += 1
             return payload
-        self.staged_failures += 1
+        if had:
+            self.staged_failures += 1
         return None
 
     def _produce(self, fetch_list):

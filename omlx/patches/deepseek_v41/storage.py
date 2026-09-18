@@ -7,11 +7,9 @@ Resident tables retain their packed bytes; prefetch workers only copy CPU rows.
 """
 
 import fcntl
-import json
 import math
 import mmap
 import os
-import struct
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -21,6 +19,11 @@ from threading import RLock
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+from omlx.utils.safetensors import (
+    SAFETENSORS_NUMPY_DTYPES,
+    read_safetensors_header,
+)
 
 RESIDENT_READ_BYTES = 8 * 1024 * 1024
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -52,17 +55,14 @@ def _resident_buffer(shape, dtype):
     return np.asarray(value)
 
 
+# Shared safetensors dtype table plus the fp8 tags it does not carry:
+# E8M0 scales and the FN/FNU variants travel as raw bytes and
+# decode_array expands them on the MLX side.
 _NP_DTYPES = {
-    "BF16": "<u2",
-    "F16": "<f2",
-    "F32": "<f4",
-    "U32": "<u4",
-    "U8": "u1",
-    "I8": "i1",
-    "F8_E4M3": "u1",
-    "F8_E8M0": "u1",
-    "F8_E4M3FN": "u1",
-    "F8_E8M0FNU": "u1",
+    **SAFETENSORS_NUMPY_DTYPES,
+    "F8_E8M0": np.dtype("u1"),
+    "F8_E4M3FN": np.dtype("u1"),
+    "F8_E8M0FNU": np.dtype("u1"),
 }
 
 
@@ -72,9 +72,9 @@ class TensorFile:
         self._path = Path(path)
         self._file = self._path.open("rb")  # noqa: SIM115 -- owned until close()
         try:
-            length = struct.unpack("<Q", self._file.read(8))[0]
-            self.header = json.loads(self._file.read(length))
-            self._start = length + 8
+            # Shared parser leaves the file positioned at data start.
+            self.header = read_safetensors_header(self._file)
+            self._start = self._file.tell()
             self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
             self._file_size = os.fstat(self._file.fileno()).st_size
             self._seen_pages = None

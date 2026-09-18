@@ -24,11 +24,16 @@ ceilings enforced lazily; ``capacity`` reports the uniform base.
 from __future__ import annotations
 
 import logging
-import threading
 from dataclasses import dataclass, field
 
 from ..expert_streaming._env import env_bool, env_float
+from ..expert_streaming.residency_adapter import PerLayerResidencyAdapter
 from ..expert_streaming.slot_cache import DecodeVisitStats
+from ..expert_streaming.staging import (
+    PrevTokenPredictor,
+    ewma,
+    stage_headroom,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +47,6 @@ logger = logging.getLogger(__name__)
 # holding the recall gate open ("" -> 0.0 would stage unconditionally).
 _STAGED_MIN_RECALL = env_float("OMLX_V41_STAGE_MIN_RECALL", 0.3)
 _STAGED_RECALL_DECAY = 0.9
-
-
-def _ewma(table: dict, key: int, obs: float) -> None:
-    """EWMA-update ``table[key]`` toward *obs* (decay _STAGED_RECALL_DECAY)."""
-    table[key] = (
-        _STAGED_RECALL_DECAY * table.get(key, 0.0) + (1.0 - _STAGED_RECALL_DECAY) * obs
-    )
 
 
 def _verify_ra_enabled() -> bool:
@@ -118,8 +116,10 @@ class _V41CacheStats(DecodeVisitStats):
             )
 
 
-class V41StreamingBacking:
+class V41StreamingBacking(PerLayerResidencyAdapter):
     """Governor-facing cache over V4.1's per-layer expert slots."""
+
+    _GOVERNOR_LABEL = "V4.1"
 
     def __init__(
         self,
@@ -132,19 +132,22 @@ class V41StreamingBacking:
         stall_target: float | None = None,
         min_cap: int | None = None,
     ) -> None:
-        self._lock = threading.RLock()
         self.plan = plan
         self.slots_of = {}
         for layer_idx, slots in layers:
             self.slots_of[int(layer_idx)] = slots
             slots.backing = self
             slots.layer = int(layer_idx)
-        self.num_layers = len(self.slots_of)
         # Staging predictor: last decode-token routing per layer, the
         # MoE layer order used to find the "next" layer to stage, and the
         # per-layer prev-token recall EWMA that gates speculative reads.
-        self.prev_uniq: dict = {}
-        self.recall_ewma: dict = {}
+        # prev_uniq/recall_ewma alias the shared predictor's tables so
+        # direct inspection (and test writes) stays live.
+        self._predictor = PrevTokenPredictor(
+            decay=_STAGED_RECALL_DECAY, min_recall=_STAGED_MIN_RECALL
+        )
+        self.prev_uniq = self._predictor.prev_uniq_by_layer
+        self.recall_ewma = self._predictor.recall_ewma
         self._order = sorted(self.slots_of)
         self.staged_skips = 0
         # Megaplan F0: skip causes split for diagnostics — a staged_hits=0
@@ -173,119 +176,61 @@ class V41StreamingBacking:
         # F6 fractional verify->hunger bridge accumulator (see
         # _verify_hunger_frac); crossing 1.0 emits one decode visit.
         self._verify_hunger_credit = 0.0
+        # The adapter owns _lock/cache/overrides/stats/num_layers/
+        # per_slot/base_cap/governor and the resize/clear/cap plumbing.
+        super().__init__(
+            self.slots_of,
+            dynamic=dynamic,
+            max_budget_bytes=max_budget_bytes,
+            min_budget_bytes=min_budget_bytes,
+            stall_target=stall_target,
+            min_cap=min_cap,
+        )
+
+    # -- PerLayerResidencyAdapter hooks -------------------------------------
+    def _iter_units(self):
+        return self.slots_of.values()
+
+    def _per_slot_bytes(self) -> int:
         # plan.full_bytes spans ALL layers while count is per-layer: derive
         # per-expert size from resident_bytes (capacity x layers) so the
         # governor's GiB budgets stay truthful. Actions are scale-invariant
         # (halve/double/+25%), but byte floors and log labels are not.
         per_expert = max(
             1,
-            int(plan.resident_bytes)
-            // max(1, int(plan.capacity) * max(1, len(self.slots_of))),
+            int(self.plan.resident_bytes)
+            // max(1, int(self.plan.capacity) * max(1, len(self.slots_of))),
         )
         # Per-layer units (see module docstring).
-        self.per_slot = per_expert * max(1, self.num_layers)
-        self.base_cap = int(plan.capacity)
-        self.overrides: dict = {}
-        self.stats = _V41CacheStats()
-        if not dynamic or self.num_layers == 0:
-            self.governor = None
-            return
-        from ..expert_streaming.governor import arm_dynamic
+        return per_expert * max(1, len(self.slots_of))
 
+    def _initial_base_cap(self) -> int:
+        return int(self.plan.capacity)
+
+    def _floor_cap(self) -> int:
         # Never shrink a layer below one token's decode working set:
-        # below n_activated_experts `ensure` raises "working set
-        # exceeds resident capacity" mid-generation — a fixed floor
-        # smaller than top_k breaks on top-k>8 models.
-        # The plan already guarantees capacity >= n_activated.
-        # arm_dynamic resolves the byte budgets and applies an explicit
-        # min_cap over this floor_default; on failure residency stays
-        # static (returns None).
-        self.governor = arm_dynamic(
-            self,
-            self.per_slot,
-            self.base_cap,
-            floor_default=max(
-                1,
-                min(
-                    int(getattr(plan, "n_activated", 8) or 8),
-                    self.base_cap,
-                ),
-            ),
-            max_budget_bytes=max_budget_bytes,
-            min_budget_bytes=min_budget_bytes,
-            stall_target=stall_target,
-            min_cap=min_cap,
-            num_layers=1,
-            label="V4.1",
-        )
+        # below n_activated_experts `ensure` raises "working set exceeds
+        # resident capacity" mid-generation — a fixed floor smaller than
+        # top_k breaks on top-k>8 models. The plan already guarantees
+        # capacity >= n_activated.
+        return max(1, int(getattr(self.plan, "n_activated", 8) or 8))
 
-    # -- governor duck-type ------------------------------------------------
-    def resize(self, cap: int, per_layer: int | None) -> None:
-        """Retarget the uniform per-layer base (atomic under the lock).
+    def _apply_layer_caps(self) -> None:
+        for layer_idx, slots in self.slots_of.items():
+            eff = self._cap_for(layer_idx)
+            # Lock order backing -> slots (same as clear); the cap write
+            # and the compact must be one atomic step against a
+            # concurrent ensure on this layer.
+            with slots._slots_lock:
+                slots.book.cap = eff
+                self._compact(slots, eff)
 
-        With ``num_layers=1`` the governor always passes ``per_layer ==
-        cap``; growth materializes lazily inside ``ensure`` (realloc on
-        demand), so resize only ever sets ceilings and compacts overs.
-        Targeting overrides reset to uniform; the governor re-applies
-        them via ``set_layer_caps`` right after (same contract as the
-        generic cache).
-        """
-        want = max(1, int(per_layer if per_layer is not None else cap))
-        # Never apply a per-layer ceiling below one token's working set:
-        # a book.cap < n_activated makes ensure() raise "working set
-        # exceeds resident capacity" mid-generation. base_cap keeps the
-        # governor's raw request so consecutive shrinks do not flap.
-        floor = max(1, int(getattr(self.plan, "n_activated", 1) or 1))
-        eff = max(floor, want)
-        with self._lock:
-            self.base_cap = want
-            self.overrides = {}
-            for layer_idx, slots in self.slots_of.items():
-                # Lock order backing -> slots (same as clear); the
-                # cap write and the compact must be one atomic step
-                # against a concurrent ensure on this layer.
-                with slots._slots_lock:
-                    slots.book.cap = eff
-                    self._compact(slots, eff)
+    def _clear_units(self) -> None:
+        for slots in self.slots_of.values():
+            slots.clear_residency()
 
-    def clear(self) -> None:
-        with self._lock:
-            for slots in self.slots_of.values():
-                slots.clear_residency()
-
-    def set_layer_caps(self, caps: dict) -> None:
-        floor = max(1, int(getattr(self.plan, "n_activated", 1) or 1))
-        with self._lock:
-            self.overrides = {}
-            for k, v in (caps or {}).items():
-                eff = max(floor, int(v))
-                # An override that lands on the applied base is not
-                # targeting — dropping it keeps layer_cap_overrides()
-                # truthful (the governor's num_layers==1 retarget sends
-                # exactly this no-op).
-                if eff != max(floor, self.base_cap):
-                    self.overrides[int(k)] = eff
-            for layer_idx, slots in self.slots_of.items():
-                eff = max(floor, self.overrides.get(layer_idx, self.base_cap))
-                with slots._slots_lock:
-                    slots.book.cap = eff
-                    self._compact(slots, eff)
-
-    def layer_cap_overrides(self) -> dict:
-        return dict(self.overrides)
-
-    @property
-    def capacity(self) -> int:
-        # Generic-cache contract: total
-        # budget units, which for the per-layer-unit fiction equal the
-        # uniform per-layer base.
-        return self.base_cap
-
-    @property
-    def evictions(self) -> int:
-        # Per-layer counters live on the slots; the backing just
-        # aggregates.
-        return sum(s.evictions for s in self.slots_of.values())
+    def _make_stats(self) -> _V41CacheStats:
+        return _V41CacheStats()
 
     # No ``streaming_guard_info``: the scheduler's prefill-bank transient
     # exists for the generic path's lazy mini-banks; V4.1 expert slots are
@@ -305,26 +250,8 @@ class V41StreamingBacking:
             logger.debug("V4.1 plan close failed", exc_info=True)
 
     # -- stats -------------------------------------------------------------
-    def note_visit(self, layer_idx: int, missed: bool) -> None:
-        # Called by _ExpertSlots.ensure AFTER its per-layer lock is
-        # released — taking the backing lock here keeps the order
-        # slots._slots_lock then backing._lock impossible to invert.
-        with self._lock:
-            self.stats.note_visit(layer_idx, missed)
-        # Mid-request governor
-        # tick — one decode visit per layer-call is the same cadence the
-        # generic path uses; tick() self-throttles on _GOV_TICK_S so the
-        # cost is a monotonic compare until the interval elapses. Runs
-        # outside the backing lock: observe() may resize() which retakes
-        # it (RLock is reentrant, but keeping the call unscoped matches
-        # the lock-ordering comment above).
-        gov = self.governor
-        if gov is not None:
-            try:
-                gov.tick()
-            except Exception:
-                logger.debug("governor tick failed", exc_info=True)
-
+    # ``note_visit`` comes from the adapter — the decode-visit counter +
+    # governor tick contract is identical here.
     def note_verify_visit(self, layer_idx: int, missed: bool) -> None:
         """Count one verify-phase layer-call (telemetry only, F0).
 
@@ -373,7 +300,11 @@ class V41StreamingBacking:
             prev = self.verify_uniq.get(li)
             if prev:
                 obs = len(prev & now) / len(now)
-                _ewma(self.verify_recall, li, obs)
+                self.verify_recall[li] = ewma(
+                    self.verify_recall.get(li, 0.0),
+                    obs,
+                    _STAGED_RECALL_DECAY,
+                )
             acc = self.verify_acc.get(li)
             if acc is None:
                 acc = self.verify_acc[li] = set()
@@ -425,7 +356,7 @@ class V41StreamingBacking:
         # pressure it competes with THIS layer's demand reads. The
         # prediction is only early-fetch of true demand; skipping it
         # under pressure just reverts to demand-time reads.
-        if not self._stage_headroom():
+        if not stage_headroom(self.governor):
             self.verify_ra_headroom += 1
             return
         try:
@@ -445,13 +376,7 @@ class V41StreamingBacking:
         row, so a looser predictor would spend real reads; instead the
         observed prev-token recall EWMA below gates ``stage_next``.
         """
-        li = int(layer_idx)
-        now = {int(e) for e in experts}
-        prev = self.prev_uniq.get(li)
-        if prev and now:
-            obs = len(set(prev) & now) / len(now)
-            _ewma(self.recall_ewma, li, obs)
-        self.prev_uniq[li] = now
+        self._predictor.record(layer_idx, experts)
 
     def stage_next(self, layer_idx: int) -> None:
         """Stage the NEXT MoE layer's predicted set.
@@ -467,18 +392,18 @@ class V41StreamingBacking:
             # int(None)/int(non-numeric) escapes ValueError alone; an
             # unconvertible or unknown layer just means "don't stage".
             return
-        pred = self.prev_uniq.get(nxt)
+        pred = self._predictor.predict(nxt)
         if not pred:
             self.staged_skips_no_pred += 1
             return
         # Recall gate (generic stage_gate parity): a layer whose
         # prev-token prediction stopped covering demand does not earn
         # speculative reads — the EWMA shuts it off after a bounded burst.
-        if self.recall_ewma.get(nxt, 0.0) < _STAGED_MIN_RECALL:
+        if not self._predictor.gate(nxt):
             self.staged_skips += 1
             self.staged_skips_recall += 1
             return
-        if not self._stage_headroom():
+        if not stage_headroom(self.governor):
             self.staged_skips += 1
             self.staged_skips_headroom += 1
             return
@@ -505,25 +430,9 @@ class V41StreamingBacking:
         except Exception:
             pass
 
-    def _stage_headroom(self) -> bool:
-        """Speculative reads only pay when residency has slack.
-
-        On a starved regime (cap pinned at the working-set floor,
-        governor clearing) mispredicted reads compete with demand
-        fetches on a saturated disk for slots that cannot hold them.
-        Suppress staging when the governor has shrunk to the floor or
-        last saw free memory inside the desperate-clear band; keep it
-        whenever capacity has room for a prediction to persist.
-        """
-        gov = self.governor
-        if gov is None:
-            return True
-        try:
-            if gov.at_floor() or gov.in_desperate_band():
-                return False
-        except Exception:
-            return True
-        return True
+    # ``stage_headroom(governor)`` is the shared suppress check — at the
+    # governor floor or inside the desperate-clear band, speculative
+    # reads only compete with demand fetches.
 
     # -- storage -----------------------------------------------------------
     # Realloc/compact live on _ExpertSlots (layer-3 mechanics: packed
