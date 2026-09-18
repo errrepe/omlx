@@ -47,6 +47,17 @@
         ...EXPERT_STREAMING_EDITOR_KEYS,
         ...EXPERT_STREAMING_ADVANCED_KEYS,
     ];
+    // Static bounds for the numeric editor inputs — mirrors
+    // STREAMING_SETTING_SCHEMA (model_profiles) so the form stays
+    // correct when the settings-schema endpoint is unreachable; once
+    // served, expertStreamingNumInput prefers the schema's bounds.
+    const EXPERT_STREAMING_NUM_INPUT_BOUNDS = {
+        expert_streaming_budget_gib: {min: 0, max: 64, step: 0.5},
+        expert_streaming_dynamic_max_gib: {min: 0.5, max: 64, step: 0.5},
+        expert_streaming_dynamic_min_gib: {min: 0, max: 64, step: 0.5},
+        expert_streaming_dynamic_stall_target: {min: 0, max: 0.9, step: 0.01},
+        expert_streaming_prefill_budget_gib: {min: 0.5, max: 64, step: 0.5},
+    };
     // Profile-form encoders for keys whose control state doesn't map 1:1
     // onto the wire value. Each handler writes (or deliberately omits)
     // its key on `out`; not writing keeps the key absent from the
@@ -1797,6 +1808,25 @@
                         && (f.type === 'float' || f.type === 'int')
                         && f.key !== 'expert_streaming_budget_gib')
                     .map(f => f.key);
+            },
+            expertStreamingNumInput(key) {
+                // {min, max, step} for a numeric editor input. Schema
+                // bounds win when served (they ARE the PUT validator's
+                // bounds); the literal table is the offline fallback.
+                // HTML min is inclusive, so a lo_open schema bound maps
+                // to the first grid point above lo (lo + step).
+                const fallback = EXPERT_STREAMING_NUM_INPUT_BOUNDS[key]
+                    || {min: 0, step: 1};
+                const f = (this.expertStreamingSchemaFields || [])
+                    .find(f => f && f.key === key);
+                const b = f && f.bounds;
+                if (!b) return {...fallback};
+                const attrs = {
+                    min: b.lo_open ? b.lo + fallback.step : b.lo,
+                    step: fallback.step,
+                };
+                if (b.hi !== null && b.hi !== undefined) attrs.max = b.hi;
+                return attrs;
             },
 
             async loadPresets() {
