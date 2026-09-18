@@ -126,6 +126,26 @@ struct ServerScreen: View {
                 }
             }
 
+            SectionHeader(String(localized: "server.section.usage",
+                                  defaultValue: "Usage History",
+                                  comment: "Section heading for the local usage history switch in Server screen"))
+            // Deep-link target for the Status screen's "Usage history is off"
+            // notice (see AppServices.ServerAnchor.usageHistory).
+            .id(ServerAnchor.usageHistory.rawValue)
+            ListGroup {
+                Row(
+                    label: String(localized: "server.row.usage_history",
+                                  defaultValue: "Record usage history",
+                                  comment: "Row label for the switch that records local hourly usage history"),
+                    sublabel: String(localized: "server.row.usage_history.sub",
+                                     defaultValue: "Stores hourly per-model token totals in usage.sqlite3. Turning this off keeps existing history.",
+                                     comment: "Sublabel explaining the usage history switch"),
+                    isLast: true
+                ) {
+                    RowSwitch(isOn: vm.bind($vm.usageHistoryEnabled, save: vm.saveUsageHistory))
+                }
+            }
+
             SectionHeader(
                 String(localized: "server.section.storage",
                        defaultValue: "Storage",
@@ -168,6 +188,15 @@ struct ServerScreen: View {
                              comment: "Hint footer text under the Server screen explaining which controls apply immediately vs. via the Apply button"),
                 error: vm.lastError
             ) {
+                Button(String(localized: "settings.button.reset_defaults",
+                              defaultValue: "Reset Defaults",
+                              comment: "Fill this screen with defaults before applying")) {
+                    Task { await vm.resetDefaults(client: services.client) }
+                }
+                .buttonStyle(.omlx(.normal))
+                .disabled(vm.isMovingBasePath || vm.isLoading || vm.isResetting || services.canSaveSettingsOffline)
+                .help(String(localized: "settings.reset_defaults.help",
+                             defaultValue: "Restore default values. Paths and API keys are kept. Click Apply to save."))
                 Button(String(localized: "server.button.apply",
                               defaultValue: "Apply",
                               comment: "Button to apply pending server settings: port, default profile, storage, and aliases")) {
@@ -175,8 +204,15 @@ struct ServerScreen: View {
                 }
                     .buttonStyle(.omlx(.primary))
                     .disabled(!vm.hasPendingServerChanges(services: services)
-                              || vm.isMovingBasePath)
+                              || vm.isMovingBasePath || vm.isResetting)
             }
+        }
+        .alert(String(localized: "settings.reset_defaults.title",
+                      defaultValue: "Settings Reset"), isPresented: $vm.showResetNotice) {
+            Button(String(localized: "common.ok", defaultValue: "OK"), role: .cancel) {}
+        } message: {
+            Text(String(localized: "settings.reset_defaults.message",
+                        defaultValue: "Settings have been reset to defaults. Click Apply to save the changes."))
         }
         .task {
             // services.config is already populated by AppDelegate before this
@@ -545,8 +581,8 @@ private struct ServerDefaultProfileEditor: View {
                                                   defaultValue: "Pin in memory",
                                                   comment: "Disabled row label for Pin in memory"),
                                     note: String(localized: "server.profile.pin_in_memory.note",
-                                                 defaultValue: "Per-model only.",
-                                                 comment: "Note marking Pin in memory as per-model only"))
+                                                 defaultValue: "Per-model only - see Models > [model] > Advanced.",
+                                                 comment: "Note explaining where to configure Pin in memory"))
                     perModelOnlyRow(label: String(localized: "server.profile.speculative_decoding",
                                                   defaultValue: "Speculative decoding",
                                                   comment: "Disabled row label for Speculative decoding"),

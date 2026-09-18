@@ -2010,13 +2010,14 @@ class TestSpeculationStats:
 @pytest.mark.parametrize(
     "scenario", ["complete", "abort", "cancel_queued", "cancel_running"]
 )
-async def test_generation_abort_lifetime(monkeypatch, streaming, scenario):
+async def test_generation_abort_lifetime(monkeypatch, caplog, streaming, scenario):
     from dflash_mlx.engine.events import TokenEvent
 
     from omlx.engine.dflash import DFlashEngine
     from omlx.exceptions import PrefillMemoryAbortedError
     from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
+    monkeypatch.setattr("omlx.engine.dflash._EXECUTOR_DRAIN_TIMEOUT", 0.01)
     started = threading.Event()
     release = threading.Event()
     closed = threading.Event()
@@ -2061,10 +2062,12 @@ async def test_generation_abort_lifetime(monkeypatch, streaming, scenario):
                         await asyncio.sleep(0.01)
             if scenario.startswith("cancel"):
                 task.cancel()
-                # Exercise the real 10-second drain timeout, including its
-                # cancellation of the asyncio wrapper around executor work.
+                # Exercise the real timeout path with a short test deadline,
+                # including cancellation of the asyncio executor wrapper.
                 with pytest.raises(asyncio.CancelledError):
                     await task
+                assert "DFlash executor did not exit within" in caplog.text
+                assert not closed.is_set()
                 assert engine.has_active_requests() is (blocker is None)
             else:
                 if scenario == "abort":
@@ -2099,3 +2102,43 @@ async def test_generation_abort_lifetime(monkeypatch, streaming, scenario):
         assert not engine._active_stop_events
         assert closed.is_set() is (blocker is None)
         assert engine.get_activity_snapshot()["active_requests"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["stop", "_evict_dflash_and_start_fallback"])
+async def test_shutdown_persists_snapshot_on_generation_thread(
+    monkeypatch, tmp_path, method
+):
+    cache_manager = pytest.importorskip("dflash_mlx.cache.manager")
+    from omlx import engine_core
+    from omlx.engine import batched, dflash
+
+    engine = dflash.DFlashEngine("target", "draft")
+    target = object()
+    engine._target_model = target
+    persisted = tmp_path / "snapshot"
+    fallback = SimpleNamespace(start=AsyncMock())
+    monkeypatch.setattr(batched, "BatchedEngine", lambda **kwargs: fallback)
+    memory = iter((2, 1))
+    monkeypatch.setattr(dflash.mx, "get_active_memory", lambda: next(memory))
+    monkeypatch.setattr(dflash.mx, "synchronize", lambda: None)
+    monkeypatch.setattr(dflash.mx, "clear_cache", lambda: None)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(engine_core, "get_mlx_executor", lambda: executor)
+        owner = await asyncio.get_running_loop().run_in_executor(
+            executor, threading.get_ident
+        )
+
+        def persist():
+            assert threading.get_ident() == owner
+            assert engine._target_model is target
+            persisted.write_bytes(b"snapshot")
+
+        monkeypatch.setattr(cache_manager, "shutdown_runtime_cache_manager", persist)
+        await getattr(engine, method)()
+
+    assert persisted.read_bytes() == b"snapshot"
+    assert engine._target_model is None
+    if method != "stop":
+        fallback.start.assert_awaited_once()

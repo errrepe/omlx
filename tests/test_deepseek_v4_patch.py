@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the DeepSeek V4 monkey-patch (PR 1192 port)."""
 
-import importlib
 import inspect
 import json
 import os
@@ -162,6 +161,32 @@ class TestUtilsPatch:
             is True
         )
 
+    @pytest.mark.parametrize("location", ["quantization", "quantization_config", "text_quantization", "text_quantization_config"])
+    @pytest.mark.parametrize("bits", [2, 3, 3.5])
+    def test_nested_sub4_override_disables_native_attention(self, location, bits):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        quantization = {"bits": 4, "overrides": [{"layers.0.mlp": {"bits": bits}}]}
+        config = {"model_type": "deepseek_v4"}
+        if location.startswith("text_"):
+            config["text_config"] = {location[5:]: quantization}
+        else:
+            config[location] = quantization
+        assert _native_ratio128_attention_enabled(config) is False
+
+    @pytest.mark.parametrize("bits", [4, 8, True, False, None, "3"])
+    def test_nested_non_sub4_values_keep_existing_dispatch(self, bits):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        config = {"model_type": "deepseek_v4", "quantization": {"layers": {"bits": bits}}}
+        assert _native_ratio128_attention_enabled(config) is True
+        config = {"model_type": "qwen3", "quantization": {"bits": 2}}
+        assert _native_ratio128_attention_enabled(config) is True
+
     @pytest.mark.parametrize(
         ("bits", "expected_enabled"),
         ((4, True), (2, False)),
@@ -202,17 +227,12 @@ class TestUtilsPatch:
         assert loaded_config["use_native_ratio128_attention"] is expected_enabled
 
 
-class TestGeneratePatch:
-    """mlx_lm.generate._make_cache replaced."""
+class TestBatchCacheConversion:
+    """Model-owned caches retain batch conversion with upstream cache creation."""
 
-    def test_make_cache_replaced(self, applied_patch):
-        gen_mod = importlib.import_module("mlx_lm.generate")
+    def test_pooling_cache_conversion(self, applied_patch):
+        from omlx.scheduler import _patched_merge_caches
 
-        assert hasattr(gen_mod, "_make_cache")
-        # Source must include PoolingCache → BatchPoolingCache branch.
-        # We can't easily compare functions, so just verify the new
-        # behavior: passing a model with a PoolingCache in make_cache
-        # produces a BatchPoolingCache.
         from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
 
         class FakeModel:
@@ -222,7 +242,7 @@ class TestGeneratePatch:
             def make_cache(self):
                 return [PoolingCache(ratio=4)]
 
-        result = gen_mod._make_cache(FakeModel(), [0], None)
+        result = _patched_merge_caches([FakeModel().make_cache()])
         assert len(result) == 1
         assert isinstance(result[0], BatchPoolingCache)
 
@@ -238,8 +258,7 @@ class TestGeneratePatch:
             patch_setup = (
                 "apply_deepseek_v4_patch()\n            import omlx.scheduler"
             )
-        script = textwrap.dedent(
-            f"""
+        script = textwrap.dedent(f"""
             import importlib
 
             from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -260,11 +279,10 @@ class TestGeneratePatch:
                     return [CacheList(PoolingCache(4), QSAKVCache())]
 
             generate = importlib.import_module("mlx_lm.generate")
-            caches = generate._make_cache(Model(), [0], None)
+            caches = generate._merge_caches([Model().make_cache()])
             assert isinstance(caches[0].caches[0], BatchPoolingCache)
             assert isinstance(caches[0].caches[1], BatchQSAKVCache)
-            """
-        )
+            """)
         env = dict(os.environ)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         result = subprocess.run(

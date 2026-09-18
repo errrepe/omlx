@@ -2,9 +2,9 @@
 //   • ServerHeroCard (the same card the Server screen mounts; defined in
 //     ServerScreen.swift)
 //   • Serving Stats — prefill/cache tiles + average speed from /admin/api/stats
+//   • Active Now — active_models slice from /api/stats
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
 //   • Updates — release check status + auto-check/auto-notify prefs
-//   • Active Now — active_models slice from /api/stats
 //
 // Polling is on-screen-only: a 5s timer ticks while the view is visible.
 
@@ -66,6 +66,8 @@ struct StatusScreen: View {
                                   defaultValue: "Active Now",
                                   comment: "Section header for the currently active models list"))
             ActiveNowList(models: vm.stats?.activeModels.models ?? [])
+
+            UsageHistoryView()
 
             SectionHeader(String(localized: "status.section.system",
                                   defaultValue: "System",
@@ -487,8 +489,8 @@ private struct SystemRamTrailing: View {
         guard let used = metrics.ramUsedBytes,
               let total = metrics.ramTotalBytes
         else { return "—" }
-        let u = SystemMetricsPoller.formatBytesAsGB(used)
-        let t = SystemMetricsPoller.formatBytesAsGB(total)
+        let u = SystemMetricsPoller.formatBytesAsGiB(used)
+        let t = SystemMetricsPoller.formatBytesAsGiB(total)
         return "\(u) / \(t) GB"
     }
 }

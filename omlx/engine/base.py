@@ -29,6 +29,22 @@ _PREFLIGHT_CLEANUP_POLL_INTERVAL_S = 0.05
 _PREFLIGHT_UNREACHABLE_WARNED: set[tuple[str, str]] = set()
 
 
+async def _close_engine_core(engine) -> bool:
+    """Finish off-loop close even when its caller is cancelled.
+
+    Return cancellation to the wrapper so it can clear its references first.
+    """
+    task = asyncio.create_task(asyncio.to_thread(engine.close))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    return cancelled
+
+
 def _clear_teardown_references(
     engine: object,
     *,
@@ -204,6 +220,18 @@ class BaseEngine(ABC):
     Both SimpleEngine and BatchedEngine implement this interface,
     allowing the server to use either without code changes.
     """
+
+    @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        """Whether Chat may parse raw tool envelopes before engine finish.
+
+        Default-false by design. An engine may opt in only when its underlying
+        producer cannot also return authoritative structured ``tool_calls`` for
+        the same stream; otherwise the API layer cannot safely emit before the
+        terminal output arrives.
+        """
+
+        return False
 
     @property
     @abstractmethod
@@ -592,6 +620,9 @@ class BaseNonStreamingEngine(ActivityTrackingMixin, ABC):
     These engines compute outputs in a single forward pass and don't
     support streaming or chat completion interfaces.
     """
+
+    def set_memory_soft_limit(self, soft_limit_bytes: int) -> None:
+        """Receive the enforcer's soft watermark; override when needed."""
 
     @property
     @abstractmethod

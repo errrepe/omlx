@@ -25,6 +25,7 @@ compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 
 from mlx_vlm.models.qwen4_exp.language import (  # noqa: E402
     DiskBackedShardedEmbedding,
+    _SafeTensorMMap,
     _align_ranges_to_page,
     _merge_byte_ranges,
     _ple_prefault_min_rows,
@@ -248,6 +249,13 @@ def test_prefault_survives_pread_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "pread", exploding_pread)
     monkeypatch.setenv(PREFAULT_ENV, "1")
+    # Scope to our prefault path: upstream's page-touch prefetch re-raises
+    # I/O failures by contract (see test_qwen4_runtime_ple_fork_cpu.py), so
+    # it is stubbed out here — the exploding pread must only reach
+    # _prefault_fd_ranges, which is the best-effort path under test.
+    monkeypatch.setattr(
+        _SafeTensorMMap, "_prefetch_missing_pages", lambda *a, **k: True
+    )
 
     assert _gather(tmp_path, indices, num_embeddings).tolist() == baseline.tolist()
 

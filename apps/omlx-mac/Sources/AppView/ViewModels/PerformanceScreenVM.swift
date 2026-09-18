@@ -42,6 +42,9 @@ final class PerformanceScreenVM {
     private(set) var loadedInitialCacheBlocks: Int? = nil
 
     private(set) var isSaving: Bool = false
+    var showResetNotice = false
+    private(set) var isLoading = false
+    private(set) var isResetting = false
     var lastError: String?
 
     /// System memory snapshot from GET /admin/api/global-settings. Drives
@@ -68,7 +71,52 @@ final class PerformanceScreenVM {
             || parsedInitialCacheBlocks != loadedInitialCacheBlocks
     }
 
+    func resetDefaults(client: OMLXClient) async {
+        guard !isLoading, !isResetting else { return }
+        isResetting = true
+        defer { isResetting = false }
+        do {
+            let s = try await client.getGlobalSettingsDefaults()
+            if let sched = s.scheduler {
+                self.maxConcurrentText = String(sched.maxConcurrentRequests)
+                let embeddingBatchSize = sched.embeddingBatchSize ?? 32
+                self.embeddingBatchSizeText = String(embeddingBatchSize)
+                self.chunkedPrefill = sched.chunkedPrefill ?? false
+                let priority = sched.prefillPriority == "speed" ? "speed" : "context"
+                self.prefillPriority = priority
+            }
+            if let mem = s.memory {
+                self.prefillMemoryGuard = mem.prefillMemoryGuard ?? false
+                let tier = canonicalMemoryGuardTier(mem.memoryGuardTier ?? "balanced")
+                self.memoryGuardTier = tier
+                let customGb = mem.memoryGuardCustomCeilingGb ?? 0
+                self.memoryGuardCustomCeilingText = customGb > 0 ? trimDouble(customGb) : ""
+            }
+            if let model = s.model {
+                self.modelFallback = model.modelFallback ?? false
+            }
+            if let idle = s.idleTimeout {
+                self.idleTimeoutText = idle.idleTimeoutSeconds.map { String($0) } ?? ""
+            }
+            if let cache = s.cache {
+                self.cacheEnabled = cache.enabled
+                self.hotCacheOnly = cache.hotCacheOnly ?? false
+                let hotCacheMaxSize = canonicalHotCacheMaxSize(cache.hotCacheMaxSize ?? "")
+                self.hotCacheMaxSize = hotCacheMaxSize
+                self.ssdCacheMaxSize = cache.ssdCacheMaxSize ?? ""
+                self.initialCacheBlocksText = cache.initialCacheBlocks.map { String($0) } ?? ""
+            }
+
+            self.lastError = nil
+            self.showResetNotice = true
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
     func load(client: OMLXClient) async {
+        isLoading = true
+        defer { isLoading = false }
         do {
             let s = try await client.getGlobalSettings()
             if let sched = s.scheduler {
