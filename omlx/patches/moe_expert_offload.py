@@ -782,9 +782,14 @@ class LegacyOffloadState:
         min_budget_bytes: int | None = None,
         stall_target: float | None = None,
         min_cap: int | None = None,
+        streaming_fallback_reason: str | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self.caches = list(caches)
+        # B8 downgrade marker: set when the unified streaming backend
+        # owned this model type but converted nothing — surfaced through
+        # summary() so the fallback is visible, not silent.
+        self.streaming_fallback_reason = streaming_fallback_reason
         self.num_layers = len(self.caches)
         self.per_slot = max(
             1,
@@ -894,7 +899,7 @@ class LegacyOffloadState:
             misses = sum(c.misses for c in self.caches)
             resident = sum(len(c.slot_of) for c in self.caches)
         total = hits + misses
-        return {
+        out = {
             "hits": hits,
             "misses": misses,
             "hit_rate": (hits / total) if total else 0.0,
@@ -904,6 +909,10 @@ class LegacyOffloadState:
             "layers": self.num_layers,
             "governor": gov,
         }
+        if self.streaming_fallback_reason:
+            # Folds into expert_streaming_summary's backing slot.
+            out["streaming_fallback_reason"] = self.streaming_fallback_reason
+        return out
 
 
 def _resolve_model_dir(model_path: str | Path) -> Path | None:
@@ -1093,6 +1102,16 @@ def apply_moe_expert_offload(
             "%s; falling back to the legacy fetch-on-miss adapter",
             model_path,
         )
+        return _apply_legacy_adapter(
+            model,
+            model_path,
+            resident_fraction,
+            model_settings,
+            streaming_fallback_reason=(
+                "expert_streaming owns this model type but converted "
+                "nothing"
+            ),
+        )
     return _apply_legacy_adapter(
         model, model_path, resident_fraction, model_settings
     )
@@ -1103,12 +1122,19 @@ def _apply_legacy_adapter(
     model_path: str | Path,
     resident_fraction: float = 0.25,
     model_settings=None,
+    *,
+    streaming_fallback_reason: str | None = None,
 ) -> int:
     """Legacy fetch-on-miss adapter (legacy-owned types + unit tests).
 
     Unchanged behavior: wraps covered stock SwitchGLUs in OffloadSwitchGLU.
     Must run before lazy weights are materialized for the memory saving
     to exist.
+
+    ``streaming_fallback_reason`` marks a downgrade: the unified backend
+    owned this model type but produced nothing, so the wrapped state is
+    stamped with the reason (visible via ``expert_streaming_summary``)
+    and logged at error level instead of passing silently.
     """
     model_dir = _resolve_model_dir(model_path)
     if model_dir is None:
@@ -1158,6 +1184,7 @@ def _apply_legacy_adapter(
             # requests would thrash an LRU sized for a single stream. The
             # store doubles as the shutdown
             # handle — shutdown_expert_streaming() calls close() on it.
+            store.streaming_fallback_reason = streaming_fallback_reason
             model._expert_streaming_backing = store  # type: ignore[attr-defined]
         except Exception:
             pass
@@ -1186,12 +1213,22 @@ def _apply_legacy_adapter(
                     "expert_streaming_dynamic_stall_target"
                 ),
                 min_cap=minimum,
+                streaming_fallback_reason=streaming_fallback_reason,
             )
             for m in wrapped_mods:
                 m._state = state
             model._moe_offload_legacy_state = state  # type: ignore[attr-defined]
         except Exception:
             logger.debug("legacy offload state wiring failed", exc_info=True)
+        if streaming_fallback_reason:
+            # The downgrade must be loud: a streaming-owned model running
+            # the legacy adapter is a degraded mode, not a silent choice.
+            logger.error(
+                "moe expert offload: DOWNGRADED to the legacy "
+                "fetch-on-miss adapter: %s (%d layers wrapped)",
+                streaming_fallback_reason,
+                wrapped,
+            )
         logger.info(
             "moe expert offload: wrapped %d layers at %.1f%% residency "
             "(expert tables: %.2f GB total, %.2f GB resident)",
@@ -1238,14 +1275,37 @@ def _apply_via_streaming(
     resident_fraction: float,
     model_settings=None,
 ) -> int:
-    """Convert via the expert_streaming stack; 0 when it converts nothing."""
+    """Convert via the expert_streaming stack; 0 when it converts nothing.
+
+    Downgrade contract: a failure while support is unproven (imports, the
+    structural estimate itself) degrades to the legacy adapter — the
+    caller stamps that fallback with a downgrade marker. Once
+    ``est.supported`` holds the generic converter owns this model family,
+    so a crash there is re-raised: a broken conversion must not hide
+    behind a silent legacy fallback.
+    """
     import dataclasses
 
-    from ..model_settings import ModelSettings
-    from .expert_streaming import _budget_is_pinned, convert_model_to_streaming
-    from .expert_streaming.residency import expert_streaming_estimate
+    try:
+        from ..model_settings import ModelSettings
+        from .expert_streaming import (
+            _budget_is_pinned,
+            convert_model_to_streaming,
+        )
+        from .expert_streaming.residency import expert_streaming_estimate
 
-    est = expert_streaming_estimate(str(model_path))
+        est = expert_streaming_estimate(str(model_path))
+    except Exception:
+        # Raised while support is unproven: degrade to the legacy adapter
+        # (downgrade-stamped by the caller) instead of crashing a load it
+        # could still serve.
+        logger.error(
+            "moe expert offload: streaming backend unavailable for %s; "
+            "falling back to the legacy fetch-on-miss adapter",
+            model_path,
+            exc_info=True,
+        )
+        return 0
     if not est.supported:
         return 0
     if getattr(model, "_expert_streaming_backing", None) is not None:
@@ -1284,15 +1344,16 @@ def _apply_via_streaming(
     try:
         _, backing = convert_model_to_streaming(model, model_path, settings)
     except Exception:
-        # Never crash a load the legacy adapter could still serve: fall
-        # through to it.
-        logger.warning(
-            "moe expert offload: streaming backend failed for %s; falling "
-            "back to the legacy fetch-on-miss adapter",
+        # Fail hard: the structural estimate says streaming owns this
+        # family, so a converter crash is a real defect — re-raise rather
+        # than hide it behind a legacy fallback that was never asked for.
+        logger.error(
+            "moe expert offload: streaming backend crashed on a "
+            "streaming-owned model (%s); refusing silent legacy fallback",
             model_path,
             exc_info=True,
         )
-        return 0
+        raise
     if backing is None:
         return 0
     try:
