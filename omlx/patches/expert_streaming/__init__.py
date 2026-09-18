@@ -95,6 +95,13 @@ from .lifecycle import (
 from .lifecycle import (
     teardown_expert_streaming as teardown_expert_streaming,
 )
+from .model_hooks import (
+    DEFAULT_PREFIX_TEMPLATES as DEFAULT_PREFIX_TEMPLATES,
+    find_moe_container as find_moe_container,
+    find_moe_owner as find_moe_owner,
+    find_mtp_stages as find_mtp_stages,
+    hooks_for as hooks_for,
+)
 from .residency import (
     SUPPORTED_TYPES,
     load_config_model_type,
@@ -154,6 +161,16 @@ try:
     from .governor import dynamic_residency_enabled
 except Exception:  # pragma: no cover - governor has no mlx dependency
     dynamic_residency_enabled = lambda: False  # type: ignore[assignment]
+
+try:
+    # Leaf imports (expert_cache/cache_policies) — the pre-split spelling
+    # ``from .streaming_switch import ...`` is equivalent, the leaves are
+    # where they live now; the guard keeps mlx-less imports working.
+    from .cache_policies import S3FIFOExpertCache
+    from .expert_cache import make_expert_cache
+except Exception:  # pragma: no cover - these leaves import mlx
+    S3FIFOExpertCache = None  # type: ignore[assignment]
+    make_expert_cache = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 

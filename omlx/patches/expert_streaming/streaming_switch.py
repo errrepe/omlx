@@ -101,3 +101,14 @@ from .streaming_layers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str):
+    # `from .streaming_switch import S3FIFOExpertCache` keeps working —
+    # the class lives in cache_policies (which imports the expert_cache
+    # leaf, never this façade, so the lazy edge cannot cycle).
+    if name == "S3FIFOExpertCache":
+        from .cache_policies import S3FIFOExpertCache
+
+        return S3FIFOExpertCache
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
