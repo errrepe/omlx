@@ -347,7 +347,7 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_pin_gib: float | None = None
     expert_streaming_pin_sync: bool | None = None
     expert_streaming_pin_regime: str | None = None
-    # "2"/"3" select a cold precision tier (""/None = off); int values are
+    # "2".."8" select a cold precision tier (""/None = off); int values are
     # accepted and coerce the same way the bounds check does (str()).
     expert_streaming_cold_tier: str | int | None = None
     expert_streaming_hot_fraction: float | None = None
@@ -3633,8 +3633,12 @@ def _validate_expert_streaming_bounds(settings: dict) -> None:
     # The advanced toggles are strict booleans: the runtime treats any
     # truthy/falsy value as a flag, so silently accepting "true"/1/[] would
     # persist a value the load path interprets differently from what the
-    # admin contract reported back. Missing/None means "keep the default".
+    # admin contract reported back (e.g. dynamic "auto" -> bool() -> forced
+    # on, budget_auto 0 -> `is False` misses -> auto stays on). Missing/None
+    # means "keep the default".
     for name in (
+        "expert_streaming_budget_auto",
+        "expert_streaming_dynamic",
         "expert_streaming_coalesce",
         "expert_streaming_readahead",
         "expert_streaming_seed",
@@ -3657,7 +3661,10 @@ def _validate_expert_streaming_bounds(settings: dict) -> None:
         ("expert_streaming_pin_gib", 0, 64, True, False, " GiB"),
         ("expert_streaming_dynamic_stall_target", 0, 0.9, False, False, ""),
         ("expert_streaming_io_depth", 1, 64, False, True, ""),
-        ("expert_streaming_topk_threshold", 0, 1, True, False, ""),
+        # Runtime floor is _MIN_THRESHOLD (adaptive_topk.py): below 0.05
+        # the value is dropped to exact routing, so the admin rejects it
+        # instead of persisting a knob that never engages.
+        ("expert_streaming_topk_threshold", 0.05, 1, False, False, ""),
         ("expert_streaming_cache_prior", 0, None, False, False, ""),
         ("expert_streaming_hot_fraction", 0, 1, False, False, ""),
     )
@@ -3686,7 +3693,9 @@ def _validate_expert_streaming_bounds(settings: dict) -> None:
     choice_fields = (
         ("expert_streaming_cache_policy", ("lru", "s3fifo")),
         ("expert_streaming_pin_regime", ("decode", "prefill")),
-        ("expert_streaming_cold_tier", ("", "2", "3")),
+        # Runtime accepts any "2".."8" digit label
+        # (conversion._resolve_cold_tier_root); "" stays legal = off.
+        ("expert_streaming_cold_tier", ("", "2", "3", "4", "5", "6", "7", "8")),
     )
     for name, choices in choice_fields:
         value = settings.get(name)
