@@ -62,7 +62,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
-from .patches.expert_streaming import find_streaming_backing
+from .patches.expert_streaming import find_model_streaming_backing
 from .patches.expert_streaming._env import env_float
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
@@ -1586,9 +1586,12 @@ def _streaming_backing_of(model: Any) -> Any | None:
     requests would stream without serialization and the prefill guard
     would never charge the mini-bank transient. Delegates to the shared
     breadth-first walk — its visited set and depth cap bound adapter
-    property loops the same way the old linear chain's did.
+    property loops the same way the old linear chain's did. The
+    model-side variant is required: a walk rooted at a model must not
+    hop into ``engine``/``_model`` (a MagicMock model fabricates those,
+    and a real ``.engine`` back-ref could surface a sibling's backing).
     """
-    return find_streaming_backing(model)
+    return find_model_streaming_backing(model)
 
 
 def _model_uses_expert_streaming(model: Any) -> bool:

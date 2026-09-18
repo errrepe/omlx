@@ -376,22 +376,27 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
 # holders (``engine``/``_model``/``_vlm_model`` — the chain the old
 # ``_engine_holders`` walked flat). One walk covers both spellings so no
 # consumer needs a second chain.
-_BACKING_HOPS = (
+#
+# The sets stay separate on purpose: a walk that STARTS at a model must
+# not hop into ``engine``/``_model`` — a model's ``.engine`` back-ref
+# would surface a sibling model's backing (and mock-based callers
+# fabricate those attributes).
+_MODEL_BACKING_HOPS = (
     "language_model",
     "model",
-    "_model",
     "_vlm_model",
     "_language_model",
-    "engine",
 )
+_ENGINE_BACKING_HOPS = ("engine", "_model")
+_BACKING_HOPS = _MODEL_BACKING_HOPS + _ENGINE_BACKING_HOPS
 
 # Depth cap bounds adapter property loops (a hop that returns ``self``)
 # and pathological wrapper nesting; both legacy walks used 5.
 _BACKING_WALK_DEPTH = 5
 
 
-def _backing_holders(root: Any):
-    """Yield *root*, then every object reachable via ``_BACKING_HOPS``.
+def _backing_holders(root: Any, hops: tuple[str, ...] = _BACKING_HOPS):
+    """Yield *root*, then every object reachable via *hops*.
 
     Breadth-first so an engine's ``_model`` and ``_vlm_model`` are both
     visited (the flat engine-holder order) before descending into their
@@ -409,7 +414,7 @@ def _backing_holders(root: Any):
                 continue
             seen.add(id(obj))
             yield obj
-            for attr in _BACKING_HOPS:
+            for attr in hops:
                 try:
                     child = getattr(obj, attr, None)
                 except Exception:
@@ -429,6 +434,20 @@ def find_streaming_backing(root: Any) -> Any | None:
     breadth-first hop order wins.
     """
     for holder in _backing_holders(root):
+        backing = getattr(holder, "_expert_streaming_backing", None)
+        if backing is not None:
+            return backing
+    return None
+
+
+def find_model_streaming_backing(model: Any) -> Any | None:
+    """Model-side variant of ``find_streaming_backing``.
+
+    Uses only ``_MODEL_BACKING_HOPS`` — a walk rooted at a model never
+    hops into ``engine``/``_model``, where it could surface a different
+    model's backing (and mock-based callers fabricate those attributes).
+    """
+    for holder in _backing_holders(model, _MODEL_BACKING_HOPS):
         backing = getattr(holder, "_expert_streaming_backing", None)
         if backing is not None:
             return backing
@@ -782,6 +801,7 @@ __all__ = [
     "convert_model_to_streaming",
     "ensure_streaming_backing_or_raise",
     "find_streaming_backing",
+    "find_model_streaming_backing",
     "gate_up_fusion_blocked",
     "load_config_model_type",
     "post_load_offload_pipeline",
