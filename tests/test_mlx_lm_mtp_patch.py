@@ -11,9 +11,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten
+from omlx.cache.type_registry import CacheTypeRegistry
+from mlx_lm.generate_utils import BatchCounters
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.models.cache import KVCache
-from mlx_vlm.models.qwen3_5 import language
 
 from omlx.model_settings import ModelSettings
 from omlx.patches import mlx_lm_mtp
@@ -135,10 +136,7 @@ class TestMtpBoundaryCommit:
             _token_context=[],
             max_tokens=[1000],
             _num_tokens=[0],
-            _matcher_states=[0],
-            state_machines=[
-                SimpleNamespace(match=lambda state, token: (0, None, None))
-            ],
+            _matchers=[SimpleNamespace(advance=lambda token: False)],
         )
 
         monkeypatch.setattr(bg, "_call_backbone", fake_backbone)
@@ -1056,7 +1054,7 @@ class TestBatchGeneratorDispatch:
             _prompt_batch=prompt_batch,
             _currently_processing=[([[123]], 0, 1)],
             _unprocessed_sequences=[],
-            _gen_tokens_counter=0,
+            _counters=BatchCounters(),
             _steps_counter=0,
             _prompt_tokens_counter=0,
             _prompt_time_counter=0.0,
@@ -1262,7 +1260,6 @@ class TestBatchGeneratorDispatch:
 
         from omlx.patches.mlx_lm_mtp import batch_generator
 
-        matcher_state = object()
         batch = SimpleNamespace(
             uids=[7],
             _omlx_mtp_park_state=batch_generator._MtpParkState(
@@ -1272,12 +1269,7 @@ class TestBatchGeneratorDispatch:
             _step=lambda: ([42], [None]),
             _num_tokens=[0],
             max_tokens=[10],
-            state_machines=[
-                SimpleNamespace(
-                    match=lambda state, _token: (state, None, state)
-                )
-            ],
-            _matcher_states=[matcher_state],
+            _matchers=[SimpleNamespace(advance=lambda token: False)],
             Response=lambda **kwargs: kwargs,
             extract_cache=lambda _idx: [],
             tokens=[[]],
@@ -1406,23 +1398,73 @@ class TestBatchGeneratorDispatch:
         assert batch._next_tokens.tolist() == [999]
         assert backbone_calls == []
 
-    def test_late_join_handoff_failure_keeps_state(self, monkeypatch):
-        import mlx.core as mx
+    @pytest.mark.parametrize(
+        "handoff", ["_handoff_mtp_for_late_join", "_park_mtp_to_standard"]
+    )
+    @pytest.mark.parametrize("recovery_fails", [False, True])
+    def test_handoff_recovers_after_cache_mutation(
+        self, monkeypatch, handoff, recovery_fails
+    ):
+        from mlx_lm.models.cache import TokenBuffer
 
         bg, batch, state, backbone_calls = self._make_handoff_batch(
-            monkeypatch,
-            queue_entries=[],
-            next_main=mx.array([7], dtype=mx.uint32),
+            monkeypatch, queue_entries=[], next_main=mx.array([13], dtype=mx.uint32)
         )
+        batch.model = CountingModel()
+        backbone = bg._call_backbone
+        sampler = batch.fallback_sampler
+        error = RuntimeError("sampling failed after cache write")
+        samples = []
 
-        def broken_backbone(*_, **__):
-            raise RuntimeError("boom")
+        class Processor:
+            def __init__(self):
+                self.count = 0
+                self.prefixes = []
 
-        monkeypatch.setattr(bg, "_call_backbone", broken_backbone)
+            def __call__(self, tokens, logits):
+                self.count += 1
+                self.prefixes.append(tokens.tolist())
+                return logits
 
-        assert bg._handoff_mtp_for_late_join(batch, state) is False
-        assert batch._omlx_mtp_state is state
-        assert batch._next_tokens.tolist() == [999]
+            def snapshot_state(self):
+                return self.count
+
+            def restore_state(self, count):
+                self.count = count
+
+        processor = Processor()
+        batch.logits_processors = [[processor]]
+        batch._token_context = [TokenBuffer([10, 11, 12])]
+
+        def advancing_backbone(model, inputs, cache, **kwargs):
+            cache[0].offset += int(inputs.shape[1])
+            return backbone(model, inputs, cache, **kwargs)
+
+        def fail_once(logprobs):
+            samples.append(True)
+            if len(samples) == 1:
+                raise error
+            return sampler(logprobs)
+
+        monkeypatch.setattr(bg, "_call_backbone", advancing_backbone)
+        batch.fallback_sampler = fail_once
+        if recovery_fails:
+            monkeypatch.setattr(bg, "_rebuild_singleton_cache", lambda model: None)
+            with pytest.raises(RuntimeError, match="could not restore") as caught:
+                getattr(bg, handoff)(batch, state)
+            assert caught.value.__cause__ is error
+            assert batch._omlx_mtp_state is state
+            assert batch._next_tokens.tolist() == [999]
+        else:
+            assert getattr(bg, handoff)(batch, state)
+            assert batch._next_tokens.tolist() == [14]
+            cache = batch.prompt_cache[0].extract(0)
+            assert cache.keys[0, 0, : cache.offset, 0].tolist() == [10, 11, 12, 13]
+            assert batch._token_context[0].tokens.tolist() == [10, 11, 12, 13]
+            assert processor.count == 1
+            assert processor.prefixes == [[10, 11, 12, 13]] * 2
+            assert not hasattr(batch, "_omlx_mtp_state")
+        assert backbone_calls == [1]
 
     def test_performance_park_starts_reentry_cooldown(self, monkeypatch):
         import mlx.core as mx
@@ -1853,10 +1895,10 @@ class TestBatchGeneratorDispatch:
             queue_entries=[],
         )
 
-        # Nothing streamed yet -> cannot re-prefill; signal plain-drop fallback.
+        # No committed history is available to reconstruct.
         assert bg._reconcile_mtp_to_standard(batch, state) is False
 
-    def test_reconcile_fallback_on_rebuild_failure(self, monkeypatch):
+    def test_reconcile_reports_rebuild_failure(self, monkeypatch):
         import mlx.core as mx
 
         bg, batch, state = self._make_reconcile_batch(
@@ -1867,8 +1909,28 @@ class TestBatchGeneratorDispatch:
         )
         monkeypatch.setattr(bg, "_rebuild_singleton_cache", lambda model: None)
 
-        # Cache rebuild unavailable -> degrade to plain drop, never crash.
+        # The caller must stop decoding when cache recovery is unavailable.
         assert bg._reconcile_mtp_to_standard(batch, state) is False
+
+    def test_extend_stops_when_singleton_cache_recovery_fails(self, monkeypatch):
+        from mlx_lm.generate import GenerationBatch
+
+        bg, batch, state = self._make_reconcile_batch(
+            monkeypatch, uid=7, tokens=[10, 11], queue_entries=[]
+        )
+        monkeypatch.setattr(bg, "_rebuild_singleton_cache", lambda model: None)
+
+        class UnmergeableUids(list):
+            def extend(self, other):
+                pytest.fail("Merged rows after cache recovery failed")
+
+        batch.uids = UnmergeableUids(batch.uids)
+        donor = SimpleNamespace(uids=[8])
+
+        with pytest.raises(RuntimeError, match="could not restore the committed cache"):
+            GenerationBatch.extend(batch, donor)
+        assert batch.uids == [7]
+        assert batch._omlx_mtp_state is state
 
 
 # ---------------------------------------------------------------------------
@@ -2407,7 +2469,7 @@ class TestRotatingCacheMtpUndo:
         mx.eval(ck, cv, rk, rv)
         assert mx.array_equal(ck, rk).item()
         assert mx.array_equal(cv, rv).item()
-        assert cache.meta_state == ref.meta_state
+        assert (cache.max_size, cache._idx) == (ref.max_size, ref._idx)
         c_off = cache.offset
         r_off = ref.offset
         if hasattr(c_off, "tolist"):
@@ -2892,8 +2954,12 @@ class TestReconcileChunked:
                 logits = model(tokens[None, start : start + step], cache=reference)
                 mx.eval(logits)
             for actual, wanted in zip(target.prompt_cache, reference):
-                for a, b in zip(actual.state, wanted.state):
-                    assert mx.allclose(a, b).item()
+                for (_, a), (_, b) in zip(
+                    tree_flatten(actual.state), tree_flatten(wanted.state)
+                ):
+                    assert (
+                        mx.allclose(a, b).item() if isinstance(a, mx.array) else a == b
+                    )
             expected_token = 7 if queued else mx.argmax(logits[:, -1, :]).item()
             assert target._next_tokens.item() == expected_token
         finally:
@@ -3008,6 +3074,77 @@ def generate(
         return output, terminal
     finally:
         gen.close()
+
+
+@pytest.mark.parametrize("recovery_fails", [False, True])
+def test_singleton_rollback_requires_successful_cache_recovery(
+    monkeypatch, recovery_fails
+):
+    class RejectDrafts(CountingModel):
+        def mtp_forward(self, hidden, tokens, cache, return_hidden=False, **kwargs):
+            logits = self._logits(tokens + 1)
+            return (
+                (logits, tokens[..., None].astype(mx.float32))
+                if return_hidden
+                else logits
+            )
+
+    monkeypatch.setattr(bg, "_chain_rollback", lambda *args: False)
+    if recovery_fails:
+        monkeypatch.setattr(bg, "_rebuild_singleton_cache", lambda model: None)
+        with pytest.raises(RuntimeError, match="could not restore the committed cache"):
+            generate(RejectDrafts(), [[1, 2]], [8])
+    else:
+        output, terminal = generate(RejectDrafts(), [[1, 2]], [8])
+        assert output[0] == list(range(3, 11))
+        cache = terminal[0].prompt_cache[0]
+        assert cache.keys[0, 0, : cache.offset, 0].tolist() == list(range(1, 10))
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_park_recovery_includes_the_token_being_emitted(monkeypatch, stop):
+    class RejectDrafts(CountingModel):
+        def mtp_forward(self, hidden, tokens, cache, return_hidden=False, **kwargs):
+            logits = self._logits(tokens + 1)
+            return (
+                (logits, tokens[..., None].astype(mx.float32))
+                if return_hidden
+                else logits
+            )
+
+    feed = bg._feed_next_main_to_standard
+    backbone = bg._call_backbone
+    failures = []
+    in_handoff = False
+
+    def observed_feed(*args):
+        nonlocal in_handoff
+        in_handoff = True
+        try:
+            return feed(*args)
+        finally:
+            in_handoff = False
+
+    def fail_after_forward(*args, **kwargs):
+        result = backbone(*args, **kwargs)
+        if in_handoff and not failures:
+            failures.append(True)
+            raise RuntimeError("injected handoff failure")
+        return result
+
+    monkeypatch.setattr(bg, "_feed_next_main_to_standard", observed_feed)
+    monkeypatch.setattr(bg, "_call_backbone", fail_after_forward)
+    monkeypatch.setattr(bg._DepthController, "should_exit", lambda self: True)
+    output, terminal = generate(
+        RejectDrafts(), [[1, 2]], [8], stop_tokens=[[5]] if stop else None
+    )
+    assert failures == ([] if stop else [True])
+    assert output[0] == list(range(3, 6 if stop else 11))
+    assert terminal[0].finish_reason == ("stop" if stop else "length")
+    cache = terminal[0].prompt_cache[0]
+    assert cache.keys[0, 0, : cache.offset, 0].tolist() == list(
+        range(1, 5 if stop else 11)
+    )
 
 
 @pytest.mark.parametrize("limits", [[8, 9], [1, 8], [3, 8], [4, 8]])
@@ -3694,15 +3831,9 @@ def _model(family):
 
         return Model(ModelArgs.from_dict(TINY_CFG))
     if family == "glm5":
-        from test_glm5_next_mtp import TINY_TEXT_CONFIG
+        from test_glm5_next_mtp import make_host
 
-        from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
-
-        glm5_next_vlm_runtime.apply()
-        from mlx_vlm.models.glm5_next.config import TextConfig
-        from mlx_vlm.models.glm5_next.language import LanguageModel
-
-        return _adapter(LanguageModel(TextConfig.from_dict(TINY_TEXT_CONFIG)))
+        return _adapter(make_host(mtp_layers=1))
     if family == "step":
         from test_step3p7_patch import step3p7_mtp_model
 
@@ -3760,7 +3891,9 @@ def test_reconcile_matches_ordinary_prefill_cache_and_next_token(family, queued)
                     assert mx.array_equal(value, ref).item(), (family, key)
                 else:
                     assert value == ref
-            assert actual.meta_state == expected.meta_state
+            assert getattr(actual, "meta_state", ()) == getattr(
+                expected, "meta_state", ()
+            )
         expected_token = 7 if queued else mx.argmax(logits[:, -1, :]).item()
         assert batch._next_tokens.item() == expected_token
         assert batch.tokens == [history]
@@ -3800,7 +3933,9 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
                     assert mx.array_equal(value, ref), (family, key)
                 else:
                     assert value == ref
-            assert actual.meta_state == expected.meta_state
+            assert getattr(actual, "meta_state", ()) == getattr(
+                expected, "meta_state", ()
+            )
         handoffs.append(tuple(batch.uids))
         return result
 
@@ -4087,6 +4222,75 @@ def test_cost_includes_scheduler_interval_but_not_a_mode_transition():
     assert abs(policy.cycle_time_ms("mtp", 2.034, 2.064) - 34) < 1e-9
 
 
+def test_prefill_wait_does_not_park_a_faster_batch():
+    policy = calibrated(batch=2, depth=2)
+    now = 0.0
+    for _ in range(40):
+        costs = {depth: list(values) for depth, values in policy.costs.items()}
+        policy.interrupt_timing()
+        now += 1.0
+        elapsed = policy.cycle_time_ms("mtp", now, now + 0.02)
+        policy.observe_mtp(2, [2, 2], elapsed, stable=True)
+        assert elapsed is None
+        assert {depth: list(values) for depth, values in policy.costs.items()} == costs
+        now += 0.02
+        for _ in range(3):
+            depth = policy.cur
+            elapsed = policy.cycle_time_ms("mtp", now, now + 0.02)
+            policy.observe_mtp(depth, [depth, depth], elapsed, stable=True)
+            now += 0.02
+        assert not policy.should_park()
+    assert all(abs(t - 20) < 1e-6 for costs in policy.costs.values() for t in costs)
+
+
+def test_interrupted_standard_sample_preserves_calibration_and_cooldown():
+    policy = calibrated()
+    policy.park()
+    for _ in range(128):
+        policy.interrupt_timing()
+        elapsed = policy.cycle_time_ms("standard", 1, 2)
+        policy.observe_standard(elapsed)
+    assert policy.remaining == 0
+    assert policy.standard_warmup == 2
+    assert list(policy.standard) == [10, 10, 10]
+    for i in range(3):
+        now = 2 + i * 0.01
+        policy.observe_standard(policy.cycle_time_ms("standard", now, now + 0.01))
+    assert not policy.needs_standard()
+
+
+def test_generator_prefill_interrupts_batch_cost_samples(monkeypatch):
+    observed = []
+    clock = BatchPolicy.cycle_time_ms
+
+    def record(policy, *args):
+        elapsed = clock(policy, *args)
+        observed.append(elapsed)
+        return elapsed
+
+    monkeypatch.setattr(BatchPolicy, "cycle_time_ms", record)
+    bg.apply()
+    gen = BatchGenerator(
+        CountingModel(),
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=2,
+        prefill_step_size=3,
+        max_tokens=100,
+    )
+    try:
+        gen.insert([[1, 2], [3, 4]])
+        for _ in range(12):
+            gen.next()
+        observed.clear()
+        gen.insert([[20] * 24])
+        for _ in range(6):
+            gen.next()
+        assert None in observed
+        assert any(value is not None for value in observed)
+    finally:
+        gen.close()
+
+
 def _coupled_sampler(index):
     key = mx.random.key(index + 90)
 
@@ -4162,7 +4366,16 @@ def test_batched_head_matches_row_caches_across_depth_changes(size, family, stoc
                     actual = layer.extract(index)
                     assert actual.offset == reference.offset
                     for (_, tensor), (_, expected) in zip(
-                        tree_flatten(actual.state), tree_flatten(reference.state)
+                        tree_flatten(
+                            CacheTypeRegistry.get_handler_for_object(
+                                actual
+                            ).serialize_state(actual)
+                        ),
+                        tree_flatten(
+                            CacheTypeRegistry.get_handler_for_object(
+                                reference
+                            ).serialize_state(reference)
+                        ),
                     ):
                         assert mx.allclose(tensor, expected, rtol=1e-4, atol=1e-4)
         batched_head.flush(owner)
@@ -4385,36 +4598,39 @@ def test_singleton_only_model_decodes_multirow_without_mtp(monkeypatch, late_joi
         mlx_lm_mtp.set_mtp_active(active)
 
 
-def test_singleton_and_ordinary_dispatch_are_preserved():
+def test_singleton_and_ordinary_dispatch_are_preserved(monkeypatch):
     calls = []
 
-    def original(linear, x, verify):
-        calls.append((x.shape, verify))
-        return verify
+    from mlx_vlm.speculative.ops import linear as ops
 
-    fake = SimpleNamespace(_use_target_verify_dense=original)
-    qwen35_verify_linear.apply(fake)
-    first = fake._use_target_verify_dense
-    qwen35_verify_linear.apply(fake)
-    assert fake._use_target_verify_dense is first
-    assert first(None, mx.zeros((1, 3, 64)), True)
-    assert not first(None, mx.zeros((1, 1, 64)), False)
-    assert not first(None, mx.zeros((4, 3, 64)), True)
-    assert calls == [((1, 3, 64), True), ((1, 1, 64), False)]
+    def original(linear, x):
+        calls.append(x.shape)
+        return True
+
+    monkeypatch.setattr(ops, "_use_target_verify_dense", original)
+    qwen35_verify_linear.apply()
+    first = ops._use_target_verify_dense
+    qwen35_verify_linear.apply()
+    assert ops._use_target_verify_dense is first
+    assert first(None, mx.zeros((1, 3, 64)))
+    assert not first(None, mx.zeros((4, 3, 64)))
+    assert calls == [(1, 3, 64)]
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("bits", [None, 4, 8])
 @pytest.mark.parametrize("batch,length", [(2, 2), (4, 3)])
 def test_batch_linear_matches_standard_projection(dtype, bits, batch, length):
-    qwen35_verify_linear.apply(language)
+    qwen35_verify_linear.apply()
     mx.random.seed(79)
     layer = nn.Linear(2048, 4096, bias=False)
     if bits is not None:
         layer = nn.QuantizedLinear.from_linear(layer, bits=bits, group_size=64)
     layer.set_dtype(dtype)
     x = mx.random.normal((batch, length, 2048)).astype(dtype)
-    actual = language._target_verify_linear(layer, x, True)
+    from mlx_vlm.speculative.ops.linear import _target_verify_linear
+
+    actual = _target_verify_linear(layer, x)
     expected = layer(x)
     assert actual.dtype == dtype
     assert mx.array_equal(actual, expected)
@@ -4442,17 +4658,19 @@ def test_quantized_qwen_batch_matches_standard(bits, size, monkeypatch):
         host._omlx_mtp_decode_enabled = False
         expected, _ = generate(model, prompts, limits)
         host._omlx_mtp_decode_enabled = True
-        gate = language._use_target_verify_dense
+        from mlx_vlm.speculative.ops import linear as ops
+
+        gate = ops._use_target_verify_dense
         observed = []
 
-        def record(linear, x, verify):
-            result = gate(linear, x, verify)
-            if verify and x.ndim == 3 and x.shape[0] > 1 and x.shape[1] > 1:
+        def record(linear, x):
+            result = gate(linear, x)
+            if x.ndim == 3 and x.shape[0] > 1 and x.shape[1] > 1:
                 observed.append(tuple(x.shape))
                 assert not result
             return result
 
-        monkeypatch.setattr(language, "_use_target_verify_dense", record)
+        monkeypatch.setattr(ops, "_use_target_verify_dense", record)
         actual, _ = generate(model, prompts, limits)
         assert observed, "Actual multi-row verification must use ordinary projections"
         assert actual == expected
@@ -4516,11 +4734,13 @@ def test_vector_commit_matches_scalar_states_and_ordinary_tokens(
                 accepted,
             ]
             for values in cases:
-                references = {count: copy.deepcopy(caches) for count in set(values)}
-                for count, reference in references.items():
-                    original(reference, gdn, count, size)
-                actual = copy.deepcopy(caches)
-                original(actual, gdn, values, size)
+                copies = {count: copy.deepcopy((caches, gdn)) for count in set(values)}
+                references = {}
+                for count, (reference, transaction) in copies.items():
+                    original(reference, transaction, [count] * len(values), size)
+                    references[count] = reference
+                actual, transaction = copy.deepcopy((caches, gdn))
+                original(actual, transaction, values, size)
                 _assert_rows_equal(actual, references, values)
                 checked.append(tuple(values))
             return original(caches, gdn, accepted, size)
@@ -4533,3 +4753,85 @@ def test_vector_commit_matches_scalar_states_and_ordinary_tokens(
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
         mlx_lm_mtp.set_mtp_depth(previous_depth)
+
+
+def _cache_rows(cache):
+    for layer in cache or ():
+        offset = getattr(layer, "offset", None)
+        if isinstance(offset, mx.array) and offset.ndim == 1:
+            return int(offset.size)
+    return None
+
+
+@pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
+def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family):
+    previous = mlx_lm_mtp.is_mtp_active()
+    previous_depth = mlx_lm_mtp.get_mtp_depth()
+    mlx_lm_mtp.set_mtp_active(True)
+    mlx_lm_mtp.set_mtp_depth(2)
+    monkeypatch.setattr(bg, "_DepthController", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    try:
+        mx.random.seed(173)
+        model = _model(family)
+        host = model._language_model
+        mx.eval(model.parameters())
+        prompts = [[3, 4, 5, 6, 7], [3, 6, 7, 8, 4, 5, 6], [4, 5, 6]]
+        limits = [18, 22, 17]
+        host._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, limits)
+        host._omlx_mtp_decode_enabled = True
+        # Force boundary crossings within the short generation.
+        model._omlx_mtp_commit_align = 4
+        materialized = []
+        last_verify_rows = [0]
+        original_materialize = bg._materialize_mtp_boundary_emit
+
+        def materialize(row, state):
+            materialized.append(last_verify_rows[0])
+            return original_materialize(row, state)
+
+        original_backbone = bg._call_backbone
+
+        def backbone(target, inputs, cache, n_confirmed=0):
+            rows = _cache_rows(cache)
+            assert rows is None or rows == int(inputs.shape[0])
+            if n_confirmed:
+                last_verify_rows[0] = int(inputs.shape[0])
+            return original_backbone(target, inputs, cache, n_confirmed)
+
+        monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
+        monkeypatch.setattr(bg, "_call_backbone", backbone)
+        actual, _ = generate(model, prompts, limits)
+        assert actual == expected
+        assert any(rows > 1 for rows in materialized)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+        mlx_lm_mtp.set_mtp_depth(previous_depth)
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_lightning_verify_preserves_quantized_linear_dispatch(monkeypatch, batch):
+    from mlx_vlm.models.qwen3_5 import speculative_verifier
+    from mlx_vlm.speculative.ops import linear as ops
+
+    from omlx.patches import qwen35_verify_qmm
+
+    qwen35_verify_linear.apply()
+    monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: True)
+    calls = []
+    layer = nn.QuantizedLinear(64, 64, bits=4, group_size=64)
+    x = mx.zeros((batch, 3, 64))
+
+    def projection(self, values):
+        calls.append(values.shape)
+        return values
+
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", projection)
+    assert ops._target_verify_linear(layer, x) is x
+    assert ops._target_verify_linears((layer, layer), x) == (x, x)
+    verifier = speculative_verifier.Qwen3_5BatchInvariantForward()
+    assert verifier._linear(layer, x) is x
+    assert verifier._linears((layer, layer), x) == (x, x)
+    assert verifier.quantized_linear(layer, x) is x
+    assert calls == [x.shape] * 7

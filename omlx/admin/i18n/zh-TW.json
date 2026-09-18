@@ -36,6 +36,7 @@
   "navbar.tab.logs": "記錄",
   "navbar.tab.bench": "基準",
   "navbar.tab.chat": "聊天",
+  "navbar.tablist_label": "儀表板區段",
   "navbar.dropdown.manager": "管理器",
   "navbar.dropdown.downloader": "下載工具",
   "navbar.dropdown.quantizer": "oQ量化",
@@ -361,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "限制單次請求中轉換的文件附件數量。",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF 處理引擎",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "選擇 PDF 文件請求由 MarkItDown 本身或 OCR 引擎處理。",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "所選的 OCR 模型無法使用。在模型恢復可用或選擇其他引擎之前，PDF 將使用 MarkItDown 處理。",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "選取 MarkItDown 時，掃描或純圖片 PDF 將會失敗，含表格的 PDF 可能無法正確處理。",
   "settings.integrations.websearch.section_label": "Web Search",
   "settings.integrations.websearch.provider": "Search provider",
@@ -1989,5 +1991,11 @@
   "modal.model_settings.streaming_max_gib": "Ceiling (GiB)",
   "modal.model_settings.streaming_min_gib": "Floor (GiB)",
   "modal.model_settings.streaming_stall": "Stall target",
-  "modal.model_settings.streaming_prefill": "Prefill budget (GiB)"
+  "modal.model_settings.streaming_prefill": "Prefill budget (GiB)",
+  "settings.global.reset_defaults": "Reset Defaults",
+  "settings.global.reset_hint": "Restore default values. Paths and API keys are kept. Click Save to apply.",
+  "settings.global.reset_failed": "Failed to load default settings.",
+  "settings.global.reset_title": "Settings Reset",
+  "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
+  "settings.global.reset_ok": "OK"
 }

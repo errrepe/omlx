@@ -367,17 +367,16 @@ def apply_qwen35_moe_topk_patch() -> bool:
 
     orig_call = cls.__call__
 
-    def patched_call(self, x, target_verify: bool = False):
+    def patched_call(self, x):
         # Per-instance isolation: a resident block keeps its own model's
         # threshold/prior; globals are only the fallback for blocks never
         # stamped (backward compat with direct configure() in tests).
         thr = instance_threshold(self)
         bonus = instance_prior(self)
         if (thr is None or thr >= 1.0) and bonus <= 0:
-            return orig_call(self, x, target_verify=target_verify)
+            return orig_call(self, x)
         try:
-            gates = q35._target_verify_linear(self.gate, x, target_verify)
-            gates = mx.softmax(gates, axis=-1, precise=True)
+            gates = mx.softmax(self.gate(x), axis=-1, precise=True)
             if bonus > 0:
                 gates = rerank_cache_prior(
                     gates, resident_experts(self.switch_mlp), bonus
@@ -388,17 +387,14 @@ def apply_qwen35_moe_topk_patch() -> bool:
             scores = scores / scores.sum(axis=-1, keepdims=True)
             if thr is not None and thr < 1.0:
                 inds, scores = truncate_topk_mass(inds, scores, thr)
-            y = q35._target_verify_switch_glu(self.switch_mlp, x, inds, target_verify)
+            y = self.switch_mlp(x, inds)
             y = (y * scores[..., None]).sum(axis=-2)
-            shared_y = self.shared_expert(x, target_verify)
-            shared_y = (
-                mx.sigmoid(q35._target_verify_linear(self.shared_expert_gate, x, target_verify))
-                * shared_y
-            )
+            shared_y = self.shared_expert(x)
+            shared_y = self._shared_expert_scale(x) * shared_y
             return y + shared_y
         except Exception:
             logger.warning("adaptive top-k routing failed; stock fallback", exc_info=True)
-            return orig_call(self, x, target_verify=target_verify)
+            return orig_call(self, x)
 
     cls.__call__ = patched_call
     cls._omlx_topk_truncate = True

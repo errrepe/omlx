@@ -3200,13 +3200,14 @@ class TestMemorySettleBarrier:
     """Tests for memory settle barrier in _unload_engine()."""
 
     @pytest.fixture
-    def pool_with_loaded_model(self, small_mock_model_dir):
+    def pool_with_loaded_model(self, small_mock_model_dir, monkeypatch):
         """Create pool with a mock-loaded model for settle barrier testing.
 
         Sets estimated_size to 5GB. With scaled tolerance
         (max(2GB, 5% of 5GB) = max(2GB, 0.25GB) = 2GB), the barrier
         requires at least 3GB freed.
         """
+        monkeypatch.setattr("omlx.engine_pool.gc", MagicMock())
         pool = _make_pool(ceiling=100 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
@@ -4129,6 +4130,7 @@ class TestFailedLoadReclaim:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             with (
+                patch("omlx.engine_pool.gc"),
                 patch(
                     "omlx.engine_pool.mx.get_active_memory",
                     return_value=80 * 1024**3,

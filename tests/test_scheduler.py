@@ -167,6 +167,8 @@ class TestVLMExtraSlicing:
             "token_type_ids": mx.array([[0, 1, 1, 0]]),
             "per_layer_inputs": mx.zeros((1, 4, 2, 3)),
             "scalar": mx.array(7),
+            "rope_deltas": mx.array([[-12]]),
+            "_captured_rope_deltas": mx.array([[-12]]),
         }
 
         sliced = scheduler_module._slice_vlm_extra(extra, 3)
@@ -180,6 +182,9 @@ class TestVLMExtraSlicing:
         assert advanced["token_type_ids"].tolist() == [[1, 1, 0]]
         assert advanced["per_layer_inputs"].shape == (1, 3, 2, 3)
         assert advanced["scalar"] is extra["scalar"]
+        for key in ("rope_deltas", "_captured_rope_deltas"):
+            assert sliced[key] is extra[key]
+            assert advanced[key] is extra[key]
 
 
 class TestSchedulingPolicy:
@@ -2608,7 +2613,14 @@ class TestSchedulerXtcSpecialTokens:
 class TestSyncAndClearCache:
     """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
 
-    def test_swallows_generation_stream_thread_error(self):
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "There is no Stream(gpu, 0) in current thread.",
+            "kIOGPUCommandBufferCallbackErrorTimeout",
+        ],
+    )
+    def test_swallows_generation_stream_thread_error(self, message):
         """generation_stream sync failing must not break cache clear.
 
         Reproduces #888: on some MLX builds mx.synchronize(generation_stream)
@@ -2624,7 +2636,7 @@ class TestSyncAndClearCache:
 
         def fake_gen_sync(stream):
             calls.append(("gen_sync", stream))
-            raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
+            raise RuntimeError(message)
 
         def fake_default_sync():
             calls.append(("default_sync",))
@@ -2647,6 +2659,33 @@ class TestSyncAndClearCache:
         assert calls[0][0] == "gen_sync"
         assert ("default_sync",) in calls
         assert ("clear_cache",) in calls
+
+    @pytest.mark.parametrize("stage", ["generation", "default", "clear"])
+    def test_terminal_gpu_error_exits_before_further_cleanup(self, stage):
+        from omlx.utils import metal_sync
+
+        error = RuntimeError(
+            "[METAL] Command buffer execution failed: "
+            "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored"
+        )
+
+        def synchronize(*args):
+            if (stage == "generation" and args) or (stage == "default" and not args):
+                raise error
+
+        with (
+            patch.object(metal_sync.mx, "synchronize", side_effect=synchronize),
+            patch.object(
+                metal_sync.mx,
+                "clear_cache",
+                side_effect=error if stage == "clear" else None,
+            ) as clear,
+            patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal,
+            pytest.raises(SystemExit),
+        ):
+            metal_sync._sync_and_clear_cache()
+        fatal.assert_called_once()
+        assert clear.call_count == (1 if stage == "clear" else 0)
 
     def test_propagates_default_stream_error(self):
         """Errors on the default stream sync are not swallowed."""
@@ -2961,16 +3000,39 @@ class TestSchedulerBoundarySnapshots:
 
         assert 4 in scheduler._boundary_cache_snapshots["req-cl-ok"]
 
+    @pytest.mark.parametrize(
+        "prompt_tokens,output_tokens,cached_tokens,shared_prefix_blocks,needs_think_prefix,"
+        "preserve_reasoning,expected_reason",
+        [
+            (34885, 1, 0, 0, False, False, "boundary_snapshot_unavailable"),
+            (34885, 1, 32768, 8, False, False, "no_new_boundary"),
+            (36863, 1, 32768, 8, False, False, "boundary_snapshot_unavailable"),
+            (34885, 3000, 32768, 8, True, False, "no_new_boundary"),
+            (34885, 3000, 32768, 8, True, True, "boundary_snapshot_unavailable"),
+            (1024, 1, 0, 0, False, False, "no_new_boundary"),
+            (34885, 1, 32768, 0, False, False, "boundary_snapshot_unavailable"),
+        ],
+    )
     def test_cleanup_finished_skips_store_without_boundary_snapshot(
-        self, mock_model, mock_tokenizer, caplog
+        self,
+        mock_model,
+        mock_tokenizer,
+        caplog,
+        prompt_tokens,
+        output_tokens,
+        cached_tokens,
+        shared_prefix_blocks,
+        needs_think_prefix,
+        preserve_reasoning,
+        expected_reason,
     ):
-        """Snapshot-needing models must not store live non-sliceable state
-        when no boundary-aligned snapshot exists (e.g. every capture was
-        skipped by the speculative-decode skew guard)."""
-        config = SchedulerConfig(paged_cache_block_size=4)
+        """Only missing snapshots beyond the restored prefix indicate a failure."""
+        config = SchedulerConfig(paged_cache_block_size=4096)
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
         scheduler.block_aware_cache = MagicMock()
-        scheduler.paged_cache_manager = None
+        scheduler.paged_cache_manager = MagicMock()
+        block_table = scheduler.paged_cache_manager.get_block_table.return_value
+        block_table.block_ids = [7, 8]
         scheduler._boundary_snapshot_required = True
 
         request = Request(
@@ -2978,33 +3040,84 @@ class TestSchedulerBoundarySnapshots:
             prompt="hello",
             sampling_params=SamplingParams(),
         )
-        request.prompt_token_ids = [1, 2, 3, 4]
-        request.num_prompt_tokens = 4
-        request.output_token_ids = [5, 6, 7, 8]  # Total = 8 (2 full blocks)
+        request.prompt_token_ids = [1] * prompt_tokens
+        request.num_prompt_tokens = prompt_tokens
+        request.output_token_ids = [2] * output_tokens
+        request.cached_tokens = cached_tokens
+        request.shared_prefix_blocks = shared_prefix_blocks
+        request.needs_think_prefix = needs_think_prefix
+        request.preserve_reasoning = preserve_reasoning
         request._extracted_cache = [{"state": "live-cache"}]
         request._model_cache_config = "live-config"
 
-        scheduler.running["req-no-snap"] = request
-        scheduler.requests["req-no-snap"] = request
-        # No boundary snapshots recorded for this request.
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
 
-        with caplog.at_level("INFO", logger="omlx.scheduler"):
-            scheduler._cleanup_finished({"req-no-snap"})
+        with caplog.at_level("DEBUG", logger="omlx.scheduler"):
+            scheduler._cleanup_finished({request.request_id})
 
         scheduler.block_aware_cache.store_cache.assert_not_called()
         scheduler.block_aware_cache.clear_request_entry.assert_called_with(
-            "req-no-snap"
+            request.request_id
+        )
+        scheduler.paged_cache_manager.release_for_eviction.assert_called_once_with(
+            [7, 8]
         )
         diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
         assert diagnostics["override_attempts"] == 1
         assert diagnostics["override_misses"] == 1
         assert diagnostics["store_skips"] == 1
-        assert diagnostics["reasons"] == {
-            "boundary_snapshot_unavailable": 1,
-            "no_snapshots": 1,
-        }
-        assert diagnostics["last_event"]["cause"] == "no_snapshots"
+        assert diagnostics["reasons"] == {expected_reason: 1, "no_snapshots": 1}
+        event = diagnostics["last_event"]
+        assert event["cause"] == "no_snapshots"
+        assert event["prompt_tokens"] == prompt_tokens
+        assert event["cached_tokens"] == cached_tokens
+        assert event["uncached_prompt_tokens"] == prompt_tokens - cached_tokens
+        skip = next(r for r in caplog.records if "Skipping cache store" in r.message)
+        assert f"reason={expected_reason}" in skip.message
+        assert f"prompt_tokens={prompt_tokens}" in skip.message
+        assert f"cached_tokens={cached_tokens}" in skip.message
+        assert f"uncached_prompt_tokens={prompt_tokens - cached_tokens}" in skip.message
+        assert skip.levelname == (
+            "DEBUG" if expected_reason == "no_new_boundary" else "INFO"
+        )
+
+    def test_cleanup_finished_reports_unreadable_existing_boundary(
+        self, mock_model, mock_tokenizer, caplog
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4096),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+        scheduler._boundary_snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store.load.return_value = None
+        request = Request(
+            request_id="req-unreadable-snapshot",
+            prompt="hello",
+            prompt_token_ids=[1] * 34885,
+            sampling_params=SamplingParams(),
+        )
+        request.cached_tokens = 32768
+        request.shared_prefix_blocks = 8
+        request.output_token_ids = [2]
+        request._extracted_cache = [{"state": "live-cache"}]
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler._boundary_cache_snapshots[request.request_id] = {32768: None}
+
+        with caplog.at_level("INFO", logger="omlx.scheduler"):
+            scheduler._cleanup_finished({request.request_id})
+
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        event = scheduler._boundary_snapshot_diagnostics.snapshot()["last_event"]
+        assert event["reason"] == "boundary_snapshot_unavailable"
+        assert event["cause"] == "ssd_load_failed"
+        assert event["available_boundaries"] == 1
         assert "reason=boundary_snapshot_unavailable" in caplog.text
+        assert "no_new_boundary" not in caplog.text
 
     def test_prefix_lookup_observation_explains_reprefill_boundary(
         self, mock_model, mock_tokenizer
@@ -4981,6 +5094,22 @@ class TestCacheCorruptionRecovery:
         assert "req-prefill" in scheduler._prefill_states
         assert req not in scheduler.waiting
 
+    def test_fail_all_requests_exits_on_terminal_gpu_error(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        error = RuntimeError(
+            "[METAL] Command buffer execution failed: "
+            "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored"
+        )
+        with (
+            patch("omlx.utils.metal_sync.mx.synchronize", side_effect=error),
+            patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal,
+            pytest.raises(SystemExit),
+        ):
+            scheduler.fail_all_requests()
+        fatal.assert_called_once()
+
     def test_fail_all_requests_clears_everything(self, mock_model, mock_tokenizer):
         """fail_all_requests removes all running and waiting requests."""
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
@@ -6655,9 +6784,7 @@ class TestBuildStateMachineStopStrings:
     def test_no_stop_string_only_eos_transitions(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
         sm = scheduler._build_state_machine(self._request_with_stop([]))
-        # SequenceStateMachine has internal _states dict; non-empty implies
-        # at least the EOS transitions are present.
-        assert sm._states
+        assert sm.matcher().advance(mock_tokenizer.eos_token_id)
 
     def test_stop_string_added_as_token_sequence(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
@@ -6666,13 +6793,10 @@ class TestBuildStateMachineStopStrings:
         assert expected_seq, "MockTokenizer must produce a token for 'delta'"
 
         sm = scheduler._build_state_machine(self._request_with_stop(["delta"]))
-        # Walk the trie following expected_seq; the terminal node must
-        # have a __match__ entry, meaning the sequence is registered.
-        node = sm._states["normal"][0]
-        for tok in expected_seq:
-            assert tok in node, f"token {tok} missing from trie"
-            node = node[tok]
-        assert "__match__" in node, "stop sequence not terminated in trie"
+        matcher = sm.matcher()
+        matches = [matcher.advance(token) for token in expected_seq]
+        assert not any(matches[:-1])
+        assert matches[-1]
 
     def test_empty_or_non_string_entries_skipped(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
@@ -6680,22 +6804,16 @@ class TestBuildStateMachineStopStrings:
         # should be tokenized.
         sm = scheduler._build_state_machine(self._request_with_stop(["", "real", 123]))
         real_seq = mock_tokenizer.encode("real", add_special_tokens=False)
-        node = sm._states["normal"][0]
-        for tok in real_seq:
-            assert tok in node
-            node = node[tok]
-        assert "__match__" in node
+        matcher = sm.matcher()
+        assert [matcher.advance(token) for token in real_seq][-1]
 
     def test_multiple_stop_strings_all_registered(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
         sm = scheduler._build_state_machine(self._request_with_stop(["foo", "bar"]))
         for stop_str in ("foo", "bar"):
             seq = mock_tokenizer.encode(stop_str, add_special_tokens=False)
-            node = sm._states["normal"][0]
-            for tok in seq:
-                assert tok in node
-                node = node[tok]
-            assert "__match__" in node
+            matcher = sm.matcher()
+            assert [matcher.advance(token) for token in seq][-1]
 
 
 class _StopSequenceDetokenizer:
@@ -7475,10 +7593,9 @@ def _fake_batch(n, max_tokens=None):
             self._num_tokens = [0] * n
             self.max_tokens = list(max_tokens)
             # matcher that never triggers a stop sequence
-            self.state_machines = [
-                SimpleNamespace(match=lambda st, tok: (0, None, None)) for _ in range(n)
+            self._matchers = [
+                SimpleNamespace(advance=lambda token: False) for _ in range(n)
             ]
-            self._matcher_states = [0] * n
             self.filtered = None
 
         def extract_cache(self, idx):
@@ -7552,3 +7669,121 @@ def test_scheduler_ignores_remaining_responses_after_string_stop():
     assert finished == {"stop-output"}
     assert request.output_token_ids == [10]
     assert all(o.finished for o in outputs)
+
+
+def test_vlm_chunked_cache_keeps_serial_scheduler_contract():
+    from mlx_vlm.models.cache import ChunkedKVCache
+
+    cache = ChunkedKVCache(chunk_size=8)
+    keys = mx.ones((1, 1, 3, 4))
+    cache.update_and_fetch(keys, keys)
+    merged = scheduler_module._patched_merge_caches([[cache]])
+    assert merged[0] is cache
+    cache.filter([0])
+    assert cache.extract(0) is cache
+    with pytest.raises(NotImplementedError, match="batch_size > 1"):
+        cache.merge([cache, cache])
+    cache.filter([])
+    assert cache.empty() and cache.offset == 0 and cache.start_position == 0
+
+
+@pytest.mark.parametrize(
+    "cached, truncated, expected", [(2, False, 0), (8, False, 8), (8, True, 0)]
+)
+def test_image_prefix_cache_requires_complete_image_span(
+    mock_model, mock_tokenizer, cached, truncated, expected
+):
+    from omlx.cache.paged_cache import BlockTable
+
+    mock_model.minimum_prefill_prefix = lambda tokens: 6
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    scheduler.block_aware_cache = MagicMock()
+    scheduler.paged_cache_manager = MagicMock()
+    scheduler._model_has_unreconstructible_cache = lambda: False
+    table = BlockTable(request_id="image-prefix", block_ids=[1], num_tokens=cached)
+    scheduler.block_aware_cache.fetch_cache.return_value = (table, [])
+
+    def reconstruct(*args, **kwargs):
+        if truncated:
+            table.num_tokens = 2
+        return [KVCache()]
+
+    scheduler.block_aware_cache.reconstruct_cache.side_effect = reconstruct
+    request = Request(
+        request_id="image-prefix",
+        prompt=list(range(10)),
+        sampling_params=SamplingParams(),
+    )
+    scheduler.add_request(request)
+    scheduler._prepare_prefix_cache_for_request(request)
+    assert request.cached_tokens == expected
+    assert request.remaining_tokens == request.prompt_token_ids[expected:]
+    if not expected:
+        scheduler.paged_cache_manager.delete_block_table.assert_called_once_with(
+            request.request_id
+        )
+
+
+def test_external_prefill_keeps_image_prefix_atomic(mock_model, mock_tokenizer):
+    from mlx_vlm.models.cache import RotatingKVCache
+
+    mock_model.minimum_prefill_prefix = lambda tokens: 6
+    scheduler = Scheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(prefill_step_size=2, paged_cache_block_size=4),
+    )
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._emit_prefill_boundary_snapshot = MagicMock()
+    cache = [RotatingKVCache(max_size=16)]
+    request = Request(
+        request_id="atomic-image",
+        prompt=list(range(13)),
+        sampling_params=SamplingParams(),
+    )
+    request.prompt_token_ids = list(range(13))
+    request.num_prompt_tokens = 13
+    request.benchmark_trace = True
+    scheduler._do_external_prefill(
+        request,
+        request.prompt_token_ids,
+        cache,
+        vlm_embeds=(mx.zeros((1, 13, 8)), {}, 0),
+    )
+    assert request.benchmark_prefill_chunks == [8, 2, 2]
+    assert [
+        c.args[2] for c in scheduler._emit_prefill_boundary_snapshot.call_args_list
+    ] == [8, 12]
+
+
+@pytest.mark.parametrize("on_ssd", [True, False])
+def test_first_image_boundary_reached_during_decode(mock_model, mock_tokenizer, on_ssd):
+    from mlx_vlm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+    from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+
+    apply_deepseek_v4_patch()
+    mock_model.minimum_prefill_prefix = lambda tokens: 6
+    scheduler = Scheduler(mock_model, mock_tokenizer, SchedulerConfig(paged_cache_block_size=4))
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._boundary_snapshot_required = True
+    scheduler._model_has_unreconstructible_cache = lambda: False
+    request = Request(request_id="decode-image", prompt=list(range(7)), sampling_params=SamplingParams())
+    request.prompt_token_ids = list(range(7))
+    request.num_prompt_tokens = 7
+    request.output_token_ids = [2]
+    rotating = RotatingKVCache(max_size=4)
+    rotating.update_and_fetch(mx.ones((1, 1, 8, 8)), mx.ones((1, 1, 8, 8)))
+    pool = PoolingCache(4)
+    pool.state = (None, None, mx.ones((1, 2, 8)))
+    scheduler._extract_boundary_snapshot = MagicMock(return_value=[CacheList(rotating, pool)])
+    if on_ssd:
+        scheduler._boundary_snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store.save.return_value = True
+    scheduler._maybe_capture_boundary_snapshot(request, 0)
+    if on_ssd:
+        assert scheduler._boundary_snapshot_store.save.call_args.kwargs["block_size"] == 8
+    else:
+        _, layers = scheduler._boundary_cache_snapshots[request.request_id][8]
+        assert layers[0]["pooling_delta_ranges"]["1"] == [0, 2]
+        assert layers[0]["state"][1][2].shape[1] == 2

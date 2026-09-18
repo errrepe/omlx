@@ -21,6 +21,10 @@ final class ServerScreenVM {
     /// Live switch; commits through `saveUsageHistory()` like the other
     /// auto-apply rows rather than the Apply button.
     var usageHistoryEnabled: Bool = true
+    private(set) var hasPendingDefaults = false
+    var showResetNotice = false
+    private(set) var isLoading = false
+    private(set) var isResetting = false
     var lastError: String?
     private(set) var isMovingBasePath: Bool = false
 
@@ -63,7 +67,42 @@ final class ServerScreenVM {
     @ObservationIgnored
     private var hasLoaded = false
 
+    func resetDefaults(client: OMLXClient) async {
+        guard !isLoading, !isResetting else { return }
+        isResetting = true
+        defer { isResetting = false }
+        do {
+            let dto = try await client.getGlobalSettingsDefaults()
+            self.host = dto.server.host
+            self.portText = String(dto.server.port)
+            self.logLevel = canonicalize(level: dto.server.logLevel)
+            self.autoStartOnLaunch = dto.server.autoStartOnLaunch ?? true
+            self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
+            self.maxAudioUploadSizeText = dto.server.maxAudioUploadSize ?? "100MB"
+            self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
+            self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
+            self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
+            if let s = dto.sampling {
+                self.samplingContextText = String(s.maxContextWindow)
+                self.samplingMaxTokensText = String(s.maxTokens)
+                self.samplingTemperatureText = trimDouble(s.temperature)
+                self.samplingTopPText = trimDouble(s.topP)
+                self.samplingTopKText = String(s.topK)
+                self.samplingRepetitionPenaltyText = trimDouble(s.repetitionPenalty)
+            }
+
+            self.hasPendingDefaults = true
+
+            self.lastError = nil
+            self.showResetNotice = true
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
     func load(client: OMLXClient) async {
+        isLoading = true
+        defer { isLoading = false }
         self.client = client
         do {
             let dto = try await client.getGlobalSettings()
@@ -106,6 +145,7 @@ final class ServerScreenVM {
     /// Snapshot current draft values as the new "applied" baseline. Called
     /// at the end of `load()` and after a successful `applyServerSettings()`.
     private func snapshotApplyBaselines() {
+        hasPendingDefaults = false
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         baselinePortText = t(portText)
         baselineSamplingContextText = t(samplingContextText)
@@ -125,6 +165,7 @@ final class ServerScreenVM {
     /// Address / Log Level / SSE Keep-Alive Mode auto-apply via `bind()`
     /// and are intentionally excluded from this check.
     func hasPendingServerChanges(services: AppServices) -> Bool {
+        if hasPendingDefaults { return true }
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         if t(portText) != baselinePortText { return true }
         if t(samplingContextText) != baselineSamplingContextText { return true }
@@ -150,6 +191,14 @@ final class ServerScreenVM {
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         var patch = GlobalSettingsPatch()
         var nextPort: Int? = nil
+        let nextHost = hasPendingDefaults && host != appliedBindAddress ? host : nil
+        if hasPendingDefaults {
+            patch.host = nextHost
+            patch.logLevel = logLevel
+            patch.sseKeepaliveMode = sseKeepaliveMode
+            patch.autoStartOnLaunch = autoStartOnLaunch
+            patch.usageHistory = usageHistoryEnabled
+        }
 
         if t(portText) != baselinePortText {
             guard let p = Int(t(portText)), (1...65535).contains(p) else {
@@ -253,7 +302,7 @@ final class ServerScreenVM {
             patch.modelDirs = diff.normalizedModelDirs
         }
 
-        let patchHasFields = patch.port != nil
+        let patchHasFields = hasPendingDefaults || patch.port != nil
             || patch.samplingMaxContextWindow != nil
             || patch.samplingMaxTokens != nil
             || patch.samplingTemperature != nil
@@ -306,6 +355,9 @@ final class ServerScreenVM {
                 if patchHasFields, let client {
                     _ = try await client.updateGlobalSettings(patch)
                 }
+                if hasPendingDefaults {
+                    try services.setAutoStartOnLaunch(autoStartOnLaunch, persist: false)
+                }
                 if diff.baseChanged {
                     // Hand the bundled port to the storage flow so its single
                     // restart binds the new port. Without this the restart
@@ -323,15 +375,16 @@ final class ServerScreenVM {
                     try await services.applyStorageChanges(
                         basePath: diff.baseChanged ? diff.normalizedBase : nil,
                         modelDirs: relocatedModelDirs,
-                        port: nextPort
+                        port: nextPort,
+                        host: nextHost
                     )
                     self.basePathText = services.config.basePath
                     self.modelDirTexts = services.config.effectiveModelDirs
                     if let p = nextPort { self.effectivePort = p }
                 } else {
-                    if let p = nextPort {
-                        try await services.applyServerEndpoint(port: p)
-                        self.effectivePort = p
+                    if nextPort != nil || nextHost != nil {
+                        try await services.applyServerEndpoint(host: nextHost, port: nextPort)
+                        if let p = nextPort { self.effectivePort = p }
                     }
                     if diff.modelDirsChanged {
                         var updated = services.config
@@ -339,6 +392,10 @@ final class ServerScreenVM {
                         services.updateConfig(updated)
                         self.modelDirTexts = diff.normalizedModelDirs
                     }
+                }
+                if let nextHost {
+                    self.appliedBindAddress = nextHost
+                    self.effectiveHost = AppConfig.connectableHost(for: nextHost)
                 }
                 self.lastError = nil
                 self.snapshotApplyBaselines()
@@ -620,7 +677,7 @@ final class ServerScreenVM {
             set: { newValue in
                 let changed = binding.wrappedValue != newValue
                 binding.wrappedValue = newValue
-                if changed { save() }
+                if changed && !self.hasPendingDefaults { save() }
             }
         )
     }

@@ -16,6 +16,9 @@ final class NetworkScreenVM {
     private(set) var loadedCaBundle: String = ""
 
     private(set) var isSaving: Bool = false
+    var showResetNotice = false
+    private(set) var isLoading = false
+    private(set) var isResetting = false
     var lastError: String?
 
     /// Trimmed draft != loaded for at least one field. Whitespace-only edits
@@ -27,7 +30,28 @@ final class NetworkScreenVM {
         || trim(caBundle)   != loadedCaBundle
     }
 
+    func resetDefaults(client: OMLXClient) async {
+        guard !isLoading, !isResetting else { return }
+        isResetting = true
+        defer { isResetting = false }
+        do {
+            let settings = try await client.getGlobalSettingsDefaults()
+            if let net = settings.network {
+                self.httpProxy = net.httpProxy
+                self.httpsProxy = net.httpsProxy
+                self.noProxy = net.noProxy
+            }
+
+            self.lastError = nil
+            self.showResetNotice = true
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
     func load(client: OMLXClient) async {
+        isLoading = true
+        defer { isLoading = false }
         do {
             let settings = try await client.getGlobalSettings()
             if let net = settings.network {

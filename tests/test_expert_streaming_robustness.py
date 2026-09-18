@@ -190,22 +190,26 @@ class TestV41CompactAtomic:
 class TestLegacyCacheAtomicity:
     """Fetch-first install + a real lock on the legacy cache."""
 
-    def test_failed_install_mutates_nothing(self, tmp_path):
+    def test_failed_install_mutates_nothing(self, tmp_path, monkeypatch):
         cache = _legacy_cache(tmp_path)
         cache.ensure(mx.array([0]))  # one resident
         before_slots = dict(cache.slot_of)
         before_free = list(cache.free)
 
-        orig = cache.disk.fetch
+        from omlx.patches.moe_expert_offload import CheckpointExpertStore
+
+        orig = CheckpointExpertStore.read
         calls = {"n": 0}
 
-        def _boom(proj, field, expert):
+        def _boom(plan):
             calls["n"] += 1
             if calls["n"] > 2:
                 raise OSError("injected")
-            return orig(proj, field, expert)
+            return orig(plan)
 
-        cache.disk.fetch = _boom
+        monkeypatch.setattr(
+            CheckpointExpertStore, "read", staticmethod(_boom)
+        )
         with pytest.raises(OSError):
             cache._install(1)
         assert cache.slot_of == before_slots
