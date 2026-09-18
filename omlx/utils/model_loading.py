@@ -700,11 +700,16 @@ def maybe_apply_pre_load_patches(
         # Model type for the scoped DSpark exception (V4.1 native MTP +
         # offload runs under frozen residency). Read here: the shared
         # config load below has not run yet at this point. The offload
-        # patch's reader also resolves HF repo dirs, so a non-local
-        # model_name still gets its config model_type.
-        from ..patches.moe_expert_offload import _read_config_model_type
+        # patch's dir resolver also resolves HF repo dirs, so a non-local
+        # model_name still gets its config model_type; the canonical
+        # reader supplies the normalized type.
+        from ..patches.expert_streaming.residency import load_config_model_type
+        from ..patches.moe_expert_offload import _resolve_model_dir
 
-        _pre_mtype = _read_config_model_type(model_name)
+        _model_dir = _resolve_model_dir(model_name)
+        _pre_mtype = (
+            load_config_model_type(_model_dir) if _model_dir is not None else None
+        )
         validate_moe_expert_offload(
             {
                 "moe_expert_offload_resident_fraction": getattr(
