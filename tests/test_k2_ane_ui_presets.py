@@ -77,6 +77,7 @@ def test_shared_ane_web_state_preserves_backend_default_and_saved_fraction(
         "const OCR_CONFIG_MODEL_TYPES = new Set(); "
         + advanced_keys
         + " const app = {isDiffusionModel: () => false, buildCtKwargEntries: () => [],"
+        + " expertStreamingAdvancedKeys: () => EXPERT_STREAMING_ADVANCED_KEYS,"
         + method
         + "};"
     )
