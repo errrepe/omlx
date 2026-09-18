@@ -1,24 +1,96 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Expert streaming (SSD) patch for MoE models (glm_moe_dsa, deepseek_v4, ...)."""
+"""Expert streaming (SSD) patch for MoE models (glm_moe_dsa, deepseek_v4, ...).
+
+Thin façade: the implementation lives in leaf modules — ``settings``
+(budget/override policy and schema coercion), ``lifecycle`` (backing
+traversal + engine load/teardown) — plus ``model_hooks``/``residency``/
+``governor``/``conversion``/``streaming_switch`` for the mechanism
+itself. This file only re-exports the package's public surface so
+existing consumers keep working.
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any as Any
 
-from ...model_profiles import STREAMING_SETTING_SCHEMA
-
-logger = logging.getLogger(__name__)
-
-# Re-exported from the leaf modules — they hold the single copy, so the
-# gates cannot drift apart. Both names stay importable from the package
-# root; there is exactly one definition.
-from .model_hooks import (
-    DEFAULT_PREFIX_TEMPLATES as DEFAULT_PREFIX_TEMPLATES,
-    find_moe_container as find_moe_container,
-    find_moe_owner as find_moe_owner,
-    find_mtp_stages as find_mtp_stages,
-    hooks_for as hooks_for,
+# Conversion pipeline lives in conversion.py (stacked-key resolution, the
+# switch-MLP rewrite, the orchestrator, transition-profile persistence).
+# These names stay importable from the package root: tests and engines
+# import them from here, and lifecycle.shutdown_expert_streaming resolves
+# save_transition_profile through this namespace. conversion.py top-level
+# only touches leaf modules, so this cannot cycle.
+from .conversion import (
+    _resolve_moe_dims as _resolve_moe_dims,
+)
+from .conversion import (
+    _resolve_stacked_key as _resolve_stacked_key,
+)
+from .conversion import (
+    convert_model_to_streaming as convert_model_to_streaming,
+)
+from .conversion import (
+    load_transition_profile as load_transition_profile,
+)
+from .conversion import (
+    save_transition_profile as save_transition_profile,
+)
+from .lifecycle import (
+    _BACKING_HOPS as _BACKING_HOPS,
+)
+from .lifecycle import (
+    _BACKING_WALK_DEPTH as _BACKING_WALK_DEPTH,
+)
+from .lifecycle import (
+    _ENGINE_BACKING_HOPS as _ENGINE_BACKING_HOPS,
+)
+from .lifecycle import (
+    _MODEL_BACKING_HOPS as _MODEL_BACKING_HOPS,
+)
+from .lifecycle import (
+    _backing_holders as _backing_holders,
+)
+from .lifecycle import (
+    _engine_holders as _engine_holders,
+)
+from .lifecycle import (
+    ensure_streaming_backing_or_raise as ensure_streaming_backing_or_raise,
+)
+from .lifecycle import (
+    expert_streaming_summary as expert_streaming_summary,
+)
+from .lifecycle import (
+    find_model_streaming_backing as find_model_streaming_backing,
+)
+from .lifecycle import (
+    find_streaming_backing as find_streaming_backing,
+)
+from .lifecycle import (
+    gate_up_fusion_blocked as gate_up_fusion_blocked,
+)
+from .lifecycle import (
+    log_expert_streaming_summary as log_expert_streaming_summary,
+)
+from .lifecycle import (
+    post_load_offload_pipeline as post_load_offload_pipeline,
+)
+from .lifecycle import (
+    resolve_streaming_backing as resolve_streaming_backing,
+)
+from .lifecycle import (
+    save_expert_pin_profile as save_expert_pin_profile,
+)
+from .lifecycle import (
+    shutdown_expert_streaming as shutdown_expert_streaming,
+)
+from .lifecycle import (
+    streaming_offload_load as streaming_offload_load,
+)
+from .lifecycle import (
+    streaming_summary_backing as streaming_summary_backing,
+)
+from .lifecycle import (
+    teardown_expert_streaming as teardown_expert_streaming,
 )
 from .residency import (
     SUPPORTED_TYPES,
@@ -26,776 +98,61 @@ from .residency import (
     normalize_model_type,
     streaming_owns_model,
 )
+from .settings import (
+    _BUDGET_GIB_ATTRS as _BUDGET_GIB_ATTRS,
+)
+from .settings import (
+    _BUDGET_MIB_ATTRS as _BUDGET_MIB_ATTRS,
+)
+from .settings import (
+    _IO_OVERRIDE_KEYS as _IO_OVERRIDE_KEYS,
+)
+from .settings import (
+    _IO_OVERRIDE_VALIDATORS as _IO_OVERRIDE_VALIDATORS,
+)
+from .settings import (
+    MAX_EXPERT_STREAMING_BUDGET_BYTES as MAX_EXPERT_STREAMING_BUDGET_BYTES,
+)
+from .settings import (
+    STREAMING_SETTING_SCHEMA as STREAMING_SETTING_SCHEMA,
+)
+from .settings import (
+    _auto_budget_bytes as _auto_budget_bytes,
+)
+from .settings import (
+    _budget_is_pinned as _budget_is_pinned,
+)
+from .settings import (
+    _clamp_budget_bytes as _clamp_budget_bytes,
+)
+from .settings import (
+    _dynamic_armed as _dynamic_armed,
+)
+from .settings import (
+    _io_overrides as _io_overrides,
+)
+from .settings import (
+    _prior_usable as _prior_usable,
+)
+from .settings import (
+    is_supported_model_type as is_supported_model_type,
+)
+from .settings import (
+    resolve_budget_bytes as resolve_budget_bytes,
+)
+from .settings import (
+    validate_streaming_setting as validate_streaming_setting,
+)
 
 try:
-    # Public cache-policy API at the package root.
+    # Public cache-policy API at the package root. Re-exported here (not
+    # in settings) so ``settings._dynamic_armed`` can resolve it through
+    # this namespace at call time — tests monkeypatch the package attr.
     from .governor import dynamic_residency_enabled
 except Exception:  # pragma: no cover - governor has no mlx dependency
     dynamic_residency_enabled = lambda: False  # type: ignore[assignment]
 
-try:
-    from .streaming_switch import S3FIFOExpertCache, make_expert_cache
-except Exception:  # pragma: no cover - streaming_switch imports mlx
-    S3FIFOExpertCache = None  # type: ignore[assignment]
-    make_expert_cache = None  # type: ignore[assignment]
-
-# Conversion pipeline lives in conversion.py (stacked-key resolution, the
-# switch-MLP rewrite, the orchestrator, transition-profile persistence).
-# These names stay importable from the package root: tests and engines
-# import them from here, and shutdown_expert_streaming calls
-# save_transition_profile below. conversion.py top-level only touches leaf
-# modules, so this cannot cycle.
-from .conversion import (
-    _resolve_moe_dims as _resolve_moe_dims,
-    _resolve_stacked_key as _resolve_stacked_key,
-    convert_model_to_streaming as convert_model_to_streaming,
-    load_transition_profile as load_transition_profile,
-    save_transition_profile as save_transition_profile,
-)
-
-
-def is_supported_model_type(model_type: str | None) -> bool:
-    # Same allowlist gate as residency.streaming_owns_model — that one
-    # also accepts a local checkpoint dir, this one takes the type string
-    # directly.
-    return streaming_owns_model(model_type)
-
-
-# Upper bound on the expert LRU budget. The admin PUT handler rejects
-# anything outside 0-64 GiB (routes.py); the loader path -- a hand-edited
-# settings file, an autotune --apply, or an env override -- bypasses that
-# check, so clamp here too.
-MAX_EXPERT_STREAMING_BUDGET_BYTES = 64 * 1024**3
-
-
-def _clamp_budget_bytes(raw: float) -> int:
-    """Clamp a raw byte budget to [0, 64 GiB]. 0 means page-cache only."""
-    try:
-        val = int(raw)
-    except (TypeError, ValueError):
-        return 0
-    return max(0, min(MAX_EXPERT_STREAMING_BUDGET_BYTES, val))
-
-
-def _dynamic_armed(setting_val: Any | None, model_settings: Any | None) -> bool:
-    """Resolve the dynamic-governor switch (user-testable auto rule).
-
-    Explicit setting wins (True forces on over a pinned budget, False opts
-    out); then the OMLX_EXPERT_STREAMING_DYNAMIC env; then the auto rule:
-    on when the budget itself is automatic (no explicit pin), off when the
-    user pinned a budget (manual mode stays put unless forced).
-    """
-    if setting_val is not None:
-        return bool(setting_val)
-    try:
-        if dynamic_residency_enabled():
-            return True
-    except Exception:
-        pass
-    return not _budget_is_pinned(model_settings)
-
-
-# Budget attribute spellings on the settings object — GiB pair preferred
-# over the legacy MiB pair; any explicit value pins the budget (manual
-# mode in _dynamic_armed).
-_BUDGET_GIB_ATTRS = ("expert_streaming_budget_gib", "expert_cache_budget_gib")
-_BUDGET_MIB_ATTRS = ("expert_streaming_budget_mib", "expert_cache_budget_mib")
-
-
-def _budget_is_pinned(model_settings: Any | None) -> bool:
-    """True when the user pinned an explicit budget (manual mode)."""
-    if model_settings is None:
-        return False
-    for attr in _BUDGET_GIB_ATTRS + _BUDGET_MIB_ATTRS:
-        if getattr(model_settings, attr, None) is not None:
-            return True
-    return False
-
-
-def _auto_budget_bytes() -> int:
-    """RAM-scaled starting budget for the auto stack (~5% of total RAM).
-
-    Only the STARTING point: the dynamic governor adapts it at runtime
-    (grow on proven hunger, shrink on pressure). Clamped to [0.5, 4] GiB
-    so small machines stay safe and big ones do not pre-grab memory the
-    model weights may still need during load.
-    """
-    try:
-        from ...utils.psutil_compat import get_total_memory
-
-        total = int(get_total_memory())
-    except Exception:
-        total = 0
-    if total <= 0:
-        return int(1.0 * 1024**3)
-    return _clamp_budget_bytes(
-        max(0.5 * 1024**3, min(4.0 * 1024**3, int(total * 0.05)))
-    )
-
-
-def resolve_budget_bytes(model_settings: Any | None) -> int:
-    """Resolved app-level LRU budget for the streaming heap.
-
-    Public (admission path): ``engine_pool`` charges exactly this — the
-    real commitment a streaming load makes — instead of a fraction-based
-    heuristic. Settings precedence: explicit GiB > explicit MiB > the
-    auto stack (RAM-scaled, governor-adapted) > 0 when
-    ``expert_streaming_budget_auto`` is False or no settings object
-    exists.
-    """
-    if model_settings is not None:
-        # Preferred name (model_settings.py:222) + legacy cache name.
-        # Explicit 0 = page-cache only (no app-level LRU); None falls through
-        # to the auto stack below.
-        for attr in _BUDGET_GIB_ATTRS:
-            gib = getattr(model_settings, attr, None)
-            if gib is not None:
-                try:
-                    return _clamp_budget_bytes(float(gib) * 1024**3)
-                except (TypeError, ValueError):
-                    continue
-        # legacy mib
-        for attr in _BUDGET_MIB_ATTRS:
-            mib = getattr(model_settings, attr, None)
-            if mib is not None:
-                try:
-                    if int(mib) <= 0:
-                        continue
-                except (TypeError, ValueError):
-                    continue
-                return _clamp_budget_bytes(int(mib) * 1024 * 1024)
-        # Auto (default): RAM-scaled starting budget for the dynamic
-        # governor. False opts out to page-cache only (the OS file cache
-        # serves reuse from clean pages).
-        if getattr(model_settings, "expert_streaming_budget_auto", True) is False:
-            return 0
-        return _auto_budget_bytes()
-    # No settings object (bench direct path): stay page-cache only unless
-    # the caller passes budget_bytes explicitly.
-    return 0
-
-
-def _prior_usable(cache: Any) -> bool:
-    """Cache-prior needs app-level LRU residency as its signal.
-
-    With a page-cache-only budget the resident set is always empty and the
-    rerank is pure overhead — refuse it so budget-0 stays on the stock
-    path."""
-    try:
-        return int(getattr(cache, "capacity", 0) or 0) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-# Per-model streaming IO override keys (None = unset: keep the env-var /
-# built-in default). Validators below normalize the value or drop it back
-# to None when it is unusable.
-#
-# NOT here on purpose: expert_streaming_cache_prior,
-# expert_streaming_cold_tier, expert_streaming_topk_threshold. They are
-# routing/tier knobs, not IO-path overrides — their consumers read
-# model_settings through dedicated resolvers (adaptive_topk.resolve_*,
-# conversion._resolve_cold_tier_root) that each coerce defensively and
-# fall back to env/exact on garbage, and the admin PUT validates them at
-# the write boundary. Listing them here would create a second, divergent
-# contract.
-_IO_OVERRIDE_KEYS = (
-    "expert_streaming_io_depth",
-    "expert_streaming_coalesce",
-    "expert_streaming_readahead",
-    "expert_streaming_seed",
-    "expert_streaming_per_layer_eval",
-    "expert_streaming_pins",
-    "expert_streaming_hot_fraction",
-    "expert_streaming_pin_gib",
-    "expert_streaming_pin_sync",
-    "expert_streaming_pin_regime",
-    "expert_streaming_cache_policy",
-    "expert_streaming_dynamic",
-    "expert_streaming_dynamic_max_gib",
-    "expert_streaming_dynamic_min_gib",
-    "expert_streaming_dynamic_stall_target",
-    "expert_streaming_prefill_budget_gib",
-)
-
-
-def validate_streaming_setting(name: str, value: Any) -> Any | None:
-    """Normalize one ``expert_streaming_*`` value, or None when unusable.
-
-    The runtime-side reader of ``model_profiles.STREAMING_SETTING_SCHEMA``
-    — the single bounds table shared with the admin write path. Per type:
-    bools stay strict (True/False only — "true"/1 are rejected, not
-    coerced, matching the admin contract); ints coerce, reject below lo
-    and clamp above hi; floats coerce and must sit inside (lo, hi] /
-    [lo, hi] / [lo, ∞); choices lower-case and match. None in means
-    unset — None out (keep the env / built-in default).
-    """
-    if value is None:
-        return None
-    spec = STREAMING_SETTING_SCHEMA.get(name)
-    if spec is None:
-        return None
-    kind = spec["type"]
-    if kind == "bool":
-        return value if isinstance(value, bool) else None
-    if kind == "choice":
-        v = str(value).strip().lower()
-        return v if v in spec["choices"] else None
-    # Numeric: bools are not numbers for these knobs — True must not
-    # silently become 1 GiB of pinned budget (admin rejects bools too).
-    if isinstance(value, bool):
-        return None
-    lo, hi, lo_open = spec["bounds"]
-    if kind == "int":
-        try:
-            v = int(value)
-        except (TypeError, ValueError):
-            return None
-        if v < lo:
-            return None
-        return min(hi, v) if hi is not None else v
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not ((lo < v) if lo_open else (lo <= v)):
-        return None
-    if hi is not None and v > hi:
-        return None
-    return v
-
-
-# Bounds now live in model_profiles.STREAMING_SETTING_SCHEMA; the
-# validators delegate so the write-boundary table and this load-time
-# coercion share one source. Only non-bool io keys get a validator — the
-# bool flags keep their historical raw pass-through (None = unset), so
-# _io_overrides() semantics are unchanged.
-_IO_OVERRIDE_VALIDATORS = {
-    key: (lambda _k: lambda v: validate_streaming_setting(_k, v))(key)
-    for key in _IO_OVERRIDE_KEYS
-    if STREAMING_SETTING_SCHEMA.get(key, {}).get("type") != "bool"
-}
-
-
-def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
-    """Per-model streaming IO overrides with env-fallback semantics.
-
-    Returns a dict whose values are None when the setting is unset (keep the
-    env-var / built-in default) or the requested override otherwise.
-    """
-    raw = {
-        key: getattr(model_settings, key, None) if model_settings is not None else None
-        for key in _IO_OVERRIDE_KEYS
-    }
-    for key, validate in _IO_OVERRIDE_VALIDATORS.items():
-        if raw[key] is not None:
-            raw[key] = validate(raw[key])
-    return raw
-
-
-def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
-    """One-line request/bench summary of streaming health.
-
-    Aggregates the counters the implementation already keeps (LRU hits,
-    advisor, ctx fallbacks) into a single
-    dict for per-request logs and the admin payload. Never raises;
-    missing pieces report as None/0.
-    """
-    out: dict = {}
-    try:
-        stats = getattr(cache, "stats", None)
-        hits = int(getattr(stats, "hits", 0) or 0)
-        misses = int(getattr(stats, "misses", 0) or 0)
-        out["lru_hit_rate"] = hits / (hits + misses) if (hits + misses) else 0.0
-        out["lru_hits"] = hits
-        out["lru_misses"] = misses
-        out["lru_evictions"] = int(getattr(stats, "evictions", 0) or 0)
-        out["lru_size"] = int(getattr(cache, "size", 0) or 0)
-        out["lru_capacity"] = int(getattr(cache, "capacity", 0) or 0)
-    except Exception:
-        pass
-    try:
-        # Partitioned backends (V4.1 dedicated adapter, legacy
-        # fetch-on-miss) have no app-level LRU cache — the backing's own
-        # summary carries the counters, folded into the lru_* slots the
-        # request log reads so the line stops reporting a permanent 0.
-        if cache is None and backing is not None:
-            bsum = getattr(backing, "summary", None)
-            if callable(bsum):
-                b = bsum()
-                if isinstance(b, dict):
-                    out["backing"] = b
-                    hits = int(b.get("hits", 0) or 0)
-                    misses = int(b.get("misses", 0) or 0)
-                    out["lru_hit_rate"] = (
-                        hits / (hits + misses) if (hits + misses) else 0.0
-                    )
-                    out["lru_hits"] = hits
-                    out["lru_misses"] = misses
-                    out["lru_evictions"] = int(b.get("evictions", 0) or 0)
-                    out["lru_size"] = int(b.get("resident", 0) or 0)
-                    out["lru_capacity"] = int(
-                        b.get("capacity_per_layer", 0) or 0
-                    ) * int(b.get("layers", 0) or 0)
-    except Exception:
-        pass
-    try:
-        out["ctx_fallbacks"] = dict(getattr(cache, "ctx_fallback_stats", lambda: {})())
-    except Exception:
-        out["ctx_fallbacks"] = {}
-    try:
-        gov = getattr(backing, "governor", None) if backing is not None else None
-        if gov is not None:
-            out["governor"] = gov.summary()
-    except Exception:
-        pass
-    try:
-        out["cache_policy"] = getattr(cache, "policy", "lru")
-    except Exception:
-        pass
-    try:
-        # Speculation state: advisor counter + learned transition table.
-        spec = getattr(cache, "spec_state", None)
-        if spec is not None:
-            sstats = getattr(spec, "stats", None)
-            if isinstance(sstats, dict):
-                out["advised"] = int(sstats.get("advised", 0) or 0)
-                if sstats.get("trans_overfetch"):
-                    out["trans_overfetch"] = int(sstats["trans_overfetch"])
-            out["trans_updates"] = int(getattr(spec, "trans_updates", 0) or 0)
-            out["trans_sources"] = len(getattr(spec, "trans", {}) or {})
-    except Exception:
-        pass
-    return out
-
-
-# Wrapper hops a ``_expert_streaming_backing`` can hide behind, on either
-# side of the engine/model boundary: the model-side descent
-# (``language_model``/``model``/``_vlm_model``/``_language_model`` — the
-# chain ``scheduler._streaming_backing_of`` walks) plus the engine-side
-# holders (``engine``/``_model``/``_vlm_model`` — the chain the old
-# ``_engine_holders`` walked flat). One walk covers both spellings so no
-# consumer needs a second chain.
-#
-# The sets stay separate on purpose: a walk that STARTS at a model must
-# not hop into ``engine``/``_model`` — a model's ``.engine`` back-ref
-# would surface a sibling model's backing (and mock-based callers
-# fabricate those attributes).
-_MODEL_BACKING_HOPS = (
-    "language_model",
-    "model",
-    "_vlm_model",
-    "_language_model",
-)
-_ENGINE_BACKING_HOPS = ("engine", "_model")
-_BACKING_HOPS = _MODEL_BACKING_HOPS + _ENGINE_BACKING_HOPS
-
-# Depth cap bounds adapter property loops (a hop that returns ``self``)
-# and pathological wrapper nesting; both legacy walks used 5.
-_BACKING_WALK_DEPTH = 5
-
-
-def _backing_holders(root: Any, hops: tuple[str, ...] = _BACKING_HOPS):
-    """Yield *root*, then every object reachable via *hops*.
-
-    Breadth-first so an engine's ``_model`` and ``_vlm_model`` are both
-    visited (the flat engine-holder order) before descending into their
-    model-side wrappers; a visited set plus the depth cap bound cycles
-    and property loops.
-    """
-    seen: set[int] = set()
-    frontier = [root]
-    for _ in range(_BACKING_WALK_DEPTH):
-        if not frontier:
-            return
-        nxt: list = []
-        for obj in frontier:
-            if obj is None or id(obj) in seen:
-                continue
-            seen.add(id(obj))
-            yield obj
-            for attr in hops:
-                try:
-                    child = getattr(obj, attr, None)
-                except Exception:
-                    continue
-                if child is not None:
-                    nxt.append(child)
-        frontier = nxt
-
-
-def find_streaming_backing(root: Any) -> Any | None:
-    """The ``_expert_streaming_backing`` anywhere on *root*'s wrapper chain.
-
-    Works from either side: pass a model (covers the
-    ``language_model``/``model``/``_vlm_model``/``_language_model``
-    descent the scheduler's ``_streaming_backing_of`` performs) or an
-    engine (covers its ``_model``/``_vlm_model`` holders). First match in
-    breadth-first hop order wins.
-    """
-    for holder in _backing_holders(root):
-        backing = getattr(holder, "_expert_streaming_backing", None)
-        if backing is not None:
-            return backing
-    return None
-
-
-def find_model_streaming_backing(model: Any) -> Any | None:
-    """Model-side variant of ``find_streaming_backing``.
-
-    Uses only ``_MODEL_BACKING_HOPS`` — a walk rooted at a model never
-    hops into ``engine``/``_model``, where it could surface a different
-    model's backing (and mock-based callers fabricate those attributes).
-    """
-    for holder in _backing_holders(model, _MODEL_BACKING_HOPS):
-        backing = getattr(holder, "_expert_streaming_backing", None)
-        if backing is not None:
-            return backing
-    return None
-
-
-def _engine_holders(engine: Any):
-    """Yield the objects that can carry streaming state for an engine:
-    the engine itself, then its ``_model`` / ``_vlm_model`` wrappers and
-    whatever those wrap (same walk ``find_streaming_backing`` uses)."""
-    yield from _backing_holders(engine)
-
-
-def resolve_streaming_backing(engine: Any) -> Any | None:
-    """Return the engine's streaming backing, walking the holder chain.
-
-    The unified converter stamps the backing on engine and model; the
-    legacy adapter (and the alias' streaming fallback) stamps its store
-    on the model only. Used by the engine stop paths so legacy fds/mmaps
-    release on teardown instead of whenever GC gets around to it.
-    """
-    return find_streaming_backing(engine)
-
-
-def streaming_summary_backing(engine: Any) -> Any | None:
-    """The object owning governor + summary for this engine.
-
-    The legacy adapter aggregates its per-layer caches under a
-    governor-facing state stamped as ``_moe_offload_legacy_state`` (same
-    duck-type as the V4.1 backing); when present it overrides the plain
-    backing for reporting.
-    """
-    for holder in _engine_holders(engine):
-        state = getattr(holder, "_moe_offload_legacy_state", None)
-        if state is not None:
-            return state
-    return resolve_streaming_backing(engine)
-
-
-def log_expert_streaming_summary(
-    engine: Any, *, prompt_tokens: int = 0, completion_tokens: int = 0
-) -> None:
-    """One-line MoE streaming health log per completed request.
-
-    No-op unless expert streaming is active. Also drives the dynamic
-    governor's per-request observation. Never raises.
-    """
-    try:
-        backing = streaming_summary_backing(engine)
-        if backing is None:
-            return
-        # Dynamic residency: revisit cache capacity from free memory
-        # once per request boundary (opt-in; never raises).
-        governor = getattr(backing, "governor", None)
-        if governor is not None:
-            try:
-                action = governor.observe()
-            except Exception:
-                logger.debug("governor observe failed", exc_info=True)
-            else:
-                logger.info("expert_streaming governor: %s", action)
-        cache = getattr(backing, "_streaming_cache", None)
-        summary = expert_streaming_summary(cache, backing)
-        if not summary:
-            return
-        logger.info(
-            "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
-            "(h=%d m=%d evict=%d size=%d/%d) advised=%d "
-            "ctx_fallbacks=%s",
-            prompt_tokens,
-            completion_tokens,
-            summary.get("lru_hit_rate", 0.0),
-            summary.get("lru_hits", 0),
-            summary.get("lru_misses", 0),
-            summary.get("lru_evictions", 0),
-            summary.get("lru_size", 0),
-            summary.get("lru_capacity", 0),
-            summary.get("advised", 0),
-            summary.get("ctx_fallbacks", {}),
-        )
-    except Exception:
-        pass
-
-
-def ensure_streaming_backing_or_raise(
-    model: Any,
-    backing: Any | None,
-    *,
-    requested: bool,
-    model_name: str,
-) -> None:
-    """Fail a lazy load whose streaming conversion produced nothing.
-
-    A model lazy-loaded on the promise of SSD streaming must not reach
-    materialize_lazy_state with every expert bank resident — that is the
-    silent-OOM path the conversion exists to prevent. Raises when the
-    checkpoint structurally supports streaming but neither the unified
-    converter nor the legacy adapter claimed any MoE layer. No-op when the
-    intent was off, the estimate declines the checkpoint, or real
-    conversion happened — backing presence alone is not evidence of
-    conversion.
-    """
-    if not requested:
-        return
-    if backing is not None and int(
-        getattr(backing, "streaming_converted", 0) or 0
-    ) > 0:
-        return
-    try:
-        from .residency import expert_streaming_estimate
-
-        estimate = expert_streaming_estimate(str(model_name))
-    except Exception:
-        return
-    if not estimate.supported:
-        return
-    # A legacy OffloadSwitchGLU wrap also satisfies the intent (resident
-    # fraction by design). Class-name match avoids a circular import.
-    try:
-        for _, mod in model.named_modules():
-            cls_name = mod.__class__.__name__
-            if cls_name in ("StreamingSwitchGLU", "OffloadSwitchGLU"):
-                return
-    except Exception:
-        pass
-    raise RuntimeError(
-        f"Expert streaming: {model_name} supports streaming and was "
-        "lazy-loaded for it, but no MoE layer was converted — refusing to "
-        "materialize every expert bank in RAM"
-    )
-
-
-async def streaming_offload_load(
-    model: Any,
-    model_name: str,
-    settings: Any,
-    *,
-    label: str = "model",
-) -> tuple[Any | None, int]:
-    """The load-time offload sequence shared by the engine paths.
-
-    Streaming conversion -> legacy MoE offload -> zero-conversion guard.
-    Must run BEFORE ``materialize_lazy_state`` and gate/up fusion: the
-    checkpoint stayed lazy on this path and dropping the stock MoE modules
-    is what keeps non-resident experts from ever materializing. All MLX
-    work runs on the MLX executor because it allocates the resident slot
-    tensors (#1304).
-
-    Returns ``(backing, wrapped)`` — the streaming backing for the caller
-    to keep alive, and the legacy-offload wrapped-layer count (0 when the
-    unified path served or offload was not requested). The caller stamps
-    ``backing`` onto the engine itself.
-    """
-    import asyncio
-
-    from ...engine_core import get_mlx_executor
-    from ...model_settings import moe_offload_requested
-
-    loop = asyncio.get_running_loop()
-    offload_requested = moe_offload_requested(settings)
-    backing = None
-    if getattr(settings, "expert_streaming_enabled", False):
-        try:
-            def _do_streaming():
-                _, b = convert_model_to_streaming(model, model_name, settings)
-                # keep backing alive on the model
-                if b is not None:
-                    model._expert_streaming_backing = b  # type: ignore[attr-defined]
-                return b
-
-            backing = await loop.run_in_executor(get_mlx_executor(), _do_streaming)
-            logger.info("Expert streaming enabled for %s %s", label, model_name)
-        except Exception as e:
-            # Fail clean: streaming was explicitly enabled, so a backing
-            # failure must fail the load — continuing to materialize
-            # would retain all expert banks in RAM (OOM).
-            logger.error(
-                "Expert streaming conversion failed for %s %s: %s",
-                label,
-                model_name,
-                e,
-                exc_info=True,
-            )
-            raise RuntimeError(
-                f"Expert streaming conversion failed for {label} {model_name}: {e}"
-            ) from e
-
-    # MoE expert offload: replace covered SwitchGLU layers with a
-    # fetch-on-miss LRU cache streaming experts from the checkpoint's
-    # own safetensors. The caches' slot maps and resident slots live on
-    # plain attributes outside the module tree, so the lazy-state
-    # materialization never reaches them; left lazy they stay bound to
-    # the loader stream and the first request from an inference thread
-    # dies with "There is no Stream(gpu, N) in current thread" — the
-    # post-apply materialize fixes that on the same executor.
-    wrapped = 0
-    if offload_requested:
-        from ..moe_expert_offload import (
-            apply_moe_expert_offload,
-            materialize_offload_state,
-        )
-
-        fraction = float(
-            getattr(settings, "moe_expert_offload_resident_fraction", 0.25)
-        )
-        wrapped = await loop.run_in_executor(
-            get_mlx_executor(),
-            apply_moe_expert_offload,
-            model,
-            model_name,
-            fraction,
-            settings,
-        )
-        if wrapped:
-            await loop.run_in_executor(
-                get_mlx_executor(), materialize_offload_state, model
-            )
-
-    # Fail before materializing: a lazy-loaded streaming checkpoint with
-    # zero converted layers would evaluate every expert bank in RAM.
-    if offload_requested:
-        ensure_streaming_backing_or_raise(
-            model, backing, requested=True, model_name=model_name
-        )
-    return backing, wrapped
-
-
-async def post_load_offload_pipeline(
-    model: Any,
-    model_name: str,
-    settings: Any,
-    *,
-    label: str = "model",
-    holder: Any | None = None,
-) -> tuple[Any | None, int]:
-    """The post-load offload sequence every engine path repeats.
-
-    ``streaming_offload_load`` (conversion / legacy wrap / the
-    zero-conversion guard) then ``materialize_lazy_state`` — all MLX work
-    on the MLX executor. Conversion must precede materialize so the
-    dropped expert banks never evaluate (OOM); materialize must precede
-    gate/up fusion, which ``gate_up_fusion_blocked`` gates for the
-    caller. When *holder* is given (engines pass ``self``) the streaming
-    backing is stamped on it — the model-side stamp already happened
-    inside ``streaming_offload_load``.
-
-    Returns ``(backing, wrapped)`` exactly like ``streaming_offload_load``
-    so callers keep their fusion-skip logging context.
-    """
-    import asyncio
-
-    from ...engine_core import get_mlx_executor
-    from ...utils.model_loading import materialize_lazy_state
-
-    loop = asyncio.get_running_loop()
-    backing, wrapped = await streaming_offload_load(
-        model, model_name, settings, label=label
-    )
-    if backing is not None and holder is not None:
-        try:
-            holder._expert_streaming_backing = backing  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    # Materialize lazy buffers on the loader thread so per-engine
-    # inference threads can read them (#1304). Post-conversion the MoE
-    # banks are gone, so this stays bounded.
-    await loop.run_in_executor(get_mlx_executor(), materialize_lazy_state, model)
-    return backing, wrapped
-
-
-def gate_up_fusion_blocked(settings: Any, wrapped: int) -> bool:
-    """True when the post-load MoE gate/up fusion must be skipped.
-
-    Fusion concatenates the stock SwitchGLU gate/up weights in place, so
-    it cannot run when either offload system is active: legacy-wrapped
-    layers (``wrapped``) were never materialized and are not stock
-    SwitchGLU anyway, and a streaming conversion already owns the
-    projection layout. An explicit ``moe_gate_up_fusion_enabled=False``
-    also blocks it. Mirrors the predicate both engines spell inline.
-    """
-    if wrapped:
-        return True
-    return not (
-        getattr(settings, "moe_gate_up_fusion_enabled", True) is not False
-        and not getattr(settings, "expert_streaming_enabled", False)
-    )
-
-
-def shutdown_expert_streaming(backing: Any) -> None:
-    """Release MoE streaming resources held by *backing*.
-
-    Persists the transition table, then closes shard fds/mmaps.
-    Idempotent; safe to call with None or a RAM-dict backing. Engines
-    call this in stop() and before replacing the model on reload so
-    threads/fds never leak across model lifetimes.
-    """
-    if backing is None or isinstance(backing, dict):
-        return
-    # Persist the learned transition table before threads/fds die.
-    try:
-        save_transition_profile(backing)
-    except Exception:
-        pass
-    try:
-        close = getattr(backing, "close", None)
-        if callable(close):
-            close()
-    except Exception:
-        pass
-
-
-def save_expert_pin_profile(engine: Any) -> None:
-    """Persist the learned pin profile of a streaming engine, if any.
-
-    Called from the engine ``stop()`` paths while the backing store (and the
-    PinController attached to it) is still reachable — before teardown drops
-    the references. Never raises: a failed save only costs the learned hot
-    set, never correctness.
-    """
-    for holder in _engine_holders(engine):
-        backing = getattr(holder, "_expert_streaming_backing", None)
-        pinner = getattr(backing, "_pin_controller", None)
-        if pinner is not None:
-            try:
-                pinner.save_profile()
-            except Exception:
-                logger.debug(
-                    "Expert streaming: pin profile save failed", exc_info=True
-                )
-            return
-
-
-def teardown_expert_streaming(engine: Any) -> None:
-    """Engine-stop teardown shared by the batched and VLM wrappers.
-
-    Persists the learned pin profile while the backing is still
-    reachable, then shuts the backing down (transition profile +
-    fds/mmaps) and clears the engine-side reference so a later
-    ``resolve_streaming_backing`` cannot hand back a closed store. Each
-    piece is already never-raise.
-    """
-    save_expert_pin_profile(engine)
-    shutdown_expert_streaming(resolve_streaming_backing(engine))
-    try:
-        engine._expert_streaming_backing = None  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "convert_model_to_streaming",

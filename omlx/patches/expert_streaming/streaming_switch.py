@@ -1077,18 +1077,6 @@ def make_expert_cache(
     return ExpertLRUCache(budget_bytes, per_slot, num_layers=num_layers)
 
 
-def __getattr__(name: str):
-    # Lazy re-exports: the policies subclass ExpertLRUCache (cache_policies
-    # -> streaming_switch), so a top-level import here would cycle. Module
-    # __getattr__ keeps `from .streaming_switch import S3FIFOExpertCache`
-    # working for callers like the package __init__.
-    if name in ("S3FIFOExpertCache",):
-        from . import cache_policies
-
-        return getattr(cache_policies, name)
-    raise AttributeError(name)
-
-
 # ---------------------------------------------------------------------------
 # Helpers that mirror switch_layers.py
 # ---------------------------------------------------------------------------
