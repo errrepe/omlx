@@ -22,7 +22,11 @@
         'expert_streaming_dynamic_stall_target',
         'expert_streaming_prefill_budget_gib',
     ];
-    // Order matches the summary line's historical display order.
+    // Fallback copy of the advanced-keys list (= the served settings
+    // schema minus the editor keys, in schema order — which matches the
+    // summary line's historical display order). loadExpertStreamingSchema
+    // refreshes the derived list from GET /api/expert-streaming/
+    // settings-schema; this literal keeps working when the fetch fails.
     const EXPERT_STREAMING_ADVANCED_KEYS = [
         'expert_streaming_io_depth',
         'expert_streaming_coalesce',
@@ -381,6 +385,7 @@
             templates: [],               // global templates
             presets: [],                 // curated presets (bundled + remote refresh)
             profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
+            expertStreamingSchemaFields: [],  // /api/expert-streaming/settings-schema; [] = fallback literals
             profileScope: 'model',       // 'preset' | 'global' | 'model'
             refreshingPresets: false,
             activeProfileName: null,     // currently-active profile for the form
@@ -777,6 +782,7 @@
                     this.loadModels(),
                     this.loadServerInfo(),
                     this.loadProfileFields(),
+                    this.loadExpertStreamingSchema(),
                     this.loadPresets(),
                     this.checkForUpdate()
                 ]);
@@ -1741,6 +1747,57 @@
                     console.error('Failed to load profile field definitions:', e);
                 }
             },
+            async loadExpertStreamingSchema() {
+                // Progressive enhancement: the served bounds table
+                // (STREAMING_SETTING_SCHEMA) refreshes the streaming key
+                // lists so a new tunable surfaces without a JS release;
+                // the module literals stay the fallback.
+                try {
+                    const r = await fetch('/admin/api/expert-streaming/settings-schema');
+                    if (r.ok) {
+                        const data = await r.json();
+                        const fields = Array.isArray(data.fields) ? data.fields : [];
+                        this.expertStreamingSchemaFields =
+                            fields.filter(f => f && typeof f.key === 'string');
+                        // The whole family is unsupported on the diffusion
+                        // lane — fold in any tunable the JS literals predate.
+                        for (const f of this.expertStreamingSchemaFields) {
+                            DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.add(f.key);
+                        }
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load expert streaming schema:', e);
+                }
+            },
+            expertStreamingAdvancedKeys() {
+                // Schema keys minus the editor's dedicated controls —
+                // same order the schema declares (the historical display
+                // order). Falls back to the literal when unfetched.
+                const fields = this.expertStreamingSchemaFields;
+                if (!fields || !fields.length) return EXPERT_STREAMING_ADVANCED_KEYS;
+                const editor = new Set(EXPERT_STREAMING_EDITOR_KEYS);
+                return fields.map(f => f.key).filter(k => !editor.has(k));
+            },
+            expertStreamingEditorNumericKeys() {
+                // The governor/prefill numeric inputs — schema-typed
+                // numbers among the editor keys, minus budget_gib (the
+                // 3-state budget mode serializes it separately above).
+                const fields = this.expertStreamingSchemaFields;
+                if (!fields || !fields.length) {
+                    return ['expert_streaming_dynamic_max_gib',
+                            'expert_streaming_dynamic_min_gib',
+                            'expert_streaming_dynamic_stall_target',
+                            'expert_streaming_prefill_budget_gib'];
+                }
+                const editor = new Set(EXPERT_STREAMING_EDITOR_KEYS);
+                return fields
+                    .filter(f => editor.has(f.key)
+                        && (f.type === 'float' || f.type === 'int')
+                        && f.key !== 'expert_streaming_budget_gib')
+                    .map(f => f.key);
+            },
 
             async loadPresets() {
                 // Use localStorage cache if present, otherwise fall back to the bundled file.
@@ -2058,7 +2115,7 @@
                     // keys (autotune/hand-edited settings) that have no
                     // editor controls.
                     expert_streaming_advanced_summary:
-                        EXPERT_STREAMING_ADVANCED_KEYS
+                        this.expertStreamingAdvancedKeys()
                             .map(k => [k.slice('expert_streaming_'.length), s[k]])
                             .filter(([, v]) => v !== undefined && v !== null && v !== '')
                             .map(([k, v]) => `${k}=${v}`)
@@ -3092,10 +3149,7 @@
                                 // value only while streaming is on and the
                                 // input parses; otherwise explicit null.
                                 ...Object.fromEntries(
-                                    ['expert_streaming_dynamic_max_gib',
-                                     'expert_streaming_dynamic_min_gib',
-                                     'expert_streaming_dynamic_stall_target',
-                                     'expert_streaming_prefill_budget_gib']
+                                    this.expertStreamingEditorNumericKeys()
                                         .map(k => [k, this.modelSettings.expert_streaming_enabled
                                             && Number.isFinite(Number(this.modelSettings[k]))
                                             ? Number(this.modelSettings[k]) : null])),
@@ -3232,15 +3286,13 @@
                                     qwen35_ane_prefill_cpu_threads: 8,
                                     qwen35_ane_prefill_cpu_shared_resource: true,
                                     // Whole expert-streaming family is
-                                    // unsupported on the diffusion lane.
+                                    // unsupported on the diffusion lane:
+                                    // enabled off, every other editor key null.
                                     expert_streaming_enabled: false,
-                                    expert_streaming_budget_gib: null,
-                                    expert_streaming_budget_auto: null,
-                                    expert_streaming_dynamic: null,
-                                    expert_streaming_dynamic_max_gib: null,
-                                    expert_streaming_dynamic_min_gib: null,
-                                    expert_streaming_dynamic_stall_target: null,
-                                    expert_streaming_prefill_budget_gib: null,
+                                    ...Object.fromEntries(
+                                        EXPERT_STREAMING_EDITOR_KEYS
+                                            .filter(k => k !== 'expert_streaming_enabled')
+                                            .map(k => [k, null])),
                                     moe_expert_offload_enabled: false,
                                     moe_expert_offload_resident_fraction: 0.25,
                                     deepseek_v41_engram_ssd_offload: false,

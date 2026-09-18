@@ -3620,90 +3620,67 @@ def _raise_if_alias_conflicts_exposed_profiles(
             )
 
 
+def _fmt_bound(bound) -> object:
+    """Display a schema bound without a trailing .0 (64.0 -> 64)."""
+    return int(bound) if isinstance(bound, float) and bound.is_integer() else bound
+
+
 def _validate_expert_streaming_bounds(settings: dict) -> None:
     """Reject expert-streaming values outside the runtime-supported ranges.
 
-    Ranges mirror the runtime's own bounds
-    (patches/expert_streaming/__init__.py ``_IO_OVERRIDE_VALIDATORS`` and
-    ``_clamp_budget_bytes``). Persisting out-of-range values used to be
-    silently dropped/clamped at load, diverging from what the admin
-    reported back; the admin contract rejects them instead. Raises
-    ValueError -> HTTP 400.
+    Types, bounds and choices come from the single bounds table
+    (model_profiles.STREAMING_SETTING_SCHEMA) via the runtime's own
+    ``validate_streaming_setting`` coercion, so the write boundary cannot
+    drift from the load path. The admin contract stays stricter on
+    numerics: out-of-range values are rejected rather than
+    clamped/dropped the way the loader coerces them, and int fields
+    demand an integral value. Raises ValueError -> HTTP 400.
     """
-    # The advanced toggles are strict booleans: the runtime treats any
-    # truthy/falsy value as a flag, so silently accepting "true"/1/[] would
-    # persist a value the load path interprets differently from what the
-    # admin contract reported back (e.g. dynamic "auto" -> bool() -> forced
-    # on, budget_auto 0 -> `is False` misses -> auto stays on). Missing/None
-    # means "keep the default".
-    for name in (
-        "expert_streaming_budget_auto",
-        "expert_streaming_dynamic",
-        "expert_streaming_coalesce",
-        "expert_streaming_readahead",
-        "expert_streaming_seed",
-        "expert_streaming_per_layer_eval",
-        "expert_streaming_pins",
-        "expert_streaming_pin_sync",
-    ):
-        value = settings.get(name)
-        if value is not None and not isinstance(value, bool):
-            raise ValueError(f"{name} must be a boolean.")
+    from ..model_profiles import STREAMING_SETTING_SCHEMA
+    from ..patches.expert_streaming import validate_streaming_setting
 
-    # (name, lo, hi, lo_open, integral, unit). lo/hi = closed bounds unless
-    # lo_open; hi=None means "no upper bound". Explicit 0 is valid for the
-    # GiB fields: page-cache only (no app-level LRU pin).
-    numeric_bounds = (
-        ("expert_streaming_budget_gib", 0, 64, False, False, " GiB"),
-        ("expert_streaming_dynamic_max_gib", 0, 64, True, False, " GiB"),
-        ("expert_streaming_dynamic_min_gib", 0, 64, False, False, " GiB"),
-        ("expert_streaming_prefill_budget_gib", 0, 64, True, False, " GiB"),
-        ("expert_streaming_pin_gib", 0, 64, True, False, " GiB"),
-        ("expert_streaming_dynamic_stall_target", 0, 0.9, False, False, ""),
-        ("expert_streaming_io_depth", 1, 64, False, True, ""),
-        # Runtime floor is _MIN_THRESHOLD (adaptive_topk.py): below 0.05
-        # the value is dropped to exact routing, so the admin rejects it
-        # instead of persisting a knob that never engages.
-        ("expert_streaming_topk_threshold", 0.05, 1, False, False, ""),
-        ("expert_streaming_cache_prior", 0, None, False, False, ""),
-        ("expert_streaming_hot_fraction", 0, 1, False, False, ""),
-    )
-    for name, lo, hi, lo_open, integral, unit in numeric_bounds:
+    for name, spec in STREAMING_SETTING_SCHEMA.items():
         value = settings.get(name)
         if value is None:
             continue
+        kind = spec["type"]
+        if kind == "bool" or kind == "choice":
+            # Strict booleans: the runtime treats any truthy/falsy value
+            # as a flag, so silently accepting "true"/1/[] would persist
+            # a value the load path interprets differently from what the
+            # admin contract reported back (e.g. dynamic "auto" -> bool()
+            # -> forced on, budget_auto 0 -> `is False` misses -> auto
+            # stays on). Choices normalize case/whitespace; cold_tier's
+            # "" stays legal (off). None out = unusable.
+            if validate_streaming_setting(name, value) is not None:
+                continue
+            if kind == "bool":
+                raise ValueError(f"{name} must be a boolean.")
+            shown = " or ".join(f'"{c}"' for c in spec["choices"] if c)
+            raise ValueError(f"{name} must be {shown}.")
+        # Numeric: bools are not numbers for these knobs — True must not
+        # silently become 1 GiB of pinned budget.
+        lo, hi, lo_open = spec["bounds"]
+        integral = kind == "int"
+        lo_d = _fmt_bound(lo)
+        hi_d = _fmt_bound(hi) if hi is not None else None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(
-                f"{name} must be an integer in [{lo}, {hi}]."
+                f"{name} must be an integer in [{lo_d}, {hi_d}]."
                 if integral
                 else f"{name} must be a number."
             )
         if integral and int(value) != value:
-            raise ValueError(f"{name} must be an integer in [{lo}, {hi}].")
+            raise ValueError(f"{name} must be an integer in [{lo_d}, {hi_d}].")
         if hi is None:
             if value < lo:
-                raise ValueError(f"{name} must be >= {lo}.")
+                raise ValueError(f"{name} must be >= {lo_d}.")
             continue
         ok = (lo < value <= hi) if lo_open else (lo <= value <= hi)
         if not ok:
-            bound = f"({lo}, {hi}]" if lo_open else f"[{lo}, {hi}]"
+            bound = f"({lo_d}, {hi_d}]" if lo_open else f"[{lo_d}, {hi_d}]"
+            unit = " GiB" if name.endswith("_gib") else ""
             raise ValueError(f"{name} must be in {bound}{unit}.")
-
-    # Choice fields normalize case/whitespace; cold_tier's "" stays legal.
-    choice_fields = (
-        ("expert_streaming_cache_policy", ("lru", "s3fifo")),
-        ("expert_streaming_pin_regime", ("decode", "prefill")),
-        # Runtime accepts any "2".."8" digit label
-        # (conversion._resolve_cold_tier_root); "" stays legal = off.
-        ("expert_streaming_cold_tier", ("", "2", "3", "4", "5", "6", "7", "8")),
-    )
-    for name, choices in choice_fields:
-        value = settings.get(name)
-        if value is None:
-            continue
-        if str(value).strip().lower() not in choices:
-            shown = " or ".join(f'"{c}"' for c in choices if c)
-            raise ValueError(f"{name} must be {shown}.")
 
 
 def _validate_model_settings(entry, settings):
@@ -4412,6 +4389,39 @@ async def apply_optimal_settings(
         f"https://omlx.ai/benchmarks/performance/{request.benchmark_id}"
     )
     return {**summary, **applied}
+
+
+@router.get("/api/expert-streaming/settings-schema")
+async def expert_streaming_settings_schema(
+    is_admin: bool = Depends(require_admin),
+):
+    """Serve STREAMING_SETTING_SCHEMA as JSON-safe field descriptors.
+
+    The settings form derives its expert-streaming key lists and input
+    bounds from this so a tunable added to the shared table
+    (model_profiles.STREAMING_SETTING_SCHEMA — the same source the PUT
+    validator and the runtime coercion read) surfaces without a JS
+    release. Per field: key, type, default, bounds {lo, hi, lo_open}
+    (numeric only; hi null = unbounded), choices (choice only).
+    """
+    from ..model_profiles import STREAMING_SETTING_SCHEMA
+
+    fields = []
+    for key, spec in STREAMING_SETTING_SCHEMA.items():
+        field = {
+            "key": key,
+            "type": spec["type"],
+            "default": spec.get("default"),
+        }
+        bounds = spec.get("bounds")
+        if bounds is not None:
+            lo, hi, lo_open = bounds
+            field["bounds"] = {"lo": lo, "hi": hi, "lo_open": bool(lo_open)}
+        choices = spec.get("choices")
+        if choices is not None:
+            field["choices"] = list(choices)
+        fields.append(field)
+    return {"fields": fields}
 
 
 @router.get("/api/profile-fields")
