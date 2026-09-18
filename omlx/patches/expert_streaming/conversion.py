@@ -5,10 +5,11 @@ Everything that turns a resident MoE checkpoint into streaming layers lives
 here: stacked-key resolution, the per-module switch-MLP rewrite, the
 ``convert_model_to_streaming`` orchestrator, and the transition-profile
 persistence for its speculation state. Settings/budget resolution
-(``_io_overrides``, ``resolve_budget_bytes`` ...) stays in the package
-``__init__`` — ``moe_expert_offload`` and the engines import it from there —
-and is lazily imported inside the functions that need it, so this module is
-import-safe at package-init time.
+(``_io_overrides``, ``resolve_budget_bytes`` ...) lives in ``settings.py``
+(re-exported through the package ``__init__`` — ``moe_expert_offload`` and
+the engines import it from there) and is lazily imported inside the
+functions that need it, so this module is import-safe at package-init
+time.
 """
 
 from __future__ import annotations
