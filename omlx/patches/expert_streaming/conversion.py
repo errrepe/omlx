@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ._env import env_bool
 from .model_hooks import (
     DEFAULT_PREFIX_TEMPLATES,
     find_moe_container,
@@ -119,8 +120,8 @@ def _wire_streaming_io_overrides(
     pool = io_pool_for(io_depth) if io_depth is not None else None
     wired = 0
     targets = list(layers or []) + list(mtp_stages or [])
-    for lyr in targets:
-        sm = getattr(find_moe_container(lyr, attr_chain), "switch_mlp", None)
+    for _i, moe in _iter_moe(targets, attr_chain):
+        sm = getattr(moe, "switch_mlp", None)
         if sm is None:
             continue
         for proj in _PROJ_ATTRS:
@@ -688,10 +689,23 @@ def _convert_switch_mlp_module(
     return True
 
 
+def _iter_moe(nodes: Any, attr_chain: tuple[str, ...] = ("mlp", "ffn")):
+    """Yield (idx, moe_container) for each node carrying a MoE block.
+
+    The one ``find_moe_container`` walk shared by the conversion scans
+    (switch-MLP rewrite, IO overrides, per-instance routing stamp) —
+    nodes without a MoE container are skipped here so every caller sees
+    only real containers.
+    """
+    for idx, node in enumerate(nodes or ()):
+        moe = find_moe_container(node, attr_chain)
+        if moe is not None:
+            yield idx, moe
+
+
 def _switch_glus(layers: Any, attr_chain: tuple[str, ...] = ("mlp", "ffn")):
     """Yield (layer_idx, switch_mlp) for each layer holding a switch_mlp."""
-    for layer_idx, layer in enumerate(layers or ()):
-        moe = find_moe_container(layer, attr_chain)
+    for layer_idx, moe in _iter_moe(layers, attr_chain):
         sm = getattr(moe, "switch_mlp", None)
         if sm is not None:
             yield layer_idx, sm
@@ -734,7 +748,7 @@ def _plan_conversion(
     # callers): the engines gate this path on expert_streaming_enabled
     # alone. Defense in depth for every entry point, including direct
     # callers.
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
+    if not env_bool("OMLX_MOE_EXPERT_OFFLOAD", True):
         logger.info(
             "Expert streaming: disabled by OMLX_MOE_EXPERT_OFFLOAD=0 (%s)",
             model_path,
@@ -959,18 +973,21 @@ def _resolve_hot_fraction(io_ov: dict) -> float | None:
 
 def _apply_hobbit_split(
     backing, model_path, io_ov, estimate, cold_root
-) -> dict[int, set]:
+) -> tuple[dict[int, set], float | None]:
     """HOBBIT per-expert hot/cold split: with a cold tier
     active, the top fraction of experts per layer (by learned
     pin-profile frequency) keeps the ORIGINAL packing while the
     rest compute at the tier. No profile = uniform cold tier.
 
-    Returns the per-layer hot id sets (empty dict without a split)."""
+    Returns (per-layer hot id sets, resolved hot fraction) — the
+    fraction is resolved once here so the pin fingerprint downstream
+    records the SAME value the split used (empty dict without a
+    split; the fraction still reports what was resolved)."""
     from . import shard_bank as _shard_mod
 
     hot_ids_by_layer: dict[int, set] = {}
+    hot_fraction = _resolve_hot_fraction(io_ov)
     if cold_root is not None:
-        hot_fraction = _resolve_hot_fraction(io_ov)
         hot_keys = (
             _shard_mod.load_hot_set_from_profile(
                 Path(model_path) / ".omlx" / "expert_pin_profile.json",
@@ -1000,7 +1017,7 @@ def _apply_hobbit_split(
             logger.debug(
                 "Expert streaming: hot fraction unset — uniform cold tier (I5)"
             )
-    return hot_ids_by_layer
+    return hot_ids_by_layer, hot_fraction
 
 
 def _build_expert_backing(
@@ -1009,13 +1026,13 @@ def _build_expert_backing(
     io_ov: dict,
     estimate: Any,
     use_file_backing: bool,
-) -> tuple[Any, str, dict, Any]:
+) -> tuple[Any, str, dict, Any, float | None]:
     """SSD/RAM backing construction: cold tier, spill absorb, expert bank,
     HOBBIT hot/cold split, guard-info stamp.
 
-    Returns (backing, backing_kind, hot_ids_by_layer, cold_root).
-    Raises RuntimeError when file backing was requested but cannot be
-    built — never silently retains expert banks in RAM.
+    Returns (backing, backing_kind, hot_ids_by_layer, cold_root,
+    hot_fraction). Raises RuntimeError when file backing was requested
+    but cannot be built — never silently retains expert banks in RAM.
     """
     cold_root = None
     # Backing store
@@ -1023,8 +1040,10 @@ def _build_expert_backing(
     backing_kind = "ram"
     # HOBBIT split state: populated only when a complete cold tier
     # exists AND a learned pin profile provides frequencies; otherwise the
-    # convert keeps the uniform cold tier semantics.
+    # convert keeps the uniform cold tier semantics. hot_fraction is the
+    # resolved knob value (also recorded in the pin fingerprint).
     hot_ids_by_layer: dict[int, set] = {}
+    hot_fraction: float | None = None
     if use_file_backing:
         try:
             from .shard_bank import ExpertBackingStore
@@ -1053,7 +1072,7 @@ def _build_expert_backing(
                         )
             except Exception:
                 logger.debug("Expert streaming: spill absorb skipped", exc_info=True)
-            hot_ids_by_layer = _apply_hobbit_split(
+            hot_ids_by_layer, hot_fraction = _apply_hobbit_split(
                 backing, model_path, io_ov, estimate, cold_root
             )
             # Guard metadata for the scheduler's prefill chunk sizing:
@@ -1101,7 +1120,7 @@ def _build_expert_backing(
         backing = {}
         backing_kind = "ram-dict"
 
-    return backing, backing_kind, hot_ids_by_layer, cold_root
+    return backing, backing_kind, hot_ids_by_layer, cold_root, hot_fraction
 
 
 def _find_decoder_layers(model: Any) -> tuple[Any, Any]:
@@ -1366,10 +1385,8 @@ def _stamp_instance_routing(
     # (including exact None/0.0) so later models cannot move it.
     try:
         _targets = list(layers or []) + list(mtp_stages or [])
-        for _lyr in _targets:
-            _moe = find_moe_container(_lyr, _moe_chain)
-            if _moe is not None:
-                set_instance_routing(_moe, thr, prior)
+        for _i, _moe in _iter_moe(_targets, _moe_chain):
+            set_instance_routing(_moe, thr, prior)
     except Exception:
         logger.debug("Expert streaming: per-instance routing stamp skipped", exc_info=True)
     if thr is not None or prior > 0:
@@ -1444,13 +1461,27 @@ def _wire_stream_eval_boundary(layers, io_ov, _moe_chain, _hooks, backing) -> No
 
 
 def _attach_warm_pin_hooks(
-    model_path, layers, io_ov, _moe_chain, backing, cache, estimate, cold_root
+    model_path,
+    layers,
+    io_ov,
+    _moe_chain,
+    backing,
+    cache,
+    estimate,
+    cold_root,
+    spec_state,
+    hot_fraction,
 ) -> None:
-    """mlock pins + page-cache complements: F_RDADVISE readahead (RA)
-    rides the prediction flow with kernel hints instead of reads and
-    defaults ON, as does the prefill-hotness cache seed (SEED). The
-    per-model readahead/seed settings (autotune) override the env
-    defaults when set."""
+    """mlock pins (PIN) + prefill-hotness cache seed (SEED): both ride
+    the per-layer hook the streaming GLU calls. F_RDADVISE readahead (RA)
+    has a single predictor now — the spec-state advisor in
+    streaming_switch — so the resolved per-model flag is only STAMPED on
+    ``spec_state.readahead_enabled`` for it here (the advisor reads
+    ``getattr(spec_state, "readahead_enabled", None)``, None = env
+    default). The per-model readahead/seed/pin settings (autotune)
+    override the env defaults when set; *hot_fraction* is the value the
+    HOBBIT split already resolved (single resolution, shared with the
+    fingerprint)."""
     from . import warmer as _warmer_mod
 
     def _env_or(key: str, env_default: bool) -> bool:
@@ -1460,6 +1491,8 @@ def _attach_warm_pin_hooks(
         return env_default if setting is None else bool(setting)
 
     ra_enabled = _env_or("expert_streaming_readahead", _warmer_mod.RA_ENABLED)
+    if spec_state is not None:
+        spec_state.readahead_enabled = ra_enabled
     seed_enabled = _env_or("expert_streaming_seed", _warmer_mod.SEED_ENABLED)
     pins_enabled = _env_or("expert_streaming_pins", _warmer_mod.PIN_ENABLED)
     pin_gib = io_ov["expert_streaming_pin_gib"]
@@ -1469,7 +1502,7 @@ def _attach_warm_pin_hooks(
         else float(pin_gib) * 1024**3  # io_ov already validated (0, 64]
     )
 
-    if pins_enabled or ra_enabled or seed_enabled:
+    if pins_enabled or seed_enabled:
         try:
             glus: dict[int, Any] = {
                 i: sm
@@ -1480,11 +1513,6 @@ def _attach_warm_pin_hooks(
                 i: [getattr(g, p) for p in _PROJ_ATTRS if hasattr(g, p)]
                 for i, g in glus.items()
             }
-            warmer = (
-                _warmer_mod.PageCacheWarmer(linears_by_layer)
-                if ra_enabled
-                else None
-            )
             pinner = None
             if pins_enabled and backing is not None and not isinstance(backing, dict):
                 # Per-model learned-pin profile so the hot set is wired
@@ -1505,16 +1533,15 @@ def _attach_warm_pin_hooks(
                     _pin_sync_eff = _warmer_mod.PIN_SYNC_ENABLED
                 # The pin profile applies only when the loaded
                 # model's fingerprint matches the one it was learned from.
-                # hot_fraction resolves inside the cold-tier branch above;
-                # resolve it again here so the fingerprint is stable even
-                # when no cold tier is active.
-                _hf = _resolve_hot_fraction(io_ov)
+                # hot_fraction was resolved once by the backing build —
+                # the fingerprint records the SAME value the split used,
+                # even when no cold tier is active.
                 _pin_fp = _expert_pin_fingerprint(
                     model_path,
                     linears_by_layer,
                     backing,
                     cold_root,
-                    _hf,
+                    hot_fraction,
                 )
                 pinner = _warmer_mod.PinController(
                     linears_by_layer,
@@ -1542,21 +1569,55 @@ def _attach_warm_pin_hooks(
                     cache,
                     per_expert_bytes=estimate.per_expert_bytes,
                 )
-            if warmer is not None or pinner is not None or recorder is not None:
-                hook = _warmer_mod.WarmPinHook(warmer, pinner, recorder)
+            if pinner is not None or recorder is not None:
+                hook = _warmer_mod.WarmPinHook(pinner, recorder)
                 for sm_ in glus.values():
                     sm_._warm_pins = hook  # type: ignore[attr-defined]
                 logger.info(
-                    "Expert streaming: pin=%s readahead=%s seed=%s attached (%d layers)",
+                    "Expert streaming: pin=%s seed=%s attached "
+                    "(readahead=%s via spec_state, %d layers)",
                     bool(pinner),
-                    bool(warmer),
                     bool(recorder),
+                    ra_enabled,
                     len(glus),
                 )
         except Exception as e:
             logger.warning(
                 "Expert streaming: warm/pin init failed: %s", e, exc_info=True
             )
+
+
+def _clear_cache_synced() -> None:
+    """Release the reusable Metal pool, but only after a full sync.
+
+    ``mx.clear_cache`` must never run with command buffers in flight: on
+    M4 the driver panics with 'completeMemory() prepare count underflow'
+    (#300/#888). ``omlx.utils.metal_sync._sync_and_clear_cache`` drains
+    the stream first and takes the buffer-access lock that keeps the
+    async store-cache worker from observing a half-reclaimed pool
+    (#1106), so it is preferred whenever it is importable.
+    """
+    # The bare clear is ONLY the import-failure fallback. A failure
+    # INSIDE the synced helper (lock, sync, clear) must not fall through
+    # to the unsynchronized clear — that reintroduces the very 'clear
+    # with command buffers in flight' race the helper exists to prevent.
+    try:
+        from omlx.utils.metal_sync import _sync_and_clear_cache
+    except Exception:
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
+        return
+    try:
+        _sync_and_clear_cache()
+    except Exception:
+        logger.warning(
+            "Expert streaming: synced cache clear failed — skipping",
+            exc_info=True,
+        )
 
 
 def convert_model_to_streaming(
@@ -1581,15 +1642,17 @@ def convert_model_to_streaming(
     cache, io_ov, _governor = _make_streaming_cache_and_governor(
         model_settings, budget_bytes, per_slot, estimate
     )
-    backing, backing_kind, hot_ids_by_layer, cold_root = _build_expert_backing(
-        model_path, model_settings, io_ov, estimate, use_file_backing
+    backing, backing_kind, hot_ids_by_layer, cold_root, hot_fraction = (
+        _build_expert_backing(
+            model_path, model_settings, io_ov, estimate, use_file_backing
+        )
     )
 
     # Wire one SpeculationState (and the governor) onto cache+backing.
     # One speculation state per conversion: it hangs off the cache
     # (always) and off the backing store (file backing) so close()
     # drains the speculation workers with the readers.
-    from .streaming_switch import SpeculationState
+    from .speculation import SpeculationState
 
     _spec_state = SpeculationState()
     cache.spec_state = _spec_state  # type: ignore[attr-defined]
@@ -1668,9 +1731,7 @@ def convert_model_to_streaming(
 
     # Post-conversion wiring: IO overrides, adaptive top-k, eval
     # boundary, guard info, warm/pin/seed hooks.
-    import mlx.core as mx
-
-    mx.clear_cache()
+    _clear_cache_synced()
     logger.info(
         "Expert streaming: converted %d MoE layers "
         "(backing=%s, cache_capacity=%d experts)",
@@ -1710,6 +1771,8 @@ def convert_model_to_streaming(
         cache,
         estimate,
         cold_root,
+        _spec_state,
+        hot_fraction,
     )
 
     try:

@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Warm/pin hook phase threading (audit): seq_len is the authoritative
+"""Pin/seed hook phase threading (audit): seq_len is the authoritative
 decode/prefill signal — routed-row count alone conflates a short prefill
 with a wide decode.
 
 Also covers the PinController latch fix: a pin pass that cannot run
 (empty regime / unknown expert width) must not latch ``pinned`` — it
 would suppress every later attempt.
+
+(F_RDADVISE readahead left this hook: the spec-state advisor in
+streaming_switch is the sole predictor now, gated by
+``spec_state.readahead_enabled``.)
 """
 from types import SimpleNamespace
 
 from omlx.patches.expert_streaming.warmer import (
-    PageCacheWarmer,
     PinController,
     PrefillHotnessRecorder,
     _is_decode_call,
@@ -34,16 +37,6 @@ def _lin(layer=0):
         stacked_scales_key=None,
         stacked_biases_key=None,
     )
-
-
-def test_warmer_gates_on_seq_len_not_rows():
-    w = PageCacheWarmer({0: [_lin()], 1: [_lin()]})
-    # seq_len=4 with only 8 routed rows: prefill — must not record or
-    # fire readahead for the next layer.
-    w.on_layer_plan(0, [1, 2, 3], 8, seq_len=4)
-    assert w.last_uniq[0] == []
-    w.on_layer_plan(0, [1, 2, 3], 8, seq_len=1)
-    assert w.last_uniq[0] == [1, 2, 3]
 
 
 def test_pin_controller_regime_by_seq_len():

@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""F_RDADVISE readahead and mlock pinning for streamed experts.
+"""mlock pinning and prefill-hotness seeding for streamed experts.
 
 Both mechanisms exploit the page-cache-only streaming default (no LRU):
 the OS file cache holds recently read expert pages, and reuse is served
 from RAM at memory bandwidth instead of the NVMe.
 
-PageCacheWarmer
-    During decode, right before a MoE layer loads its experts, submit
-    F_RDADVISE kernel readahead hints for the PREVIOUS token's experts of
-    the NEXT layer. Independent per-layer routing repeats ~35% of experts
-    across adjacent tokens, so the kernel prefetch brings those pages into
-    RAM before the next layer's demand reads. Hints only — nothing is
-    stored, no heap, no LRU, no userspace copy.
+F_RDADVISE readahead
+    Readahead hints for the NEXT layer's previous-token experts are
+    issued by the spec-state advisor
+    (``streaming_switch._advise_next_layer_prev_token``), the single
+    predictor — the per-model ``expert_streaming_readahead`` flag is
+    stamped on ``spec_state.readahead_enabled`` at convert time and the
+    OMLX_EXPERT_STREAMING_RA env default below feeds it. This module
+    keeps only the pin/seed machinery.
 
 PinController
     Observe routed experts for the first N decode calls, then mlock the
@@ -39,9 +40,11 @@ from ._env import env_bool, env_float
 logger = logging.getLogger(__name__)
 
 PIN_ENABLED = env_bool("OMLX_EXPERT_STREAMING_PIN", False)
-# F_RDADVISE readahead: the submitted jobs are kernel readahead hints,
-# not discarded reads — no userspace copy, near-zero cost, so it defaults
-# ON (disable with OMLX_EXPERT_STREAMING_RA=0).
+# F_RDADVISE readahead: the spec-state advisor submits kernel readahead
+# hints, not discarded reads — no userspace copy, near-zero cost, so it
+# defaults ON (disable with OMLX_EXPERT_STREAMING_RA=0). The converter
+# stamps the resolved per-model flag on spec_state.readahead_enabled;
+# this constant is its env default.
 RA_ENABLED = env_bool("OMLX_EXPERT_STREAMING_RA", True)
 # Prefill-hotness seeding: after a streaming prefill, replace the expert
 # cache contents with the prompt's hot experts.
@@ -149,74 +152,6 @@ def _proj_keys(linear: Any) -> list[str]:
     if b:
         keys.append(b)
     return keys
-
-
-class PageCacheWarmer:
-    """F_RDADVISE kernel readahead for the previous token's next-layer
-    experts, grouped per contiguous expert run. Hints only — zero data
-    copied into userspace.
-    """
-
-    def __init__(self, linears_by_layer: Dict[int, list]):
-        self.linears_by_layer = linears_by_layer
-        self.keys_by_layer: Dict[int, dict[int, list[str]]] = _keys_by_layer(
-            linears_by_layer
-        )
-        self.last_uniq: Dict[int, list[int]] = {}
-
-    def on_layer_start(
-        self, layer_idx: int, positions: int, seq_len: int | None = None
-    ) -> None:
-        """Fire the next layer's previous-token readahead hints before this
-        layer's demand loads (maximum overlap with GPU compute)."""
-        if not _is_decode_call(positions, seq_len):
-            return
-        nxt = layer_idx + 1
-        prev = self.last_uniq.get(nxt)
-        if prev:
-            linears = self.linears_by_layer.get(nxt)
-            if linears:
-                self._submit(prev, linears, nxt)
-
-    def on_layer_plan(
-        self,
-        layer_idx: int,
-        uniq_list: list[int],
-        positions: int,
-        seq_len: int | None = None,
-    ) -> None:
-        """Record this token's expert set for the next token's advisory."""
-        self.last_uniq[layer_idx] = (
-            list(uniq_list) if _is_decode_call(positions, seq_len) else []
-        )
-
-    def _submit(self, eids: list[int], linears: list, layer_idx: int) -> None:
-        backing = getattr(linears[0], "backing", None)
-        if backing is None:
-            return
-        if not hasattr(backing, "advise_expert_run"):
-            return
-        jobs = [
-            (key, eids)
-            for lin in linears
-            for key in self.keys_by_layer.get(layer_idx, {}).get(id(lin), [])
-        ]
-        if not jobs:
-            return
-
-        def _run():
-            for key, ids in jobs:
-                # ids come from np.unique (ascending): group contiguous runs.
-                for first, count in _runs(ids):
-                    self._advise_one(backing, key, first, count)
-
-        _WARM_POOL.submit(_run)
-
-    def _advise_one(self, backing: Any, key: str, first_id: int, count: int) -> None:
-        try:
-            backing.advise_expert_run(key, first_id, count)
-        except Exception:
-            pass
 
 
 class PinController:
@@ -798,15 +733,18 @@ class PrefillHotnessRecorder:
 
 
 class WarmPinHook:
-    """Attachment point for StreamingSwitchGLU (attribute `_warm_pins`)."""
+    """Attachment point for StreamingSwitchGLU (attribute `_warm_pins`).
+
+    Pin + seed legs only — the readahead advisor is not a hook leg: it
+    lives on the spec state (``streaming_switch`` drives it from
+    ``spec_state.prev_uniq_by_layer`` / ``readahead_enabled``).
+    """
 
     def __init__(
         self,
-        warmer: PageCacheWarmer | None,
         pinner: PinController | None,
         recorder: "PrefillHotnessRecorder | None" = None,
     ):
-        self.warmer = warmer
         self.pinner = pinner
         self.recorder = recorder
 
@@ -814,11 +752,10 @@ class WarmPinHook:
     def wants_usage_counts(self) -> bool:
         # Only the pin/recorder consumers use the per-token usage
         # histogram, so the switch only pays the np.bincount when at least
-        # one of them is attached. The readahead warmer keeps the plain
-        # uniq_list contract (contiguous-run F_RDADVISE grouping).
-        # The recorder stops consuming counts once seeded — without the
-        # latch the default config (seed on, pins off) pays a per-token
-        # np.bincount forever for a histogram nobody reads.
+        # one of them is attached. The recorder stops consuming counts
+        # once seeded — without the latch the default config (seed on,
+        # pins off) pays a per-token np.bincount forever for a histogram
+        # nobody reads.
         return self.pinner is not None or (
             self.recorder is not None and not self.recorder.seeded
         )
@@ -828,8 +765,6 @@ class WarmPinHook:
     ) -> None:
         if self.recorder is not None:
             self.recorder.maybe_seed(layer_idx, positions, seq_len=seq_len)
-        if self.warmer is not None:
-            self.warmer.on_layer_start(layer_idx, positions, seq_len=seq_len)
 
     def on_layer_plan(
         self,
@@ -839,13 +774,6 @@ class WarmPinHook:
         counts=None,
         seq_len: int | None = None,
     ) -> None:
-        if self.warmer is not None:
-            # The readahead warmer keeps the uniq-list signal: its
-            # predictions are set-based (contiguous-run grouping), and a
-            # histogram adds nothing there.
-            self.warmer.on_layer_plan(
-                layer_idx, uniq_list, positions, seq_len=seq_len
-            )
         if self.pinner is not None:
             self.pinner.on_layer_plan(
                 layer_idx, uniq_list, positions, counts, seq_len=seq_len

@@ -178,6 +178,66 @@ class TestPrefillPinOrdering:
             backing.close()
 
 
+class TestReadaheadStamp:
+    """The per-model readahead flag rides spec_state to the spec-state
+    advisor (the sole F_RDADVISE predictor); the warm hook carries no
+    warmer leg anymore."""
+
+    def _model(self):
+        import mlx.core as mx
+
+        layers = []
+        for _ in range(2):
+            glu = SimpleNamespace(
+                gate_up_proj=SimpleNamespace(weight=mx.zeros((4, 32, 32))),
+                down_proj=SimpleNamespace(weight=mx.zeros((4, 32, 16))),
+            )
+            layers.append(SimpleNamespace(mlp=SimpleNamespace(switch_mlp=glu)))
+        return SimpleNamespace(model=SimpleNamespace(layers=layers))
+
+    def test_readahead_setting_stamps_spec_state(self, tmp_path):
+        from omlx.patches.expert_streaming import convert_model_to_streaming
+
+        write_moe_checkpoint(tmp_path, fused=True)
+        model = self._model()
+        _, backing = convert_model_to_streaming(
+            model,
+            str(tmp_path),
+            SimpleNamespace(expert_streaming_readahead=False),
+            use_file_backing=True,
+        )
+        assert backing is not None
+        try:
+            # The advisor reads spec_state.readahead_enabled (None = env
+            # default) — the resolved per-model flag must be stamped.
+            assert backing.spec_state.readahead_enabled is False
+            # Seed defaults on, so the warm/pin hook still attaches —
+            # with pin + recorder legs only, never a warmer leg.
+            sm = model.model.layers[0].mlp.switch_mlp
+            hook = getattr(sm, "_warm_pins", None)
+            assert hook is not None
+            assert not hasattr(hook, "warmer")
+            assert hook.pinner is None
+            assert hook.recorder is not None
+        finally:
+            backing.close()
+
+    def test_readahead_unset_defaults_on(self, tmp_path):
+        from omlx.patches.expert_streaming import convert_model_to_streaming
+        from omlx.patches.expert_streaming import warmer as _warmer_mod
+
+        write_moe_checkpoint(tmp_path, fused=True)
+        _, backing = convert_model_to_streaming(
+            self._model(), str(tmp_path), None, use_file_backing=True
+        )
+        assert backing is not None
+        try:
+            # Setting unset -> the env default (RA_ENABLED) is stamped.
+            assert backing.spec_state.readahead_enabled is _warmer_mod.RA_ENABLED
+        finally:
+            backing.close()
+
+
 class TestCanonicalKillSwitch:
     """OMLX_MOE_EXPERT_OFFLOAD=0 gates the canonical path too."""
 
