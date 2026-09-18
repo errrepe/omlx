@@ -2101,25 +2101,21 @@ class VLMBatchedEngine(BaseEngine):
         # MoE expert offload for the VLM path: Gemma 4 checkpoints are
         # detected as VLMs, so this — not BatchedEngine — is their default
         # engine. Same shared sequence as batched.py: wrap on the MLX
-        # executor BEFORE materialize so non-resident experts never load.
-        from ..patches.expert_streaming import streaming_offload_load
+        # executor BEFORE materialize so non-resident experts never load;
+        # the shared pipeline then stamps the backing on this engine and
+        # materializes lazy buffers (RoPE freqs, vision/audio towers) on
+        # the loader thread (#1304).
+        from ..patches.expert_streaming import (
+            gate_up_fusion_blocked,
+            post_load_offload_pipeline,
+        )
 
-        _es_backing, self._moe_offload_wrapped = await streaming_offload_load(
+        _es_backing, self._moe_offload_wrapped = await post_load_offload_pipeline(
             self._vlm_model,
             self._model_name,
             self._model_settings,
             label="VLM",
-        )
-        if _es_backing is not None:
-            self._expert_streaming_backing = _es_backing
-
-        # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
-        # loader thread so per-engine inference threads can read them (#1304).
-        # Post-streaming: the MoE banks are gone, so this stays bounded.
-        from ..utils.model_loading import materialize_lazy_state
-
-        await loop.run_in_executor(
-            get_mlx_executor(), materialize_lazy_state, self._vlm_model
+            holder=self,
         )
 
         # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
@@ -2150,10 +2146,8 @@ class VLMBatchedEngine(BaseEngine):
                 "fusion on the VLM path",
                 self._moe_offload_wrapped,
             )
-        elif (
-            getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
-            is not False
-            and not getattr(self._model_settings, "expert_streaming_enabled", False)
+        elif not gate_up_fusion_blocked(
+            self._model_settings, getattr(self, "_moe_offload_wrapped", 0)
         ):
             try:
                 from ..patches.qwen35_moe_gate_up import (
