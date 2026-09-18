@@ -6,6 +6,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ...model_profiles import STREAMING_SETTING_SCHEMA
+
 logger = logging.getLogger(__name__)
 
 # Re-exported from the leaf modules — they hold the single copy, so the
@@ -18,7 +20,12 @@ from .model_hooks import (
     find_mtp_stages as find_mtp_stages,
     hooks_for as hooks_for,
 )
-from .residency import SUPPORTED_TYPES, normalize_model_type
+from .residency import (
+    SUPPORTED_TYPES,
+    load_config_model_type,
+    normalize_model_type,
+    streaming_owns_model,
+)
 
 try:
     # Public cache-policy API at the package root.
@@ -48,9 +55,10 @@ from .conversion import (
 
 
 def is_supported_model_type(model_type: str | None) -> bool:
-    if not model_type:
-        return False
-    return normalize_model_type(model_type) in SUPPORTED_TYPES
+    # Same allowlist gate as residency.streaming_owns_model — that one
+    # also accepts a local checkpoint dir, this one takes the type string
+    # directly.
+    return streaming_owns_model(model_type)
 
 
 # Upper bound on the expert LRU budget. The admin PUT handler rejects
@@ -113,18 +121,11 @@ def _auto_budget_bytes() -> int:
     model weights may still need during load.
     """
     try:
-        import psutil
+        from ...utils.psutil_compat import get_total_memory
 
-        total = int(psutil.virtual_memory().total)
+        total = int(get_total_memory())
     except Exception:
         total = 0
-    if total <= 0:
-        try:
-            from .governor import _total_ram_bytes
-
-            total = int(_total_ram_bytes())
-        except Exception:
-            total = 0
     if total <= 0:
         return int(1.0 * 1024**3)
     return _clamp_budget_bytes(
@@ -218,57 +219,61 @@ _IO_OVERRIDE_KEYS = (
 )
 
 
-def _clamped_int(value: Any, lo: int, hi: int) -> int | None:
-    """Coerce to int; below lo is invalid, above hi clamps."""
-    # bools are not numbers for these knobs: True must not silently
-    # become 1 GiB of pinned budget (admin rejects bools too).
+def validate_streaming_setting(name: str, value: Any) -> Any | None:
+    """Normalize one ``expert_streaming_*`` value, or None when unusable.
+
+    The runtime-side reader of ``model_profiles.STREAMING_SETTING_SCHEMA``
+    — the single bounds table shared with the admin write path. Per type:
+    bools stay strict (True/False only — "true"/1 are rejected, not
+    coerced, matching the admin contract); ints coerce, reject below lo
+    and clamp above hi; floats coerce and must sit inside (lo, hi] /
+    [lo, hi] / [lo, ∞); choices lower-case and match. None in means
+    unset — None out (keep the env / built-in default).
+    """
+    if value is None:
+        return None
+    spec = STREAMING_SETTING_SCHEMA.get(name)
+    if spec is None:
+        return None
+    kind = spec["type"]
+    if kind == "bool":
+        return value if isinstance(value, bool) else None
+    if kind == "choice":
+        v = str(value).strip().lower()
+        return v if v in spec["choices"] else None
+    # Numeric: bools are not numbers for these knobs — True must not
+    # silently become 1 GiB of pinned budget (admin rejects bools too).
     if isinstance(value, bool):
         return None
-    try:
-        v = int(value)
-    except (TypeError, ValueError):
-        return None
-    return max(lo, min(hi, v)) if v >= lo else None
-
-
-def _bounded_float(value: Any, lo: float, hi: float, lo_open: bool) -> float | None:
-    """Coerce to float accepted only inside (lo, hi] or [lo, hi]."""
-    if isinstance(value, bool):
-        return None
+    lo, hi, lo_open = spec["bounds"]
+    if kind == "int":
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return None
+        if v < lo:
+            return None
+        return min(hi, v) if hi is not None else v
     try:
         v = float(value)
     except (TypeError, ValueError):
         return None
-    ok = (lo < v <= hi) if lo_open else (lo <= v <= hi)
-    return v if ok else None
+    if not ((lo < v) if lo_open else (lo <= v)):
+        return None
+    if hi is not None and v > hi:
+        return None
+    return v
 
 
-def _choice(*allowed: str):
-    """Lowercased-membership validator factory: returns the normalized
-    value or None."""
-
-    def _validate(value: Any) -> str | None:
-        p = str(value).strip().lower()
-        return p if p in allowed else None
-
-    return _validate
-
-
-_policy_choice = _choice("lru", "s3fifo")
-# Consumed as a lowercase regime name (warmer.PinController.pin_regime).
-_pin_regime_choice = _choice("decode", "prefill")
-
-
+# Bounds now live in model_profiles.STREAMING_SETTING_SCHEMA; the
+# validators delegate so the write-boundary table and this load-time
+# coercion share one source. Only non-bool io keys get a validator — the
+# bool flags keep their historical raw pass-through (None = unset), so
+# _io_overrides() semantics are unchanged.
 _IO_OVERRIDE_VALIDATORS = {
-    "expert_streaming_io_depth": lambda v: _clamped_int(v, 1, 64),
-    "expert_streaming_cache_policy": _policy_choice,
-    "expert_streaming_hot_fraction": lambda v: _bounded_float(v, 0, 1, False),
-    "expert_streaming_pin_gib": lambda v: _bounded_float(v, 0, 64, True),
-    "expert_streaming_pin_regime": _pin_regime_choice,
-    "expert_streaming_dynamic_max_gib": lambda v: _bounded_float(v, 0, 64, True),
-    "expert_streaming_dynamic_min_gib": lambda v: _bounded_float(v, 0, 64, False),
-    "expert_streaming_dynamic_stall_target": lambda v: _bounded_float(v, 0.0, 0.9, False),
-    "expert_streaming_prefill_budget_gib": lambda v: _bounded_float(v, 0, 64, True),
+    key: (lambda _k: lambda v: validate_streaming_setting(_k, v))(key)
+    for key in _IO_OVERRIDE_KEYS
+    if STREAMING_SETTING_SCHEMA.get(key, {}).get("type") != "bool"
 }
 
 
@@ -364,16 +369,77 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
     return out
 
 
+# Wrapper hops a ``_expert_streaming_backing`` can hide behind, on either
+# side of the engine/model boundary: the model-side descent
+# (``language_model``/``model``/``_vlm_model``/``_language_model`` — the
+# chain ``scheduler._streaming_backing_of`` walks) plus the engine-side
+# holders (``engine``/``_model``/``_vlm_model`` — the chain the old
+# ``_engine_holders`` walked flat). One walk covers both spellings so no
+# consumer needs a second chain.
+_BACKING_HOPS = (
+    "language_model",
+    "model",
+    "_model",
+    "_vlm_model",
+    "_language_model",
+    "engine",
+)
+
+# Depth cap bounds adapter property loops (a hop that returns ``self``)
+# and pathological wrapper nesting; both legacy walks used 5.
+_BACKING_WALK_DEPTH = 5
+
+
+def _backing_holders(root: Any):
+    """Yield *root*, then every object reachable via ``_BACKING_HOPS``.
+
+    Breadth-first so an engine's ``_model`` and ``_vlm_model`` are both
+    visited (the flat engine-holder order) before descending into their
+    model-side wrappers; a visited set plus the depth cap bound cycles
+    and property loops.
+    """
+    seen: set[int] = set()
+    frontier = [root]
+    for _ in range(_BACKING_WALK_DEPTH):
+        if not frontier:
+            return
+        nxt: list = []
+        for obj in frontier:
+            if obj is None or id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            yield obj
+            for attr in _BACKING_HOPS:
+                try:
+                    child = getattr(obj, attr, None)
+                except Exception:
+                    continue
+                if child is not None:
+                    nxt.append(child)
+        frontier = nxt
+
+
+def find_streaming_backing(root: Any) -> Any | None:
+    """The ``_expert_streaming_backing`` anywhere on *root*'s wrapper chain.
+
+    Works from either side: pass a model (covers the
+    ``language_model``/``model``/``_vlm_model``/``_language_model``
+    descent the scheduler's ``_streaming_backing_of`` performs) or an
+    engine (covers its ``_model``/``_vlm_model`` holders). First match in
+    breadth-first hop order wins.
+    """
+    for holder in _backing_holders(root):
+        backing = getattr(holder, "_expert_streaming_backing", None)
+        if backing is not None:
+            return backing
+    return None
+
+
 def _engine_holders(engine: Any):
     """Yield the objects that can carry streaming state for an engine:
-    the engine itself, then its ``_model`` / ``_vlm_model`` wrappers."""
-    for holder in (
-        engine,
-        getattr(engine, "_model", None),
-        getattr(engine, "_vlm_model", None),
-    ):
-        if holder is not None:
-            yield holder
+    the engine itself, then its ``_model`` / ``_vlm_model`` wrappers and
+    whatever those wrap (same walk ``find_streaming_backing`` uses)."""
+    yield from _backing_holders(engine)
 
 
 def resolve_streaming_backing(engine: Any) -> Any | None:
@@ -384,11 +450,7 @@ def resolve_streaming_backing(engine: Any) -> Any | None:
     on the model only. Used by the engine stop paths so legacy fds/mmaps
     release on teardown instead of whenever GC gets around to it.
     """
-    for holder in _engine_holders(engine):
-        backing = getattr(holder, "_expert_streaming_backing", None)
-        if backing is not None:
-            return backing
-    return None
+    return find_streaming_backing(engine)
 
 
 def streaming_summary_backing(engine: Any) -> Any | None:
@@ -594,6 +656,67 @@ async def streaming_offload_load(
     return backing, wrapped
 
 
+async def post_load_offload_pipeline(
+    model: Any,
+    model_name: str,
+    settings: Any,
+    *,
+    label: str = "model",
+    holder: Any | None = None,
+) -> tuple[Any | None, int]:
+    """The post-load offload sequence every engine path repeats.
+
+    ``streaming_offload_load`` (conversion / legacy wrap / the
+    zero-conversion guard) then ``materialize_lazy_state`` — all MLX work
+    on the MLX executor. Conversion must precede materialize so the
+    dropped expert banks never evaluate (OOM); materialize must precede
+    gate/up fusion, which ``gate_up_fusion_blocked`` gates for the
+    caller. When *holder* is given (engines pass ``self``) the streaming
+    backing is stamped on it — the model-side stamp already happened
+    inside ``streaming_offload_load``.
+
+    Returns ``(backing, wrapped)`` exactly like ``streaming_offload_load``
+    so callers keep their fusion-skip logging context.
+    """
+    import asyncio
+
+    from ...engine_core import get_mlx_executor
+    from ...utils.model_loading import materialize_lazy_state
+
+    loop = asyncio.get_running_loop()
+    backing, wrapped = await streaming_offload_load(
+        model, model_name, settings, label=label
+    )
+    if backing is not None and holder is not None:
+        try:
+            holder._expert_streaming_backing = backing  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    # Materialize lazy buffers on the loader thread so per-engine
+    # inference threads can read them (#1304). Post-conversion the MoE
+    # banks are gone, so this stays bounded.
+    await loop.run_in_executor(get_mlx_executor(), materialize_lazy_state, model)
+    return backing, wrapped
+
+
+def gate_up_fusion_blocked(settings: Any, wrapped: int) -> bool:
+    """True when the post-load MoE gate/up fusion must be skipped.
+
+    Fusion concatenates the stock SwitchGLU gate/up weights in place, so
+    it cannot run when either offload system is active: legacy-wrapped
+    layers (``wrapped``) were never materialized and are not stock
+    SwitchGLU anyway, and a streaming conversion already owns the
+    projection layout. An explicit ``moe_gate_up_fusion_enabled=False``
+    also blocks it. Mirrors the predicate both engines spell inline.
+    """
+    if wrapped:
+        return True
+    return not (
+        getattr(settings, "moe_gate_up_fusion_enabled", True) is not False
+        and not getattr(settings, "expert_streaming_enabled", False)
+    )
+
+
 def shutdown_expert_streaming(backing: Any) -> None:
     """Release MoE streaming resources held by *backing*.
 
@@ -658,9 +781,15 @@ def teardown_expert_streaming(engine: Any) -> None:
 __all__ = [
     "convert_model_to_streaming",
     "ensure_streaming_backing_or_raise",
+    "find_streaming_backing",
+    "gate_up_fusion_blocked",
+    "load_config_model_type",
+    "post_load_offload_pipeline",
     "resolve_budget_bytes",
     "save_expert_pin_profile",
+    "streaming_owns_model",
     "teardown_expert_streaming",
+    "validate_streaming_setting",
     "is_supported_model_type",
     "normalize_model_type",
     "SUPPORTED_TYPES",

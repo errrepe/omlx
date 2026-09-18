@@ -73,54 +73,36 @@ def _max_dynamic_budget_bytes(default_gib: float = 0.0) -> int:
     return max(0, int(gib * 1024**3))
 
 
-def _psutil_vm(field: str) -> int | None:
-    """psutil.virtual_memory() field in bytes, or None when unavailable."""
-    try:
-        import psutil
-
-        return int(getattr(psutil.virtual_memory(), field))
-    except Exception:
-        return None
-
-
 def _free_bytes() -> int:
-    """Best-effort system free memory (psutil.available; vm_stat fallback)."""
-    avail = _psutil_vm("available")
-    if avail is not None:
-        return avail
-    try:
-        import subprocess
+    """Best-effort system free memory (``virtual_memory().available``).
 
-        out = subprocess.run(
-            ["vm_stat"], capture_output=True, text=True, timeout=2
-        ).stdout
-        page = 16384
-        free = inactive = purgeable = 0
-        for line in out.splitlines():
-            if "Pages free:" in line:
-                free = int(line.split(":")[1].strip().rstrip("."))
-            elif "Pages inactive:" in line:
-                inactive = int(line.split(":")[1].strip().rstrip("."))
-            elif "Pages purgeable:" in line:
-                purgeable = int(line.split(":")[1].strip().rstrip("."))
-        return (free + inactive + purgeable) * page
+    Shared with the rest of oMLX via ``utils.psutil_compat`` — native
+    ``host_statistics64`` first, TTL-cached ``vm_stat`` subprocess only as
+    the fallback (no per-observe subprocess churn, real page size, no
+    hardcoded guess). ``available`` = free + inactive: psutil's primary
+    path never counted purgeable pages, so the old vm_stat fallback's
+    purgeable-inclusive figure was the outlier, not the contract. 0 when
+    every probe fails — callers treat it as "unknown" and idle.
+    """
+    try:
+        from ...utils.psutil_compat import virtual_memory
+
+        return int(virtual_memory().available)
     except Exception:
         return 0
 
 
 def _total_ram_bytes() -> int:
-    total = _psutil_vm("total")
-    if total is not None:
-        return total
+    """Total physical RAM (psutil_compat's sysconf/sysctl/psutil chain)."""
     try:
-        import subprocess
+        from ...utils.psutil_compat import get_total_memory
 
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2
-        ).stdout.strip()
-        return int(out) if out else 64 * 1024**3
+        total = int(get_total_memory())
     except Exception:
-        return 64 * 1024**3
+        total = 0
+    # Keep the 64 GiB guess when every probe fails: the watermark
+    # fractions need a nonzero RAM figure — 0 would freeze the governor.
+    return total if total > 0 else 64 * 1024**3
 
 
 def _clampf(v, lo: float, hi: float, default: float) -> float:
@@ -504,6 +486,7 @@ def arm_dynamic(
     stall_target: float | None,
     min_cap: int | None = None,
     num_layers: int = 1,
+    initial_total_bytes: int | None = None,
     label: str = "expert streaming",
     **governor_kwargs,
 ) -> ExpertResidencyGovernor | None:
@@ -518,12 +501,19 @@ def arm_dynamic(
     0.25 GiB). ``floor_default`` is the caller's model-specific min-cap
     fallback (e.g. one token's routed working set); an explicit
     ``min_cap`` always wins. ``num_layers`` is the governor's layer count
-    for windowing (1 for per-layer-units caches). Extra governor kwargs
-    pass through. Arming failure is soft: residency just stays static
-    (returns None).
+    for windowing (1 for per-layer-units caches). ``initial_total_bytes``
+    overrides the initial total budget estimate (defaults to
+    ``base_cap * per_slot``) for caches whose slot bookkeeping makes that
+    product a poor measure of the real starting footprint. Extra governor
+    kwargs pass through. Arming failure is soft: residency just stays
+    static (returns None).
     """
     try:
-        initial_total = int(base_cap) * max(1, int(per_slot))
+        initial_total = (
+            int(base_cap) * max(1, int(per_slot))
+            if initial_total_bytes is None
+            else int(initial_total_bytes)
+        )
         gov_max = (
             int(max_budget_bytes)
             if max_budget_bytes is not None

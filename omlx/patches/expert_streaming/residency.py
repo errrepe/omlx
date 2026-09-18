@@ -232,6 +232,46 @@ def _load_config(model_path: Path) -> dict:
         return {}
 
 
+def load_config(model_path: str | Path) -> dict:
+    """The checkpoint's ``config.json`` as a dict ({} when unreadable).
+
+    Canonical local-dir config read — the single copy every "what does
+    this checkpoint claim to be" check shares (previously duplicated in
+    ``moe_expert_offload._read_config_model_type`` and the model loader).
+    Callers holding an HF repo id must resolve it to a snapshot dir
+    first (e.g. ``moe_expert_offload._resolve_model_dir``).
+    """
+    return _load_config(Path(model_path).expanduser())
+
+
+def load_config_model_type(model_path: str | Path) -> str:
+    """Normalized effective ``model_type`` of a local checkpoint dir.
+
+    Top level wins; VLM wrappers fall back to ``text_config`` — the same
+    reading the structural estimate applies. "" when the config is
+    unreadable or carries no type.
+    """
+    return _config_model_type(load_config(model_path))
+
+
+def streaming_owns_model(model_path_or_type: str | Path | None) -> bool:
+    """True when the ``SUPPORTED_TYPES`` allowlist covers this model.
+
+    Accepts a ``model_type`` spelling (normalized before lookup) or a
+    local model dir whose ``config.json`` supplies the type. This is the
+    single "the unified streaming backend claims this checkpoint" gate —
+    the legacy offload adapter and the model loader consult it rather
+    than re-reading config.json or keeping a second list.
+    """
+    if not model_path_or_type:
+        return False
+    s = str(model_path_or_type)
+    p = Path(s).expanduser()
+    if p.is_dir() and (p / "config.json").is_file():
+        s = load_config_model_type(p)
+    return normalize_model_type(s) in SUPPORTED_TYPES
+
+
 def _derive_expert_dims(
     expert_keys: list[str], headers: dict[str, dict]
 ) -> tuple[int, int, bool]:

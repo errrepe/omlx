@@ -62,6 +62,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from .patches.expert_streaming._env import env_float
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.sdpa256_attention import set_unfused_headroom_provider
@@ -4204,8 +4205,8 @@ class Scheduler:
     # follows a power law and saturates far below 512); 0.2 keeps ~40%
     # headroom without over-predicting mid-size chunks into guard rejection.
     # Env-overridable.
-    _STREAMING_BANK_TOKEN_RATIO: float = float(
-        os.environ.get("OMLX_STREAMING_BANK_TOKEN_RATIO", "") or 0.10
+    _STREAMING_BANK_TOKEN_RATIO: float = env_float(
+        "OMLX_STREAMING_BANK_TOKEN_RATIO", 0.10
     )
     # Definitive streaming guard: when a per-layer eval boundary is live the
     # lazy graph no longer retains one streaming mini-bank per MoE layer,

@@ -7,8 +7,34 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-from .deepseek_v41.residency import _files_signature
+try:
+    # Shared per-file (size, mtime_ns) signature (omlx/utils/safetensors.py).
+    from ..utils.safetensors import file_signature as _file_sig
+except ImportError:  # pragma: no cover - shared helper lands same-wave
+    _file_sig = None
 
+
+def _files_signature(files):
+    """``(path, size, mtime_ns)`` tuples — the cache key for header scans.
+
+    A replaced file changes size or mtime and re-runs the scan; an
+    untouched one stays cached. Composed on the shared per-file
+    ``file_signature`` when present (same-wave helper), else stat'd
+    locally.
+    """
+    if _file_sig is not None:
+        return tuple((str(f), *_file_sig(f)) for f in sorted(files))
+    return tuple(
+        (str(f), st.st_size, st.st_mtime_ns)
+        for f in sorted(files)
+        for st in (f.stat(),)
+    )
+
+
+# Deliberately NOT expert_streaming.residency.SUPPORTED_TYPES: that list
+# gates the unified SSD-streaming converter, this one gates the legacy
+# fetch-on-miss adapter. qwen4_exp is dual-listed; keep the two scopes
+# in sync only where a family genuinely supports both paths.
 _SUPPORTED_TYPES = frozenset({"deepseek_v41", "qwen4_exp", "gemma4", "olmoe"})
 
 

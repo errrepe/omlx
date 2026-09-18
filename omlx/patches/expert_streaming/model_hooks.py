@@ -220,6 +220,16 @@ def hooks_for(model_type: object) -> ModelHooks:
     return _HOOKS.get(normalize_model_type(model_type), _DEFAULT)
 
 
+def topk_supported_types() -> frozenset:
+    """Registered model types carrying an adaptive top-k hook.
+
+    The registry is the single source of truth — adaptive_topk derives
+    its ``TOPK_APPLICABLE_TYPES`` gate from this instead of duplicating
+    the list.
+    """
+    return frozenset(t for t, h in _HOOKS.items() if h.topk_supported)
+
+
 def _resolve_hook(model_type: object, field: str) -> Any | None:
     """Run the family's named ModelHooks resolver field, or None."""
     resolver = getattr(hooks_for(model_type), field, None)
@@ -265,16 +275,14 @@ def resolve_weighted_sum_kernel(model_type: object) -> Any | None:
 def find_moe_container(
     node: Any,
     attr_chain: tuple[str, ...] = ("mlp", "ffn"),
-    *,
-    descend_block: bool = True,
 ) -> Any | None:
     """The MoE container on a decoder layer / MTP stage, or None.
 
     Tries each attribute of *attr_chain* in order and returns the first
     that exists AND holds a ``switch_mlp`` member — the "first match with
     a switch" semantics every caller used inline. When the direct chain
-    misses and *descend_block* is set, the chain repeats one level under
-    ``node.block`` (legacy MTPBlock layouts nest ``block.mlp``/``block.ffn``).
+    misses, the chain repeats one level under ``node.block`` (legacy
+    MTPBlock layouts nest ``block.mlp``/``block.ffn``).
     """
     if node is None:
         return None
@@ -282,13 +290,12 @@ def find_moe_container(
         moe = getattr(node, attr, None)
         if moe is not None and getattr(moe, "switch_mlp", None) is not None:
             return moe
-    if descend_block:
-        block = getattr(node, "block", None)
-        if block is not None:
-            for attr in attr_chain:
-                moe = getattr(block, attr, None)
-                if moe is not None and getattr(moe, "switch_mlp", None) is not None:
-                    return moe
+    block = getattr(node, "block", None)
+    if block is not None:
+        for attr in attr_chain:
+            moe = getattr(block, attr, None)
+            if moe is not None and getattr(moe, "switch_mlp", None) is not None:
+                return moe
     return None
 
 

@@ -478,7 +478,7 @@ class ModelSettings:
         # "decode" or "prefill" (default env OMLX_EXPERT_STREAMING_PIN_REGIME).
     )
     expert_streaming_cold_tier: Optional[str] = (
-        None  # Cold precision tier for streamed experts: "2"/"3" reads expert
+        None  # Cold precision tier for streamed experts: "2".."8" reads expert
         # banks from a pre-built <model>/expert_cold/ tier directory — fewer
         # bytes per token on the NVMe I/O floor, at the tier's fidelity.
         # None/"" = off.

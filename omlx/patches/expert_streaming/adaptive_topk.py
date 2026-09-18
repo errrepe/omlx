@@ -43,14 +43,22 @@ _MAX_THRESHOLD = 1.0
 # glm hook lives in the vendored Glm5NextMoE.__call__. Any other supported
 # streaming type silently ignores the threshold without this gate — the
 # converter must warn instead of logging it active (see is_topk_applicable).
-TOPK_APPLICABLE_TYPES = frozenset(
-    {
-        "qwen4_exp",
-        "qwen4_exp_text",
-        "glm5_next",
-        "glm5_next_text",
-    }
-)
+# Derived from the registry so the two lists cannot drift; the literal
+# fallback keeps is_topk_applicable usable when model_hooks itself is
+# unimportable (the failure mode the except below guards).
+try:
+    from .model_hooks import topk_supported_types
+
+    TOPK_APPLICABLE_TYPES = topk_supported_types()
+except Exception:  # pragma: no cover - model_hooks is a leaf import
+    TOPK_APPLICABLE_TYPES = frozenset(
+        {
+            "qwen4_exp",
+            "qwen4_exp_text",
+            "glm5_next",
+            "glm5_next_text",
+        }
+    )
 
 
 def is_topk_applicable(model_type: object) -> bool:
