@@ -169,8 +169,13 @@ def mech_sweep(path: str, span: int, size: int, iters: int) -> None:
 
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from omlx.patches.expert_streaming import dispatch_io as dio
-        if dio.available():
+        try:
+            from omlx.patches.expert_streaming import dispatch_io as dio
+        except ImportError:
+            # Bench-only shim (feat/v41-moe-streaming-opts) — not present
+            # on every branch; treat its absence like available()=False.
+            dio = None
+        if dio is not None and dio.available():
             fd = os.open(path, os.O_RDONLY)
             offs = fresh_offs()
             timed(lambda o: dio.read_into(fd, o, np.empty(size, np.uint8)),

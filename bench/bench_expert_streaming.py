@@ -340,7 +340,6 @@ def _effective_config(
     across incompatible instrumentation, schedules or cache protocols.
     """
     from omlx.patches.expert_streaming import streaming_switch as _ss
-    from omlx.patches.expert_streaming import warmer as _warmer_mod
 
     return {
         "git_sha": git_sha,
@@ -352,7 +351,12 @@ def _effective_config(
         "budget_mode": str(budget_mode),
         "cold_tier": cold_tier,
         "hot_fraction": hot_fraction,
-        "ctx_mode_policy": "hybrid" if _ss._CTX_ROLLING_ENV else "union",
+        # OMLX_EXPERT_STREAMING_CTX_ROLLING is gone (one-path cleanup):
+        # mode is picked per call — union for decode-shaped calls while
+        # DECODE_UNION_ROWS > 0, rolling everywhere when it is 0.
+        "ctx_mode_policy": (
+            "hybrid" if _ss._DECODE_UNION_MAX_ROWS > 0 else "rolling"
+        ),
         "decode_union_rows": int(_ss._DECODE_UNION_MAX_ROWS),
         "ctx_ahead": int(_ss._CTX_PREFETCH_AHEAD),
         "expert_qd": int(expert_qd),
@@ -361,7 +365,7 @@ def _effective_config(
         # Dedicated prefetch queue removed 2026-09-09 (audit P2-13, no win in
         # three campaigns). Prefetch shares the demand pool; nothing to
         # record here.
-        "ra_enabled": bool(_warmer_mod.RA_ENABLED),
+        "ra_enabled": bool(_ss._RA_ENV),
         "pins_enabled": bool(pins),
         "pin_sync_effective": bool(
             getattr(pinner, "pin_sync", False) if pinner is not None else False
@@ -1339,7 +1343,10 @@ async def run(
             ),
             run_qd=0,
             expert_qd=_expert_qd or 0,
-            prefill_qd=_ss_cfg._PREFILL_QD_ENV,
+            # The dedicated prefill pool is gone (one-path cleanup):
+            # prefill shares the demand pool. 0 = "no separate queue",
+            # the same value the removed knob defaulted to.
+            prefill_qd=int(getattr(_ss_cfg, "_PREFILL_QD_ENV", 0)),
             knobs=knobs,
         )
         from omlx.patches.expert_streaming.shard_bank import _RUN_IO_QD as _rqd_cfg
