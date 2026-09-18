@@ -10,11 +10,22 @@ from __future__ import annotations
 import os
 
 
-def env_int(name: str, default: int, lo: int | None = None) -> int:
-    try:
-        v = int(os.environ.get(name, "") or default)
-    except (TypeError, ValueError):
+def env_int(
+    name: str, default: int, lo: int | None = None, invalid: int | None = None
+) -> int:
+    """Int knob: unset -> ``default``; unparseable (including "") ->
+    ``default``, or ``invalid`` when the caller needs malformed to
+    differ from unset (e.g. a kill switch where garbage must select the
+    conservative option, not the normal default). ``lo`` floors the
+    result."""
+    raw = os.environ.get(name)
+    if raw is None:
         v = int(default)
+    else:
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            v = int(default) if invalid is None else int(invalid)
     return v if lo is None else max(lo, v)
 
 

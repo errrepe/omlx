@@ -498,10 +498,15 @@ class _ShardReader:
         """Whole-tensor read for *key* (all expert rows) as one array.
 
         For the per-expert checkpoint layout this is the (E, *per) bank
-        itself — the span read of the full row range.
+        itself. Element-granular (not a ``read_span`` of the row range)
+        so every stored shape round-trips — including 1-D tensors, whose
+        ``per_shape`` equals the whole shape and cannot express a row
+        slice.
         """
         rp = self._rp_for(key)
-        return self.read_span(key, 0, rp.num_experts)
+        buf = np.empty(rp.num_experts * rp.expert_bytes, dtype=np.uint8)
+        self._read_into(rp.tensor_abs_off, buf)
+        return np.frombuffer(buf, dtype=rp.np_dtype).reshape(rp.shape)
 
     def _read_into(self, abs_off: int, out: np.ndarray) -> None:
         """Zero-copy read of out.nbytes bytes at abs_off into the writable

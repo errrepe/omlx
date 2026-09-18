@@ -32,9 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import struct
 import threading
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -49,9 +47,13 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
-from ..scheduler import _sync_and_clear_cache
-from .expert_streaming._env import env_bool
-from .expert_streaming.slot_cache import DecodeVisitStats, SlotBookkeeping
+from omlx.utils.metal_sync import _sync_and_clear_cache
+from omlx.utils.safetensors import read_safetensors_header
+
+from .expert_streaming._env import env_bool, env_int
+from .expert_streaming.residency_adapter import PerLayerResidencyAdapter
+from .expert_streaming.shard_bank import ExpertBackingStore, np_to_mx
+from .expert_streaming.slot_cache import SlotBookkeeping
 
 logger = logging.getLogger(__name__)
 
@@ -62,22 +64,19 @@ _PER_EXPERT_PROJ_RE = re.compile(
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<field>weight|scales|biases)$"
 )
 
-# A pending slab read: everything needed to turn a byte range of a shard
-# into an mx.array, and nothing that touches MLX or cache state — so the
-# ``os.pread`` half can run on any thread.
-_ReadPlan = namedtuple("_ReadPlan", "fd offset nbytes np_dtype mx_view shape")
+# A pending slab read: everything needed to turn an expert-row range of a
+# shard into an mx.array — the shared backing store, the tensor key, the
+# row range (``hi=None`` plans a whole tensor), the output shape and the
+# safetensors dtype tag — and nothing that touches MLX or cache state, so
+# the store read can run on any thread.
+_ReadPlan = namedtuple("_ReadPlan", "store key lo hi shape dtype_str")
 
-# safetensors dtype tag -> (numpy transport dtype, mlx dtype to view as).
-# bf16 has no numpy equivalent, so it travels as raw uint16 and is
-# reinterpreted on the mlx side; everything else converts directly.
-_DTYPES = {
-    "BF16": (np.uint16, mx.bfloat16),
-    "F16": (np.float16, None),
-    "F32": (np.float32, None),
-    "U32": (np.uint32, None),
-    "I32": (np.int32, None),
-    "U8": (np.uint8, None),
-}
+# Dtype tags this adapter serves bit-exactly (bf16 travels as raw uint16
+# and is reinterpreted on the mlx side via np_to_mx; the rest convert
+# directly). The shared SAFETENSORS_NUMPY_DTYPES table is a superset —
+# tags outside this set are declined at coverage time, so the failure
+# mode stays "runs resident" instead of a fetch-time surprise.
+_SUPPORTED_DTYPES = frozenset({"BF16", "F16", "F32", "U32", "I32", "U8"})
 
 
 def _minimum_experts(model_dir):
@@ -104,43 +103,43 @@ class CheckpointExpertStore:
 
     Expert tables are stored stacked with the expert axis leading
     (``[num_experts, ...]``), so one expert is a contiguous byte range in the
-    shard. Each shard is opened once read-only and read with ``os.pread``,
-    which takes the offset as an argument instead of carrying one on the
-    descriptor — so reads of different experts are safe to run concurrently,
-    off the calling thread. The read splits in two: :meth:`read` produces
-    bytes and touches neither MLX nor cache state (any thread), :meth:`to_mx`
-    turns those bytes into an array (the calling thread's stream).
+    shard. Reads delegate to the shared
+    :class:`~omlx.patches.expert_streaming.shard_bank.ExpertBackingStore`
+    (mmap + positional ``preadv`` — no fd carried on the descriptor), so
+    reads of different experts are safe to run concurrently, off the
+    calling thread. The read splits in two: :meth:`read` produces the
+    ndarray rows and touches neither MLX nor cache state (any thread),
+    :meth:`to_mx` turns them into an array (the calling thread's stream).
+
+    The ``_specs`` index (name -> dtype/shape) answers the coverage probes
+    (``has``/``spec``) without opening a reader.
     """
 
     def __init__(self, model_path: str | Path):
-        self._specs: dict[str, tuple[Path, str, tuple[int, ...], int]] = {}
-        self._fds: dict[Path, int] = {}
         model_path = Path(model_path)
+        self._specs: dict[str, tuple[str, tuple[int, ...]]] = {}
         for shard in sorted(model_path.glob("*.safetensors")):
-            with open(shard, "rb") as f:
-                header_len = struct.unpack("<Q", f.read(8))[0]
-                header = json.loads(f.read(header_len))
-            data_base = 8 + header_len
-            for name, spec in header.items():
+            for name, spec in read_safetensors_header(shard).items():
                 if name == "__metadata__":
                     continue
                 self._specs[name] = (
-                    shard,
-                    spec["dtype"],
+                    str(spec["dtype"]),
                     tuple(spec["shape"]),
-                    data_base + spec["data_offsets"][0],
                 )
-            # Opened once here, read-only and never mutated afterwards: the
-            # store is fully populated before any fetch, which is what makes
-            # concurrent reads against it safe without a lock.
-            self._fds[shard] = os.open(shard, os.O_RDONLY)
+        # Raises ValueError on repacked co-activation checkpoints
+        # (expert_order.json) — serving those would silently return
+        # permuted experts. Callers turn that into a declined wrap.
+        self._backing = ExpertBackingStore(model_path)
+        # B8 downgrade marker: stamped by _apply_legacy_adapter when the
+        # unified streaming backend owned this model type but produced
+        # nothing, so the fallback is visible instead of silent.
+        self.streaming_fallback_reason: str | None = None
 
     def __del__(self):
-        for fd in self._fds.values():
-            try:
-                os.close(fd)
-            except Exception:
-                pass
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __bool__(self) -> bool:
         return bool(self._specs)
@@ -149,53 +148,41 @@ class CheckpointExpertStore:
         return name in self._specs
 
     def spec(self, name: str) -> tuple[tuple[int, ...], str]:
-        _, dtype, shape, _ = self._specs[name]
+        dtype, shape = self._specs[name]
         return shape, dtype
-
-    def _plan(
-        self, name: str, start_elem: int, n_elems: int, out_shape: tuple[int, ...]
-    ) -> _ReadPlan:
-        shard, dtype, _, offset = self._specs[name]
-        np_dtype, mx_view = _DTYPES[dtype]
-        itemsize = np.dtype(np_dtype).itemsize
-        return _ReadPlan(
-            self._fds[shard],
-            offset + start_elem * itemsize,
-            n_elems * itemsize,
-            np_dtype,
-            mx_view,
-            out_shape,
-        )
 
     def plan_expert(self, name: str, expert: int) -> _ReadPlan:
         """Plan one expert's slab of a stacked ``[num_experts, ...]`` tensor."""
-        _, _, shape, _ = self._specs[name]
-        slab = int(np.prod(shape[1:]))
-        return self._plan(name, expert * slab, slab, shape[1:])
+        dtype, _shape = self._specs[name]
+        return _ReadPlan(
+            self._backing, name, int(expert), int(expert) + 1, _shape[1:], dtype
+        )
 
     def plan_tensor(self, name: str) -> _ReadPlan:
         """Plan a whole tensor (per-expert checkpoint layouts)."""
-        _, _, shape, _ = self._specs[name]
-        return self._plan(name, 0, int(np.prod(shape)), shape)
+        dtype, shape = self._specs[name]
+        return _ReadPlan(self._backing, name, 0, None, shape, dtype)
 
     @staticmethod
-    def read(plan: _ReadPlan) -> bytes:
-        """The plan's raw bytes. Thread-safe: positional reads only."""
-        chunks = []
-        got = 0
-        while got < plan.nbytes:
-            chunk = os.pread(plan.fd, plan.nbytes - got, plan.offset + got)
-            if not chunk:
-                raise OSError(f"short read of {plan.nbytes} bytes at {plan.offset}")
-            chunks.append(chunk)
-            got += len(chunk)
-        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+    def read(plan: _ReadPlan) -> np.ndarray:
+        """The plan's rows as an ndarray, in the transport dtype.
+
+        Thread-safe: the backing store's reads are positional (preadv on
+        a shared read-only mapping). ``hi=None`` plans whole tensors.
+        """
+        arr = (
+            plan.store.load_tensor(plan.key)
+            if plan.hi is None
+            else plan.store.read_span(plan.key, plan.lo, plan.hi)
+        )
+        # read_span returns (hi-lo, *per_shape); expert plans want the
+        # row itself, whole-tensor plans already carry the stored shape.
+        return arr if arr.shape == plan.shape else arr.reshape(plan.shape)
 
     @staticmethod
-    def to_mx(plan: _ReadPlan, raw: bytes) -> mx.array:
-        """Reinterpret a plan's bytes as its array (host-side, one copy)."""
-        out = mx.array(np.frombuffer(raw, dtype=plan.np_dtype).reshape(plan.shape))
-        return out.view(plan.mx_view) if plan.mx_view is not None else out
+    def to_mx(plan: _ReadPlan, raw: np.ndarray) -> mx.array:
+        """Promote a plan's rows to its mx.array (host-side, one copy)."""
+        return np_to_mx(raw, plan.dtype_str)
 
     def fetch_expert(self, name: str, expert: int) -> mx.array:
         """One expert's slab of a stacked ``[num_experts, ...]`` tensor."""
@@ -208,14 +195,11 @@ class CheckpointExpertStore:
         return self.to_mx(plan, self.read(plan))
 
     def close(self) -> None:
-        """Close the shard descriptors (also called via the engine's
+        """Close the shard readers (also called via the engine's
         ``_expert_streaming_backing`` shutdown hook). Idempotent."""
-        for fd in self._fds.values():
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-        self._fds.clear()
+        backing = getattr(self, "_backing", None)
+        if backing is not None:
+            backing.close()
 
 
 class _GLUStoreView:
@@ -283,27 +267,25 @@ _IO_BATCH = 0
 _IO_CONFIGURED = False
 
 
-def _env_int(name: str, default: int, invalid: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return invalid
-
-
 def _io_pool() -> ThreadPoolExecutor | None:
-    """The shared reader pool, or ``None`` when reads must stay serial."""
+    """The shared reader pool, or ``None`` when reads must stay serial.
+
+    Not ``streaming_switch.io_pool_for``: that pool is never None
+    (depth <= 1 maps to the shared default executor) while the legacy
+    contract is workers <= 1 -> serial reads with no pool threads at all.
+    """
     global _IO_POOL, _IO_BATCH, _IO_CONFIGURED
     with _IO_LOCK:
         if not _IO_CONFIGURED:
             _IO_CONFIGURED = True
-            workers = _env_int("OMLX_MOE_OFFLOAD_IO_WORKERS", _IO_WORKERS, 0)
+            # malformed -> 0 -> serial (the env_int invalid sentinel).
+            workers = env_int(
+                "OMLX_MOE_OFFLOAD_IO_WORKERS", _IO_WORKERS, invalid=0
+            )
             if workers > 1:
                 _IO_BATCH = max(
                     1,
-                    _env_int("OMLX_MOE_OFFLOAD_IO_BATCH", 4 * workers, 4 * workers),
+                    env_int("OMLX_MOE_OFFLOAD_IO_BATCH", 4 * workers),
                 )
                 _IO_POOL = ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix="omlx-moe-io"
@@ -758,13 +740,14 @@ class OffloadSwitchGLU(nn.Module):
         return out.reshape(indices.shape + (x.shape[-1],))
 
 
-class LegacyOffloadState:
+class LegacyOffloadState(PerLayerResidencyAdapter):
     """Governor-facing cache over the legacy per-layer ``ExpertCache``s.
 
     Same duck-type ``V41StreamingBacking`` presents to
-    ``ExpertResidencyGovernor`` — ``capacity`` / ``resize`` / ``clear`` /
-    ``set_layer_caps`` / ``layer_cap_overrides`` / ``stats`` — so one
-    policy drives both partitioned backends. Units are per-layer like
+    ``ExpertResidencyGovernor``, now via the shared
+    ``PerLayerResidencyAdapter`` base — ``capacity`` / ``resize`` /
+    ``clear`` / ``set_layer_caps`` / ``layer_cap_overrides`` / ``stats``
+    plus the ``note_visit`` decode counter. Units are per-layer like
     V4.1: ``per_slot`` is one resident row in every wrapped layer, the
     governor sees ``num_layers=1``, and ``capacity`` reports the uniform
     per-layer base. Attached to the model as ``_moe_offload_legacy_state``;
@@ -772,6 +755,8 @@ class LegacyOffloadState:
     request serialization (the guard's mini-bank transient does not apply
     to these persistent slot buffers).
     """
+
+    _GOVERNOR_LABEL = "moe expert offload"
 
     def __init__(
         self,
@@ -784,107 +769,59 @@ class LegacyOffloadState:
         min_cap: int | None = None,
         streaming_fallback_reason: str | None = None,
     ) -> None:
-        self._lock = threading.RLock()
+        # ``caches`` lands before super().__init__: the base ctor runs the
+        # hooks below (_iter_units / _per_slot_bytes / _initial_base_cap)
+        # while wiring num_layers/per_slot/base_cap and arming the governor.
         self.caches = list(caches)
         # B8 downgrade marker: set when the unified streaming backend
         # owned this model type but converted nothing — surfaced through
         # summary() so the fallback is visible, not silent.
         self.streaming_fallback_reason = streaming_fallback_reason
-        self.num_layers = len(self.caches)
-        self.per_slot = max(
-            1,
-            sum(
-                max(1, int(getattr(c, "per_expert_bytes", 0) or 0))
-                for c in self.caches
-            ),
-        )
-        self.base_cap = (
-            min(int(c.capacity) for c in self.caches) if self.caches else 0
-        )
-        self.overrides: dict = {}
-        # The shared contract class (expert_streaming.slot_cache) is the
-        # shape ExpertResidencyGovernor._window duck-reads — same fields
-        # the V4.1 backing and the unified CacheStats expose.
-        self.stats = DecodeVisitStats()
-        self.governor = None
-        if not dynamic or not self.caches:
-            return
-        from .expert_streaming.governor import arm_dynamic
-
-        # Never shrink a layer below one token's decode working set:
-        # the wrap-time capacity already floors at the model's routing
-        # top-k, and going below it turns every step into a fetch storm.
-        # floor_default covers the no-explicit-min_cap case (8 like the
-        # legacy wrap default); an explicit min_cap wins in arm_dynamic.
-        self.governor = arm_dynamic(
-            self,
-            self.per_slot,
-            self.base_cap,
-            floor_default=min(8, self.base_cap),
+        super().__init__(
+            self.caches,
+            dynamic=dynamic,
             max_budget_bytes=max_budget_bytes,
             min_budget_bytes=min_budget_bytes,
             stall_target=stall_target,
             min_cap=min_cap,
-            num_layers=1,
-            label="moe expert offload",
         )
 
-    # -- governor duck-type ------------------------------------------------
-    def resize(self, cap: int, per_layer: int | None) -> None:
-        """Retarget the uniform per-layer base (atomic under the lock)."""
-        want = max(1, int(per_layer if per_layer is not None else cap))
-        with self._lock:
-            self.base_cap = want
-            self.overrides = {}
-            for cache in self.caches:
-                cache.resize(want)
+    # -- PerLayerResidencyAdapter hooks ------------------------------------
+    def _iter_units(self):
+        """The per-layer ``ExpertCache``s in wrap order."""
+        return iter(self.caches)
 
-    def clear(self) -> None:
-        with self._lock:
-            for cache in self.caches:
-                cache.clear()
+    def _per_slot_bytes(self) -> int:
+        return sum(
+            max(1, int(getattr(c, "per_expert_bytes", 0) or 0))
+            for c in self.caches
+        )
 
-    def set_layer_caps(self, caps: dict) -> None:
-        with self._lock:
-            self.overrides = {int(k): max(1, int(v)) for k, v in caps.items()}
-            for idx, cache in enumerate(self.caches):
-                cache.resize(self.overrides.get(idx, self.base_cap))
+    def _initial_base_cap(self) -> int:
+        return (
+            min(int(c.capacity) for c in self.caches) if self.caches else 0
+        )
 
-    def layer_cap_overrides(self) -> dict:
-        return dict(self.overrides)
+    def _floor_cap(self) -> int:
+        # Never shrink a layer below one token's decode working set:
+        # the wrap-time capacity already floors at the model's routing
+        # top-k, and going below it turns every step into a fetch storm.
+        # Covers the no-explicit-min_cap case (8 like the legacy wrap
+        # default); an explicit min_cap wins inside arm_dynamic.
+        return min(8, self.base_cap)
 
-    @property
-    def capacity(self) -> int:
-        # Per-layer-units contract (see class docstring).
-        return self.base_cap
+    def _apply_layer_caps(self) -> None:
+        for idx, cache in enumerate(self.caches):
+            cache.resize(self._cap_for(idx))
 
-    @property
-    def evictions(self) -> int:
-        return sum(c.evictions for c in self.caches)
+    def _clear_units(self) -> None:
+        for cache in self.caches:
+            cache.clear()
 
     # No ``streaming_guard_info``: the scheduler's prefill-bank transient
     # exists for the generic path's lazy mini-banks; the legacy slot
     # buffers are persistent and pre-allocated, so that term does not
     # apply. The scheduler reads it via getattr-with-default.
-    def note_visit(self, layer_idx: int, missed: bool) -> None:
-        # Called by OffloadSwitchGLU.__call__ AFTER the cache lock is
-        # released — taking the state lock here keeps the order
-        # cache._lock then state._lock impossible to invert.
-        with self._lock:
-            self.stats.note_visit(layer_idx, missed)
-        # Mid-request governor tick — parity with the V4.1 backing's
-        # note_visit and the unified cache: one visit per layer-call is
-        # the same cadence, and tick() self-throttles on _GOV_TICK_S so
-        # the cost is a monotonic compare until the interval elapses.
-        # Runs outside the state lock: observe() may resize() which
-        # retakes it (RLock is reentrant; unscoped matches the V4.1
-        # lock-ordering contract).
-        gov = self.governor
-        if gov is not None:
-            try:
-                gov.tick()
-            except Exception:
-                logger.debug("legacy governor tick failed", exc_info=True)
 
     def summary(self) -> dict:
         # The governor snapshot runs OUTSIDE the state lock on purpose:
@@ -1059,7 +996,7 @@ def _resolve_store_view(
                 shape, dtype = store.spec(name)
                 if shape != want_shape:
                     return None, f"{name!r} shape {shape} != expected {want_shape}"
-                if dtype not in _DTYPES:
+                if dtype not in _SUPPORTED_DTYPES:
                     return None, f"{name!r} has unsupported dtype {dtype!r}"
     return view, None
 
@@ -1140,7 +1077,17 @@ def _apply_legacy_adapter(
     if model_dir is None:
         return 0
     minimum = _minimum_experts(model_dir)
-    store = CheckpointExpertStore(model_dir)
+    try:
+        store = CheckpointExpertStore(model_dir)
+    except Exception:
+        # An unreadable (or repacked co-activation) checkpoint declines
+        # offload — the model stays resident, the load must not crash.
+        logger.warning(
+            "moe expert offload: cannot open checkpoint store under %s",
+            model_dir,
+            exc_info=True,
+        )
+        return 0
     if not store:
         logger.warning("moe expert offload: no safetensors under %s", model_dir)
         return 0
@@ -1241,32 +1188,34 @@ def _apply_legacy_adapter(
 
 
 def _read_config_model_type(model_path: str | Path) -> str | None:
-    """Effective config model_type (top level wins, text_config fallback)."""
+    """Effective config model_type (top level wins, text_config fallback).
+
+    Thin delegate kept for ``model_loading``'s settings validation: the
+    canonical reader is ``expert_streaming.residency.load_config_model_type``
+    (normalized); this wrapper only adds HF-repo-id resolution via
+    ``_resolve_model_dir``.
+    """
     try:
         model_dir = _resolve_model_dir(model_path)
         if model_dir is None:
             return None
-        cfg = json.loads((Path(model_dir) / "config.json").read_text())
-        for cand in (cfg, cfg.get("text_config") or {}):
-            mt = cand.get("model_type")
-            if mt:
-                return str(mt)
+        from .expert_streaming.residency import load_config_model_type
+
+        return load_config_model_type(model_dir) or None
     except Exception:
         return None
-    return None
 
 
 def _streaming_owns_model(model_path: str | Path) -> bool:
     """True when expert_streaming covers this model type (unified backend)."""
     try:
-        from .expert_streaming.residency import (
-            SUPPORTED_TYPES,
-            normalize_model_type,
-        )
+        from .expert_streaming.residency import streaming_owns_model
     except Exception:
         return False
-    mt = _read_config_model_type(model_path)
-    return bool(mt) and normalize_model_type(mt) in SUPPORTED_TYPES
+    # streaming_owns_model reads config.json from a local dir; resolve
+    # hub repo ids first so both spellings work here.
+    model_dir = _resolve_model_dir(model_path)
+    return model_dir is not None and streaming_owns_model(model_dir)
 
 
 def _apply_via_streaming(
@@ -1441,9 +1390,7 @@ def estimate_offload_admission_bytes(
         per_expert: dict[str, dict] = {}
 
         for shard in sorted(Path(model_dir).glob("*.safetensors")):
-            with open(shard, "rb") as f:
-                header_len = struct.unpack("<Q", f.read(8))[0]
-                header = json.loads(f.read(header_len))
+            header = read_safetensors_header(shard)
             for name, spec in header.items():
                 if name == "__metadata__":
                     continue

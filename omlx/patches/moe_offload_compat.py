@@ -7,11 +7,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-try:
-    # Shared per-file (size, mtime_ns) signature (omlx/utils/safetensors.py).
-    from ..utils.safetensors import file_signature as _file_sig
-except ImportError:  # pragma: no cover - shared helper lands same-wave
-    _file_sig = None
+from ..utils.safetensors import file_signature
 
 
 def _files_signature(files):
@@ -19,16 +15,9 @@ def _files_signature(files):
 
     A replaced file changes size or mtime and re-runs the scan; an
     untouched one stays cached. Composed on the shared per-file
-    ``file_signature`` when present (same-wave helper), else stat'd
-    locally.
+    ``file_signature`` (omlx/utils/safetensors.py).
     """
-    if _file_sig is not None:
-        return tuple((str(f), *_file_sig(f)) for f in sorted(files))
-    return tuple(
-        (str(f), st.st_size, st.st_mtime_ns)
-        for f in sorted(files)
-        for st in (f.stat(),)
-    )
+    return tuple((str(f), *file_signature(f)) for f in sorted(files))
 
 
 # Deliberately NOT expert_streaming.residency.SUPPORTED_TYPES: that list
@@ -102,7 +91,15 @@ def _inspect(path, signature):
             return True, ""
         return False, "The checkpoint has no offloadable routed experts."
 
+    from .expert_streaming.model_hooks import legacy_checkpoint_layout
     from .moe_expert_offload import CheckpointExpertStore
+
+    layout = legacy_checkpoint_layout(kind)
+    if layout is None:
+        # _SUPPORTED_TYPES gates entry; deepseek_v41 returned above, so an
+        # unknown kind here means the registry and the gate drifted apart.
+        return False, "MoE expert offload is not supported for this model type."
+    parents, leaf = layout
 
     text = raw.get("text_config", raw)
     count = int(text.get("num_experts") or 0)
@@ -121,23 +118,17 @@ def _inspect(path, signature):
         return False, "Expert offload requires an MLX quantized checkpoint."
     store = CheckpointExpertStore(path)
     for layer in range(layers):
-        if kind == "olmoe":
-            parent = f"model.layers.{layer}.mlp"
-            prefix = parent + ".switch_mlp"
-        elif kind == "qwen4_exp":
-            parent = f"language_model.model.layers.{layer}.mlp"
-            prefix = parent + ".switch_mlp"
-            if not store.has(prefix + ".gate_proj.weight"):
-                # mlx-vlm nesting: the checkpoint (and its quantization
-                # policy) omits the runtime's `.model` segment, so both the
-                # store names AND the per-key spec lookup below must use
-                # the de-nested spelling — otherwise the lookup falls back
-                # to the global 8-bit spec and the shape math is wrong.
-                parent = f"language_model.layers.{layer}.mlp"
-                prefix = parent + ".switch_mlp"
-        else:
-            parent = f"language_model.model.layers.{layer}.experts"
-            prefix = parent + ".switch_glu"
+        # First parent whose stacked spelling exists wins; otherwise the
+        # last candidate's parent drives the per-expert probe (e.g. the
+        # de-nested qwen4_exp spelling — the checkpoint omits the
+        # runtime's `.model` segment, and the per-key spec lookup below
+        # must use the same spelling or it falls back to the global
+        # 8-bit quant spec and the shape math is wrong).
+        for cand in parents:
+            parent = cand.format(layer=layer)
+            prefix = parent + "." + leaf
+            if store.has(prefix + ".gate_proj.weight"):
+                break
         per_expert = not store.has(prefix + ".gate_proj.weight")
         for proj in ("gate_proj", "up_proj", "down_proj"):
             key = prefix + "." + proj

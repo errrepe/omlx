@@ -230,6 +230,41 @@ def topk_supported_types() -> frozenset:
     return frozenset(t for t, h in _HOOKS.items() if h.topk_supported)
 
 
+# Legacy fetch-on-miss adapter layouts (moe_expert_offload /
+# moe_offload_compat): checkpoint container spellings for the families
+# the unified converter does NOT own but the legacy per-expert adapter
+# serves. ``(candidate parent templates, container leaf)`` — each parent
+# expands with ``layer=<i>`` and is tried in order on the stacked
+# ``<parent>.<leaf>.gate_proj.weight`` probe; the first hit wins, the
+# last becomes the per-expert probe's parent. Kept here so a layout fix
+# lands once for every consumer. Runtime-side resolution
+# (``moe_expert_offload._resolve_store_view``) deliberately stays
+# generic — it probes the module-tree path plus the ``.model.``
+# de-nesting, no family table — so only the header-only compat check,
+# which cannot walk the runtime tree, reads this table.
+LEGACY_CHECKPOINT_LAYOUTS: dict[str, tuple[tuple[str, ...], str]] = {
+    "olmoe": (("model.layers.{layer}.mlp",), "switch_mlp"),
+    # mlx-vlm nests the LM under .model at runtime while the checkpoint
+    # may omit it — nested spelling first, then the de-nested one.
+    "qwen4_exp": (
+        (
+            "language_model.model.layers.{layer}.mlp",
+            "language_model.layers.{layer}.mlp",
+        ),
+        "switch_mlp",
+    ),
+    "gemma4": (("language_model.model.layers.{layer}.experts",), "switch_glu"),
+}
+
+
+def legacy_checkpoint_layout(
+    model_type: object,
+) -> tuple[tuple[str, ...], str] | None:
+    """(parent templates, leaf) for *model_type*'s legacy offload layout,
+    or None when the family has no legacy path."""
+    return LEGACY_CHECKPOINT_LAYOUTS.get(normalize_model_type(model_type))
+
+
 def _resolve_hook(model_type: object, field: str) -> Any | None:
     """Run the family's named ModelHooks resolver field, or None."""
     resolver = getattr(hooks_for(model_type), field, None)
