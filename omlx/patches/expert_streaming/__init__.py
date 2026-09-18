@@ -84,6 +84,9 @@ from .lifecycle import (
     shutdown_expert_streaming as shutdown_expert_streaming,
 )
 from .lifecycle import (
+    streaming_cache_of as streaming_cache_of,
+)
+from .lifecycle import (
     streaming_offload_load as streaming_offload_load,
 )
 from .lifecycle import (

@@ -214,6 +214,16 @@ def streaming_summary_backing(engine: Any) -> Any | None:
     return resolve_streaming_backing(engine)
 
 
+def streaming_cache_of(backing: Any) -> Any | None:
+    """The app-level expert cache a backing exposes, if any.
+
+    The converter stamps the shared LRU/policy cache on the backing as
+    ``_streaming_cache``; keep the private-name knowledge here so the
+    scheduler and engine pool stop getattr-mining it.
+    """
+    return getattr(backing, "_streaming_cache", None)
+
+
 def log_expert_streaming_summary(
     engine: Any, *, prompt_tokens: int = 0, completion_tokens: int = 0
 ) -> None:
@@ -236,7 +246,7 @@ def log_expert_streaming_summary(
                 logger.debug("governor observe failed", exc_info=True)
             else:
                 logger.info("expert_streaming governor: %s", action)
-        cache = getattr(backing, "_streaming_cache", None)
+        cache = streaming_cache_of(backing)
         summary = expert_streaming_summary(cache, backing)
         if not summary:
             return

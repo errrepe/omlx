@@ -62,7 +62,10 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
-from .patches.expert_streaming import find_model_streaming_backing
+from .patches.expert_streaming import (
+    find_model_streaming_backing,
+    streaming_cache_of,
+)
 from .patches.expert_streaming._env import env_float
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
@@ -4341,7 +4344,7 @@ class Scheduler:
             # BEFORE the first chunk runs, so the warmup fill is
             # corrected too. Missing/unreadable cache disables the
             # tracker correction (raw deltas flow through).
-            self._streaming_lru_cache = getattr(backing, "_streaming_cache", None)
+            self._streaming_lru_cache = streaming_cache_of(backing)
             self._streaming_lru_bytes_last = Scheduler._streaming_lru_resident_bytes(
                 self
             )

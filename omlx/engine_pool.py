@@ -3548,10 +3548,13 @@ class EnginePool:
             # Same holder walk the engines use per request: the converter
             # stamps the backing on the engine and/or model, and the legacy
             # adapter exposes its governor-facing state.
-            from .patches.expert_streaming import streaming_summary_backing
+            from .patches.expert_streaming import (
+                streaming_cache_of,
+                streaming_summary_backing,
+            )
 
             backing = streaming_summary_backing(engine)
-            cache = getattr(backing, "_streaming_cache", None)
+            cache = streaming_cache_of(backing)
 
             sched = self._resolve_scheduler_from_engine(engine)
             guard_info = None
