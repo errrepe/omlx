@@ -48,7 +48,7 @@ SAFETENSORS_NUMPY_DTYPES: dict[str, np.dtype] = {
 }
 
 
-def read_safetensors_header(source: Union[str, Path, BinaryIO]) -> dict:
+def read_safetensors_header(source: str | Path | BinaryIO) -> dict:
     """Parse a safetensors JSON header (8-byte LE length + JSON dict).
 
     ``source`` is a filesystem path (opened read-only for the call) or an
@@ -67,7 +67,7 @@ def _parse_header(f: BinaryIO) -> dict:
     return json.loads(f.read(hsize))
 
 
-def file_signature(path: Union[str, Path]) -> tuple[int, int]:
+def file_signature(path: str | Path) -> tuple[int, int]:
     """``(size, mtime_ns)`` change signature for *path*.
 
     Same semantic as residency's ``_index_sig_of``: a rewrite with an

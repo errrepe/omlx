@@ -20,7 +20,8 @@ switch and the per-family backings can share it without a cycle.
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Dict, Tuple
+from collections.abc import Callable
 
 
 def ewma(prev: float, new: float, decay: float) -> float:
@@ -43,8 +44,8 @@ class PrevTokenPredictor:
     def __init__(self, decay: float = 0.9, min_recall: float = 0.25) -> None:
         self.decay = float(decay)
         self.min_recall = float(min_recall)
-        self.prev_uniq_by_layer: Dict[int, list[int]] = {}
-        self.recall_ewma: Dict[int, float] = {}
+        self.prev_uniq_by_layer: dict[int, list[int]] = {}
+        self.recall_ewma: dict[int, float] = {}
 
     def record(self, layer_idx: int, ids) -> list[int] | None:
         """Store *ids* as the layer's last demand; return the previous set.
@@ -99,8 +100,8 @@ class StagedReads:
 
     def __init__(self, max_keys: int) -> None:
         self.max_keys = max(1, int(max_keys))
-        self.rows: Dict[Any, Any] = {}
-        self.futs: Dict[Any, Tuple[Any, list, Callable[[int], Any]]] = {}
+        self.rows: dict[Any, Any] = {}
+        self.futs: dict[Any, tuple[Any, list, Callable[[int], Any]]] = {}
         self.hits = 0
         self.misses = 0
         self.closed = False
