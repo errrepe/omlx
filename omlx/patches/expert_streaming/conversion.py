@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ._env import env_bool
+from ._env import env_bool, env_str
 from .model_hooks import (
     DEFAULT_PREFIX_TEMPLATES,
     find_moe_container,
@@ -835,42 +835,38 @@ def _make_streaming_cache_and_governor(
     _dyn_setting = io_ov.get("expert_streaming_dynamic")
     _dyn_on = _dynamic_armed(_dyn_setting, model_settings)
     if _dyn_on and budget_bytes > 0 and per_slot > 0:
+        from .governor import arm_dynamic
+
+        def _gib(key: str) -> int | None:
+            """io_ov GiB knob -> bytes (already range-validated); None
+            keeps arm_dynamic's env/default resolution."""
+            v = io_ov.get(key)
+            return int(v * 1024**3) if v is not None else None
+
+        # initial_total_bytes: the resolved LRU budget is the real
+        # starting footprint — the default base_cap*per_slot product
+        # would under-report it (capacity floors at 1 while the budget
+        # is the byte figure the governor must never shrink-past
+        # without operator intent). base_cap only feeds the arm log's
+        # "per-layer slots" field here; pass the cache's real per-layer
+        # cap so the line stays truthful.
         try:
-            from .governor import (
-                ExpertResidencyGovernor,
-                _max_dynamic_budget_bytes,
-            )
-
-            def _gib(key: str, default) -> int:
-                """io_ov GiB knob -> bytes (already range-validated);
-                callable *default* stays lazy so _total_ram_bytes only
-                runs when the knob is unset."""
-                v = io_ov.get(key)
-                return default() if v is None else int(v * 1024**3)
-
-            _gov_max = _gib(
-                "expert_streaming_dynamic_max_gib", _max_dynamic_budget_bytes
-            )
-            _gov_min = _gib(
-                "expert_streaming_dynamic_min_gib",
-                lambda: max(int(0.25 * 1024**3), int(budget_bytes) // 4),
-            )
-            _gov_stall = io_ov.get("expert_streaming_dynamic_stall_target")
-            _governor = ExpertResidencyGovernor(
+            _governor = arm_dynamic(
                 cache,
                 per_slot,
-                estimate.num_moe_layers,
-                max(_gov_max, int(budget_bytes)),
-                min_budget_bytes=_gov_min,
-                **({"stall_target": _gov_stall} if _gov_stall is not None else {}),
-            )
-            logger.info(
-                "Expert streaming: dynamic residency governor armed (budget %.2f GiB, min %.2f GiB, max %.2f GiB)",
-                budget_bytes / 1024**3,
-                _governor.min_budget_bytes / 1024**3,
-                _governor.max_budget_bytes / 1024**3,
+                max(1, int(getattr(cache, "capacity", 0) or 0))
+                // max(1, int(getattr(estimate, "num_moe_layers", 0) or 0)),
+                floor_default=None,
+                max_budget_bytes=_gib("expert_streaming_dynamic_max_gib"),
+                min_budget_bytes=_gib("expert_streaming_dynamic_min_gib"),
+                stall_target=io_ov.get("expert_streaming_dynamic_stall_target"),
+                num_layers=estimate.num_moe_layers,
+                initial_total_bytes=int(budget_bytes),
+                label="Expert streaming",
             )
         except Exception:
+            # arm_dynamic itself soft-fails; this guard covers the
+            # argument coercion above (int casts on duck-typed fields).
             logger.debug("governor arming failed", exc_info=True)
             _governor = None
     # Phase-aware prefill budget: explicit pin wins, else the cache
@@ -905,7 +901,7 @@ def _resolve_cold_tier_root(model_path, model_settings) -> "Path | None":
         # sandboxed checkout) instead of <model>/expert_cold. The
         # runtime only requires the tier SHARDS to be complete
         # (cold_tier_status checks whichever dir is used).
-        _cr_env = os.environ.get("OMLX_EXPERT_STREAMING_COLD_ROOT")
+        _cr_env = env_str("OMLX_EXPERT_STREAMING_COLD_ROOT", None)
         cold_root = Path(_cr_env) if _cr_env else None
         cold_dir = cold_root if cold_root is not None else Path(model_path) / "expert_cold"
         ok, why = _cold_tier_status_dir(cold_dir, Path(model_path))
