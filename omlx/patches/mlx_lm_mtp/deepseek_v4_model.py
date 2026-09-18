@@ -877,7 +877,17 @@ def _patch_model(dsv4: Any) -> None:
 
             _spill_src = Path(spill_model_path())  # type: ignore[arg-type]
             _spill_dir = spill_dir_for(_spill_src)
-            _valid = spill_is_valid(_spill_src)
+            # Mode-guarded validity: the manifest must have been written
+            # by a load with the same MTP stage count and key spelling
+            # (mtp.{i}.ffn. vs mtp.{i}.block.ffn. for DSpark). A mismatch
+            # is a miss — the respill path below clears the stale dir —
+            # so a hit can never inject mtp.* keys a strict load rejects
+            # or leave expected stage banks unserved.
+            _valid = spill_is_valid(
+                _spill_src,
+                mtp_stages=n_mtp,
+                block_part=block_part,
+            )
             if _valid is not None:
                 load_spill_into(weights, _valid)
                 # The raw per-expert keys are superseded by the spilled
@@ -972,7 +982,14 @@ def _patch_model(dsv4: Any) -> None:
                     p.name
                     for p in _spill_dir.glob("spill_*.safetensors")
                 )
-                write_manifest(_spill_dir, _spill_src, _files, _key_to_file)
+                write_manifest(
+                    _spill_dir,
+                    _spill_src,
+                    _files,
+                    _key_to_file,
+                    mtp_stages=n_mtp,
+                    block_part=block_part,
+                )
                 logger.info(
                     "dsv4 spill miss: stacked %d layers to %s",
                     n_layers,

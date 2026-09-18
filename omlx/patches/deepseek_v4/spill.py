@@ -15,7 +15,10 @@ before ``materialize_lazy_state`` and replaces the MoE modules) drops
 those arrays before they are ever faulted into RAM.
 
 The spill directory persists across runs: a manifest records the source
-shards' sizes+mtimes, so a repeat load skips re-spilling entirely.
+shards' sizes+mtimes plus the spill mode (how many MTP stage banks were
+spilled and which key spelling they use), so a repeat load skips
+re-spilling entirely — and a load whose mode differs (MTP or DSpark
+toggled) misses and re-spills instead of serving mismatched keys.
 Spill layout (all paths outside the checkpoint dir — discovery globs
 ``**/*.safetensors`` recursively, so nothing may be written inside it)::
 
@@ -30,16 +33,27 @@ Set ``OMLX_DSV4_SPILL=0`` to restore the legacy in-RAM stacking, or
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from ..expert_streaming._env import env_bool, env_str
 
-# Version 2: manifests now also cover MTP stage banks (spill_mtp_*) —
-# a v1 manifest would validate while serving no mtp.* stacked keys,
-# and the sanitize hit path would drop the raw mtp experts anyway.
-_SPILL_VERSION = 2
+logger = logging.getLogger(__name__)
+
+# Version 3: manifests now record the spill mode (``mode.mtp_stages`` +
+# ``mode.block_part`` — how many MTP stage banks were spilled and the
+# ``mtp.{i}[.block].ffn.`` key spelling). A load whose expected mode
+# differs must miss and re-spill: an MTP-on spill injected into an
+# MTP-off model would fail strict load on unexpected mtp.* keys, and an
+# MTP-off spill under an MTP-on model would leave the stage banks
+# missing. v2 manifests are still accepted — they predate the mode
+# block, so the mode is derived from the ``key_to_file`` spelling, which
+# records exactly which banks the spill serves. v1 manifests stay
+# rejected (they can validate while serving no mtp.* stacked keys).
+_SPILL_VERSION = 3
+_SPILL_READ_VERSIONS = frozenset((2, _SPILL_VERSION))
 _MANIFEST_NAME = "manifest.json"
 _LAYER_FILE = "spill_layer_{idx:02d}.safetensors"
 _MTP_FILE = "spill_mtp_{idx:02d}.safetensors"
@@ -100,12 +114,78 @@ def read_manifest(spill_dir: Path) -> dict[str, Any] | None:
         return None
 
 
-def spill_is_valid(model_path: str | os.PathLike) -> Path | None:
-    """Spill dir when a fresh spill exists for this checkpoint, else None."""
+def manifest_mode(manifest: dict[str, Any]) -> tuple[int, str | None]:
+    """Spill mode recorded in — or derivable from — a manifest.
+
+    Returns ``(mtp_stages, block_part)``: how many MTP stage banks the
+    spill serves and the key spelling they sit under (``".block"`` for
+    Lightning MTP, ``""`` for DSpark). ``block_part`` is None iff no MTP
+    banks were spilled — with zero stages the spelling serves nothing, so
+    it is normalized away.
+
+    v3 manifests carry an explicit ``mode`` block; v2 manifests predate
+    it, so the mode is derived from the ``key_to_file`` map (and the
+    ``files`` list as a floor), which spells out exactly which banks the
+    spill serves. A derived mode can only *mismatch* a load's
+    expectation — never hallucinate banks the spill does not serve.
+    """
+    mode = manifest.get("mode")
+    if isinstance(mode, dict):
+        try:
+            stages = int(mode.get("mtp_stages") or 0)
+        except (TypeError, ValueError):
+            stages = 0
+        bp = mode.get("block_part")
+        # Zero stages => the spelling serves nothing; normalize to None.
+        return stages, (bp if stages and isinstance(bp, str) else None)
+    stage_ids: set[int] = set()
+    bp: str | None = None
+    raw = manifest.get("key_to_file")
+    if not isinstance(raw, dict):
+        raw = {}
+    for key in raw:
+        if not isinstance(key, str) or not key.startswith("mtp."):
+            continue
+        parts = key.split(".")
+        if len(parts) < 3 or not parts[1].isdigit():
+            continue
+        stage_ids.add(int(parts[1]))
+        bp = ".block" if parts[2] == "block" else ""
+    if stage_ids:
+        return max(stage_ids) + 1, bp
+    # key_to_file lists no mtp.* banks; the files list is the floor —
+    # spill_mtp_* shards with no recorded keys still mean the writing
+    # load spilled stages (spelling then unknown → never matches a
+    # block_part-expecting load).
+    files = manifest.get("files")
+    n_mtp_files = (
+        sum(1 for f in files if str(f).startswith("spill_mtp_"))
+        if isinstance(files, (list, tuple))
+        else 0
+    )
+    return (n_mtp_files, None) if n_mtp_files else (0, None)
+
+
+def spill_is_valid(
+    model_path: str | os.PathLike,
+    *,
+    mtp_stages: int | None = None,
+    block_part: str | None = None,
+) -> Path | None:
+    """Spill dir when a fresh spill exists for this checkpoint, else None.
+
+    When ``mtp_stages`` is given, the manifest's spill mode (recorded, or
+    derived for pre-v3 manifests) must equal ``(mtp_stages,
+    block_part)`` — a mismatch means the shards serve a key set this load
+    cannot consume, so the caller must treat the dir as a miss and
+    re-spill. Callers that do not know the load's mode (e.g. the
+    expert-streaming map absorb) omit it and get the source/freshness
+    check only.
+    """
     mp = Path(model_path)
     sd = spill_dir_for(mp)
     manifest = read_manifest(sd)
-    if not manifest or manifest.get("version") != _SPILL_VERSION:
+    if not manifest or manifest.get("version") not in _SPILL_READ_VERSIONS:
         return None
     if manifest.get("model_path") != str(mp):
         return None
@@ -119,6 +199,19 @@ def spill_is_valid(model_path: str | os.PathLike) -> Path | None:
     for fname in _files:
         if not (sd / fname).is_file():
             return None
+    if mtp_stages is not None:
+        expected = (int(mtp_stages), block_part if mtp_stages else None)
+        served = manifest_mode(manifest)
+        if served != expected:
+            logger.info(
+                "dsv4 spill mode mismatch at %s: serves (mtp_stages=%s, "
+                "block_part=%r), load expects %s — re-spilling",
+                sd,
+                served[0],
+                served[1],
+                expected,
+            )
+            return None
     return sd
 
 
@@ -127,8 +220,17 @@ def write_manifest(
     model_path: Path,
     files: list[str],
     key_to_file: dict[str, str],
+    *,
+    mtp_stages: int = 0,
+    block_part: str | None = None,
 ) -> None:
-    """Persist the spill manifest after a full re-spill."""
+    """Persist the spill manifest after a full re-spill.
+
+    ``mtp_stages``/``block_part`` record the spill mode: how many MTP
+    stage banks were spilled and under which key spelling (``".block"``
+    for Lightning MTP, ``""`` for DSpark). A later load whose expected
+    mode differs treats the dir as a miss and re-spills.
+    """
     spill_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "version": _SPILL_VERSION,
@@ -136,6 +238,10 @@ def write_manifest(
         "source": _source_sig(model_path),
         "files": files,
         "key_to_file": key_to_file,
+        "mode": {
+            "mtp_stages": int(mtp_stages),
+            "block_part": block_part if mtp_stages else None,
+        },
     }
     (spill_dir / _MANIFEST_NAME).write_text(json.dumps(manifest, indent=1))
 
