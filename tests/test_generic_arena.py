@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from streaming_fixtures import closer, write_safetensors
 
-import omlx.patches.expert_streaming.streaming_switch as ss
+import omlx.patches.expert_streaming.streaming_layers as ss
 from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
 from omlx.patches.expert_streaming.streaming_switch import (
     ExpertLRUCache,

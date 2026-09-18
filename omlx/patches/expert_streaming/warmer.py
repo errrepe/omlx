@@ -95,10 +95,10 @@ def _is_decode_call(positions: int, seq_len: int | None = None) -> bool:
     definition (``seq_len`` = indices.shape[-2] is authoritative; the
     routed-row bound ``_DECODE_UNION_MAX_ROWS`` /
     OMLX_EXPERT_STREAMING_DECODE_UNION_ROWS is the fallback for
-    legacy/test wiring). Imported lazily: streaming_switch pulls in mlx,
+    legacy/test wiring). Imported lazily: bank_io pulls in mlx,
     and this module must stay importable without it.
     """
-    from .streaming_switch import _decode_call_shape
+    from .bank_io import _decode_call_shape
 
     return _decode_call_shape(positions, seq_len)
 

@@ -6,7 +6,7 @@ per-layer caps, retain_hot, stats and the speculation
 hooks — only the victim-selection order differs. Selected via
 OMLX_EXPERT_STREAMING_CACHE (or the per-model
 ``expert_streaming_cache_policy`` setting) in
-``streaming_switch.make_expert_cache``; the default stays ``lru``.
+``expert_cache.make_expert_cache``; the default stays ``lru``.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Any, Dict
 
-from .streaming_switch import (
+from .expert_cache import (
     ExpertLRUCache,
     _layer_index_add,
     _layer_index_drop,

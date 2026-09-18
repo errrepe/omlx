@@ -115,7 +115,7 @@ def _wire_streaming_io_overrides(
     """
     if io_depth is None and coalesce is None:
         return 0
-    from .streaming_switch import io_pool_for
+    from .bank_io import io_pool_for
 
     pool = io_pool_for(io_depth) if io_depth is not None else None
     wired = 0
@@ -387,7 +387,7 @@ def _convert_switch_mlp_module(
     """
     import mlx.core as mx
 
-    from .streaming_switch import (
+    from .streaming_layers import (
         StreamingQuantizedSwitchLinear,
         StreamingSwitchGLU,
         StreamingSwitchLinear,
@@ -814,7 +814,7 @@ def _make_streaming_cache_and_governor(
     from . import _dynamic_armed, _io_overrides
 
     # Import here to avoid circular
-    from .streaming_switch import make_expert_cache
+    from .expert_cache import make_expert_cache
 
     # IO overrides (settings/env resolution) are resolved before the cache:
     # the eviction policy setting and the governor arming below read them,

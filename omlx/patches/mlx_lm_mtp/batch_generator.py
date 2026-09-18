@@ -917,7 +917,7 @@ def _mtp_streaming_gate() -> Tuple[str, Optional[dict]]:
     if _MTP_STREAM_GATE not in ("auto", "on", "off"):
         return "on", None
     try:
-        from omlx.patches.expert_streaming.streaming_switch import (
+        from omlx.patches.expert_streaming.expert_cache import (
             streaming_gate_state,
         )
 

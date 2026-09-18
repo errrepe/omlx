@@ -140,7 +140,7 @@ class TestReadaheadGate:
     False vetoes advise_expert_run; None falls back to the env default."""
 
     def _advisor_fixture(self, readahead):
-        import omlx.patches.expert_streaming.streaming_switch as ss
+        import omlx.patches.expert_streaming.streaming_layers as ss
 
         spec = SpeculationState()
         spec.readahead_enabled = readahead
@@ -182,7 +182,7 @@ class TestReadaheadGate:
         assert spec.stats.get("advised", 0) > 0
 
     def test_none_falls_back_to_env(self, monkeypatch):
-        import omlx.patches.expert_streaming.streaming_switch as ss
+        import omlx.patches.expert_streaming.streaming_layers as ss
 
         # Env default on: an unstamped state still advises.
         spec, advised, lin, plan, call = self._advisor_fixture(None)
